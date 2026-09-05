@@ -19,6 +19,7 @@ import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/ap
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { createPlaylist, addSongsToPlaylist } from '@/lib/services/playlist-service'
 import { getRecommendedPlaylistDetail, isDiscoverySource, type DiscoverySource } from '@/lib/services/discovery-service'
+import { upsertMusicInfosInTransaction } from '@/lib/db'
 import { logger } from '@/lib/logger'
 
 // 各平台歌单链接 → (source, id)
@@ -31,8 +32,8 @@ const URL_PATTERNS: Array<{ source: DiscoverySource; re: RegExp }> = [
   { source: 'tx', re: /y\.qq\.com\/n\/ryqq\/playlist\/([A-Za-z0-9]+)|[?&]disstid=([A-Za-z0-9]+)|qq\.com\/[^\s]*?playlist\.html\?[^\s]*?[&?]id=([A-Za-z0-9]+)/i },
   // 酷我：kuwo.cn/playlist_detail/123 或任意 kuwo 链接带 pid=123
   { source: 'kw', re: /kuwo\.cn\/playlist_detail\/(\d+)|[?&]pid=(\d+)/i },
-  // 酷狗：kugou.com/yy/special/single/xxx.html 或 specialid=xxx
-  { source: 'kg', re: /kugou\.com\/yy\/special\/single\/(\w+)|[?&]specialid=(\w+)/i },
+  // 酷狗：kugou.com/yy/special/single/xxx.html 或 specialid=xxx 或 songlist/gcid_xxx（个人歌单，需 Cookie）
+  { source: 'kg', re: /kugou\.com\/yy\/special\/single\/(\w+)|[?&]specialid=(\w+)|kugou\.com\/songlist\/gcid_([A-Za-z0-9]+)/i },
   // 咪咕：music.migu.cn/v3/music/playlist/xxx，或 App 分享页 h5.nf.migu.cn/...?id=xxx
   { source: 'mg', re: /migu(?:video)?\.cn\/v3\/music\/playlist\/([A-Za-z0-9]+)|h5\.nf\.migu\.cn[^\s]*?playlist[^\s]*?[?&]id=([A-Za-z0-9]+)/i },
 ]
@@ -68,6 +69,59 @@ async function resolveShareUrl(url: string): Promise<string | null> {
     } finally {
       clearTimeout(timer)
     }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 酷狗 gcid 个人歌单抓取（需 Cookie）：
+ * 服务端请求 songlist/gcid_xxx 页面（带 Cookie），从 HTML 的 SSR 数据中提取歌曲。
+ * 页面模板中歌曲行格式：mixsong/{hash}.html ... 编号 歌手 - 歌名
+ * 返回 null 表示未获取到歌曲（Cookie 无效或歌单不存在）。
+ */
+async function scrapeKgGcidPlaylist(
+  gcid: string,
+  cookie: string,
+): Promise<{ name: string; songs: Array<{ name: string; singer: string; hash: string }> } | null> {
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 12000)
+    let html: string
+    try {
+      const resp = await fetch(`https://www.kugou.com/songlist/gcid_${gcid}/`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          Cookie: cookie,
+          Referer: 'https://www.kugou.com/',
+        },
+        signal: controller.signal,
+      })
+      html = await resp.text()
+    } finally {
+      clearTimeout(timer)
+    }
+
+    // 提取歌单名（页面 <title> 或面包屑）
+    const titleMatch = html.match(/<title>(.+?)_/) || html.match(/名称：(.+?)\n/)
+    const playlistName = titleMatch ? titleMatch[1].trim() : ''
+
+    // 提取歌曲（mixsong hash + 歌名 + 歌手）
+    const songs: Array<{ name: string; singer: string; hash: string }> = []
+    const songRegex = /mixsong\/(\w+)\.html[^>]*>([^<]*(?:<[^>]*>[^<]*)*?)<\/a>/g
+    let match: RegExpExecArray | null
+    while ((match = songRegex.exec(html)) !== null) {
+      const hash = match[1].toUpperCase()
+      const rawText = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+      // 格式："01 歌手 - 歌名" 或 "歌手 - 歌名"
+      const m = rawText.match(/^(?:\d+\s+)?(.+?)\s+-\s+(.+)$/)
+      if (m) {
+        songs.push({ singer: m[1].trim(), name: m[2].trim(), hash })
+      }
+    }
+
+    if (songs.length === 0) return null
+    return { name: playlistName, songs }
   } catch {
     return null
   }
@@ -113,6 +167,65 @@ export async function POST(request: NextRequest) {
     }
 
     const cookie = typeof raw.cookie === 'string' ? raw.cookie.trim() : ''
+
+    // 酷狗 gcid 个人歌单：走独立抓取链路（需 Cookie）
+    if (source === 'kg' && id && !/^\d+$/.test(id)) {
+      if (!cookie) {
+        return createErrorResponse(
+          ErrorCodes.INVALID_PARAMS,
+          '酷狗个人歌单（gcid）需要登录 Cookie。请展开「私有歌单」选项填入酷狗网页版 Cookie',
+          400,
+        )
+      }
+      const gcidResult = await scrapeKgGcidPlaylist(id, cookie)
+      if (!gcidResult || gcidResult.songs.length === 0) {
+        return createErrorResponse('NOT_FOUND', '歌单不存在或 Cookie 已失效', 404)
+      }
+
+      const gcidName = (typeof raw.name === 'string' && raw.name.trim()) || gcidResult.name || `酷狗歌单 ${id}`
+      const gcidPlaylist = await createPlaylist(user.username, gcidName.trim())
+
+      // hash 直接作为 kg songmid（HollyMusic 的 kg 存储键 = FileHash）
+      const gcidMusicInfos = gcidResult.songs.map(s => ({
+        name: s.name,
+        singer: s.singer,
+        source: 'kg' as const,
+        songmid: s.hash,
+        hash: s.hash,
+        interval: '',
+        types: [
+          { type: '128k' as const, size: '' },
+          { type: '320k' as const, size: '' },
+          { type: 'flac' as const, size: '' },
+        ],
+        _types: { '128k': {}, '320k': {}, flac: {} } as Record<string, object>,
+        typeUrl: {},
+      }))
+
+      await upsertMusicInfosInTransaction(gcidMusicInfos)
+      await addSongsToPlaylist(
+        gcidPlaylist.id,
+        user.username,
+        gcidMusicInfos.map(mi => `kg-${mi.hash}`),
+      )
+
+      logger.info(
+        '[api/playlists/import-remote] 用户 %s 导入酷狗gcid歌单「%s」(%s)：%d 首',
+        user.username, gcidName, id, gcidMusicInfos.length,
+      )
+      return createSuccessResponse(
+        {
+          playlistId: gcidPlaylist.id,
+          name: gcidPlaylist.name,
+          source: 'kg',
+          sourcePlaylistId: id,
+          author: '',
+          imported: gcidMusicInfos.length,
+        },
+        201,
+      )
+    }
+
     const detail = await getRecommendedPlaylistDetail(source, id, cookie || undefined)
     if (!detail || detail.tracks.length === 0) {
       return createErrorResponse(
