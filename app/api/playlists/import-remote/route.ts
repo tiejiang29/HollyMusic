@@ -20,6 +20,8 @@ import { requireUser, AuthError } from '@/lib/services/user-context'
 import { createPlaylist, addSongsToPlaylist } from '@/lib/services/playlist-service'
 import { getRecommendedPlaylistDetail, isDiscoverySource, type DiscoverySource } from '@/lib/services/discovery-service'
 import { upsertMusicInfosInTransaction } from '@/lib/db'
+import type { MusicInfo } from '@/lib/types/music'
+import * as musicSearch from '@/lib/music-core/music-search'
 import { logger } from '@/lib/logger'
 
 // 各平台歌单链接 → (source, id)
@@ -108,7 +110,12 @@ const KG_HEADERS: Record<string, string> = {
  */
 async function fetchKgGcidPlaylist(
   gcid: string,
-): Promise<{ name: string; total: number; songs: Array<{ name: string; singer: string; hash: string }> } | null> {
+): Promise<{ name: string; total: number; songs: Array<{
+  name: string; singer: string; hash: string; interval: string
+  img?: string; audioId?: string; albumId?: string; albumName?: string
+  types: Array<{ type: string; size: string }>
+  '320hash'?: string; sqhash?: string
+}> } | null> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 15000)
   try {
@@ -154,8 +161,13 @@ async function fetchKgGcidPlaylist(
     const total = infoData?.data?.songcount ?? 0
     if (total === 0) return null
 
-    // 步骤3: 分页拉全量歌曲
-    const songs: Array<{ name: string; singer: string; hash: string }> = []
+    // 步骤3: 分页拉全量歌曲（含 duration/img/音质/audio_id）
+    const songs: Array<{
+      name: string; singer: string; hash: string; interval: string
+      img?: string; audioId?: string; albumId?: string; albumName?: string
+      types: Array<{ type: string; size: string }>
+      '320hash'?: string; sqhash?: string
+    }> = []
     const pagesize = 300
     const pageCount = Math.ceil(total / pagesize)
     for (let page = 1; page <= pageCount; page++) {
@@ -166,22 +178,147 @@ async function fetchKgGcidPlaylist(
         { headers: KG_HEADERS, signal: controller.signal },
       )
       const songData = await songResp.json() as {
-        data?: { info?: Array<{ hash?: string; filename?: string }> }
+        data?: { info?: Array<{
+          hash?: string
+          filename?: string
+          duration?: number
+          audio_id?: string | number
+          album_id?: string | number
+          album_sizable_cover?: string
+          img?: string
+          filesize?: number
+          '320filesize'?: number
+          sqfilesize?: number
+          '320hash'?: string
+          sqhash?: string
+        }> }
       }
       const rawSongs = songData?.data?.info ?? []
       for (const s of rawSongs) {
         if (!s.hash) continue
         // filename 格式: "歌手 - 歌名"
         const parts = (s.filename ?? '').split(/\s+-\s+/)
+        const durationSec = s.duration ?? 0
+        // duration 秒 → mm:ss
+        const interval = durationSec > 0
+          ? `${Math.floor(durationSec / 60)}:${String(durationSec % 60).padStart(2, '0')}`
+          : ''
+        // 封面：song_v2 可能返回 album_sizable_cover / img，否则留空让 /api/cover 代理兜底
+        const img = (s.album_sizable_cover || s.img || '').replace('{size}', '400') || undefined
         songs.push({
           singer: parts.length >= 2 ? parts[0].trim() : '',
           name: parts.length >= 2 ? parts.slice(1).join(' - ').trim() : s.filename ?? '',
           hash: s.hash.toUpperCase(),
+          interval,
+          img,
+          audioId: s.audio_id ? String(s.audio_id) : undefined,
+          albumId: s.album_id ? String(s.album_id) : undefined,
+          // 音质信息
+          types: [
+            ...(s.filesize ? [{ type: '128k' as const, size: '' }] : []),
+            ...(s['320filesize'] ? [{ type: '320k' as const, size: '' }] : []),
+            ...(s.sqfilesize ? [{ type: 'flac' as const, size: '' }] : []),
+          ],
+          '320hash': s['320hash'],
+          sqhash: s.sqhash,
         })
       }
     }
 
     if (songs.length === 0) return null
+
+    // 步骤4: 批量获取封面（gateway.kugou.com 的 album_audio API，按 hash 查，含 sizable_cover）
+    // 注意：API 不回传 hash，返回结果按输入顺序排列，用索引匹配
+    try {
+      const BATCH = 100
+      for (let i = 0; i < songs.length; i += BATCH) {
+        const batch = songs.slice(i, i + BATCH)
+        const reqBody = JSON.stringify({
+          area_code: '1', show_privilege: 1, show_album_info: '1', is_publish: '',
+          appid: 1005, clientver: 11451, mid: '1', dfid: '-',
+          clienttime: Date.now(),
+          key: 'OIlwieks28dk2k092lksi2UIkp',
+          fields: 'album_info,base',
+          data: batch.map(s => ({ hash: s.hash })),
+        })
+        const coverResp = await fetch('http://gateway.kugou.com/v2/album_audio/audio', {
+          method: 'POST',
+          headers: {
+            'KG-THash': '13a3164', 'KG-RC': '1', 'KG-Fake': '0', 'KG-RF': '00869891',
+            'User-Agent': 'Android712-AndroidPhone-11451-376-0-FeeCacheUpdate-wifi',
+            'x-router': 'kmr.service.kugou.com',
+            'Content-Type': 'application/json',
+          },
+          body: reqBody,
+          signal: controller.signal,
+        })
+        if (!coverResp.ok) continue
+        const coverData = await coverResp.json() as {
+          data?: Array<{ album_info?: { sizable_cover?: string } } | Array<{ album_info?: { sizable_cover?: string } }>>
+        }
+        const items = coverData.data ?? []
+        for (let j = 0; j < items.length && (i + j) < songs.length; j++) {
+          const raw = items[j] as { album_info?: { sizable_cover?: string; album_name?: string } } | Array<{ album_info?: { sizable_cover?: string; album_name?: string } }>
+          const item = Array.isArray(raw) ? raw[0] : raw
+          const cover = item?.album_info?.sizable_cover?.replace('{size}', '400')
+          if (cover) {
+            songs[i + j].img = cover
+          }
+          const albumName = item?.album_info?.album_name
+          if (albumName) {
+            songs[i + j].albumName = albumName
+          }
+        }
+      }
+      const coverCount = songs.filter(s => s.img).length
+      logger.info('[import-remote] kg gcid: gateway 封面 %d/%d 首', coverCount, songs.length)
+
+      // 步骤5: 跨平台补封面（洛雪 otherSource 机制的变体）
+      // gateway 没拿到封面的歌，按优先级在其他平台搜同名歌用其封面；
+      // Live/现场版歌名带括号后缀，去掉后缀搜录音室版封面
+      const noCover = songs.filter(s => !s.img)
+      if (noCover.length > 0) {
+        logger.info('[import-remote] kg gcid: %d 首无封面，跨平台搜索补齐...', noCover.length)
+        const CONCURRENCY = 5
+        // 搜索平台优先级：wy 和 mg 的搜索结果通常带 img
+        const SEARCH_PLATFORMS = ['wy', 'mg', 'kw'] as const
+
+        for (let i = 0; i < noCover.length; i += CONCURRENCY) {
+          const batch = noCover.slice(i, i + CONCURRENCY)
+          await Promise.all(batch.map(async song => {
+            if (song.img) return // 已在之前批次补上
+            // 去掉括号后缀："歌名 (Live版说明)" → "歌名"
+            const baseName = song.name.replace(/\s*[（(].*?[)）]\s*/g, '').trim() || song.name
+            const keyword = `${baseName} ${song.singer}`.trim()
+            if (!keyword) return
+
+            for (const plat of SEARCH_PLATFORMS) {
+              try {
+                const result = await (musicSearch as unknown as Record<string, { search: (kw: string, p: number, l: number) => Promise<{ list?: Array<{ name?: string; img?: string }> }> }>)[plat]?.search(keyword, 1, 5)
+                const list = (result?.list ?? []) as Array<{ name?: string; img?: string }>
+                // 宽松匹配：录音室版歌名通常是 baseName 的子串
+                const match = list.find(item =>
+                  item?.name && item?.img && (
+                    item.name.includes(baseName) || baseName.includes(item.name)
+                  )
+                )
+                if (match?.img) {
+                  song.img = match.img
+                  return // 补到了就停
+                }
+              } catch {
+                // 单平台失败换下一个
+              }
+            }
+          }))
+        }
+        const finalCount = songs.filter(s => s.img).length
+        logger.info('[import-remote] kg gcid: 跨平台补齐后封面 %d/%d 首', finalCount, songs.length)
+      }
+    } catch {
+      // 封面补充失败不阻塞导入，走代理兜底
+    }
+
     return { name: playlistName, total, songs }
   } catch {
     return null
@@ -242,21 +379,29 @@ export async function POST(request: NextRequest) {
       const gcidPlaylist = await createPlaylist(user.username, gcidName.trim())
 
       // hash 直接作为 kg songmid（HollyMusic 的 kg 存储键 = FileHash）
-      const gcidMusicInfos = gcidResult.songs.map(s => ({
-        name: s.name,
-        singer: s.singer,
-        source: 'kg' as const,
-        songmid: s.hash,
-        hash: s.hash,
-        interval: '',
-        types: [
+      const gcidMusicInfos: MusicInfo[] = gcidResult.songs.map(s => {
+        const fallbackTypes = [
           { type: '128k' as const, size: '' },
           { type: '320k' as const, size: '' },
           { type: 'flac' as const, size: '' },
-        ],
-        _types: { '128k': {}, '320k': {}, flac: {} } as Record<string, object>,
-        typeUrl: {},
-      }))
+        ]
+        const useTypes = s.types.length > 0 ? s.types : fallbackTypes
+        return {
+          name: s.name,
+          singer: s.singer,
+          source: 'kg',
+          songmid: s.hash,
+          hash: s.hash,
+          interval: s.interval,
+          img: s.img,
+          songId: s.audioId,
+          albumId: s.albumId,
+          albumName: s.albumName,
+          types: useTypes as MusicInfo['types'],
+          _types: Object.fromEntries(useTypes.map(t => [t.type, { size: t.size }])) as MusicInfo['_types'],
+          typeUrl: {},
+        }
+      })
 
       await upsertMusicInfosInTransaction(gcidMusicInfos)
       await addSongsToPlaylist(

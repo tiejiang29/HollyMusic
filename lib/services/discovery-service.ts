@@ -2,6 +2,7 @@ import { searchCache } from '@/lib/cache-manager'
 import { getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import type { MusicInfo, QualityInfo, QualityType, Song } from '@/lib/types/music'
+import { createCipheriv, createHash } from 'crypto'
 
 const QQ_MUSICU_URL = 'https://u.y.qq.com/cgi-bin/musicu.fcg'
 const QQ_SINGLE_SONG_URL = 'https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg'
@@ -407,7 +408,41 @@ function toMgMusicInfo(raw: MgSong): MusicInfo | null {
   }
 }
 
+// ==================== 网易云 linuxapi 加密（参考洛雪 musicSdk/wy/utils/crypto.js） ====================
+
+const LINUXAPI_KEY = Buffer.from('rFgB&h#%2?^eDg:Q', 'utf-8')
+
+/**
+ * 网易云 linuxapi 加密：AES-128-ECB（NoPadding），输出 hex 大写
+ * 用于走 api/linux/forward 通道，支持大歌单和私有歌单
+ */
+function linuxapiEncrypt(obj: unknown): string {
+  const text = JSON.stringify(obj)
+  const buf = Buffer.from(text, 'utf-8')
+  // 手动 PKCS7 NoPadding（补齐到 16 字节倍数，用 \0 填充——洛雪用 ECB NoPadding 即零填充）
+  const padLen = 16 - (buf.length % 16)
+  const padded = Buffer.concat([buf, Buffer.alloc(padLen, 0)])
+  const cipher = createCipheriv('aes-128-ecb', LINUXAPI_KEY, null)
+  cipher.setAutoPadding(false)
+  return Buffer.concat([cipher.update(padded), cipher.final()]).toString('hex').toUpperCase()
+}
+
+// ==================== 酷狗签名（参考洛雪 musicSdk/kg/util.js） ====================
+
+const KG_WEB_KEY = 'NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt'
+
+function kgSign(paramsStr: string): string {
+  const sorted = paramsStr.split('&').sort().join('')
+  return createHash('md5').update(`${KG_WEB_KEY}${sorted}${KG_WEB_KEY}`).digest('hex')
+}
+
 async function getWyPlaylistDetail(id: string, cookie?: string): Promise<DiscoveryCollectionDetail | null> {
+  // 优先走洛雪的 linuxapi 通道（支持大歌单 1000 首/页 + 私有歌单 Cookie）
+  const linuxResult = await getWyPlaylistDetailViaLinuxApi(id, cookie)
+  if (linuxResult) return linuxResult
+
+  // 回退到老公开 API（linuxapi 失败时兜底）
+  logger.debug('[discovery] linuxapi 失败，回退到老公开 API: wy playlist', id)
   const payload = await fetchJson<{ result?: { name?: string; description?: string; coverImgUrl?: string; creator?: { nickname?: string }; tracks?: Parameters<typeof toWyMusicInfo>[0][] } }>(`https://music.163.com/api/playlist/detail?id=${encodeURIComponent(id)}`, cookie ? { headers: { Cookie: cookie, Referer: 'https://music.163.com/' } } : undefined)
   const playlist = payload.result
   if (!playlist?.tracks) return null
@@ -418,6 +453,68 @@ async function getWyPlaylistDetail(id: string, cookie?: string): Promise<Discove
     cover: normalizeCover(playlist.coverImgUrl),
     author: playlist.creator?.nickname || '网易云音乐',
     tracks: await enrichMusicInfos(playlist.tracks.map(toWyMusicInfo).filter((item): item is MusicInfo => item !== null)),
+  }
+}
+
+/**
+ * 网易云歌单详情（洛雪 linuxapi 方案）：
+ * POST music.163.com/api/linux/forward（AES-ECB 加密）→ api/v3/playlist/detail
+ * 优势：1000 首/页、trackIds 全量返回、支持 Cookie 解锁私有歌单
+ */
+async function getWyPlaylistDetailViaLinuxApi(id: string, cookie?: string): Promise<DiscoveryCollectionDetail | null> {
+  try {
+    const eparams = linuxapiEncrypt({
+      method: 'POST',
+      url: 'https://music.163.com/api/v3/playlist/detail',
+      params: { id: Number(id), n: 1000, s: 8 },
+    })
+    const headers: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/60.0.3112.90 Safari/537.36',
+      'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    if (cookie) headers['Cookie'] = cookie
+
+    const resp = await fetch('https://music.163.com/api/linux/forward', {
+      method: 'POST',
+      headers,
+      body: `eparams=${eparams}`,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+    })
+    if (!resp.ok) return null
+    const body = await resp.json() as {
+      code?: number
+      playlist?: {
+        name?: string
+        description?: string
+        coverImgUrl?: string
+        creator?: { nickname?: string }
+        trackIds?: Array<{ id: number }>
+        tracks?: Parameters<typeof toWyMusicInfo>[0][]
+      }
+      privileges?: unknown[]
+    }
+    if (body.code !== 200 || !body.playlist) return null
+    const pl = body.playlist
+
+    // 如果 tracks 与 trackIds 数量匹配，直接用 tracks（1000 首以内）
+    let wyTracks = pl.tracks ?? []
+    if (wyTracks.length === 0 && (pl.trackIds?.length ?? 0) > 0) {
+      // trackIds 存在但 tracks 为空 → 需要走 song/detail 批量拉（此处简化，留作 TODO）
+      logger.debug('[discovery] wy playlist has trackIds but no tracks, count:', pl.trackIds?.length)
+    }
+
+    if (wyTracks.length === 0) return null
+    return {
+      id,
+      name: pl.name || '',
+      description: pl.description || '',
+      cover: normalizeCover(pl.coverImgUrl),
+      author: pl.creator?.nickname || '网易云音乐',
+      tracks: await enrichMusicInfos(wyTracks.map(toWyMusicInfo).filter((item): item is MusicInfo => item !== null)),
+    }
+  } catch (error) {
+    logger.debug('[discovery] wy linuxapi error:', error)
+    return null
   }
 }
 
@@ -494,6 +591,12 @@ type KgPlaylistInfo = {
 }
 
 async function getKgPlaylistDetail(id: string): Promise<DiscoveryCollectionDetail | null> {
+  // 优先走洛雪的签名 API（song_v2 支持分页 300/页，大歌单不截断）
+  const signedResult = await getKgPlaylistDetailViaSongV2(id)
+  if (signedResult) return signedResult
+
+  // 回退到老 v3 API（签名失败时兜底）
+  logger.debug('[discovery] kg song_v2 失败，回退到 v3: specialid', id)
   const [songsPayload, infoPayload] = await Promise.all([
     fetchJson<{ data?: { info?: KgSong[] } }>(`http://mobilecdnbj.kugou.com/api/v3/special/song?version=9108&specialid=${encodeURIComponent(id)}&plat=0&pagesize=100&page=1`),
     fetchJson<{ data?: KgPlaylistInfo }>(`http://mobilecdnbj.kugou.com/api/v5/special/info?specialid=${encodeURIComponent(id)}`).catch(error => {
@@ -511,6 +614,69 @@ async function getKgPlaylistDetail(id: string): Promise<DiscoveryCollectionDetai
     cover: normalizeCover(info?.imgurl?.replace('{size}', '400')),
     author: info?.nickname || '酷狗音乐',
     tracks: await enrichMusicInfos(songs.map(toKgMusicInfo).filter((item): item is MusicInfo => item !== null)),
+  }
+}
+
+/**
+ * 酷狗歌单详情（洛雪签名 API 方案）：
+ * info_v2 获取总数 → song_v2 分页拉全量（300/页）
+ * 签名与洛雪 musicSdk/kg/songList.js 的 getUserListDetail2 一致
+ */
+async function getKgPlaylistDetailViaSongV2(id: string): Promise<DiscoveryCollectionDetail | null> {
+  const KG_MID = '1586163242519'
+  const KG_HEADERS: Record<string, string> = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38',
+    Referer: 'https://m3ws.kugou.com/share/index.php',
+    mid: KG_MID,
+    dfid: '-',
+    clienttime: KG_MID,
+  }
+  try {
+    // 1: 获取歌单元数据（含总数）
+    const infoParams = `appid=1058&specialid=0&global_specialid=${id}&format=jsonp&srcappid=2919&clientver=20000&clienttime=${KG_MID}&mid=${KG_MID}&uuid=${KG_MID}&dfid=-`
+    const infoSig = kgSign(infoParams)
+    const infoResp = await fetch(
+      `https://mobiles.kugou.com/api/v5/special/info_v2?${infoParams}&signature=${infoSig}`,
+      { headers: KG_HEADERS, signal: AbortSignal.timeout(REQUEST_TIMEOUT) },
+    )
+    if (!infoResp.ok) return null
+    const infoData = (await infoResp.json()) as {
+      data?: { specialname?: string; songcount?: number; nickname?: string; intro?: string; imgurl?: string }
+    }
+    const info = infoData?.data
+    if (!info || (info.songcount ?? 0) === 0) return null
+    const total = info.songcount!
+
+    // 2: 分页拉全量歌曲（300/页）
+    const allSongs: KgSong[] = []
+    const pagesize = 300
+    const pageCount = Math.ceil(total / pagesize)
+    for (let page = 1; page <= pageCount; page++) {
+      const songParams = `appid=1058&global_specialid=${id}&specialid=0&plat=0&version=8000&page=${page}&pagesize=${pagesize}&srcappid=2919&clientver=20000&clienttime=${KG_MID}&mid=${KG_MID}&uuid=${KG_MID}&dfid=-`
+      const songSig = kgSign(songParams)
+      const songResp = await fetch(
+        `https://mobiles.kugou.com/api/v5/special/song_v2?${songParams}&signature=${songSig}`,
+        { headers: KG_HEADERS, signal: AbortSignal.timeout(REQUEST_TIMEOUT) },
+      )
+      if (!songResp.ok) break
+      const songData = (await songResp.json()) as { data?: { info?: KgSong[] } }
+      const songs = songData?.data?.info ?? []
+      allSongs.push(...songs)
+      if (songs.length < pagesize) break // 最后一页
+    }
+
+    if (allSongs.length === 0) return null
+    return {
+      id,
+      name: info.specialname || '酷狗推荐歌单',
+      description: info.intro || '',
+      cover: normalizeCover(info.imgurl?.replace('{size}', '400')),
+      author: info.nickname || '酷狗音乐',
+      tracks: await enrichMusicInfos(allSongs.map(toKgMusicInfo).filter((item): item is MusicInfo => item !== null)),
+    }
+  } catch (error) {
+    logger.debug('[discovery] kg song_v2 error:', error)
+    return null
   }
 }
 

@@ -24,9 +24,15 @@ export function CoverImage({ uid, cacheKey, className = '' }: CoverImageProps) {
     )
   }
 
+  // cacheKey 是 MusicInfo.img：如果有 CDN 直链，直接用它（最快最稳）
+  // 否则走 /api/cover/ 代理（按需从平台拉取）
+  const src = cacheKey && cacheKey.startsWith('http')
+    ? cacheKey
+    : buildCoverUrl(uid, cacheKey)
+
   return (
     <img
-      src={buildCoverUrl(uid, cacheKey)}
+      src={src}
       onError={() => setError(true)}
       alt=""
       loading="lazy"
