@@ -166,6 +166,20 @@ class MusicSourceManager {
     await this.initialize()
   }
 
+  /**
+   * 配置文件有变更（MD5 对比）时才重建实例；无变化时零开销。
+   * 供 health 等读状态入口刷新内存态，避免展示过期配置。
+   */
+  async ensureFresh(): Promise<void> {
+    if (this.initialized && this.checkConfigChanged()) {
+      logger.info('配置文件已变更，重新加载音源...')
+      this.resetInstances()
+    }
+    if (!this.initialized) {
+      await this.initialize()
+    }
+  }
+
   private async doInitialize(): Promise<void> {
     logger.info('开始初始化音源管理器...')
 
