@@ -58,6 +58,15 @@ docs
 *.log
 logs/
 
+# 运行时用户数据与生成产物（不进构建上下文：
+# - data/ 含音频缓存，本地可达数百 MB；CI checkout 无此目录
+# - lib/generated 为 prisma generate 输出，builder 内会重新生成，
+#   本地副本含 Windows DLL，混入会被追踪进 standalone）
+# - custom-sources 通过 volume 挂载，镜像只需空目录）
+data
+custom-sources
+lib/generated
+
 # Other
 *.tmp
 .cache
