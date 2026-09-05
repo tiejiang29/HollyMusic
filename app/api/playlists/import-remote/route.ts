@@ -74,56 +74,119 @@ async function resolveShareUrl(url: string): Promise<string | null> {
   }
 }
 
+import { createHash } from 'crypto'
+
 /**
- * 酷狗 gcid 个人歌单抓取（需 Cookie）：
- * 服务端请求 songlist/gcid_xxx 页面（带 Cookie），从 HTML 的 SSR 数据中提取歌曲。
- * 页面模板中歌曲行格式：mixsong/{hash}.html ... 编号 歌手 - 歌名
- * 返回 null 表示未获取到歌曲（Cookie 无效或歌单不存在）。
+ * 酷狗移动端 API 签名（从洛雪 musicSdk/kg/util.js 逆向）
+ * key = 'NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt'（web 平台）
+ * 算法：params 按 & 拆分排序拼接 + body + 前后各加 key → MD5
  */
-async function scrapeKgGcidPlaylist(
+function kgSignature(paramsStr: string, body = '', platform: 'web' | 'android' = 'web'): string {
+  const key = platform === 'web'
+    ? 'NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt'
+    : 'OIlwieks28dk2k092lksi2UIkp'
+  const sorted = paramsStr.split('&').sort().join('')
+  return createHash('md5').update(`${key}${sorted}${body}${key}`).digest('hex')
+}
+
+const KG_MID = '1586163242519'
+const KG_HEADERS: Record<string, string> = {
+  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38',
+  Referer: 'https://m3ws.kugou.com/share/index.php',
+  mid: KG_MID,
+  dfid: '-',
+  clienttime: KG_MID,
+}
+
+/**
+ * 酷狗 gcid 个人歌单导入（签名 API 方案，无需 Cookie）：
+ * 1. gcid → batch_decode → global_collection_id
+ * 2. global_collection_id → info_v2 → 歌单元数据（歌名、总数）
+ * 3. global_collection_id → song_v2 → 全量歌曲（hash 列表，300/页分页）
+ *
+ * 参考：洛雪 musicSdk/kg/songList.js 的 decodeGcid / getUserListDetail2
+ */
+async function fetchKgGcidPlaylist(
   gcid: string,
-  cookie: string,
-): Promise<{ name: string; songs: Array<{ name: string; singer: string; hash: string }> } | null> {
+): Promise<{ name: string; total: number; songs: Array<{ name: string; singer: string; hash: string }> } | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 15000)
   try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 12000)
-    let html: string
-    try {
-      const resp = await fetch(`https://www.kugou.com/songlist/gcid_${gcid}/`, {
+    // 步骤1: gcid → global_collection_id
+    const decodeParams = 'dfid=-&appid=1005&mid=0&clientver=20109&clienttime=640612895&uuid=-'
+    const decodeBody = JSON.stringify({ ret_info: 1, data: [{ id: gcid, id_type: 2 }] })
+    const decodeSig = kgSignature(decodeParams, decodeBody, 'android') // batch_decode 用 Android key
+    const decodeResp = await fetch(
+      `https://t.kugou.com/v1/songlist/batch_decode?${decodeParams}&signature=${decodeSig}`,
+      {
+        method: 'POST',
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          Cookie: cookie,
-          Referer: 'https://www.kugou.com/',
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 10)',
+          Referer: 'https://m.kugou.com/',
+          'Content-Type': 'application/json',
         },
+        body: decodeBody,
         signal: controller.signal,
-      })
-      html = await resp.text()
-    } finally {
-      clearTimeout(timer)
+      },
+    )
+    const decodeData = await decodeResp.json() as {
+      status?: number
+      err_code?: number
+      data?: { list?: Array<{ global_collection_id?: string; info?: { global_collection_id?: string } }> }
     }
+    // batch_decode 响应可能嵌套在 data.list 或 data.list[].info
+    const decodedList = decodeData?.data?.list ?? []
+    const globalId = decodedList[0]?.global_collection_id
+      ?? decodedList[0]?.info?.global_collection_id
+    if (!globalId) return null
 
-    // 提取歌单名（页面 <title> 或面包屑）
-    const titleMatch = html.match(/<title>(.+?)_/) || html.match(/名称：(.+?)\n/)
-    const playlistName = titleMatch ? titleMatch[1].trim() : ''
+    // 步骤2: 获取歌单元数据（歌名、总数）
+    const infoParams = `appid=1058&specialid=0&global_specialid=${globalId}&format=jsonp&srcappid=2919&clientver=20000&clienttime=${KG_MID}&mid=${KG_MID}&uuid=${KG_MID}&dfid=-`
+    const infoSig = kgSignature(infoParams)
+    const infoResp = await fetch(
+      `https://mobiles.kugou.com/api/v5/special/info_v2?${infoParams}&signature=${infoSig}`,
+      { headers: KG_HEADERS, signal: controller.signal },
+    )
+    const infoData = await infoResp.json() as {
+      data?: { specialname?: string; songcount?: number; nickname?: string }
+    }
+    const playlistName = infoData?.data?.specialname ?? ''
+    const total = infoData?.data?.songcount ?? 0
+    if (total === 0) return null
 
-    // 提取歌曲（mixsong hash + 歌名 + 歌手）
+    // 步骤3: 分页拉全量歌曲
     const songs: Array<{ name: string; singer: string; hash: string }> = []
-    const songRegex = /mixsong\/(\w+)\.html[^>]*>([^<]*(?:<[^>]*>[^<]*)*?)<\/a>/g
-    let match: RegExpExecArray | null
-    while ((match = songRegex.exec(html)) !== null) {
-      const hash = match[1].toUpperCase()
-      const rawText = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
-      // 格式："01 歌手 - 歌名" 或 "歌手 - 歌名"
-      const m = rawText.match(/^(?:\d+\s+)?(.+?)\s+-\s+(.+)$/)
-      if (m) {
-        songs.push({ singer: m[1].trim(), name: m[2].trim(), hash })
+    const pagesize = 300
+    const pageCount = Math.ceil(total / pagesize)
+    for (let page = 1; page <= pageCount; page++) {
+      const songParams = `appid=1058&global_specialid=${globalId}&specialid=0&plat=0&version=8000&page=${page}&pagesize=${pagesize}&srcappid=2919&clientver=20000&clienttime=${KG_MID}&mid=${KG_MID}&uuid=${KG_MID}&dfid=-`
+      const songSig = kgSignature(songParams)
+      const songResp = await fetch(
+        `https://mobiles.kugou.com/api/v5/special/song_v2?${songParams}&signature=${songSig}`,
+        { headers: KG_HEADERS, signal: controller.signal },
+      )
+      const songData = await songResp.json() as {
+        data?: { info?: Array<{ hash?: string; filename?: string }> }
+      }
+      const rawSongs = songData?.data?.info ?? []
+      for (const s of rawSongs) {
+        if (!s.hash) continue
+        // filename 格式: "歌手 - 歌名"
+        const parts = (s.filename ?? '').split(/\s+-\s+/)
+        songs.push({
+          singer: parts.length >= 2 ? parts[0].trim() : '',
+          name: parts.length >= 2 ? parts.slice(1).join(' - ').trim() : s.filename ?? '',
+          hash: s.hash.toUpperCase(),
+        })
       }
     }
 
     if (songs.length === 0) return null
-    return { name: playlistName, songs }
+    return { name: playlistName, total, songs }
   } catch {
     return null
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -168,18 +231,11 @@ export async function POST(request: NextRequest) {
 
     const cookie = typeof raw.cookie === 'string' ? raw.cookie.trim() : ''
 
-    // 酷狗 gcid 个人歌单：走独立抓取链路（需 Cookie）
+    // 酷狗 gcid 个人歌单：走签名 API 链路（无需 Cookie）
     if (source === 'kg' && id && !/^\d+$/.test(id)) {
-      if (!cookie) {
-        return createErrorResponse(
-          ErrorCodes.INVALID_PARAMS,
-          '酷狗个人歌单（gcid）需要登录 Cookie。请展开「私有歌单」选项填入酷狗网页版 Cookie',
-          400,
-        )
-      }
-      const gcidResult = await scrapeKgGcidPlaylist(id, cookie)
+      const gcidResult = await fetchKgGcidPlaylist(id)
       if (!gcidResult || gcidResult.songs.length === 0) {
-        return createErrorResponse('NOT_FOUND', '歌单不存在或 Cookie 已失效', 404)
+        return createErrorResponse('NOT_FOUND', '歌单不存在或已删除', 404)
       }
 
       const gcidName = (typeof raw.name === 'string' && raw.name.trim()) || gcidResult.name || `酷狗歌单 ${id}`
@@ -210,8 +266,8 @@ export async function POST(request: NextRequest) {
       )
 
       logger.info(
-        '[api/playlists/import-remote] 用户 %s 导入酷狗gcid歌单「%s」(%s)：%d 首',
-        user.username, gcidName, id, gcidMusicInfos.length,
+        '[api/playlists/import-remote] 用户 %s 导入酷狗gcid歌单「%s」(%s)：%d/%d 首',
+        user.username, gcidName, id, gcidMusicInfos.length, gcidResult.total,
       )
       return createSuccessResponse(
         {
@@ -221,6 +277,7 @@ export async function POST(request: NextRequest) {
           sourcePlaylistId: id,
           author: '',
           imported: gcidMusicInfos.length,
+          total: gcidResult.total,
         },
         201,
       )
