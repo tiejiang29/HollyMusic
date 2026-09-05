@@ -100,6 +100,7 @@ interface PlayerStore {
   setVolume: (v: number) => void
   toggleMute: () => void
   cyclePlaybackMode: () => void
+  setPlaybackMode: (m: PlaybackMode) => void
   setQuality: (q: QualityType) => void
 
   next: () => void
@@ -253,6 +254,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       const i = modes.indexOf(s.playbackMode)
       return { playbackMode: modes[(i + 1) % modes.length] }
     }),
+  setPlaybackMode: (m) => set({ playbackMode: m }),
   setQuality: (q) => {
     if (typeof window !== 'undefined') window.localStorage.setItem(QUALITY_KEY, q)
     set({ quality: q })
