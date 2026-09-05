@@ -1,8 +1,8 @@
 import { apiGet } from './client'
 import type { DiscoveryCollectionDetail, DiscoveryPlaylist, DiscoveryPlaylistFilter, DiscoverySource, DiscoveryToplist } from '@/lib/services/discovery-service'
 
-export function getToplists(source: DiscoverySource = 'tx'): Promise<DiscoveryToplist[]> {
-  return apiGet('discover/toplists', { source })
+export function getToplists(source: DiscoverySource = 'tx', scope: 'common' | 'full' = 'common'): Promise<DiscoveryToplist[]> {
+  return apiGet('discover/toplists', { source, scope })
 }
 
 export function getToplistDetail(source: DiscoverySource, id: string): Promise<DiscoveryCollectionDetail> {

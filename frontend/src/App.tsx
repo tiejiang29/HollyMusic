@@ -22,6 +22,7 @@ import { useAuthStore } from '@/hooks/useAuth'
 import { HomePage } from './routes/HomePage'
 import { DiscoveryCollectionPage } from './routes/DiscoveryCollectionPage'
 import { RecommendedMusicPage } from './routes/RecommendedMusicPage'
+import { LeaderboardPage } from './routes/LeaderboardPage'
 import { SearchPage } from './routes/SearchPage'
 import { FavoritesPage } from './routes/FavoritesPage'
 import { PlaylistsPage } from './routes/PlaylistsPage'
@@ -153,6 +154,7 @@ export function App() {
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/recommend" element={<RecommendedMusicPage />} />
+          <Route path="/leaderboard" element={<LeaderboardPage />} />
             <Route path="/discover/toplists/:id" element={<DiscoveryCollectionPage kind="toplists" />} />
             <Route path="/discover/playlists/:id" element={<DiscoveryCollectionPage kind="playlists" />} />
             <Route path="/search" element={<SearchPage />} />

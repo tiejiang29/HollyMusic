@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { Home, Search, Heart, ListMusic, History, Music2, LogIn, LogOut, User, ChevronUp, Settings, KeyRound, Shuffle } from 'lucide-react'
+import { Home, Search, Heart, ListMusic, History, Music2, LogIn, LogOut, User, ChevronUp, Settings, KeyRound, Shuffle, Trophy } from 'lucide-react'
 import { useAuthStore } from '@/hooks/useAuth'
 
 const nav = [
   { href: '/', label: '首页', icon: Home, protected: false },
   { href: '/recommend', label: '推荐', icon: Shuffle, protected: false },
+  { href: '/leaderboard', label: '排行榜', icon: Trophy, protected: true },
   { href: '/search', label: '搜索', icon: Search, protected: true },
   { href: '/favorites', label: '收藏', icon: Heart, protected: true },
   { href: '/playlists', label: '歌单', icon: ListMusic, protected: true },
