@@ -497,7 +497,7 @@ async function getWyPlaylistDetailViaLinuxApi(id: string, cookie?: string): Prom
     const pl = body.playlist
 
     // 如果 tracks 与 trackIds 数量匹配，直接用 tracks（1000 首以内）
-    let wyTracks = pl.tracks ?? []
+    const wyTracks = pl.tracks ?? []
     if (wyTracks.length === 0 && (pl.trackIds?.length ?? 0) > 0) {
       // trackIds 存在但 tracks 为空 → 需要走 song/detail 批量拉（此处简化，留作 TODO）
       logger.debug('[discovery] wy playlist has trackIds but no tracks, count:', pl.trackIds?.length)
