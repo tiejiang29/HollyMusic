@@ -3,6 +3,7 @@ import { getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/
 import { logger } from '@/lib/logger'
 import type { MusicInfo, QualityInfo, QualityType, Song } from '@/lib/types/music'
 import { createCipheriv, createHash } from 'crypto'
+import { TOPLIST_BOARDS, type ToplistBoardDef } from './toplist-boards'
 
 const QQ_MUSICU_URL = 'https://u.y.qq.com/cgi-bin/musicu.fcg'
 const QQ_SINGLE_SONG_URL = 'https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg'
@@ -16,6 +17,8 @@ export interface DiscoveryToplist {
   cover: string
   updateTime?: string
   source: DiscoverySource
+  /** 常用榜单标记（首页横排区展示集；scope=full 时返回） */
+  common?: boolean
 }
 
 export interface DiscoveryPlaylist {
@@ -69,53 +72,10 @@ type QQSong = {
   file?: QQFile
 }
 
-// 与 lxserver 的 tx/leaderboard.js 保持同一批常用榜单；列表固定可用，详情实时请求。
-const TX_TOPLISTS: DiscoveryToplist[] = [
-  { id: '4', name: '流行指数榜', description: 'QQ 音乐流行指数', cover: '', source: 'tx' },
-  { id: '26', name: '热歌榜', description: '每日更新的站内热度歌曲', cover: '', source: 'tx' },
-  { id: '27', name: '新歌榜', description: '近期热门新歌', cover: '', source: 'tx' },
-  { id: '62', name: '飙升榜', description: '热度增长最快的歌曲', cover: '', source: 'tx' },
-  { id: '58', name: '说唱榜', description: '说唱音乐精选', cover: '', source: 'tx' },
-  { id: '5', name: '内地榜', description: '内地流行音乐', cover: '', source: 'tx' },
-  { id: '3', name: '欧美榜', description: '欧美热门音乐', cover: '', source: 'tx' },
-  { id: '16', name: '韩国榜', description: '韩国热门音乐', cover: '', source: 'tx' },
-]
-
-const WY_TOPLISTS: DiscoveryToplist[] = [
-  { id: '19723756', name: '飙升榜', description: '网易云音乐飙升榜', cover: '', source: 'wy' },
-  { id: '3779629', name: '新歌榜', description: '网易云音乐新歌榜', cover: '', source: 'wy' },
-  { id: '3778678', name: '热歌榜', description: '网易云音乐热歌榜', cover: '', source: 'wy' },
-  { id: '2884035', name: '原创榜', description: '网易云音乐原创榜', cover: '', source: 'wy' },
-]
-
-const KW_TOPLISTS: DiscoveryToplist[] = [
-  { id: '16', name: '热歌榜', description: '酷我热歌榜', cover: '', source: 'kw' },
-  { id: '17', name: '新歌榜', description: '酷我新歌榜', cover: '', source: 'kw' },
-  { id: '93', name: '飙升榜', description: '酷我飙升榜', cover: '', source: 'kw' },
-  { id: '158', name: '抖音热歌榜', description: '酷我抖音热歌榜', cover: '', source: 'kw' },
-]
-
-// 与 lxserver 的 kg/leaderboard.js、mg/leaderboard.js 保持同一批常用榜单。
-const KG_TOPLISTS: DiscoveryToplist[] = [
-  { id: '8888', name: 'TOP500', description: '酷狗音乐 TOP500', cover: '', source: 'kg' },
-  { id: '6666', name: '飙升榜', description: '酷狗热度增长最快歌曲', cover: '', source: 'kg' },
-  { id: '23784', name: '网络红歌榜', description: '酷狗网络热门歌曲', cover: '', source: 'kg' },
-  { id: '52144', name: '抖音热歌榜', description: '酷狗抖音热门歌曲', cover: '', source: 'kg' },
-]
-
-const MG_TOPLISTS: DiscoveryToplist[] = [
-  { id: '27553319', name: '新歌榜', description: '咪咕尖叫新歌榜', cover: '', source: 'mg' },
-  { id: '27186466', name: '热歌榜', description: '咪咕尖叫热歌榜', cover: '', source: 'mg' },
-  { id: '27553408', name: '原创榜', description: '咪咕尖叫原创榜', cover: '', source: 'mg' },
-  { id: '75959118', name: '音乐风向榜', description: '咪咕音乐风向榜', cover: '', source: 'mg' },
-]
-
-function getBoards(source: DiscoverySource): DiscoveryToplist[] {
-  if (source === 'wy') return WY_TOPLISTS
-  if (source === 'kw') return KW_TOPLISTS
-  if (source === 'kg') return KG_TOPLISTS
-  if (source === 'mg') return MG_TOPLISTS
-  return TX_TOPLISTS
+// 全量榜单清单（含各平台常用+垂直榜）迁移至 toplist-boards.ts（数据源：lx-music-desktop）。
+// common 榜单沿用原有描述文案，继续作为首页"发现音乐"横排区的展示集。
+function findBoardDef(source: DiscoverySource, id: string): ToplistBoardDef | undefined {
+  return TOPLIST_BOARDS[source].find(item => item.id === id)
 }
 
 function getCached<T>(key: string): T | null {
@@ -551,7 +511,7 @@ async function getKwToplistDetail(id: string): Promise<DiscoveryCollectionDetail
 
 async function getKgToplistDetail(id: string): Promise<DiscoveryCollectionDetail | null> {
   const payload = await fetchJson<{ data?: { total?: number; info?: KgSong[] } }>(`http://mobilecdnbj.kugou.com/api/v3/rank/song?version=9108&ranktype=1&plat=0&pagesize=100&area_code=1&page=1&rankid=${encodeURIComponent(id)}&with_res_tag=0&show_portrait_mv=1`)
-  const board = KG_TOPLISTS.find(item => item.id === id)
+  const board = findBoardDef('kg', id)
   const songs = payload.data?.info || []
   if (songs.length === 0) return null
   return {
@@ -566,7 +526,7 @@ async function getKgToplistDetail(id: string): Promise<DiscoveryCollectionDetail
 
 async function getMgToplistDetail(id: string): Promise<DiscoveryCollectionDetail | null> {
   const payload = await fetchJson<{ code?: string; columnInfo?: { columnTitle?: string; columnUpdateTime?: string; contents?: Array<{ objectInfo?: MgSong }> } }>(`https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/querycontentbyId.do?columnId=${encodeURIComponent(id)}&needAll=0`)
-  const board = MG_TOPLISTS.find(item => item.id === id)
+  const board = findBoardDef('mg', id)
   const songs = payload.columnInfo?.contents?.map(item => item.objectInfo).filter((item): item is MgSong => Boolean(item)) || []
   if (payload.code !== '000000' || songs.length === 0) return null
   return {
@@ -944,7 +904,8 @@ async function getKgToplistCovers(): Promise<Map<string, string>> {
 }
 
 async function getKwToplistCovers(): Promise<Map<string, string>> {
-  const results = await Promise.allSettled(KW_TOPLISTS.map(async board => {
+  // 封面仅覆盖常用榜单（全量 43 个逐个请求太重；榜单页列表为纯文字形态不强依赖封面）
+  const results = await Promise.allSettled(TOPLIST_BOARDS.kw.filter(b => b.common).map(async board => {
     const payload = await fetchJson<{ pic?: string }>(`http://kbangserver.kuwo.cn/ksong.s?from=pc&fmt=json&pn=0&rn=1&type=bang&data=content&id=${encodeURIComponent(board.id)}&show_copyright_off=0&pcmp4=1&isbang=1`)
     return [board.id, normalizeCover(payload.pic || '')] as const
   }))
@@ -957,7 +918,7 @@ async function getKwToplistCovers(): Promise<Map<string, string>> {
 }
 
 async function getTxToplistCovers(): Promise<Map<string, string>> {
-  const results = await Promise.allSettled(TX_TOPLISTS.map(async board => {
+  const results = await Promise.allSettled(TOPLIST_BOARDS.tx.filter(b => b.common).map(async board => {
     const payload = await requestMusicu<{ toplist?: { data?: { data?: { headPicUrl?: string } } } }>({
       toplist: {
         module: 'musicToplist.ToplistInfoServer',
@@ -1034,13 +995,25 @@ async function getToplistCovers(source: DiscoverySource): Promise<Map<string, st
   return pending
 }
 
-export async function getToplists(source: DiscoverySource = 'tx'): Promise<DiscoveryToplist[]> {
+export async function getToplists(
+  source: DiscoverySource = 'tx',
+  scope: 'common' | 'full' = 'common',
+): Promise<DiscoveryToplist[]> {
   const covers = await getToplistCovers(source)
-  return getBoards(source).map(board => ({ ...board, cover: covers.get(board.id) || '' }))
+  return TOPLIST_BOARDS[source]
+    .filter(board => scope === 'full' || board.common)
+    .map(board => ({
+      id: board.id,
+      name: board.name,
+      description: board.description ?? '',
+      cover: covers.get(board.id) || '',
+      source,
+      ...(board.common ? { common: true as const } : {}),
+    }))
 }
 
 async function fetchToplistDetail(source: DiscoverySource, id: string): Promise<DiscoveryCollectionDetail | null> {
-  const board = getBoards(source).find(item => item.id === id)
+  const board = findBoardDef(source, id)
   if (!board) return null
   // v2：网易云公开接口字段已更新，避免复用旧字段映射写入的缓存。
   const cacheKey = `discovery:v2:${source}:toplist:${id}`
@@ -1086,7 +1059,7 @@ async function fetchToplistDetail(source: DiscoverySource, id: string): Promise<
   const detail: DiscoveryCollectionDetail = {
     id,
     name: data?.title || board.name,
-    description: data?.intro?.replace(/<br\s*\/?>/gi, '\n') || board.description,
+    description: data?.intro?.replace(/<br\s*\/?>/gi, '\n') || board.description || '',
     cover: normalizeCover(data?.headPicUrl),
     author: 'QQ 音乐',
     updateTime: data?.updateTime,

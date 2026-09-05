@@ -8,9 +8,12 @@ export async function GET(request: NextRequest) {
   try {
     await requireUser(request) // 未登录 → AuthError → 401
 
-    const source = new URL(request.url).searchParams.get('source')
+    const params = new URL(request.url).searchParams
+    const source = params.get('source')
     if (source && !isDiscoverySource(source)) return createErrorResponse(ErrorCodes.INVALID_PARAMS, '不支持的渠道', 400)
-    return createSuccessResponse(await getToplists(isDiscoverySource(source) ? source : 'tx'))
+    // scope=full 返回全量榜单（排行榜页）；默认 common 仅供首页横排区
+    const scope = params.get('scope') === 'full' ? 'full' : 'common'
+    return createSuccessResponse(await getToplists(isDiscoverySource(source) ? source : 'tx', scope))
   } catch (error) {
     if (error instanceof AuthError) {
       return createErrorResponse('UNAUTHORIZED', error.message, 401)
