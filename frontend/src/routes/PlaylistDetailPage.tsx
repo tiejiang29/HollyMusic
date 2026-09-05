@@ -1,4 +1,5 @@
 import { useParams, useNavigate } from 'react-router-dom'
+import { useState } from 'react'
 import { usePlaylistDetail } from '@/hooks/usePlaylistDetail'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
@@ -8,17 +9,30 @@ import { usePlayerStore } from '@/lib/store/player-store'
 import { shareContent, buildPlaylistShareUrl } from '@/lib/share'
 import { toTrack, type Track } from '@/lib/types/player'
 import { deletePlaylist } from '@/lib/api/playlists'
+import { SourceSwitchDialog } from '@@/components/playlists/SourceSwitchDialog'
 
 export function PlaylistDetailPage() {
   const { id: idStr } = useParams<{ id: string }>()
   const id = parseInt(idStr ?? '0', 10)
-  const { detail, loading } = usePlaylistDetail(id)
+  const { detail, loading, reload } = usePlaylistDetail(id)
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
 
+  // 保留每条 track 对应的 entry position（换源接口按 position 替换）
+  const positions: number[] = []
   const tracks: Track[] = (detail?.entries ?? [])
-    .filter(e => e.musicInfo)
+    .filter(e => {
+      if (!e.musicInfo) return false
+      positions.push(e.position)
+      return true
+    })
     .map(e => toTrack({ uid: e.songId, musicInfo: e.musicInfo! }))
+
+  const [switchTarget, setSwitchTarget] = useState<{ track: Track; position: number } | null>(null)
+
+  const handleToggleSource = (track: Track, index: number) => {
+    setSwitchTarget({ track, position: positions[index] ?? 0 })
+  }
 
   const handleDelete = async () => {
     if (!confirm('删除该歌单？')) return
@@ -83,9 +97,19 @@ export function PlaylistDetailPage() {
             </div>
           </div>
           {tracks.length > 0 ? (
-            <SongList tracks={tracks} />
+            <SongList tracks={tracks} onToggleSource={handleToggleSource} />
           ) : (
             <EmptyState icon={Music} title="歌单为空" description="去搜索并添加歌曲" />
+          )}
+
+          {switchTarget && (
+            <SourceSwitchDialog
+              playlistId={id}
+              track={switchTarget.track}
+              position={switchTarget.position}
+              onClose={() => setSwitchTarget(null)}
+              onReplaced={() => void reload()}
+            />
           )}
         </>
       )}

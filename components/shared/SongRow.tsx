@@ -8,7 +8,7 @@ import { useLongPress } from '@/hooks/useLongPress'
 import { CoverImage } from './CoverImage'
 import { SourceBadge } from './SourceBadge'
 import { QualityBadge } from './QualityBadge'
-import { Play, Pause, Heart, MoreHorizontal, Download, Loader2 } from 'lucide-react'
+import { Play, Pause, Heart, MoreHorizontal, Download, Loader2, ArrowLeftRight } from 'lucide-react'
 import { formatTime } from '@/lib/utils/format'
 import { resolveQuality } from '@/lib/quality-options'
 import type { Track } from '@/lib/types/player'
@@ -17,9 +17,11 @@ interface SongRowProps {
   track: Track
   queue?: Track[]
   index?: number
+  /** 手动换源回调（传入时行内显示换源按钮，如歌单详情页） */
+  onToggleSource?: (track: Track, index: number) => void
 }
 
-export function SongRow({ track, queue, index }: SongRowProps) {
+export function SongRow({ track, queue, index, onToggleSource }: SongRowProps) {
   const currentTrack = usePlayerStore(s => s.currentTrack)
   const isPlaying = usePlayerStore(s => s.isPlaying)
   const playTrack = usePlayerStore(s => s.playTrack)
@@ -91,6 +93,17 @@ export function SongRow({ track, queue, index }: SongRowProps) {
       <span className="hidden w-32 shrink-0 truncate text-xs text-muted-foreground sm:block">
         {track.album}
       </span>
+
+      {onToggleSource && index != null && (
+        <button
+          onClick={() => onToggleSource(track, index)}
+          className={`hidden shrink-0 p-1 text-muted-foreground opacity-70 hover:text-foreground focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 md:block`}
+          aria-label="换源"
+          title="换源（在其他平台找这首歌）"
+        >
+          <ArrowLeftRight className="h-4 w-4" />
+        </button>
+      )}
 
       <button
         onClick={() => toggleFav(track.uid).catch(() => {})}

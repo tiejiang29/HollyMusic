@@ -10,7 +10,7 @@ import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { urlCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
-import { musicSourceManager } from '@/lib/music-source-manager'
+import { musicSourceManager, type SourceToggleInfo } from '@/lib/music-source-manager'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import type { MusicInfo, QualityType } from '@/lib/types/music'
 
@@ -72,14 +72,17 @@ export async function POST(request: NextRequest) {
       await musicSourceManager.initialize()
     }
 
-    // 获取播放 URL（支持智能降级）
-    const url = await musicSourceManager.getMusicUrl(musicInfo, quality)
+    // 获取播放 URL（支持智能降级 + 跨平台自动换源）
+    const resolveCtx: { toggle?: SourceToggleInfo | null } = {}
+    const url = await musicSourceManager.getMusicUrl(musicInfo, quality, resolveCtx)
 
     // 存入缓存
     urlCache.set(cacheKey, url, URL_CACHE_TTL)
     logger.debug(`URL 已缓存: ${cacheKey}`)
 
-    return createSuccessResponse({ url })
+    return createSuccessResponse(
+      resolveCtx.toggle ? { url, toggle: resolveCtx.toggle } : { url }
+    )
   } catch (error) {
     if (error instanceof AuthError) {
       return createErrorResponse('UNAUTHORIZED', error.message, 401)
