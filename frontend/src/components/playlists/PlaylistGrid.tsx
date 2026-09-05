@@ -12,8 +12,18 @@ export function PlaylistGrid({ playlists }: { playlists: PlaylistSummary[] }) {
           to={`/playlists/${p.id}`}
           className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
         >
-          <div className="flex aspect-square items-center justify-center rounded bg-gradient-to-br from-primary/30 to-primary/10">
-            <ListMusic className="h-10 w-10 text-primary/70" />
+          <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
+            {p.coverArt ? (
+              <img
+                src={p.coverArt}
+                alt={p.name}
+                loading="lazy"
+                className="h-full w-full object-cover transition group-hover:scale-105"
+                onError={e => { e.currentTarget.style.display = 'none' }}
+              />
+            ) : (
+              <ListMusic className="h-10 w-10 text-primary/70" />
+            )}
           </div>
           <div className="truncate text-sm font-medium">{p.name}</div>
           <div className="text-xs text-muted-foreground">{p.songCount} 首</div>

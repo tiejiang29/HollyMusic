@@ -54,6 +54,7 @@ function toSummary(p: Prisma.PlaylistGetPayload<{ include: { allowedUsers: true 
 
 /**
  * 列出用户可见的所有歌单（自己创建 + 公开 + 被授权）。
+ * 未手动设置封面的歌单，封面取第一首歌的封面（img），随歌曲增删动态变化。
  */
 export async function listPlaylistsForUser(username: string): Promise<PlaylistSummary[]> {
   const rows = await prisma.playlist.findMany({
@@ -63,7 +64,43 @@ export async function listPlaylistsForUser(username: string): Promise<PlaylistSu
     include: { allowedUsers: true },
     orderBy: { createdAt: 'desc' },
   })
-  return rows.map(toSummary)
+  const summaries = rows.map(toSummary)
+
+  // 批量取每个歌单第一首歌（position 最小）的封面：
+  // 优先用 MusicInfo 里已存的 img；为空则回退到封面代理 URL
+  // （/api/cover/{songId} 按需调平台接口，部分平台的歌单 API 不返回封面图，
+  // 如酷我 pl.svc，导入时 img 为空但代理仍能拿到）
+  if (summaries.length > 0) {
+    const ids = summaries.map(s => s.id)
+    const firstPos = await prisma.playlistEntry.groupBy({
+      by: ['playlistId'],
+      where: { playlistId: { in: ids } },
+      _min: { position: true },
+    })
+    if (firstPos.length > 0) {
+      const entries = await prisma.playlistEntry.findMany({
+        where: { OR: firstPos.map(f => ({ playlistId: f.playlistId, position: f._min.position ?? 0 })) },
+        include: { musicInfo: true },
+      })
+      const coverByPlaylist = new Map<number, string>()
+      for (const e of entries) {
+        let cover = ''
+        if (e.musicInfo?.data) {
+          try {
+            cover = (JSON.parse(e.musicInfo.data) as MusicInfo).img || ''
+          } catch { /* data 损坏则跳过 */ }
+        }
+        if (!cover && e.songmid) {
+          cover = `/api/cover/${e.songmid}`
+        }
+        if (cover) coverByPlaylist.set(e.playlistId, cover)
+      }
+      for (const s of summaries) {
+        if (!s.coverArt) s.coverArt = coverByPlaylist.get(s.id) ?? null
+      }
+    }
+  }
+  return summaries
 }
 
 /**
@@ -107,11 +144,18 @@ export async function getPlaylistDetail(
     })
   }
 
-  return {
+  const detail: PlaylistDetail = {
     ...toSummary(playlist),
     entries,
     allowedUsers: playlist.allowedUsers.map(au => au.username),
   }
+  // 封面：未手动设置时取第一首歌的封面（存的 img 优先，为空走封面代理）
+  if (!detail.coverArt) {
+    const first = entries[0]
+    detail.coverArt = first?.musicInfo?.img
+      ?? (first?.songId ? `/api/cover/${first.songId}` : null)
+  }
+  return detail
 }
 
 /**
@@ -200,6 +244,43 @@ export async function addSongsToPlaylist(
   }
 
   await refreshPlaylistStats(id)
+}
+
+/**
+ * 换源：原位替换歌单中的一首歌（保持 position 不变）。
+ * 用于手动换源——某平台失效时把条目替换为其他平台的同款。
+ */
+export async function replacePlaylistEntrySong(
+  id: number,
+  username: string,
+  position: number,
+  newMusicInfo: { source: string; songmid: string }
+): Promise<void> {
+  await assertOwner(id, username)
+
+  const entry = await prisma.playlistEntry.findUnique({
+    where: { playlistId_position: { playlistId: id, position } },
+  })
+  if (!entry) throw new PlaylistError('找不到该条目', 404)
+
+  // 新歌入库并关联
+  let miRow: { id: number } | null = null
+  const stored = await prisma.musicInfo.findUnique({
+    where: { source_songmid: { source: newMusicInfo.source, songmid: newMusicInfo.songmid } },
+    select: { id: true },
+  })
+  miRow = stored
+
+  await prisma.playlistEntry.update({
+    where: { playlistId_position: { playlistId: id, position } },
+    data: {
+      songmid: `${newMusicInfo.source}-${newMusicInfo.songmid}`,
+      musicInfoId: miRow?.id ?? null,
+    },
+  })
+  logger.info(
+    `[playlist] 换源: 歌单${id} position${position} → ${newMusicInfo.source}-${newMusicInfo.songmid}`
+  )
 }
 
 /**

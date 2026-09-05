@@ -12,6 +12,15 @@ import { ConfigValidator } from './config-validator'
 import { logger } from './logger'
 import { decodeLyricEntities } from './server/lyric-decode'
 import { normalizeStructuredLyricText } from './server/lyric-normalize'
+import { findBestAlternative } from './services/source-toggle'
+
+/** 换源元信息：本次取址发生跨平台自动换源时填充，供 API 层透出给前端展示 */
+export interface SourceToggleInfo {
+  from: string
+  to: string
+  name: string
+  singer: string
+}
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const LXEnvironmentSimulator = require('./music-core/index')
@@ -238,11 +247,45 @@ class MusicSourceManager {
   }
 
   /**
-   * 获取音乐 URL（智能降级）
+   * 获取音乐 URL（智能降级 + 跨平台自动换源）
+   * 依次尝试所有音源，支持音质降级；全部失败后按歌名/歌手/时长
+   * 在其他平台找同款歌曲重试一次（换源结果带缓存）。
+   * @param ctx 可选上下文：发生换源时写入 toggle 字段，供上层展示
+   */
+  async getMusicUrl(
+    musicInfo: MusicInfo,
+    requestedQuality: QualityType = '320k',
+    ctx?: { toggle?: SourceToggleInfo | null }
+  ): Promise<string> {
+    try {
+      return await this._getMusicUrlSamePlatform(musicInfo, requestedQuality)
+    } catch (err) {
+      // 同平台全部失败 → 尝试跨平台换源（仅一次，替代版本失败不再递归）
+      if (!musicInfo.name) throw err
+      logger.warn(
+        `[source-toggle] ${musicInfo.source} 平台全失败（${musicInfo.name}），尝试跨平台换源...`
+      )
+      const alternative = await findBestAlternative(musicInfo)
+      if (!alternative) throw err
+      const url = await this._getMusicUrlSamePlatform(alternative, requestedQuality)
+      if (ctx) {
+        ctx.toggle = {
+          from: musicInfo.source,
+          to: alternative.source,
+          name: alternative.name,
+          singer: alternative.singer,
+        }
+      }
+      return url
+    }
+  }
+
+  /**
+   * 获取音乐 URL（智能降级）——原同平台瀑布逻辑
    * 依次尝试所有音源，支持音质降级
    * 支持配置文件热重载
    */
-  async getMusicUrl(musicInfo: MusicInfo, requestedQuality: QualityType = '320k'): Promise<string> {
+  private async _getMusicUrlSamePlatform(musicInfo: MusicInfo, requestedQuality: QualityType = '320k'): Promise<string> {
     // 在获取 URL 时检查配置是否变更
     if (this.initialized && this.checkConfigChanged()) {
       logger.info('配置文件已变更，重新加载音源...')

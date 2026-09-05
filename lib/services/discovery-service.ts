@@ -407,8 +407,8 @@ function toMgMusicInfo(raw: MgSong): MusicInfo | null {
   }
 }
 
-async function getWyPlaylistDetail(id: string): Promise<DiscoveryCollectionDetail | null> {
-  const payload = await fetchJson<{ result?: { name?: string; description?: string; coverImgUrl?: string; creator?: { nickname?: string }; tracks?: Parameters<typeof toWyMusicInfo>[0][] } }>(`https://music.163.com/api/playlist/detail?id=${encodeURIComponent(id)}`)
+async function getWyPlaylistDetail(id: string, cookie?: string): Promise<DiscoveryCollectionDetail | null> {
+  const payload = await fetchJson<{ result?: { name?: string; description?: string; coverImgUrl?: string; creator?: { nickname?: string }; tracks?: Parameters<typeof toWyMusicInfo>[0][] } }>(`https://music.163.com/api/playlist/detail?id=${encodeURIComponent(id)}`, cookie ? { headers: { Cookie: cookie, Referer: 'https://music.163.com/' } } : undefined)
   const playlist = payload.result
   if (!playlist?.tracks) return null
   return {
@@ -590,7 +590,7 @@ async function getTxRecommendedPlaylists(limit: number, page = 1, filter: Discov
 }
 
 /** 与 lx-music tx/songList.js 同一歌单详情端点：按 disstid 直取，不依赖列表页缓存。 */
-async function getTxPlaylistDetail(id: string): Promise<DiscoveryCollectionDetail | null> {
+async function getTxPlaylistDetail(id: string, cookie?: string): Promise<DiscoveryCollectionDetail | null> {
   const query = new URLSearchParams({
     type: '1', json: '1', utf8: '1', onlysong: '0', new_format: '1', disstid: id,
     loginUin: '0', hostUin: '0', format: 'json', inCharset: 'utf8', outCharset: 'utf-8',
@@ -602,6 +602,7 @@ async function getTxPlaylistDetail(id: string): Promise<DiscoveryCollectionDetai
   }>(`https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?${query}`, {
     headers: {
       Origin: 'https://y.qq.com',
+      ...(cookie ? { Cookie: cookie } : {}),
       Referer: `https://y.qq.com/n/yqq/playsquare/${encodeURIComponent(id)}.html`,
     },
   })
@@ -971,13 +972,16 @@ export async function getRecommendedPlaylists(source: DiscoverySource = 'tx', li
   throw new Error('Unsupported discovery source')
 }
 
-export async function getRecommendedPlaylistDetail(source: DiscoverySource, id: string): Promise<DiscoveryCollectionDetail | null> {
+export async function getRecommendedPlaylistDetail(source: DiscoverySource, id: string, cookie?: string): Promise<DiscoveryCollectionDetail | null> {
+  // 带 cookie（访问私有歌单）时完全绕过缓存：
+  // 私人歌单内容不能写入公共缓存键（多用户实例下会泄露给其他用户）
+  const useCache = !cookie
   const cacheKey = `discovery:v2:${source}:playlist:${id}`
-  const cached = getCached<DiscoveryCollectionDetail>(cacheKey)
+  const cached = useCache ? getCached<DiscoveryCollectionDetail>(cacheKey) : null
   if (cached) return cached
   if (source === 'wy') {
-    const detail = await getWyPlaylistDetail(id)
-    if (detail) searchCache.set(cacheKey, detail, CACHE_TTL)
+    const detail = await getWyPlaylistDetail(id, cookie)
+    if (detail && useCache) searchCache.set(cacheKey, detail, CACHE_TTL)
     return detail
   }
   if (source === 'kw') {
@@ -995,8 +999,8 @@ export async function getRecommendedPlaylistDetail(source: DiscoverySource, id: 
     if (detail) searchCache.set(cacheKey, detail, CACHE_TTL)
     return detail
   }
-  const detail = await getTxPlaylistDetail(id)
+  const detail = await getTxPlaylistDetail(id, cookie)
   if (!detail) return null
-  searchCache.set(cacheKey, detail, CACHE_TTL)
+  if (useCache) searchCache.set(cacheKey, detail, CACHE_TTL)
   return detail
 }
