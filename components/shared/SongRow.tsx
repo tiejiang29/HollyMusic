@@ -8,7 +8,7 @@ import { useLongPress } from '@/hooks/useLongPress'
 import { CoverImage } from './CoverImage'
 import { SourceBadge } from './SourceBadge'
 import { QualityBadge } from './QualityBadge'
-import { Play, Pause, Heart, MoreHorizontal, Download, Loader2, ArrowLeftRight } from 'lucide-react'
+import { Play, Pause, Heart, MoreHorizontal, Download, Loader2, ArrowLeftRight, Check } from 'lucide-react'
 import { formatTime } from '@/lib/utils/format'
 import { resolveQuality } from '@/lib/quality-options'
 import type { Track } from '@/lib/types/player'
@@ -17,11 +17,17 @@ interface SongRowProps {
   track: Track
   queue?: Track[]
   index?: number
+  /** 榜单模式：序号 1-3 强调显示 */
+  rankMode?: boolean
   /** 手动换源回调（传入时行内显示换源按钮，如歌单详情页） */
   onToggleSource?: (track: Track, index: number) => void
+  /** 勾选模式（批量下载等）：行点击变为勾选/取消，序号位显示复选框 */
+  selectionMode?: boolean
+  selected?: boolean
+  onToggleSelect?: (track: Track, index: number) => void
 }
 
-export function SongRow({ track, queue, index, onToggleSource }: SongRowProps) {
+export function SongRow({ track, queue, index, onToggleSource, rankMode, selectionMode, selected, onToggleSelect }: SongRowProps) {
   const currentTrack = usePlayerStore(s => s.currentTrack)
   const isPlaying = usePlayerStore(s => s.isPlaying)
   const playTrack = usePlayerStore(s => s.playTrack)
@@ -38,6 +44,10 @@ export function SongRow({ track, queue, index, onToggleSource }: SongRowProps) {
   const longPress = useLongPress((x, y) => openMenu(track, x, y))
 
   const handlePlay = () => {
+    if (selectionMode) {
+      onToggleSelect?.(track, index ?? 0)
+      return
+    }
     if (isCurrent) {
       usePlayerStore.getState().togglePlay()
     } else {
@@ -57,15 +67,37 @@ export function SongRow({ track, queue, index, onToggleSource }: SongRowProps) {
         isCurrent ? 'bg-accent/50' : 'hover:bg-accent/30'
       }`}
     >
-      {/* 序号 / 播放按钮 */}
+      {/* 序号 / 播放按钮 / 勾选框 */}
       <div className="flex w-6 shrink-0 items-center justify-center text-sm text-muted-foreground">
-        {isCurrentPlaying ? (
+        {selectionMode ? (
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={selected ?? false}
+            aria-label={selected ? `取消选择 ${track.name}` : `选择 ${track.name}`}
+            onClick={() => onToggleSelect?.(track, index ?? 0)}
+            // 外层只负责命中区（负 margin 抵消布局膨胀），视觉方框在内层 span
+            className="-m-2 rounded p-2 transition hover:bg-accent/50 pointer-coarse:-m-1 pointer-coarse:p-1.5"
+          >
+            <span
+              className={`flex h-5 w-5 items-center justify-center rounded border transition ${
+                selected ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/50'
+              }`}
+            >
+              {selected && <Check className="h-3.5 w-3.5" />}
+            </span>
+          </button>
+        ) : isCurrentPlaying ? (
           <button onClick={handlePlay} aria-label="暂停">
             <Pause className="h-4 w-4 fill-current text-primary" />
           </button>
         ) : (
           <>
-            <span className={`group-hover:hidden ${isCurrent ? 'text-primary' : ''}`}>
+            <span
+              className={`group-hover:hidden tabular-nums ${
+                isCurrent ? 'text-primary' : ''
+              } ${rankMode && index != null && index < 3 ? 'font-bold text-primary' : ''}`}
+            >
               {index != null ? index + 1 : '♪'}
             </span>
             <button onClick={handlePlay} className="hidden group-hover:block" aria-label="播放">
@@ -127,7 +159,8 @@ export function SongRow({ track, queue, index, onToggleSource }: SongRowProps) {
             })
           }
           disabled={downloading}
-          className={`hidden shrink-0 p-1 transition md:block ${
+          // 与收藏按钮一致：移动端常显（触屏无 hover），桌面 hover 显现
+          className={`shrink-0 p-1 transition pointer-coarse:p-3 pointer-coarse:-m-1.5 ${
             downloading
               ? 'text-primary opacity-100'
               : 'text-muted-foreground opacity-70 hover:text-foreground focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100'

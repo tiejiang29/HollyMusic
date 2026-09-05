@@ -101,5 +101,23 @@ export function useDownload() {
     }
   }, [])
 
-  return { download, downloading, error }
+  /**
+   * 批量下载：后端 ZIP 流式打包（GET /api/download/batch），
+   * 同样走 window.location.href 由浏览器下载管理器接管进度。
+   * 音质传当前播放偏好，后端逐首按歌曲可用音质就近降级（与单曲下载一致）。
+   */
+  const downloadBatch = useCallback((uids: string[], quality: QualityType = '320k') => {
+    if (uids.length === 0) return
+    if (uids.length > 100) {
+      toast.error('单次最多打包 100 首，请分批下载')
+      return
+    }
+    const downloadUrl =
+      `/api/download/batch?uids=${encodeURIComponent(uids.join(','))}` +
+      `&quality=${encodeURIComponent(quality)}`
+    window.location.href = downloadUrl
+    toast.success(`已开始打包下载 ${uids.length} 首`)
+  }, [])
+
+  return { download, downloading, error, downloadBatch }
 }

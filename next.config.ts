@@ -5,8 +5,10 @@ const nextConfig: NextConfig = {
   // 配合 Dockerfile 可将镜像从 ~800MB 瘦身到 ~250MB
   output: "standalone",
 
-  // needle/tunnel 被 lib/music-core/*.js 顶层 require，必须外置（不打包进 bundle）
-  serverExternalPackages: ['needle', 'tunnel'],
+  // needle/tunnel 被 lib/music-core/*.js 顶层 require，必须外置（不打包进 bundle）。
+  // archiver（批量下载 ZIP）内含 readdir-glob 等动态 require，webpack 打包会漏拷其
+  // 运行时依赖 → standalone 容器内 Cannot find module；外置后由文件追踪整包复制。
+  serverExternalPackages: ['needle', 'tunnel', 'archiver'],
 
   // 强制把以下文件纳入 standalone 文件追踪（默认基于 import 静态分析会漏掉非 JS 资源）
   // - Prisma 客户端 + 查询引擎二进制（自定义 output 路径，.node 不是 JS import）

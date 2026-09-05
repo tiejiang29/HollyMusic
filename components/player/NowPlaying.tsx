@@ -2,16 +2,19 @@
 import { usePlayerStore } from '@/lib/store/player-store'
 import { useFavoritesStore } from '@/lib/store/favorites-store'
 import { CoverImage } from '@/components/shared/CoverImage'
-import { Heart, Share2 } from 'lucide-react'
-import { QUALITY_LABEL } from '@/lib/quality-options'
+import { Heart, Share2, Download, Loader2 } from 'lucide-react'
+import { QUALITY_LABEL, resolveQuality } from '@/lib/quality-options'
 import { shareContent, buildSongShareUrl } from '@/lib/share'
+import { useDownload } from '@/hooks/useDownload'
 
 export function NowPlaying() {
   const track = usePlayerStore(s => s.currentTrack)
+  const quality = usePlayerStore(s => s.quality)
   const effectiveQuality = usePlayerStore(s => s.effectiveQuality)
   const toggleLyrics = usePlayerStore(s => s.toggleLyrics)
   const isFav = useFavoritesStore(s => (track ? s.ids.has(track.uid) : false))
   const toggle = useFavoritesStore(s => s.toggle)
+  const { download, downloading, error: downloadError } = useDownload()
 
   if (!track) {
     // 无曲目：占位封面 + 提示，保持三栏对齐且不显空
@@ -59,6 +62,22 @@ export function NowPlaying() {
         title={isFav ? '取消收藏' : '收藏'}
       >
         <Heart className={`h-4 w-4 ${isFav ? 'fill-current' : ''}`} />
+      </button>
+      <button
+        onClick={() =>
+          download({
+            uid: track.uid,
+            quality: resolveQuality(quality, track.musicInfo.types),
+          })
+        }
+        disabled={downloading}
+        className={`shrink-0 rounded-md p-2 transition-colors hover:bg-accent disabled:cursor-default ${
+          downloading ? 'text-primary' : 'text-foreground/70 hover:text-foreground'
+        }`}
+        aria-label="下载"
+        title={downloading ? '下载中…' : (downloadError ?? '下载当前歌曲')}
+      >
+        {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
       </button>
       <button
         onClick={() =>

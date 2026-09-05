@@ -10,8 +10,9 @@ import { usePlayerStore } from '@/lib/store/player-store'
 import { ProgressBar } from './ProgressBar'
 import { PlayerButton } from './PlayerButton'
 import { QualityList } from './QualityList'
-import { MoreHorizontal, Repeat, Repeat1, Shuffle, Timer, Volume2, VolumeX, ChevronDown } from 'lucide-react'
-import { QUALITY_LABEL, QUALITY_ORDER } from '@/lib/quality-options'
+import { MoreHorizontal, Repeat, Repeat1, Shuffle, Timer, Volume2, VolumeX, ChevronDown, Download, Loader2 } from 'lucide-react'
+import { QUALITY_LABEL, QUALITY_ORDER, resolveQuality } from '@/lib/quality-options'
+import { useDownload } from '@/hooks/useDownload'
 
 export function MobilePlayerMenu() {
   const [open, setOpen] = useState(false)
@@ -30,6 +31,7 @@ export function MobilePlayerMenu() {
   const isMuted = usePlayerStore(s => s.isMuted)
   const setVolume = usePlayerStore(s => s.setVolume)
   const toggleMute = usePlayerStore(s => s.toggleMute)
+  const { download, downloading, error: downloadError } = useDownload()
 
   useEffect(() => {
     if (!open) return
@@ -105,6 +107,24 @@ export function MobilePlayerMenu() {
               />
             </div>
           )}
+
+          <button
+            type="button"
+            disabled={!currentTrack || downloading}
+            onClick={() =>
+              currentTrack &&
+              download({
+                uid: currentTrack.uid,
+                quality: resolveQuality(quality, currentTrack.musicInfo.types),
+              })
+            }
+            className="flex w-full items-center justify-between rounded-md px-2 py-2.5 text-[11px] hover:bg-accent disabled:opacity-50"
+          >
+            <span className="flex items-center gap-2">
+              {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} 下载当前歌曲
+            </span>
+            <span className="text-[11px] text-muted-foreground">{downloading ? '下载中…' : (downloadError ?? QUALITY_LABEL[resolveQuality(quality, currentTrack?.musicInfo.types)])}</span>
+          </button>
 
           <button
             type="button"
