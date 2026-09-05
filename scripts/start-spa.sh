@@ -20,10 +20,10 @@ export HOSTNAME=0.0.0.0
 node ./server.js &
 NEXT_PID=$!
 
-# 等待后端就绪
+# 等待后端就绪（用 node fetch 探活，运行时镜像不装 wget/curl）
 echo "Waiting for backend..."
 for i in $(seq 1 30); do
-  if wget --quiet --tries=1 --spider http://127.0.0.1:3001/api/health 2>/dev/null; then
+  if node -e "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
     echo "Backend ready"
     break
   fi

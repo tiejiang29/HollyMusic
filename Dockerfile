@@ -70,23 +70,38 @@ RUN pnpm prisma generate
 # 导致运行时报 Cannot find module 'needle'。--webpack 退回 webpack 打包，行为与 15.x 一致。
 RUN pnpm build --webpack
 
+# standalone 瘦身（构建后确定性剪除，outputFileTracingExcludes 压不过显式 include）：
+# - data/：本地构建时 fs 追踪启发式会把音频缓存（数百 MB）带进 standalone
+#   （CI checkout 无此目录；运行时数据一律走 volume 挂载）
+# - node_modules/prisma/*.node：prisma 包内的查询引擎副本，只有 generate/studio 用，
+#   运行时客户端走 lib/generated/prisma 的引擎
+# - @prisma/engines 内 *query* / *migration-engine* 副本：migrate deploy 只需 schema-engine
+RUN rm -rf .next/standalone/data \
+ && rm -f .next/standalone/node_modules/prisma/*.node \
+          .next/standalone/node_modules/@prisma/engines/*query* \
+          .next/standalone/node_modules/@prisma/engines/*migration-engine*
+
 # ============================================================================
 # 阶段 4: 运行时（nginx + Node.js standalone）
 # ============================================================================
 # bookworm（Debian 12, glibc 2.36）：rollup 4.x 的 native 二进制要求 glibc ≥ 2.32，
 # bullseye 只有 2.31 会导致 vite build 时 dlopen 失败
-FROM node:20-bookworm-slim
+# 运行时用 debian-slim + 只拷 node 二进制（省掉 npm/corepack/yarn 等 ~60MB；
+# 与 node:20-bookworm-slim 同属 bookworm，共享库完全兼容）
+FROM debian:bookworm-slim
+COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 
 # apt 源：默认官方 deb.debian.org（Fastly 全球 CDN，GitHub Actions 海外 runner 访问快；
 # 清华 TUNA 对海外 IP 返回 403，CI 构建不可用，不能再无条件下换）。
 # 国内本地构建加速：docker build --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 # bookworm-slim 用新格式 debian.sources（非老的 sources.list）
+# nginx 顺带提供 libssl3（Prisma 查询引擎 .so 依赖）
 ARG APT_MIRROR=""
 RUN if [ -n "${APT_MIRROR}" ]; then \
       sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
     fi \
  && apt-get update \
- && apt-get install -y --no-install-recommends nginx wget \
+ && apt-get install -y --no-install-recommends nginx \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -97,15 +112,14 @@ ENV PORT=3001
 ENV HOSTNAME=0.0.0.0
 
 # ---------- standalone 核心三件套 ----------
-# server.js + 最小化 node_modules（已通过 outputFileTracingIncludes 纳入 prisma/needle/tunnel）
+# server.js + 最小化 node_modules。lib/generated/prisma（客户端+查询引擎）、
+# prisma CLI + schema-engine（migrate deploy 用）、needle/tunnel 均已由
+# outputFileTracingIncludes 追踪进 standalone，不再重复 COPY（原"双保险"白多一层 ~35MB）
 COPY --from=backend-builder /app/.next/standalone ./
 # 静态资源（独立于 standalone，需手动放到 .next/static）
 COPY --from=backend-builder /app/.next/static ./.next/static
 
-# ---------- Prisma 相关（双保险，防止追踪漏文件） ----------
-# 客户端 + 查询引擎二进制（自定义 output 路径 lib/generated/prisma，.node 不是 JS import 可能被漏）
-COPY --from=backend-builder /app/lib/generated/prisma ./lib/generated/prisma
-# schema + migrations（容器启动时 prisma migrate deploy 需要）
+# ---------- Prisma schema + migrations（migrate deploy 的 --schema 入参） ----------
 COPY --from=backend-builder /app/prisma ./prisma
 
 # ---------- 业务配置与音源 ----------
@@ -129,6 +143,6 @@ RUN chmod +x /app/start-spa.sh
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD wget --quiet --tries=1 --spider http://localhost:3000/api/health || exit 1
+  CMD node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["/app/start-spa.sh"]
