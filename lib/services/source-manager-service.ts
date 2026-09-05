@@ -121,6 +121,33 @@ export interface ScriptValidationResult {
 }
 
 /**
+ * 从脚本头部 JSDoc 注释提取 @name / @version（LX 音源脚本标准元数据）。
+ * 脚本 inited 事件只回传平台列表，名称只能从注释头解析；
+ * 上传通道文件名损坏（含 U+FFFD 乱码）时用它兜底命名。
+ */
+export function parseScriptMeta(content: string): { name?: string; version?: string } {
+  const head = content.slice(0, 2048)
+  const pick = (key: string): string | undefined => {
+    const m = head.match(new RegExp(`@${key}\\s+([^\\r\\n]+)`))
+    if (!m) return undefined
+    // 去掉行尾注释星号与空白
+    return m[1].replace(/\s*\*\s*$/, '').trim() || undefined
+  }
+  return { name: pick('name'), version: pick('version') }
+}
+
+/** 文件名是否为编码损坏的乱码（UTF-8 解码失败会产生 U+FFFD 替换符，信息不可逆） */
+export function isMojibakeName(name: string): boolean {
+  return name.includes('\uFFFD')
+}
+
+/** 用脚本元数据构建干净文件名（无元数据时退化为 unnamed-source） */
+export function buildMetaFilename(meta: { name?: string; version?: string }): string {
+  const base = [meta.name, meta.version].filter(Boolean).join(' ')
+  return `${sanitizeFilename(base || 'unnamed-source')}.js`
+}
+
+/**
  * 用 LXEnvironmentSimulator 预校验脚本（同步等待 inited）。
  * - 成功 → { ok: true, sourceInfo }
  * - 失败 → { ok: false, error }
@@ -388,12 +415,15 @@ export async function importSubscription(subscriptionUrl: string): Promise<Sourc
     throw new SourceSubscriptionError(`脚本校验失败：${validation.error || '未知错误'}`)
   }
 
-  const relativePath = await saveScript(filename, content)
+  // URL 文件名可能编码损坏（U+FFFD 不可逆），改用脚本 @name/@version 元数据命名
+  const meta = parseScriptMeta(content)
+  const effectiveFilename = isMojibakeName(filename) ? buildMetaFilename(meta) : filename
+  const relativePath = await saveScript(effectiveFilename, content)
   try {
     const sourceInfo = validation.sourceInfo as { name?: string; description?: string } | undefined
     const source = await addSource({
       path: relativePath,
-      name: sourceInfo?.name || filename.replace(/\.js$/i, ''),
+      name: sourceInfo?.name || effectiveFilename.replace(/\.js$/i, ''),
       description: sourceInfo?.description,
       enabled: true,
       pt: extractPlatforms(validation.sourceInfo),

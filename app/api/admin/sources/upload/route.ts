@@ -19,7 +19,10 @@ import {
 } from '@/lib/services/user-context'
 import {
   addSource,
+  buildMetaFilename,
   extractPlatforms,
+  isMojibakeName,
+  parseScriptMeta,
   saveScript,
   validateScriptContent,
   SOURCE_MANAGER_CONSTANTS,
@@ -72,17 +75,26 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // 保存脚本文件
-    const relativePath = await saveScript(file.name, content)
+    // 保存脚本文件。
+    // 文件名经 multipart 传输，非浏览器客户端（如 GBK 终端下的 curl）可能送来
+    // 已损坏的乱码文件名（U+FFFD，不可逆）；此时改用脚本头部 @name/@version 元数据命名。
+    const meta = parseScriptMeta(content)
+    const uploadName = isMojibakeName(file.name) ? buildMetaFilename(meta) : file.name
+    if (uploadName !== file.name) {
+      logger.warn(`[upload] 上传文件名含乱码，改用脚本元数据命名: ${file.name} → ${uploadName}`)
+    }
+    const relativePath = await saveScript(uploadName, content)
 
-    // 自动注册到配置（pt 从 sourceInfo 提取）
+    // 自动注册到配置（pt 从 sourceInfo 提取；源名称优先脚本声明，其次上传文件名。
+    // 文件名乱码时 uploadName 已是元数据名，取其去后缀形式）
     const pt = extractPlatforms(validation.sourceInfo as Record<string, unknown> | undefined)
     const scriptName = (validation.sourceInfo as { name?: string } | undefined)?.name
     const scriptDesc = (validation.sourceInfo as { description?: string } | undefined)?.description
+    const displayName = scriptName || uploadName.replace(/\.js$/i, '')
 
     const newSource = await addSource({
       path: relativePath,
-      name: scriptName || file.name.replace(/\.js$/i, ''),
+      name: displayName,
       description: scriptDesc,
       enabled: true,
       pt,

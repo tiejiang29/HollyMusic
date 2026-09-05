@@ -9,10 +9,8 @@ import { musicSourceManager } from '@/lib/music-source-manager'
 
 export async function GET() {
   try {
-    // 确保音源管理器已初始化
-    if (!musicSourceManager.isInitialized()) {
-      await musicSourceManager.initialize()
-    }
+    // 初始化音源管理器；配置文件有变更（MD5）时顺带重建，避免展示过期内存态
+    await musicSourceManager.ensureFresh()
 
     const healthStatus = musicSourceManager.getHealthStatus()
 
