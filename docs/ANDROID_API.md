@@ -1,6 +1,6 @@
 # HollyMusic 服务端接口文档（Android 客户端用）
 
-> 基线版本：v1.0.3。所有接口均需登录，未登录返回 HTTP 401 + `{"success":false,"error":{"code":"UNAUTHORIZED"}}`。
+> 基线版本：v1.0.4。所有接口均需登录，未登录返回 HTTP 401 + `{"success":false,"error":{"code":"UNAUTHORIZED"}}`。
 > 客户端收到 401 应统一引导到登录页。
 
 ## 通用约定
@@ -86,3 +86,24 @@
 - 统一 `ApiResult<T>` 解包：`success` 才取 `data`，否则抛业务异常（带 code/message）
 - 401 拦截器 → 跳登录
 - 音频流不走统一解包（是二进制），直接把 URL 交给 ExoPlayer（`DefaultHttpDataSource` 挂同一 CookieJar 或后续的 token header）
+
+## 版本更新记录（仅列 API 变化）
+
+### v1.0.4（本地已提交，待发布）
+- `GET /api/search` 新增 `source=all`：**服务端五源汇聚**——并发扇出五源、按 tx→wy→kw→kg→mg 顺序拼接、单源失败自动跳过（至少一源成功即返回）、聚合结果整体缓存 210 分钟
+  - 部分源失败时响应新增 `failedSources: string[]`（提示"结果不含 xx"用）
+  - 全部源失败返回 502 `SEARCH_FAILED`
+  - 客户端从此**无需自行聚合**，单源/全部统一走本接口
+
+### v1.0.3
+- 新增 `GET /api/discover/playlists/tags?source=`：歌单广场标签（五平台，热门 + 分组，缓存 1 小时）
+- `GET /api/discover/playlists` 全参数开放：`tag`（取值来自标签接口）/`sort`/`keyword`
+- 酷狗歌单广场排序补齐五档：`recommend|hot|new|collect(热藏)|soar(飙升)`（其余源两至三档）
+- 新增本接口文档（`docs/ANDROID_API.md`）
+
+### v1.0.2
+- 新增 `GET /api/search/suggest?keyword=`：输入联想，返回 `{text, type: singer|song|album}[]`，歌手项置顶；250ms 防抖由客户端控制
+- （无其他 API 变化；底栏歌词、导航性能均为前端改动）
+
+### v1.0.1
+- 修复 config-sync 启动时机（服务端部署层修复，无 API 变化）
