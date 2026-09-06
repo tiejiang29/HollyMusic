@@ -144,3 +144,12 @@ body {
     min-height: 44px;
   }
 }
+
+/* 底栏当前歌词行：行切换时淡入上浮 */
+@keyframes now-lyric-line-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.now-lyric-line {
+  animation: now-lyric-line-in 0.35s ease;
+}
