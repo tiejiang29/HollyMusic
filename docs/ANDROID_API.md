@@ -17,7 +17,7 @@
 | 接口 | 方法 | 参数 | 说明 |
 |---|---|---|---|
 | `/api/auth/login` | POST | body JSON `{username, password}` | 成功设会话 cookie；错误返回 `INVALID_PARAMS 用户名或密码错误` |
-| `/api/auth/me` | GET | - | 当前用户 `{username}`；用于启动时恢复会话 |
+| `/api/auth/me` | GET | - | `{authenticated, username, mustChangePassword}`；**无会话时也返回 200**（`authenticated:false, username:null`），客户端必须看 `authenticated` 字段而非状态码 |
 | `/api/auth/heartbeat` | POST | - | 保活 |
 | `/api/auth/logout` | POST | - | 注销 |
 | `/api/auth/change-password` | POST | `{oldPassword, newPassword}` | 改密后旧会话失效 |
@@ -25,7 +25,8 @@
 ## 2. 搜索
 
 - **`GET /api/search?keyword=&source=&page=1&limit=30`**
-  - `source`: `all | tx | wy | kw | kg | mg`（all 聚合五源）
+  - `source`: `tx | wy | kw | kg | mg`（**无 all**，传 all 会 400 SOURCE_NOT_SUPPORTED）
+  - "全部"由客户端实现：并发五源请求后合并展示（Web 端 search-store 即此做法，单源失败不影响其余）
   - 返回 `Song[]`
 - **`GET /api/search/suggest?keyword=`**（v1.0.2+）
   - 输入联想，250ms 防抖由客户端控制；返回 `{text, type: 'singer'|'song'|'album'}[]`，歌手项已置顶
@@ -38,7 +39,7 @@
   - `quality` 缺省 320k；传用户偏好音质
 - **`GET /api/track?uid=`** —— 单曲详情（含封面/可用音质）
 - **`GET /api/music/alternatives?uid=`** —— 跨源替换候选（可选功能）
-- **`GET /api/lyrics?uid=`** —— `{lyric: LRC文本|null, tlyric: 翻译LRC|null}`
+- **`GET /api/lyrics?id={uid}`** —— `{lyric: LRC文本|null, tlyric: 翻译LRC|null}`（注意参数名是 `id`，值传 uid）
   - LRC 行级时间戳，纯文本歌单（tx/kw/mg 部分歌曲）`lyric` 为 `[!text]` 前缀
 - **`GET /api/cover/[id]`** / 封面代理；歌单/榜单封面字段给的是完整 URL，直接加载即可（RemoteCover 逻辑已在服务端处理被拦域名）
 
@@ -60,7 +61,7 @@
 - **收藏**：
   - `GET /api/favorites?limit=200&offset=0` → `Song[]`
   - `POST /api/favorites` body `{id: uid}` 收藏；`DELETE /api/favorites?id=uid` 取消
-  - `GET /api/favorites/check?id=uid` → `{isFavorite: boolean}`
+  - `GET /api/favorites/check?id=uid` → `{starred: boolean}`
 - **自建歌单**：
   - `GET /api/playlists` 列表；`POST /api/playlists` `{name}` 新建
   - `GET /api/playlists/{id}` 详情；`PATCH /api/playlists/{id}` 改名；`DELETE /api/playlists/{id}` 删除
