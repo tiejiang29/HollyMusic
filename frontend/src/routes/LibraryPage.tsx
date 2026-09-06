@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Library as LibraryIcon, Music, Play, RefreshCw, Search, Trash2, X, Heart, ListPlus } from 'lucide-react'
+import { Library as LibraryIcon, Music, Play, RefreshCw, Search, Trash2, X, Heart, ListPlus, ListMusic, Download } from 'lucide-react'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { SourceBadge } from '@/components/shared/SourceBadge'
@@ -10,6 +10,7 @@ import { apiGet } from '@/lib/api/client'
 import { deleteLibrarySong, getLibraryList, rebuildLibraryIndex } from '@/lib/api/library'
 import { toast } from '@/lib/toast'
 import { usePlayerStore } from '@/lib/store/player-store'
+import { useDownload } from '@/hooks/useDownload'
 import { toTrack } from '@/lib/types/player'
 import type { LibrarySongItem, LibraryStats } from '@/lib/api/library'
 import type { MusicInfo } from '@/lib/types/music'
@@ -62,6 +63,8 @@ export function LibraryPage() {
   const requestId = useRef(0)
   const pageSize = 100
   const playTrack = usePlayerStore(s => s.playTrack)
+  const addToQueue = usePlayerStore(s => s.addToQueue)
+  const { download } = useDownload()
   const favoritesIds = useFavoritesStore(s => s.ids)
   const toggleFav = useFavoritesStore(s => s.toggle)
   const [playlistUid, setPlaylistUid] = useState<string | null>(null)
@@ -126,18 +129,46 @@ export function LibraryPage() {
     }
   }
 
+  /** 手动导入条目（uid 空）不可点播/入队/下载 */
+  const fetchTrack = async (item: LibrarySongItem) => {
+    const result = await apiGet<{ musicInfo: MusicInfo }>(`track?uid=${encodeURIComponent(item.uid)}`)
+    return toTrack({ uid: item.uid, musicInfo: result.musicInfo })
+  }
+
   const handlePlay = async (item: LibrarySongItem) => {
     if (!item.uid) {
       toast.error('该条目为手动导入，缺少来源信息，暂不支持点播')
       return
     }
     try {
-      const result = await apiGet<{ musicInfo: MusicInfo }>(`track?uid=${encodeURIComponent(item.uid)}`)
-      const track = toTrack({ uid: item.uid, musicInfo: result.musicInfo })
+      const track = await fetchTrack(item)
       playTrack(track, [track])
     } catch (err) {
       toast.error(`点播失败：${err instanceof Error ? err.message : String(err)}`)
     }
+  }
+
+  const handleAddQueue = async (item: LibrarySongItem) => {
+    if (!item.uid) {
+      toast.error('该条目为手动导入，缺少来源信息')
+      return
+    }
+    try {
+      const track = await fetchTrack(item)
+      addToQueue(track)
+      toast.info(`已加入播放队列：${item.name}`)
+    } catch (err) {
+      toast.error(`加入队列失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  const handleDownload = (item: LibrarySongItem) => {
+    if (!item.uid) {
+      toast.error('该条目为手动导入，缺少来源信息')
+      return
+    }
+    // 音质传当前偏好；后端音乐库命中时直接发本地文件（秒下）
+    download({ uid: item.uid, quality: usePlayerStore.getState().quality })
   }
 
   const handleRebuild = async () => {
@@ -174,7 +205,12 @@ export function LibraryPage() {
             >
               <CoverImage uid={item.uid} cacheKey={item.img} className="h-10 w-10" />
             </button>
-            <div className="min-w-0 flex-1">
+            <button
+              onClick={() => canPlay && void handlePlay(item)}
+              disabled={!canPlay}
+              className="min-w-0 flex-1 text-left disabled:cursor-default"
+              title={canPlay ? '单击播放' : '手动导入条目，无来源信息'}
+            >
               <div className="flex items-center gap-2">
                 <span className="truncate text-sm font-medium">{item.name}</span>
                 <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
@@ -188,9 +224,9 @@ export function LibraryPage() {
                 <span className="truncate">{item.singer}</span>
                 {item.album && <span className="truncate">· {item.album}</span>}
               </div>
-            </div>
+            </button>
             <span className="w-14 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{formatDuration(item.durationSec)}</span>
-            <span className="w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{formatBytes(item.fileSize)}</span>
+            <span className="hidden w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground sm:inline">{formatBytes(item.fileSize)}</span>
 
             {/* 尾部操作：收藏 / 加入歌单 / 播放 / 删除（桌面 hover 显现，移动端常显） */}
             {canPlay && (
@@ -212,7 +248,27 @@ export function LibraryPage() {
                 aria-label={`加入歌单 ${item.name}`}
                 title="加入歌单"
               >
+                <ListMusic className="h-4 w-4" />
+              </button>
+            )}
+            {canPlay && (
+              <button
+                onClick={() => void handleAddQueue(item)}
+                className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-70 transition hover:bg-accent hover:text-foreground focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5"
+                aria-label={`加入播放队列 ${item.name}`}
+                title="加入播放队列"
+              >
                 <ListPlus className="h-4 w-4" />
+              </button>
+            )}
+            {canPlay && (
+              <button
+                onClick={() => handleDownload(item)}
+                className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-70 transition hover:bg-accent hover:text-foreground focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5"
+                aria-label={`下载 ${item.name}`}
+                title="下载（优先本地库文件）"
+              >
+                <Download className="h-4 w-4" />
               </button>
             )}
             <button
