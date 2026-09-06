@@ -153,3 +153,24 @@ body {
 .now-lyric-line {
   animation: now-lyric-line-in 0.35s ease;
 }
+
+/* 卡拉OK填充：--fill 由组件按行内匀速插值驱动（0%~100%）。
+   已唱=主题绿、未唱=半透明前景色，渐变裁字可呈现半个字的硬边界。
+   注册 @property 后 --fill 可过渡，~250ms 的时间跳动被抹成连续填充；
+   不支持的内核退化为 4Hz 阶跳，仍可读。 */
+@property --fill {
+  syntax: '<percentage>';
+  inherits: false;
+  initial-value: 0%;
+}
+.now-lyric-karaoke {
+  background-image: linear-gradient(
+    90deg,
+    var(--primary) var(--fill),
+    color-mix(in oklab, var(--foreground) 42%, transparent) var(--fill)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  transition: --fill 0.3s linear;
+}
