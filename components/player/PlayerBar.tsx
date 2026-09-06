@@ -8,6 +8,7 @@ import { NowPlaying } from './NowPlaying'
 import { PlayerControls } from './PlayerControls'
 import { PlayerTools } from './PlayerTools'
 import { PlayerButton } from './PlayerButton'
+import { AudioSpectrum } from './AudioSpectrum'
 import { MobilePlayerMenu } from './MobilePlayerMenu'
 import { Mic2, ListMusic } from 'lucide-react'
 
@@ -86,8 +87,13 @@ export function PlayerBar({ audio, onAudioElement }: PlayerBarProps) {
   }, [seekNonce, seek])
 
   return (
-    <footer className="safe-area-bottom flex flex-col gap-2 border-t border-border bg-card px-3 py-3 md:min-h-[136px] md:flex-row md:items-center md:justify-between md:gap-4 md:px-4">
-      {/* 单一 DOM 布局：桌面端横排三栏，移动端纵向排列。频谱只保留一张 canvas。 */}
+    <footer className="safe-area-bottom relative isolate flex flex-col gap-2 overflow-hidden border-t border-border bg-card px-3 py-3 md:min-h-[136px] md:flex-row md:items-center md:justify-between md:gap-4 md:px-4">
+      {/* 频谱背景层：整条底栏底层淡显（歌词行占据了原频谱位，频谱降级为氛围背景）。
+          -z-10 压到内容之下、父背景之上；pointer-events-none 不挡交互。 */}
+      <div className="pointer-events-none absolute inset-0 -z-10 opacity-50" aria-hidden="true">
+        <AudioSpectrum audio={audio} isPlaying={isPlaying} className="h-full w-full" />
+      </div>
+      {/* 单一 DOM 布局：桌面端横排三栏，移动端纵向排列。 */}
       <div className="flex items-center gap-1 md:contents">
         <NowPlaying />
         <div className="flex items-center md:hidden">
@@ -96,7 +102,7 @@ export function PlayerBar({ audio, onAudioElement }: PlayerBarProps) {
           <MobilePlayerMenu />
         </div>
       </div>
-      <PlayerControls audio={audio} isPlaying={isPlaying} />
+      <PlayerControls />
       <PlayerTools />
     </footer>
   )
