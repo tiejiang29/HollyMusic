@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -23,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
@@ -61,6 +63,7 @@ import com.tiejiang.hollymusic.ui.components.MiniPlayer
 import com.tiejiang.hollymusic.ui.components.SectionHeader
 import com.tiejiang.hollymusic.ui.components.SongRow
 import com.tiejiang.hollymusic.ui.theme.Holly
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private enum class HomeTab(val label: String) { REC("推荐"), LIB("音乐库"), TOP("排行榜"), FAV("收藏") }
@@ -312,53 +315,104 @@ private fun RecommendChannel(
     }
 }
 
-/** 频道：音乐库 = 三色快捷卡 + 服务端音乐库歌曲（边听边下） */
+/** 频道：音乐库 = 搜索（歌名/歌手/拼音首字母）+ 歌手索引 chips + 歌曲列表（服务端边听边下库） */
 @Composable
 private fun LibraryChannel() {
     val scope = rememberCoroutineScope()
+    var keyword by remember { mutableStateOf("") }
+    var selectedSinger by remember { mutableStateOf("") }
     var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
     var total by remember { mutableStateOf(0) }
+    var singerGroups by remember { mutableStateOf<List<com.tiejiang.hollymusic.core.SingerGroup>>(emptyList()) }
     var loaded by remember { mutableStateOf(false) }
 
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        scope.launch {
-            runCatching { Api.library() }
-                .onSuccess { (list, t) -> songs = list; total = t }
-            loaded = true
-        }
+    // 搜索/选歌手 → 300ms 防抖请求（singerGroups 只在无筛选时刷新，避免选项跳变）
+    androidx.compose.runtime.LaunchedEffect(keyword, selectedSinger) {
+        delay(300)
+        runCatching { Api.library(keyword = keyword.trim(), singer = selectedSinger) }
+            .onSuccess { r ->
+                songs = r.list
+                total = r.total
+                if (keyword.isBlank() && selectedSinger.isBlank()) singerGroups = r.singerGroups
+            }
+        loaded = true
     }
 
-    LazyColumn {
-        item {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 18.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.spacedBy(11.dp),
+    Column {
+        // 歌手搜索框
+        Surface(
+            shape = androidx.compose.foundation.shape.CircleShape,
+            color = Color.White, shadowElevation = 2.dp,
+            modifier = Modifier
+                .padding(horizontal = 18.dp, vertical = 8.dp)
+                .fillMaxWidth()
+                .heightIn(min = 46.dp),
+        ) {
+            androidx.compose.material3.OutlinedTextField(
+                value = keyword,
+                onValueChange = { keyword = it },
+                placeholder = { Text("搜索歌名 / 歌手 / 拼音首字母", fontSize = 13.sp, color = Holly.txt3) },
+                leadingIcon = { Icon(Icons.Filled.Search, null, tint = Holly.txt3) },
+                trailingIcon = {
+                    if (keyword.isNotEmpty()) {
+                        IconButton(onClick = { keyword = "" }) {
+                            Icon(Icons.Filled.Close, "清空", tint = Holly.txt3)
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = androidx.compose.foundation.shape.CircleShape,
+                colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color.Transparent,
+                    unfocusedBorderColor = Color.Transparent,
+                    focusedContainerColor = Color.White,
+                    unfocusedContainerColor = Color.White,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        // 歌手索引 chips
+        if (singerGroups.isNotEmpty()) {
+            LazyRow(
+                Modifier.padding(horizontal = 18.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                QuickCard("最近播放", "—", Holly.grad, Modifier.weight(1f)) {}
-                QuickCard("我的收藏", "—", Holly.gradBlue, Modifier.weight(1f)) {}
-                QuickCard("已下载", "—", Holly.gradOrange, Modifier.weight(1f)) {}
+                item { HollyChip("全部 ${singerGroups.sumOf { it.count }}", selectedSinger.isBlank()) { selectedSinger = "" } }
+                items(singerGroups) { g ->
+                    HollyChip("${g.singer} ${g.count}", selectedSinger == g.singer) { selectedSinger = g.singer }
+                }
             }
         }
-        item { SectionHeader("音乐库" + if (total > 0) " · $total 首" else "") }
-        if (loaded && songs.isEmpty()) {
-            item {
-                Text(
-                    "音乐库还是空的，播放过的歌会自动入库",
-                    fontSize = 13.sp, color = Holly.txt3,
-                    modifier = Modifier.padding(18.dp),
+        Text(
+            buildString {
+                if (selectedSinger.isNotBlank()) append("$selectedSinger · ")
+                append("${songs.size}")
+                if (total > songs.size) append("/$total")
+                append(" 首")
+            },
+            fontSize = 11.sp, color = Holly.txt3,
+            modifier = Modifier.padding(start = 20.dp, top = 8.dp, bottom = 4.dp),
+        )
+        LazyColumn {
+            if (loaded && songs.isEmpty()) {
+                item {
+                    Text(
+                        if (keyword.isBlank() && selectedSinger.isBlank()) "音乐库还是空的，播放过的歌会自动入库"
+                        else "没有匹配的歌曲",
+                        fontSize = 13.sp, color = Holly.txt3,
+                        modifier = Modifier.padding(18.dp),
+                    )
+                }
+            }
+            itemsIndexed(songs) { i, s ->
+                val st = PlayerManager.state.collectAsState().value
+                SongRow(
+                    song = s,
+                    isCurrent = st.current?.uid == s.uid,
+                    isPlaying = st.playing,
+                    onPlay = { PlayerManager.playQueue(songs, i) },
                 )
             }
-        }
-        itemsIndexed(songs) { i, s ->
-            val st = PlayerManager.state.collectAsState().value
-            SongRow(
-                song = s,
-                isCurrent = st.current?.uid == s.uid,
-                isPlaying = st.playing,
-                onPlay = { PlayerManager.playQueue(songs, i) },
-            )
         }
     }
 }
