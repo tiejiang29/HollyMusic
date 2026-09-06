@@ -174,15 +174,24 @@ object Api {
         if (cookieSnapshot(server) == null) throw ApiException("COOKIE", "登录成功但未收到会话")
     }
 
-    suspend fun search(source: String, keyword: String, page: Int = 1, limit: Int = 30): Pair<List<Song>, Int> {
+    /** 搜索结果：列表 + 总数 + 失败音源（source=all 部分源失败时非空） */
+    data class SearchResult(
+        val list: List<Song>,
+        val total: Int,
+        val failedSources: List<String>,
+    )
+
+    suspend fun search(source: String, keyword: String, page: Int = 1, limit: Int = 30): SearchResult {
         val req = Request.Builder().url(
             "${baseUrl()}/api/search?source=$source&keyword=${encode(keyword)}&page=$page&limit=$limit"
         ).get().build()
         val raw = call(req)
         val obj = node(raw)
-        val listJson = obj["list"] ?: return emptyList<Song>() to 0
+        val listJson = obj["list"] ?: return SearchResult(emptyList(), 0, emptyList())
         val list = json.decodeFromJsonElement(ListSerializer(Song.serializer()), listJson)
-        return list to int(obj, "total")
+        val failed = (obj["failedSources"] as? kotlinx.serialization.json.JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNullSafe() }.orEmpty()
+        return SearchResult(list, int(obj, "total"), failed)
     }
 
     suspend fun suggest(keyword: String): List<SuggestItem> {
