@@ -3,7 +3,7 @@ import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/ap
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError, requireAdmin, ForbiddenError } from '@/lib/services/user-context'
 import { prisma, getMusicInfo } from '@/lib/db'
-import { getLibraryStats } from '@/lib/services/music-library'
+import { getLibraryStats, splitSingerArtists } from '@/lib/services/music-library'
 import { pinyin } from 'pinyin-pro'
 
 
@@ -22,6 +22,19 @@ function getInitials(text: string): string {
     initialsCache.set(text, v)
   }
   return v
+}
+
+/** DB 完整串 groupBy 结果 → 拆分聚合的全歌手列表（含首字母，按字母序） */
+function aggregateArtists(groups: Array<{ singer: string; _count: { _all: number } }>) {
+  const map = new Map<string, number>()
+  for (const g of groups) {
+    for (const artist of splitSingerArtists(g.singer)) {
+      map.set(artist, (map.get(artist) || 0) + g._count._all)
+    }
+  }
+  return [...map.entries()]
+    .map(([name, count]) => ({ singer: name, count, initials: getInitials(name) }))
+    .sort((a, b) => a.singer.localeCompare(b.singer, 'zh'))
 }
 
 /**
@@ -102,7 +115,9 @@ export async function GET(request: NextRequest) {
       page,
       pageSize,
       stats,
-      singerGroups: singerGroups.map(g => ({ singer: g.singer, count: g._count._all })),
+      // 服务端聚合全歌手（拆分多歌手串）+ 拼音首字母：前端歌手栏
+      // 搜索/过滤直接用，避免前端引入拼音库
+      singerGroups: aggregateArtists(singerGroups),
     })
   } catch (error) {
     if (error instanceof AuthError) {

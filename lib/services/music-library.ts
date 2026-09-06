@@ -82,6 +82,17 @@ function primarySinger(singer: string): string {
   return first || '未知歌手'
 }
 
+/** 完整歌手串 → 所有歌手（每段剥 feat./ft. 尾注）。与前端 splitArtists 同规则，
+ * 供 /api/library 服务端聚合（含首字母）下发，避免前端引入拼音库。 */
+export function splitSingerArtists(singer: string): string[] {
+  const normalized = normalizeText(singer)
+  if (!normalized) return []
+  return normalized
+    .split(/[、,，/／&＆;；]/)
+    .map(s => s.replace(/\s*(?:feat|ft)\..*$/i, '').trim())
+    .filter(Boolean)
+}
+
 function buildDedupeKey(name: string, singer: string): string {
   return `${normalizeText(name).toLowerCase()}|${primarySinger(singer).toLowerCase()}`
 }
