@@ -69,6 +69,31 @@ async function fetchNeteaseSuggest(keyword: string): Promise<SuggestItem[]> {
   }
 }
 
+/** 网易云艺人搜索（type=100）：补足 suggest 接口对短词只回 0-1 位歌手的短板 */
+async function fetchNeteaseArtists(keyword: string): Promise<SuggestItem[]> {
+  try {
+    const resp = await fetch(
+      `https://music.163.com/api/search/get?s=${encodeURIComponent(keyword)}&type=100&limit=5`,
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          Referer: 'https://music.163.com/',
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      }
+    )
+    if (!resp.ok) return []
+    const j = (await resp.json().catch(() => null)) as {
+      result?: { artists?: Array<{ name?: string }> }
+    } | null
+    return (j?.result?.artists ?? [])
+      .filter(a => a?.name)
+      .map(a => ({ text: a.name!, type: 'singer' as const }))
+  } catch {
+    return []
+  }
+}
+
 /** 本地音乐库联想（name/singer 包含匹配） */
 async function fetchLibrarySuggest(keyword: string): Promise<SuggestItem[]> {
   try {
@@ -96,14 +121,16 @@ export async function GET(request: NextRequest) {
     const keyword = (new URL(request.url).searchParams.get('keyword') || '').trim().slice(0, 60)
     if (!keyword) return createSuccessResponse<SuggestItem[]>([])
 
-    const cacheKey = `suggest:v2:${keyword}`
+    const cacheKey = `suggest:v3:${keyword}`
     const cached = searchCache.get(cacheKey) as SuggestItem[] | null
     if (cached) return createSuccessResponse(cached)
 
-    // 两源并行，整体预算 1.2s（超时源静默丢弃）
-    const merged = await Promise.race([
-      Promise.all([fetchNeteaseSuggest(keyword), fetchLibrarySuggest(keyword)]),
-      new Promise<[SuggestItem[], SuggestItem[]]>(r => setTimeout(() => [[], []] as [SuggestItem[], SuggestItem[]], OVERALL_BUDGET_MS)),
+    // 三源并行，整体预算 1.2s（超时源静默丢弃）
+    const [wySuggest, libraryItems, artistItems] = await Promise.race([
+      Promise.all([fetchNeteaseSuggest(keyword), fetchLibrarySuggest(keyword), fetchNeteaseArtists(keyword)]),
+      new Promise<[SuggestItem[], SuggestItem[], SuggestItem[]]>(r =>
+        setTimeout(() => [[], [], []] as [SuggestItem[], SuggestItem[], SuggestItem[]], OVERALL_BUDGET_MS)
+      ),
     ])
 
     // 去重（文本归一：去空格小写）。排序：歌手置顶（人名搜索意图最强，
@@ -117,10 +144,16 @@ export async function GET(request: NextRequest) {
       seen.add(key)
       items.push(item)
     }
-    for (const item of merged[0].filter(i => i.type === 'singer')) push(item)
-    for (const item of merged[1]) push(item)
-    for (const item of merged[0].filter(i => i.type === 'song')) push(item)
-    for (const item of merged[0].filter(i => i.type === 'album')) push(item)
+    let singerSlots = 4
+    for (const item of [...wySuggest, ...artistItems].filter(i => i.type === 'singer')) {
+      if (singerSlots <= 0) break
+      const before = items.length
+      push(item)
+      if (items.length > before) singerSlots--
+    }
+    for (const item of libraryItems) push(item)
+    for (const item of wySuggest.filter(i => i.type === 'song')) push(item)
+    for (const item of wySuggest.filter(i => i.type === 'album')) push(item)
 
     searchCache.set(cacheKey, items, CACHE_TTL)
     return createSuccessResponse(items)
