@@ -16,21 +16,8 @@ import { toTrack } from '@/lib/types/player'
 import type { LibrarySongItem, LibraryStats } from '@/lib/api/library'
 import type { MusicInfo } from '@/lib/types/music'
 
-/** 歌手分隔符（与后端入库目录规则一致；含 &/＆——酷我等平台用 & 分隔多歌手） */
-const ARTIST_SEPARATORS = /[、,，/／&\uFF06;；]/
-
-/** 完整歌手串 → 所有歌手列表（每段剥 feat./ft. 尾注） */
-function splitArtists(singer: string): string[] {
-  return (singer || '')
-    .split(ARTIST_SEPARATORS)
-    .map(s => s.replace(/\s*(?:feat|ft)\..*$/i, '').trim())
-    .filter(Boolean)
-}
-
-/** 主歌手：所有歌手的第一个（与后端入库目录规则一致） */
-function primarySinger(singer: string): string {
-  return splitArtists(singer)[0] || '未知歌手'
-}
+/** 歌手聚合与拼音首字母由服务端下发（singerGroups.initials），
+ *  前端不再本地拆分/转换，避免引入拼音库增加包体。 */
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
@@ -54,7 +41,7 @@ export function LibraryPage() {
   const [list, setList] = useState<LibrarySongItem[]>([])
   const [total, setTotal] = useState(0)
   const [stats, setStats] = useState<LibraryStats | null>(null)
-  const [singerGroups, setSingerGroups] = useState<Array<{ singer: string; count: number }>>([])
+  const [singerGroups, setSingerGroups] = useState<Array<{ singer: string; count: number; initials: string }>>([])
   const [loading, setLoading] = useState(true)
   const [keyword, setKeyword] = useState('')
   const [activeSinger, setActiveSinger] = useState('')
@@ -104,26 +91,15 @@ export function LibraryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keyword, activeSinger, page])
 
-  // 歌手聚合：DB 按完整串 groupBy，前端拆成全歌手视图——多歌手曲目计入
-  // 每个参与的歌手（各歌手计数总和会大于歌曲总数，与主流音乐应用一致）
-  const artistView = useMemo(() => {
-    const map = new Map<string, number>()
-    for (const g of singerGroups) {
-      for (const artist of splitArtists(g.singer)) {
-        map.set(artist, (map.get(artist) || 0) + g.count)
-      }
-    }
-    return [...map.entries()]
-      .map(([singer, count]) => ({ singer, count }))
-      // 按字母/拼音顺序（locale zh 下浏览器按拼音排中文）
-      .sort((a, b) => a.singer.localeCompare(b.singer, 'zh'))
-  }, [singerGroups])
+  // 歌手视图：服务端已拆分聚合（多歌手曲目计入每个参与歌手）+ 按字母/拼音排序
+  // + 附带拼音首字母（initials），前端不再本地拆分/转换
+  const artistView = useMemo(() => singerGroups, [singerGroups])
 
-  // 左栏先按歌手搜索框过滤，再截断展示（拆分后歌手项可能很多）
+  // 左栏先按歌手搜索框过滤（名字或拼音首字母），再截断展示
   const MAX_ARTISTS_SHOWN = 100
   const artistKeyword = artistQuery.trim().toLowerCase()
   const filteredArtists = artistKeyword
-    ? artistView.filter(a => a.singer.toLowerCase().includes(artistKeyword))
+    ? artistView.filter(a => a.singer.toLowerCase().includes(artistKeyword) || a.initials.includes(artistKeyword))
     : artistView
   const shownArtists = filteredArtists.slice(0, MAX_ARTISTS_SHOWN)
 
@@ -420,7 +396,7 @@ export function LibraryPage() {
             <input
               value={artistQuery}
               onChange={e => setArtistQuery(e.target.value)}
-              placeholder="搜索歌手..."
+              placeholder="搜索歌手 / 首字母..."
               className="w-full rounded-full bg-card py-1.5 pl-8 pr-7 text-xs outline-none ring-1 ring-border focus:ring-primary"
             />
             {artistQuery && (

@@ -29,7 +29,7 @@ export interface LibraryListResult {
   page: number
   pageSize: number
   stats: LibraryStats
-  singerGroups: Array<{ singer: string; count: number }>
+  singerGroups: Array<{ singer: string; count: number; initials: string }>
 }
 
 export function getLibraryList(params: { keyword?: string; singer?: string; page?: number; pageSize?: number } = {}): Promise<LibraryListResult> {
