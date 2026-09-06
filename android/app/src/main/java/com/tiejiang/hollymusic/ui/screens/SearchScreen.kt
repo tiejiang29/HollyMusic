@@ -67,12 +67,17 @@ private val SOURCES = listOf(
     "all" to "全部", "kw" to "酷我", "tx" to "企鹅", "wy" to "网易", "kg" to "酷狗", "mg" to "咪咕",
 )
 
+private val SOURCE_NAMES = mapOf(
+    "kw" to "酷我", "tx" to "企鹅", "wy" to "网易", "kg" to "酷狗", "mg" to "咪咕",
+)
+
 @Composable
 fun SearchScreen(onBack: () -> Unit) {
     var keyword by remember { mutableStateOf("") }
     var source by remember { mutableStateOf("all") }
     var results by remember { mutableStateOf<List<Song>>(emptyList()) }
     var total by remember { mutableStateOf(0) }
+    var failedSources by remember { mutableStateOf<List<String>>(emptyList()) }
     var suggests by remember { mutableStateOf<List<SuggestItem>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
     var searched by remember { mutableStateOf(false) }
@@ -89,9 +94,14 @@ fun SearchScreen(onBack: () -> Unit) {
         scope.launch {
             searching = true
             searchErr = null
+            failedSources = emptyList()
             suggests = emptyList()
             runCatching { Api.search(source, kw) }
-                .onSuccess { (list, t) -> results = list; total = t; searched = true }
+                .onSuccess { r ->
+                    results = r.list; total = r.total
+                    failedSources = r.failedSources
+                    searched = true
+                }
                 .onFailure { searchErr = "${it.javaClass.simpleName}: ${it.message}" }
             searching = false
         }
@@ -217,7 +227,10 @@ fun SearchScreen(onBack: () -> Unit) {
 
         if (searched) {
             Text(
-                "共 $total 条结果", fontSize = 11.sp, color = Holly.txt3,
+                "共 $total 条结果" + if (failedSources.isNotEmpty()) {
+                    " · 不含${failedSources.joinToString("、") { src -> SOURCE_NAMES[src] ?: src }}"
+                } else "",
+                fontSize = 11.sp, color = Holly.txt3,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
             )
         }
