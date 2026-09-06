@@ -11,10 +11,14 @@ import { toTrack } from '@/lib/types/player'
 import type { LibrarySongItem, LibraryStats } from '@/lib/api/library'
 import type { MusicInfo } from '@/lib/types/music'
 
-/** 主歌手：完整歌手串取第一个（与后端入库目录规则一致） */
+/** 主歌手：完整歌手串按分隔符取第一个（与后端入库目录规则一致）。
+ *  不能用懒惰正则 + $ 锚定——合并串会整体匹配失败回退成完整串。 */
 function primarySinger(singer: string): string {
-  const m = (singer || '').match(/^([^、,，/／&\uFF06]+?)(?:\s*(?:feat|ft)\..*)?$/i)
-  return (m?.[1] || singer || '未知歌手').trim()
+  const first = (singer || '')
+    .split(/[、,，/／&\uFF06;；]/)[0]
+    .replace(/\s*(?:feat|ft)\..*$/i, '')
+    .trim()
+  return first || '未知歌手'
 }
 
 function formatBytes(bytes: number): string {
