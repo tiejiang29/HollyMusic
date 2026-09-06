@@ -5,12 +5,12 @@
 #   1. mkdir holly-music && cd holly-music
 #   2. 将本文件复制为 docker-compose.yml（或在部署目录直接下载：
 #      curl -o docker-compose.yml \
-#        https://raw.githubusercontent.com/redcatH/HollyMusic/main/docker-compose.example.yml）
+#        https://raw.githubusercontent.com/tiejiang29/HollyMusic/main/docker-compose.example.yml）
 #   3. 创建 .env（最小配置只需 AUTH_SECRET，生成：openssl rand -hex 32）
 #   4. docker compose up -d，访问 http://localhost:3099
 #
 # 想固定版本？把 image 的 :latest 换成具体 tag（如 :v0.20.1），
-# 见 https://github.com/redcatH/HollyMusic/releases
+# 见 https://github.com/tiejiang29/HollyMusic/pkgs/container/hollymusic
 #
 # 注：仓库根目录的 docker-compose.yml 是本地源码构建版（build: .），
 #     适合开发调试；本文件面向直接使用镜像部署的用户。
@@ -18,7 +18,7 @@
 
 services:
   app:
-    image: ghcr.io/redcath/hollymusic:latest
+    image: tiejiang29/hollymusic:latest
     container_name: holly-music
     ports:
       - "3099:3000"
@@ -46,7 +46,7 @@ services:
       - ./app_logs:/app/logs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3
