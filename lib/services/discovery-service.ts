@@ -905,8 +905,8 @@ async function getKgToplistCovers(): Promise<Map<string, string>> {
 }
 
 async function getKwToplistCovers(): Promise<Map<string, string>> {
-  // 封面仅覆盖常用榜单（全量 43 个逐个请求太重；榜单页列表为纯文字形态不强依赖封面）
-  const results = await Promise.allSettled(TOPLIST_BOARDS.kw.filter(b => b.common).map(async board => {
+  // 全量 43 榜逐个请求（rn=1 轻量 + TTL 缓存）；Android 端榜单卡片依赖封面
+  const results = await Promise.allSettled(TOPLIST_BOARDS.kw.map(async board => {
     const payload = await fetchJson<{ pic?: string }>(`http://kbangserver.kuwo.cn/ksong.s?from=pc&fmt=json&pn=0&rn=1&type=bang&data=content&id=${encodeURIComponent(board.id)}&show_copyright_off=0&pcmp4=1&isbang=1`)
     return [board.id, normalizeCover(payload.pic || '')] as const
   }))
@@ -919,7 +919,8 @@ async function getKwToplistCovers(): Promise<Map<string, string>> {
 }
 
 async function getTxToplistCovers(): Promise<Map<string, string>> {
-  const results = await Promise.allSettled(TOPLIST_BOARDS.tx.filter(b => b.common).map(async board => {
+  // 全量榜单抓封面（Android 端榜单列表已卡片化依赖封面；23 个并发请求 + TTL 缓存可接受）
+  const results = await Promise.allSettled(TOPLIST_BOARDS.tx.map(async board => {
     const payload = await requestMusicu<{ toplist?: { data?: { data?: { headPicUrl?: string } } } }>({
       toplist: {
         module: 'musicToplist.ToplistInfoServer',
