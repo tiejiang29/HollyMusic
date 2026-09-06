@@ -16,19 +16,169 @@
 
 > v0.17.0 之前的完整提交历史可执行 `git log v0.17.0` 查看。
 
+## v1.0.0（2026-09-06）
+
+**完整对比**：[v0.24.3 → v1.0.0](https://github.com/redcatH/HollyMusic/compare/v0.24.3...v1.0.0)
+
+### ✨ 新增功能
+
+- security hardening + playlist import + cross-platform toggle
+- Kugou gcid personal playlist import (cookie-based scraping)
+- Kugou gcid import via signed mobile API (75/75 songs, no cookie needed)
+- **player**：play mode popover menu + lyrics page redesign
+- **leaderboard**：独立排行榜页，全量 180 榜单，收藏榜单为歌单
+- **download**：下载入口补全 + 批量 ZIP 流式打包
+- **library**：边听边下服务器音乐库（持久化 + 浏览页 + 本地优先播放）
+- **library**：本地优先音质裁决纳入平台可用音质
+- **ui**：加入歌单快捷入口（歌曲行/播放栏/移动端菜单）
+- **library**：歌手列表纳入全部参与歌手
+- **library**：歌曲行改标准布局 —— 封面前置 + 收藏/加歌单/播放按钮后置
+- **library**：行内补齐单击播放 / 加入播放队列 / 下载
+- **library**：批量下载 + 歌手字母序排列 + 歌手栏独立搜索
+- **library**：专辑独立成列 + 搜索框入头部 + 拼音首字母搜索
+
+
+### 🐛 问题修复
+
+- **covers**：cross-platform cover fill + album name on import
+- **sources**：repair mojibake script filenames, harden upload naming
+- **docker**：compose healthcheck 改用 node fetch（新运行时镜像无 wget）
+- **library**：多歌手合并名目录/去重键修复 + 存量迁移脚本
+- **library**：登记时长以文件探测为准 + 扩展名按实际内容 + 存量时长修复
+- **library**：歌手栏搜索支持拼音首字母
+
+
+### ⚡ 性能优化
+
+- **docker**：shrink image ~1GB → ~300MB uncompressed
+
+
+### 🎨 界面与样式
+
+- prefer-const for wyTracks (fix CI lint)
+
+
+### ✅ 测试
+
+- 补 music-library mock（下载路由单测适配本地优先播放）
+
+
+### 🔧 工程与依赖
+
+- 移除误提交的空 node.js 文件
+- gitignore 忽略 Next.js dev 日志与 GUI 测试截图
+- add GitHub Actions Docker build & push to Docker Hub
+- **release**：v0.23.0 版本号管理
+- **release**：v1.0.0 —— fork 版本线独立
+
+
+## v0.24.3（2026-08-25）
+
+**完整对比**：[v0.24.2 → v0.24.3](https://github.com/redcatH/HollyMusic/compare/v0.24.2...v0.24.3)
+
+### ✨ 新增功能
+
+- **player**：频谱无分析数据时降级为合成动画
+
+
+### 🐛 问题修复
+
+- **player**：修复 iOS PWA 退后台停播
+
+
+### 🔧 工程与依赖
+
+- **deps**：批量合并 dependabot 升级 #46-#53
+- **deps**：bump react and @types/react
+- **deps**：bump dayjs from 1.11.19 to 1.11.21
+- **deps-dev**：bump eslint from 9.39.2 to 9.39.5
+- **deps**：bump needle from 3.3.1 to 3.5.0
+- **deps-dev**：bump eslint-config-next from 16.1.1 to 16.3.1
+- **deps**：bump react-use from 17.6.0 to 17.6.1
+- **deps**：bump next from 16.2.12 to 16.3.1
+- **deps**：bump dexie from 4.2.1 to 4.4.4
+- **deps**：升级 tailwindcss 4.3.3 + vitest 3.2.7
+
+
+### 🧩 其他变更
+
+- Merge PR #46 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+- Merge PR #47 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+- Merge PR #48 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+- Merge PR #49 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+- Merge PR #50 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+- Merge PR #51 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+- Merge PR #52 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+- Merge PR #53 (dependabot 依赖升级，已由批量升级 044fe9b 覆盖)
+
+
+## v0.24.2（2026-08-24）
+
+**完整对比**：[v0.24.1 → v0.24.2](https://github.com/redcatH/HollyMusic/compare/v0.24.1...v0.24.2)
+
+### 🐛 问题修复
+
+- **discover**：图片加载改混合模式——仅被拦的 gtimg 域走代理，其余直连
+
+
+## v0.24.1（2026-08-24）
+
+**完整对比**：[v0.24.0 → v0.24.1](https://github.com/redcatH/HollyMusic/compare/v0.24.0...v0.24.1)
+
+### 🐛 问题修复
+
+- **discover**：图片代理白名单补充 qpic.y.qq.com 域名族
+
+
+## v0.24.0（2026-08-24）
+
+**完整对比**：[v0.23.0 → v0.24.0](https://github.com/redcatH/HollyMusic/compare/v0.23.0...v0.24.0)
+
+### ✨ 新增功能
+
+- **search**：搜索页交互改进——显式搜索按钮与 chips 源切换
+
+
+### 🐛 问题修复
+
+- **discover**：远程封面改走后端图片代理，规避浏览器拦截
+- **dev**：Windows 下 vite 轮询监听根目录共享代码，修复 HMR 偶发失效
+- **search**：修复加载/空态混淆与网络失败静默为空结果
+- **ui**：小屏隐藏页内大标题，与 MobileHeader 标题去重
+
+
+## v0.23.0（2026-08-23）
+
+**完整对比**：[v0.22.1 → v0.23.0](https://github.com/redcatH/HollyMusic/compare/v0.22.1...v0.23.0)
+
+### ✨ 新增功能
+
+- **discover**：榜单封面——五源列表获取、60分钟缓存防击穿、详情首曲兜底
+
+
+## v0.22.1（2026-08-23）
+
+**完整对比**：[v0.22.0 → v0.22.1](https://github.com/redcatH/HollyMusic/compare/v0.22.0...v0.22.1)
+
+### 🛡️ 安全修复
+
+- **security**：镜像不再内置初始密码文件，构建日志不再打印密码 (#63)
+
+
 ## v0.22.0（2026-08-23）
 
 **完整对比**：[v0.21.4 → v0.22.0](https://github.com/redcatH/HollyMusic/compare/v0.21.4...v0.22.0)
 
 ### ✨ 新增功能
 
-- 完善发现页、在线音源订阅、歌词缓存与播放器体验 (#60)（[@a-ke](https://github.com/redcatH/HollyMusic/pull/60)） ⚠️ **破坏性变更**：匿名调用 /api/music-url、/api/lyrics、/api/track、/api/random 将返回 401，外部直连需先登录获取会话。
+- 完善发现页、在线音源订阅、歌词缓存与播放器体验 (#60) ⚠️ **破坏性变更**：匿名调用 /api/music-url、/api/lyrics、/api/track、/api/random 将返回 401，外部直连需先登录获取会话。
 
 
 ### 🔧 工程与依赖
 
 - **release**：同步 v0.21.4 更新日志与版本号
-- 新增 PR 质量门禁与贡献指南对齐开源惯例 (#61)（[@redcatH](https://github.com/redcatH/HollyMusic/pull/61)）
+- 新增 PR 质量门禁与贡献指南对齐开源惯例 (#61)
+- **release**：准备 v0.22.0——更新日志署名渲染与预生成 (#62)
 
 
 ## v0.21.4（2026-08-22）
@@ -37,7 +187,7 @@
 
 ### 🐛 问题修复
 
-- **subsonic**：search3 空 query 与 PC 发现音乐同源（白名单随机），恢复 songCount (#58)（[@redcatH](https://github.com/redcatH/HollyMusic/pull/58)）
+- **subsonic**：search3 空 query 与 PC 发现音乐同源（白名单随机），恢复 songCount (#58)
 
 
 ### 🔧 工程与依赖
@@ -51,12 +201,12 @@
 
 ### 🐛 问题修复
 
-- **subsonic**：歌曲元数据真实化——bitRate/size/suffix 按默认播放音质推断 (#56)（[@redcatH](https://github.com/redcatH/HollyMusic/pull/56)）
+- **subsonic**：歌曲元数据真实化——bitRate/size/suffix 按默认播放音质推断 (#56)
 
 
 ### ⚡ 性能优化
 
-- **cover**：压缩默认 404 封面，2048px/3.6MB → 512px/107KB (#57)（[@redcatH](https://github.com/redcatH/HollyMusic/pull/57)）
+- **cover**：压缩默认 404 封面，2048px/3.6MB → 512px/107KB (#57)
 
 
 ### 🔧 工程与依赖
@@ -71,7 +221,7 @@
 ### ✨ 新增功能
 
 - **ci**：tag 发布自动创建 GitHub Release 并自动维护 CHANGELOG
-- **subsonic**：统一响应构造层，支持 XML/JSON/JSONP 输出 (#55)（[@redcatH](https://github.com/redcatH/HollyMusic/pull/55)）
+- **subsonic**：统一响应构造层，支持 XML/JSON/JSONP 输出 (#55)
 
 
 ### 🐛 问题修复
