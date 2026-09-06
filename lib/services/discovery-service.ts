@@ -8,6 +8,7 @@ import { TOPLIST_BOARDS, type ToplistBoardDef } from './toplist-boards'
 const QQ_MUSICU_URL = 'https://u.y.qq.com/cgi-bin/musicu.fcg'
 const QQ_SINGLE_SONG_URL = 'https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg'
 const CACHE_TTL = 10 * 60 * 1000
+const TAG_CACHE_TTL = 60 * 60 * 1000
 const REQUEST_TIMEOUT = 8_000
 
 export interface DiscoveryToplist {
@@ -1142,4 +1143,92 @@ export async function getRecommendedPlaylistDetail(source: DiscoverySource, id: 
   if (!detail) return null
   if (useCache) searchCache.set(cacheKey, detail, CACHE_TTL)
   return detail
+}
+
+// ==================== 歌单广场标签（接口与解析照搬 lx-music-desktop musicSdk/*/songList.js） ====================
+
+export interface PlaylistTag { id: string; name: string }
+export interface PlaylistTagGroup { name: string; list: PlaylistTag[] }
+export interface PlaylistTagsResult { hotTag: PlaylistTag[]; tags: PlaylistTagGroup[] }
+
+type TxTagItem = { id?: number | string; name?: string }
+type TxTagGroup = { group_name?: string; v_item?: TxTagItem[] }
+
+async function getTxPlaylistTags(): Promise<PlaylistTagsResult> {
+  // musicu.fcg playlist.PlaylistAllCategoriesServer（洛雪 tx.songList tagsUrl）
+  const url = 'https://u.y.qq.com/cgi-bin/musicu.fcg?loginUin=0&hostUin=0&format=json&inCharset=utf-8&outCharset=utf-8&notice=0&platform=wk_v15.json&needNewCode=0&data=' + encodeURIComponent(JSON.stringify({ tags: { method: 'get_all_categories', param: { qq: '' }, module: 'playlist.PlaylistAllCategoriesServer' } }))
+  const payload = await fetchJson<{ tags?: { data?: { v_group?: TxTagGroup[] } } }>(url, { headers: { Referer: 'https://y.qq.com/' } })
+  const toTag = (item: TxTagItem): PlaylistTag | null => {
+    const id = String(item.id ?? '')
+    return id && item.name ? { id, name: item.name } : null
+  }
+  const groups = payload.tags?.data?.v_group || []
+  return {
+    hotTag: groups.flatMap(g => g.v_item || []).map(toTag).filter((t): t is PlaylistTag => t !== null).slice(0, 10),
+    tags: groups.map(g => ({
+      name: g.group_name || '',
+      list: (g.v_item || []).map(toTag).filter((t): t is PlaylistTag => t !== null),
+    })).filter(g => g.name && g.list.length > 0),
+  }
+}
+
+async function getWyPlaylistTags(): Promise<PlaylistTagsResult> {
+  // music.163.com/api/playlist/hottags 明文 GET（洛雪走 weapi；linux/forward 对该接口返回 400，明文实测可用）
+  const payload = await fetchJson<{ code?: number; tags?: Array<{ playlistTag?: { name?: string } }> }>('https://music.163.com/api/playlist/hottags', { headers: { Referer: 'https://music.163.com/' } })
+  if (payload.code !== 200) throw new Error('网易未返回热门标签')
+  return {
+    hotTag: (payload.tags || []).map(t => ({ id: t.playlistTag?.name || '', name: t.playlistTag?.name || '' })).filter(t => t.name).slice(0, 10),
+    tags: [], // 分类全量目录对 UI 无用，只保留热门标签（与洛雪广场页高频用法一致）
+  }
+}
+
+async function getKwPlaylistTags(): Promise<PlaylistTagsResult> {
+  // wapi.kuwo.cn getRcmTagList（洛雪 kw.songList hotTagUrl）——id 需带 digest 后缀（getTagPlayList 用 id-digest）
+  const payload = await fetchJson<{ code?: number; data?: Array<{ data?: Array<{ id?: number | string; digest?: number | string; name?: string }> }> }>('http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmTagList?loginUid=0&loginSid=0&appUid=76039576')
+  if (payload.code !== 200) throw new Error('酷我未返回标签')
+  const items = payload.data?.[0]?.data || []
+  return {
+    hotTag: items.slice(0, 10).map(item => ({ id: `${item.id}-${item.digest}`, name: item.name || '' })).filter(t => t.name),
+    tags: [],
+  }
+}
+
+async function getKgPlaylistTags(): Promise<PlaylistTagsResult> {
+  // www2.kugou.kugou.com getSpecial?is_smarty=1：实测返回 JSON，
+  // data.hotTag.data 为按键索引对象（special_id 即广场列表的 c= 参数）。
+  const payload = await fetchJson<{ status?: number; data?: { hotTag?: { data?: Record<string, { special_id?: string | number; special_name?: string }> } } }>('http://www2.kugou.kugou.com/yueku/v9/special/getSpecial?is_smarty=1&cdn=cdn')
+  const items = Object.values(payload.data?.hotTag?.data || {})
+  const tags = items
+    .map(item => ({ id: String(item.special_id ?? ''), name: item.special_name || '' }))
+    .filter(t => t.id && t.name)
+  if (tags.length === 0) throw new Error('酷狗未返回标签')
+  return { hotTag: tags.slice(0, 10), tags: [] }
+}
+
+async function getMgPlaylistTags(): Promise<PlaylistTagsResult> {
+  // app.c.nf.migu.cn musiclistplaza-taglist（洛雪 mg.songList tagsUrl）
+  const payload = await fetchJson<{ code?: string; data?: Array<{ header?: { title?: string }; content?: Array<{ texts?: string[] }> }> }>('https://app.c.nf.migu.cn/pc/v1.0/template/musiclistplaza-taglist/release', { headers: { Referer: 'https://m.music.migu.cn/' } })
+  if (payload.code !== '000000') throw new Error('咪咕未返回标签')
+  const columns = payload.data || []
+  const hot = columns[0]?.content || []
+  return {
+    hotTag: hot.map(item => ({ id: item.texts?.[1] || '', name: item.texts?.[0] || '' })).filter(t => t.id && t.name).slice(0, 10),
+    tags: columns.slice(1).map(col => ({
+      name: col.header?.title || '',
+      list: (col.content || []).map(item => ({ id: item.texts?.[1] || '', name: item.texts?.[0] || '' })).filter(t => t.id && t.name),
+    })).filter(g => g.name && g.list.length > 0),
+  }
+}
+
+export async function getPlaylistTags(source: DiscoverySource = 'tx'): Promise<PlaylistTagsResult> {
+  const cacheKey = `discovery:v1:${source}:playlist-tags`
+  const cached = getCached<PlaylistTagsResult>(cacheKey)
+  if (cached) return cached
+  const result = source === 'wy' ? await getWyPlaylistTags()
+    : source === 'kw' ? await getKwPlaylistTags()
+    : source === 'kg' ? await getKgPlaylistTags()
+    : source === 'mg' ? await getMgPlaylistTags()
+    : await getTxPlaylistTags()
+  searchCache.set(cacheKey, result, TAG_CACHE_TTL)
+  return result
 }
