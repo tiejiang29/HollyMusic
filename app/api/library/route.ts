@@ -4,6 +4,25 @@ import { logger } from '@/lib/logger'
 import { requireUser, AuthError, requireAdmin, ForbiddenError } from '@/lib/services/user-context'
 import { prisma, getMusicInfo } from '@/lib/db'
 import { getLibraryStats } from '@/lib/services/music-library'
+import { pinyin } from 'pinyin-pro'
+
+
+// ---------- 拼音首字母搜索（"zjl" → 周杰伦） ----------
+// 纯字母关键词额外按歌名+歌手的拼音首字母子串匹配；缓存避免重复转换
+const initialsCache = new Map<string, string>()
+function getInitials(text: string): string {
+  let v = initialsCache.get(text)
+  if (v === undefined) {
+    try {
+      v = pinyin(text, { pattern: 'first', type: 'array' }).join('').toLowerCase()
+    } catch {
+      v = ''
+    }
+    if (initialsCache.size > 20000) initialsCache.clear()
+    initialsCache.set(text, v)
+  }
+  return v
+}
 
 /**
  * 音乐库列表 API（登录用户）
@@ -20,6 +39,17 @@ export async function GET(request: NextRequest) {
     const page = Math.max(1, parseInt(params.get('page') || '1', 10) || 1)
     const pageSize = Math.min(200, Math.max(10, parseInt(params.get('pageSize') || '100', 10) || 100))
 
+    // 纯字母关键词 → 额外匹配歌名/歌手拼音首字母（zjl → 周杰伦）；
+    // 英文名仍走普通 contains（aespa 等）
+    let initialsIds: number[] | null = null
+    if (keyword && /^[a-z]+$/i.test(keyword)) {
+      const all = await prisma.librarySong.findMany({ select: { id: true, name: true, singer: true } })
+      const kw = keyword.toLowerCase()
+      initialsIds = all
+        .filter(r => (getInitials(r.name) + getInitials(r.singer)).includes(kw))
+        .map(r => r.id)
+    }
+
     const where = {
       ...(keyword
         ? {
@@ -27,6 +57,7 @@ export async function GET(request: NextRequest) {
               { name: { contains: keyword } },
               { singer: { contains: keyword } },
               { album: { contains: keyword } },
+              ...(initialsIds ? [{ id: { in: initialsIds } }] : []),
             ],
           }
         : {}),
