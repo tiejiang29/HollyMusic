@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Library as LibraryIcon, Music, Play, RefreshCw, Search, Trash2, X, Heart, ListPlus, ListMusic, Download } from 'lucide-react'
+import { Library as LibraryIcon, Music, Play, RefreshCw, Search, Trash2, X, Heart, ListPlus, ListMusic, Download, Check, CheckSquare } from 'lucide-react'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { SourceBadge } from '@/components/shared/SourceBadge'
@@ -11,6 +11,7 @@ import { deleteLibrarySong, getLibraryList, rebuildLibraryIndex } from '@/lib/ap
 import { toast } from '@/lib/toast'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { useDownload } from '@/hooks/useDownload'
+import { QUALITY_LABEL } from '@/lib/quality-options'
 import { toTrack } from '@/lib/types/player'
 import type { LibrarySongItem, LibraryStats } from '@/lib/api/library'
 import type { MusicInfo } from '@/lib/types/music'
@@ -64,10 +65,16 @@ export function LibraryPage() {
   const pageSize = 100
   const playTrack = usePlayerStore(s => s.playTrack)
   const addToQueue = usePlayerStore(s => s.addToQueue)
-  const { download } = useDownload()
+  const quality = usePlayerStore(s => s.quality)
+  const { download, downloadBatch } = useDownload()
   const favoritesIds = useFavoritesStore(s => s.ids)
   const toggleFav = useFavoritesStore(s => s.toggle)
   const [playlistUid, setPlaylistUid] = useState<string | null>(null)
+  // 批量下载（勾选模式，仅当前页可选）
+  const [selecting, setSelecting] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  // 歌手栏独立搜索（客户端过滤）
+  const [artistQuery, setArtistQuery] = useState('')
 
   const load = async () => {
     const id = ++requestId.current
@@ -108,12 +115,43 @@ export function LibraryPage() {
     }
     return [...map.entries()]
       .map(([singer, count]) => ({ singer, count }))
-      .sort((a, b) => b.count - a.count || a.singer.localeCompare(b.singer, 'zh'))
+      // 按字母/拼音顺序（locale zh 下浏览器按拼音排中文）
+      .sort((a, b) => a.singer.localeCompare(b.singer, 'zh'))
   }, [singerGroups])
 
-  // 左栏最多展示 100 个歌手，其余靠上方搜索定位（拆分后歌手项可能很多）
+  // 左栏先按歌手搜索框过滤，再截断展示（拆分后歌手项可能很多）
   const MAX_ARTISTS_SHOWN = 100
-  const shownArtists = artistView.slice(0, MAX_ARTISTS_SHOWN)
+  const artistKeyword = artistQuery.trim().toLowerCase()
+  const filteredArtists = artistKeyword
+    ? artistView.filter(a => a.singer.toLowerCase().includes(artistKeyword))
+    : artistView
+  const shownArtists = filteredArtists.slice(0, MAX_ARTISTS_SHOWN)
+
+  // ---------- 批量下载 ----------
+  const selectableItems = list.filter(i => i.uid)
+  const allSelected = selectableItems.length > 0 && selectableItems.every(i => selectedIds.has(i.id))
+  const toggleSelect = (item: LibrarySongItem) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(item.id)) next.delete(item.id)
+      else next.add(item.id)
+      return next
+    })
+  }
+  const toggleSelectAll = () => {
+    setSelectedIds(allSelected ? new Set() : new Set(selectableItems.map(i => i.id)))
+  }
+  const exitSelecting = () => {
+    setSelecting(false)
+    setSelectedIds(new Set())
+  }
+  const handleBatchDownload = () => {
+    const uids = selectableItems.filter(i => selectedIds.has(i.id)).map(i => i.uid)
+    if (uids.length === 0) return
+    if (!confirm(`打包下载选中的 ${uids.length} 首（音质偏好：${QUALITY_LABEL[quality]}）？`)) return
+    downloadBatch(uids, quality)
+    exitSelecting()
+  }
 
   const handleDelete = async (item: LibrarySongItem) => {
     if (!confirm(`删除「${item.name}」？文件将从服务器移除。`)) return
@@ -185,6 +223,7 @@ export function LibraryPage() {
     }
   }
 
+  const selectableHint = stats?.count ?? 0
   const usedPct = stats && stats.quotaBytes > 0 ? Math.min(100, (stats.totalBytes / stats.quotaBytes) * 100) : 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
@@ -194,10 +233,28 @@ export function LibraryPage() {
         const canPlay = Boolean(item.uid)
         const isFav = canPlay && favoritesIds.has(item.uid)
         return (
-          <div key={item.id} className="group flex items-center gap-3 rounded-md px-2 py-2 hover:bg-accent/30">
+          <div key={item.id} className={`group flex items-center gap-3 rounded-md px-2 py-2 ${selecting && canPlay ? 'cursor-pointer' : ''} hover:bg-accent/30`}>
+            {selecting && canPlay && (
+              <button
+                type="button"
+                role="checkbox"
+                aria-checked={selectedIds.has(item.id)}
+                aria-label={`选择 ${item.name}`}
+                onClick={() => toggleSelect(item)}
+                className="-m-2 shrink-0 rounded p-2 transition hover:bg-accent/50 pointer-coarse:-m-1 pointer-coarse:p-1.5"
+              >
+                <span
+                  className={`flex h-5 w-5 items-center justify-center rounded border transition ${
+                    selectedIds.has(item.id) ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/50'
+                  }`}
+                >
+                  {selectedIds.has(item.id) && <Check className="h-3.5 w-3.5" />}
+                </span>
+              </button>
+            )}
             {/* 封面前置（与全局歌曲行一致；手动导入条目无封面走占位） */}
             <button
-              onClick={() => canPlay && void handlePlay(item)}
+              onClick={() => canPlay && (selecting ? toggleSelect(item) : void handlePlay(item))}
               disabled={!canPlay}
               className="shrink-0 disabled:cursor-default"
               aria-label={`播放 ${item.name}`}
@@ -206,10 +263,10 @@ export function LibraryPage() {
               <CoverImage uid={item.uid} cacheKey={item.img} className="h-10 w-10" />
             </button>
             <button
-              onClick={() => canPlay && void handlePlay(item)}
+              onClick={() => canPlay && (selecting ? toggleSelect(item) : void handlePlay(item))}
               disabled={!canPlay}
               className="min-w-0 flex-1 text-left disabled:cursor-default"
-              title={canPlay ? '单击播放' : '手动导入条目，无来源信息'}
+              title={canPlay ? (selecting ? '勾选/取消' : '单击播放') : '手动导入条目，无来源信息'}
             >
               <div className="flex items-center gap-2">
                 <span className="truncate text-sm font-medium">{item.name}</span>
@@ -303,6 +360,15 @@ export function LibraryPage() {
           <p className="text-sm text-muted-foreground">边听边下的服务器持久化音乐（{stats?.count ?? '…'} 首）</p>
         </div>
         <button
+          onClick={() => (selecting ? exitSelecting() : setSelecting(true))}
+          disabled={selectableHint === 0 && !selecting}
+          className={`flex shrink-0 items-center gap-1 rounded-full px-3 py-2 text-sm transition disabled:opacity-50 ${
+            selecting ? 'bg-primary text-primary-foreground' : 'border border-border text-muted-foreground hover:text-foreground'
+          }`}
+        >
+          <Download className="h-4 w-4" /> {selecting ? '取消选择' : '批量下载'}
+        </button>
+        <button
           onClick={() => void handleRebuild()}
           disabled={rebuilding}
           className="flex shrink-0 items-center gap-1 rounded-full border border-border px-3 py-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-50"
@@ -347,7 +413,22 @@ export function LibraryPage() {
 
       <div className="flex min-h-0 flex-1 gap-6">
         {/* 左栏：歌手聚合（移动端隐藏，改用筛选标签） */}
-        <aside className="hidden w-56 shrink-0 overflow-y-auto pr-1 md:block">
+        <aside className="hidden w-56 shrink-0 flex-col pr-1 md:flex">
+          <div className="relative mb-2">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              value={artistQuery}
+              onChange={e => setArtistQuery(e.target.value)}
+              placeholder="搜索歌手..."
+              className="w-full rounded-full bg-card py-1.5 pl-8 pr-7 text-xs outline-none ring-1 ring-border focus:ring-primary"
+            />
+            {artistQuery && (
+              <button onClick={() => setArtistQuery('')} aria-label="清空歌手搜索" className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto">
           <button
             onClick={() => { setActiveSinger(''); setPage(1) }}
             className={`mb-1 flex w-full items-center justify-between rounded-md px-2 py-2 text-left text-sm transition ${
@@ -369,15 +450,36 @@ export function LibraryPage() {
               <span className="ml-2 shrink-0 text-xs text-muted-foreground">{a.count}</span>
             </button>
           ))}
-          {artistView.length > MAX_ARTISTS_SHOWN && (
+          {(filteredArtists.length > MAX_ARTISTS_SHOWN || (artistKeyword && artistView.length > 0 && filteredArtists.length === 0)) && (
             <p className="px-2 pt-2 text-xs text-muted-foreground">
-              仅显示前 {MAX_ARTISTS_SHOWN} 位（共 {artistView.length}），其余请用上方搜索
+              {filteredArtists.length === 0
+                ? '没有匹配的歌手'
+                : `仅显示前 ${MAX_ARTISTS_SHOWN} 位（共 ${filteredArtists.length}）`}
             </p>
           )}
+          </div>
         </aside>
 
         {/* 右栏：歌曲列表 */}
         <main className="min-w-0 flex-1 md:overflow-y-auto md:pr-1">
+          {/* 批量下载工具条 */}
+          {selecting && (
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg bg-card px-3 py-2 ring-1 ring-border">
+              <button onClick={toggleSelectAll} className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
+                <CheckSquare className={`h-4 w-4 ${allSelected ? 'text-primary' : ''}`} />
+                {allSelected ? '取消全选' : '全选'}
+              </button>
+              <span className="text-sm text-muted-foreground">已选 {selectedIds.size} 首</span>
+              <div className="flex-1" />
+              <button
+                onClick={handleBatchDownload}
+                disabled={selectedIds.size === 0}
+                className="flex items-center gap-1 rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+              >
+                <Download className="h-4 w-4" /> 下载选中
+              </button>
+            </div>
+          )}
           {/* 移动端歌手筛选 chips */}
           <div className="mb-3 flex gap-2 overflow-x-auto pb-1 md:hidden">
             <button
