@@ -64,13 +64,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val SOURCES = listOf(
-    "kw" to "酷我", "tx" to "企鹅", "wy" to "网易", "kg" to "酷狗", "mg" to "咪咕",
+    "all" to "全部", "kw" to "酷我", "tx" to "企鹅", "wy" to "网易", "kg" to "酷狗", "mg" to "咪咕",
 )
 
 @Composable
 fun SearchScreen(onBack: () -> Unit) {
     var keyword by remember { mutableStateOf("") }
-    var source by remember { mutableStateOf("kw") }
+    var source by remember { mutableStateOf("all") }
     var results by remember { mutableStateOf<List<Song>>(emptyList()) }
     var total by remember { mutableStateOf(0) }
     var suggests by remember { mutableStateOf<List<SuggestItem>>(emptyList()) }
