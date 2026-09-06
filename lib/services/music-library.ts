@@ -68,12 +68,16 @@ function normalizeText(s: string | undefined): string {
   return (s || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
 }
 
-/** 主歌手：取第一个（分隔符：、,/& feat. 等） */
+/** 主歌手：按分隔符切分取第一个，再剥掉尾部 feat./ft. 标注。
+ *  注意不能用懒惰正则 + $ 锚定的写法——"灯叔、方大树"这类串会整体匹配失败
+ *  回退成完整串，导致目录名/去重键变成合并歌手名。 */
 function primarySinger(singer: string): string {
   const normalized = normalizeText(singer)
   if (!normalized) return '未知歌手'
-  const m = normalized.match(/^([^、,，/／&\uFF06]+?)(?:\s*(?:feat|ft)\..*)?$/i)
-  const first = (m?.[1] || normalized).trim()
+  const first = normalized
+    .split(/[、,，/／&\uFF06;；]/)[0]
+    .replace(/\s*(?:feat|ft)\..*$/i, '')
+    .trim()
   return first || '未知歌手'
 }
 
