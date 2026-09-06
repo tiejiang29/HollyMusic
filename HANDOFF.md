@@ -27,7 +27,9 @@ Next.js 16 后端（App Router, standalone 输出，需 --webpack 因 Turbopack 
 3. 大功能先讨论再动手（"先讨论"是高频指令）
 4. GitHub 有 release bot 会提交 CHANGELOG，push 被 reject 时先 `git fetch && git rebase origin/main`
 
-## Android 原生客户端（一期 MVP 已跑通，待真机验收）
+## Android 原生客户端（一期 MVP 已跑通，已拆独立仓库）
+
+**独立仓库：https://github.com/tiejiang29/HollyMusic-Android（私有）**——android/ 目录已从主库移除追踪（.gitignore），后续 Android 开发都在那边提交推送；主库只保留 design/（UI 设计规范与原型）与服务端。
 
 用户决定：**Kotlin + Jetpack Compose + Material 3 原生开发，不用 WebView**（嫌 Web UI 上安卓难看）。
 
