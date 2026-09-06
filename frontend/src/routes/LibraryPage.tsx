@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Library as LibraryIcon, Music, Play, RefreshCw, Search, Trash2, X } from 'lucide-react'
+import { Library as LibraryIcon, Music, Play, RefreshCw, Search, Trash2, X, Heart, ListPlus } from 'lucide-react'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { SourceBadge } from '@/components/shared/SourceBadge'
+import { CoverImage } from '@/components/shared/CoverImage'
+import { useFavoritesStore } from '@/lib/store/favorites-store'
+import { AddToPlaylistDialog } from '../components/playlists/AddToPlaylistDialog'
 import { apiGet } from '@/lib/api/client'
 import { deleteLibrarySong, getLibraryList, rebuildLibraryIndex } from '@/lib/api/library'
 import { toast } from '@/lib/toast'
@@ -59,6 +62,9 @@ export function LibraryPage() {
   const requestId = useRef(0)
   const pageSize = 100
   const playTrack = usePlayerStore(s => s.playTrack)
+  const favoritesIds = useFavoritesStore(s => s.ids)
+  const toggleFav = useFavoritesStore(s => s.toggle)
+  const [playlistUid, setPlaylistUid] = useState<string | null>(null)
 
   const load = async () => {
     const id = ++requestId.current
@@ -153,45 +159,83 @@ export function LibraryPage() {
 
   const songRows = (
     <>
-      {list.map(item => (
-        <div key={item.id} className="group flex items-center gap-3 rounded-md px-2 py-2 hover:bg-accent/30">
-          <button
-            onClick={() => void handlePlay(item)}
-            disabled={!item.uid}
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded bg-muted text-muted-foreground transition hover:bg-primary hover:text-primary-foreground disabled:opacity-50"
-            aria-label={`播放 ${item.name}`}
-            title={item.uid ? '播放' : '手动导入条目，无来源信息'}
-          >
-            <Play className="h-4 w-4 fill-current" />
-          </button>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <span className="truncate text-sm font-medium">{item.name}</span>
-              <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                item.quality.startsWith('flac') ? 'bg-primary/20 text-primary' : 'bg-muted text-muted-foreground'
-              }`}>
-                {item.quality === 'flac24bit' ? 'Hi-Res' : item.quality === 'flac' ? 'FLAC' : item.quality.toUpperCase()}
-              </span>
-              {item.uid && <SourceBadge source={item.uid.split('-')[0] as never} />}
+      {list.map(item => {
+        const canPlay = Boolean(item.uid)
+        const isFav = canPlay && favoritesIds.has(item.uid)
+        return (
+          <div key={item.id} className="group flex items-center gap-3 rounded-md px-2 py-2 hover:bg-accent/30">
+            {/* 封面前置（与全局歌曲行一致；手动导入条目无封面走占位） */}
+            <button
+              onClick={() => canPlay && void handlePlay(item)}
+              disabled={!canPlay}
+              className="shrink-0 disabled:cursor-default"
+              aria-label={`播放 ${item.name}`}
+              title={canPlay ? '播放' : '手动导入条目，无来源信息'}
+            >
+              <CoverImage uid={item.uid} cacheKey={item.img} className="h-10 w-10" />
+            </button>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="truncate text-sm font-medium">{item.name}</span>
+                <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                  item.quality.startsWith('flac') ? 'bg-primary/20 text-primary' : 'bg-muted text-muted-foreground'
+                }`}>
+                  {item.quality === 'flac24bit' ? 'Hi-Res' : item.quality === 'flac' ? 'FLAC' : item.quality.toUpperCase()}
+                </span>
+                {item.uid && <SourceBadge source={item.uid.split('-')[0] as never} />}
+              </div>
+              <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
+                <span className="truncate">{item.singer}</span>
+                {item.album && <span className="truncate">· {item.album}</span>}
+              </div>
             </div>
-            <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
-              <span className="truncate">{item.singer}</span>
-              {item.album && <span className="truncate">· {item.album}</span>}
-            </div>
+            <span className="w-14 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{formatDuration(item.durationSec)}</span>
+            <span className="w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{formatBytes(item.fileSize)}</span>
+
+            {/* 尾部操作：收藏 / 加入歌单 / 播放 / 删除（桌面 hover 显现，移动端常显） */}
+            {canPlay && (
+              <button
+                onClick={() => void toggleFav(item.uid).catch(() => {})}
+                className={`shrink-0 rounded-md p-1.5 transition hover:bg-accent focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5 ${
+                  isFav ? 'text-primary opacity-100 pointer-fine:opacity-100' : 'text-muted-foreground opacity-70 hover:text-foreground'
+                }`}
+                aria-label={isFav ? `取消收藏 ${item.name}` : `收藏 ${item.name}`}
+                title={isFav ? '取消收藏' : '收藏'}
+              >
+                <Heart className={`h-4 w-4 ${isFav ? 'fill-current' : ''}`} />
+              </button>
+            )}
+            {canPlay && (
+              <button
+                onClick={() => setPlaylistUid(item.uid)}
+                className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-70 transition hover:bg-accent hover:text-foreground focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5"
+                aria-label={`加入歌单 ${item.name}`}
+                title="加入歌单"
+              >
+                <ListPlus className="h-4 w-4" />
+              </button>
+            )}
+            <button
+              onClick={() => canPlay && void handlePlay(item)}
+              disabled={!canPlay}
+              className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-70 transition hover:bg-accent hover:text-foreground focus-visible:opacity-100 disabled:opacity-40 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5"
+              aria-label={`播放 ${item.name}`}
+              title={canPlay ? '播放' : '无来源信息'}
+            >
+              <Play className="h-4 w-4 fill-current" />
+            </button>
+            <button
+              onClick={() => void handleDelete(item)}
+              disabled={deletingId === item.id}
+              className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-70 transition hover:bg-accent hover:text-destructive focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5"
+              aria-label={`删除 ${item.name}`}
+              title="从音乐库删除文件"
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
           </div>
-          <span className="w-14 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{formatDuration(item.durationSec)}</span>
-          <span className="w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{formatBytes(item.fileSize)}</span>
-          <button
-            onClick={() => void handleDelete(item)}
-            disabled={deletingId === item.id}
-            className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-70 transition hover:bg-accent hover:text-destructive focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5"
-            aria-label={`删除 ${item.name}`}
-            title="从音乐库删除文件"
-          >
-            <Trash2 className="h-4 w-4" />
-          </button>
-        </div>
-      ))}
+        )
+      })}
     </>
   )
 
@@ -330,6 +374,8 @@ export function LibraryPage() {
           )}
         </main>
       </div>
+
+      {playlistUid && <AddToPlaylistDialog uid={playlistUid} onClose={() => setPlaylistUid(null)} />}
     </div>
   )
 }

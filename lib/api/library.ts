@@ -12,6 +12,8 @@ export interface LibrarySongItem {
   fileSize: number
   durationSec: number
   createdAt: string
+  /** 封面（后端按 uid 反查 MusicInfo.img；手动导入条目为空） */
+  img?: string
 }
 
 export interface LibraryStats {

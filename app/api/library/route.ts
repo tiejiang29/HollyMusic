@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError, requireAdmin, ForbiddenError } from '@/lib/services/user-context'
-import { prisma } from '@/lib/db'
+import { prisma, getMusicInfo } from '@/lib/db'
 import { getLibraryStats } from '@/lib/services/music-library'
 
 /**
@@ -53,8 +53,20 @@ export async function GET(request: NextRequest) {
       }),
     ])
 
+    // 封面：按 uid 反查 MusicInfo.img（重建索引的手动条目 uid 为空，无封面走占位）
+    const coverMap = new Map(
+      await Promise.all(
+        [...new Set(list.map(r => r.uid).filter(Boolean))].map(async uid => {
+          const dash = uid.indexOf('-')
+          if (dash <= 0) return [uid, ''] as const
+          const mi = await getMusicInfo(uid.slice(0, dash), uid.slice(dash + 1))
+          return [uid, mi?.img || ''] as const
+        })
+      )
+    )
+
     return createSuccessResponse({
-      list,
+      list: list.map(r => ({ ...r, img: coverMap.get(r.uid) || '' })),
       total,
       page,
       pageSize,
