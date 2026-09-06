@@ -16,6 +16,32 @@
 
 > v0.17.0 之前的完整提交历史可执行 `git log v0.17.0` 查看。
 
+## v1.0.6（2026-09-06）
+
+**完整对比**：[v1.0.5 → v1.0.6](https://github.com/redcatH/HollyMusic/compare/v1.0.5...v1.0.6)
+
+### ✨ 新增功能
+
+- **discover**：大家都在听 + 推荐歌单按类型聚合（移动端首页成型接口）
+- **discover**：trending 提至每平台 20 首；groups 改跨平台类目聚合（含儿歌）
+
+
+### 🐛 问题修复
+
+- **discover**：榜单封面全量抓取——tx/kw 去掉 common 过滤
+- **discover**：kw 榜单封面兜底 v9_pic2——43 榜全量有图
+
+
+### 📝 文档
+
+- **handoff**：工作规则——Android 会话发现后端 bug 只报告不修改
+
+
+### 🔧 工程与依赖
+
+- **release**：同步 v1.0.5 更新日志与版本号
+
+
 ## v1.0.5（2026-09-06）
 
 **完整对比**：[v1.0.4 → v1.0.5](https://github.com/redcatH/HollyMusic/compare/v1.0.4...v1.0.5)
