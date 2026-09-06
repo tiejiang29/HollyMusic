@@ -16,6 +16,26 @@
 
 > v0.17.0 之前的完整提交历史可执行 `git log v0.17.0` 查看。
 
+## v1.0.1（2026-09-06）
+
+**完整对比**：[v1.0.0 → v1.0.1](https://github.com/redcatH/HollyMusic/compare/v1.0.0...v1.0.1)
+
+### 🐛 问题修复
+
+- **auth**：config-sync 移至服务端启动钩子（修复面板部署无法登录）
+
+
+### 📝 文档
+
+- **compose**：修正示例注释（Docker Hub 镜像/版本 tag 示例过时）
+
+
+### 🔧 工程与依赖
+
+- **release**：同步 v1.0.0 更新日志与版本号
+- **release**：v1.0.1（config-sync 启动时机修复）
+
+
 ## v1.0.0（2026-09-06）
 
 **完整对比**：[v0.24.3 → v1.0.0](https://github.com/redcatH/HollyMusic/compare/v0.24.3...v1.0.0)
