@@ -69,6 +69,7 @@ function normalizeText(s: string | undefined): string {
 }
 
 /** 主歌手：按分隔符切分取第一个，再剥掉尾部 feat./ft. 标注。
+ *  分隔符含 &/＆——酷我等平台用 & 分隔多歌手。
  *  注意不能用懒惰正则 + $ 锚定的写法——"灯叔、方大树"这类串会整体匹配失败
  *  回退成完整串，导致目录名/去重键变成合并歌手名。 */
 function primarySinger(singer: string): string {

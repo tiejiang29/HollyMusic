@@ -11,14 +11,20 @@ import { toTrack } from '@/lib/types/player'
 import type { LibrarySongItem, LibraryStats } from '@/lib/api/library'
 import type { MusicInfo } from '@/lib/types/music'
 
-/** 主歌手：完整歌手串按分隔符取第一个（与后端入库目录规则一致）。
- *  不能用懒惰正则 + $ 锚定——合并串会整体匹配失败回退成完整串。 */
+/** 歌手分隔符（与后端入库目录规则一致；含 &/＆——酷我等平台用 & 分隔多歌手） */
+const ARTIST_SEPARATORS = /[、,，/／&\uFF06;；]/
+
+/** 完整歌手串 → 所有歌手列表（每段剥 feat./ft. 尾注） */
+function splitArtists(singer: string): string[] {
+  return (singer || '')
+    .split(ARTIST_SEPARATORS)
+    .map(s => s.replace(/\s*(?:feat|ft)\..*$/i, '').trim())
+    .filter(Boolean)
+}
+
+/** 主歌手：所有歌手的第一个（与后端入库目录规则一致） */
 function primarySinger(singer: string): string {
-  const first = (singer || '')
-    .split(/[、,，/／&\uFF06;；]/)[0]
-    .replace(/\s*(?:feat|ft)\..*$/i, '')
-    .trim()
-  return first || '未知歌手'
+  return splitArtists(singer)[0] || '未知歌手'
 }
 
 function formatBytes(bytes: number): string {
@@ -82,17 +88,23 @@ export function LibraryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keyword, activeSinger, page])
 
-  // 歌手聚合：DB 按完整串 groupBy，前端拆成主歌手视图（多歌手曲目计入每个主歌手）
+  // 歌手聚合：DB 按完整串 groupBy，前端拆成全歌手视图——多歌手曲目计入
+  // 每个参与的歌手（各歌手计数总和会大于歌曲总数，与主流音乐应用一致）
   const artistView = useMemo(() => {
     const map = new Map<string, number>()
     for (const g of singerGroups) {
-      const key = primarySinger(g.singer)
-      map.set(key, (map.get(key) || 0) + g.count)
+      for (const artist of splitArtists(g.singer)) {
+        map.set(artist, (map.get(artist) || 0) + g.count)
+      }
     }
     return [...map.entries()]
       .map(([singer, count]) => ({ singer, count }))
       .sort((a, b) => b.count - a.count || a.singer.localeCompare(b.singer, 'zh'))
   }, [singerGroups])
+
+  // 左栏最多展示 100 个歌手，其余靠上方搜索定位（拆分后歌手项可能很多）
+  const MAX_ARTISTS_SHOWN = 100
+  const shownArtists = artistView.slice(0, MAX_ARTISTS_SHOWN)
 
   const handleDelete = async (item: LibrarySongItem) => {
     if (!confirm(`删除「${item.name}」？文件将从服务器移除。`)) return
@@ -245,7 +257,7 @@ export function LibraryPage() {
             <span className="flex items-center gap-2"><LibraryIcon className="h-4 w-4" /> 全部歌手</span>
             <span className="text-xs text-muted-foreground">{stats?.count ?? ''}</span>
           </button>
-          {artistView.map(a => (
+          {shownArtists.map(a => (
             <button
               key={a.singer}
               onClick={() => { setActiveSinger(a.singer); setPage(1) }}
@@ -257,6 +269,11 @@ export function LibraryPage() {
               <span className="ml-2 shrink-0 text-xs text-muted-foreground">{a.count}</span>
             </button>
           ))}
+          {artistView.length > MAX_ARTISTS_SHOWN && (
+            <p className="px-2 pt-2 text-xs text-muted-foreground">
+              仅显示前 {MAX_ARTISTS_SHOWN} 位（共 {artistView.length}），其余请用上方搜索
+            </p>
+          )}
         </aside>
 
         {/* 右栏：歌曲列表 */}
