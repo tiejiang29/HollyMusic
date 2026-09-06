@@ -25,7 +25,8 @@ import { logger } from '@/lib/logger'
 import { checkTrialAudio } from '@/lib/server/audio-integrity'
 import { getAudioServeConfig, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, removeAudioCacheFiles } from '@/lib/audio-serve'
 import { sanitizeFilename, extForQuality } from '@/lib/server/download-utils'
-import { QUALITY_ORDER } from '@/lib/quality-options'
+import { QUALITY_ORDER, getAvailableQualities } from '@/lib/quality-options'
+import type { QualityInfo } from '@/lib/types/music'
 import type { MusicInfo, QualityType } from '@/lib/types/music'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 
@@ -287,6 +288,27 @@ export async function findLibrarySong(musicInfo: MusicInfo): Promise<LibrarySong
 }
 
 /**
+ * 本地优先的音质裁决：库内文件是否应当被服务。
+ * - 库内 ≥ 请求档 → 服务（含库内比请求更好的情形，省带宽不降体验）
+ * - 库内 < 请求档时看平台可用音质（musicInfo.types）：
+ *   · 平台最高档也不超过库内 → 服务（在线拿不到更好的，不白跑回源）
+ *   · 平台确有更高档 → 不服务，走在线拉取，完成后自动替换库内低档
+ *   · 音质列表未知/为空 → 不服务，在线试探（有机会升库，代价一次回源）
+ */
+export function shouldServeLibraryFile(
+  row: Pick<LibrarySong, 'quality'>,
+  requestedQuality: QualityType,
+  types?: QualityInfo[]
+): boolean {
+  const libRank = qualityRank(row.quality)
+  if (libRank <= qualityRank(requestedQuality)) return true
+  const available = getAvailableQualities(types)
+  if (available.length === 0) return false
+  // available 已按高→低排序；最高档仍不高于库内 → 平台无更好
+  return qualityRank(available[0]) >= libRank
+}
+
+/**
  * 用库内文件构建音频响应（支持 Range seek / HEAD）。
  * 音质策略：库内文件音质 ≥ 请求档时直接服务（同录音只留最高档，请求更低档也
  * 服务库内文件——本地秒开优先；库内更低则交回调用方走在线）。
@@ -299,8 +321,8 @@ export async function serveFromLibrary(
 ): Promise<Response | null> {
   const row = await findLibrarySong(musicInfo)
   if (!row) return null
-  // 库内音质低于请求档 → 不降级服务，让调用方走在线获取更高音质
-  if (qualityRank(row.quality) > qualityRank(requestedQuality)) return null
+  // 音质裁决：库内满足请求、或平台确无更高档时才本地服务（见 shouldServeLibraryFile）
+  if (!shouldServeLibraryFile(row, requestedQuality, musicInfo.types)) return null
 
   const stat = await fsp.stat(row.filePath).catch(() => null)
   if (!stat) return null

@@ -7,7 +7,7 @@ import { resolveMusicInfoById } from '@/lib/db'
 import { musicSourceManager } from '@/lib/music-source-manager'
 import { audioServe } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
-import { findLibrarySong } from '@/lib/services/music-library'
+import { findLibrarySong, shouldServeLibraryFile } from '@/lib/services/music-library'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import type { QualityType } from '@/lib/types/music'
 import {
@@ -44,14 +44,6 @@ import {
  * 鉴权：受 requireUser 保护，未登录返回 401。
  */
 
-
-/** 库内音质是否 ≥ 请求档（QUALITY_ORDER 靠前为高） */
-function qualityRankOk(libraryQuality: string, requested: QualityType): boolean {
-  const order = ['flac24bit', 'flac', '320k', '128k']
-  const li = order.indexOf(libraryQuality)
-  const ri = order.indexOf(requested)
-  return li !== -1 && ri !== -1 && li <= ri
-}
 
 /** 按扩展名给 Content-Type（库内文件无 DB contentType） */
 function contentTypeForPath(filePath: string): string {
@@ -116,7 +108,7 @@ async function handleDownloadByUid(
   // 3.5 本地优先：音乐库命中（uid 精确 → 跨平台模糊，音质 ≥ 请求档）直接发文件
   //     复用库内音质构造文件名扩展名（后端组装，不信任前端输入）
   const libraryRow = await findLibrarySong(musicInfo)
-  if (libraryRow && qualityRankOk(libraryRow.quality, quality)) {
+  if (libraryRow && shouldServeLibraryFile(libraryRow, quality, musicInfo.types)) {
     const fstat = await stat(libraryRow.filePath).catch(() => null)
     if (fstat) {
       const libFilename = sanitizeFilename(
