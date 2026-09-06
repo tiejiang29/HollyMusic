@@ -2,10 +2,12 @@
 import { usePlayerStore } from '@/lib/store/player-store'
 import { useFavoritesStore } from '@/lib/store/favorites-store'
 import { CoverImage } from '@/components/shared/CoverImage'
-import { Heart, Share2, Download, Loader2 } from 'lucide-react'
+import { Heart, Share2, Download, Loader2, ListPlus } from 'lucide-react'
 import { QUALITY_LABEL, resolveQuality } from '@/lib/quality-options'
 import { shareContent, buildSongShareUrl } from '@/lib/share'
 import { useDownload } from '@/hooks/useDownload'
+import { useState } from 'react'
+import { AddToPlaylistDialog } from '../../frontend/src/components/playlists/AddToPlaylistDialog'
 
 export function NowPlaying() {
   const track = usePlayerStore(s => s.currentTrack)
@@ -15,6 +17,7 @@ export function NowPlaying() {
   const isFav = useFavoritesStore(s => (track ? s.ids.has(track.uid) : false))
   const toggle = useFavoritesStore(s => s.toggle)
   const { download, downloading, error: downloadError } = useDownload()
+  const [addToPlOpen, setAddToPlOpen] = useState(false)
 
   if (!track) {
     // 无曲目：占位封面 + 提示，保持三栏对齐且不显空
@@ -64,6 +67,14 @@ export function NowPlaying() {
         <Heart className={`h-4 w-4 ${isFav ? 'fill-current' : ''}`} />
       </button>
       <button
+        onClick={() => setAddToPlOpen(true)}
+        className="shrink-0 rounded-md p-2 text-foreground/70 transition-colors hover:bg-accent hover:text-foreground"
+        aria-label="加入歌单"
+        title="加入歌单"
+      >
+        <ListPlus className="h-4 w-4" />
+      </button>
+      <button
         onClick={() =>
           download({
             uid: track.uid,
@@ -93,6 +104,8 @@ export function NowPlaying() {
       >
         <Share2 className="h-4 w-4" />
       </button>
+
+      {addToPlOpen && <AddToPlaylistDialog uid={track.uid} onClose={() => setAddToPlOpen(false)} />}
     </div>
   )
 }

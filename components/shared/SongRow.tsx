@@ -1,4 +1,5 @@
 
+import { useState } from 'react'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { useFavoritesStore } from '@/lib/store/favorites-store'
 import { useContextMenuStore } from '@/lib/store/context-menu-store'
@@ -8,10 +9,12 @@ import { useLongPress } from '@/hooks/useLongPress'
 import { CoverImage } from './CoverImage'
 import { SourceBadge } from './SourceBadge'
 import { QualityBadge } from './QualityBadge'
-import { Play, Pause, Heart, MoreHorizontal, Download, Loader2, ArrowLeftRight, Check } from 'lucide-react'
+import { Play, Pause, Heart, MoreHorizontal, Download, Loader2, ArrowLeftRight, Check, ListPlus } from 'lucide-react'
 import { formatTime } from '@/lib/utils/format'
 import { resolveQuality } from '@/lib/quality-options'
 import type { Track } from '@/lib/types/player'
+// ponytail: 与 SongContextMenu 同源引用 frontend 副本，保证 react-router context 一致
+import { AddToPlaylistDialog } from '../../frontend/src/components/playlists/AddToPlaylistDialog'
 
 interface SongRowProps {
   track: Track
@@ -36,6 +39,7 @@ export function SongRow({ track, queue, index, onToggleSource, rankMode, selecti
   const openMenu = useContextMenuStore(s => s.openMenu)
   const authenticated = useAuthStore(s => s.authenticated)
   const { download, downloading, error } = useDownload()
+  const [addToPlOpen, setAddToPlOpen] = useState(false)
 
   const isCurrent = currentTrack?.uid === track.uid
   const isCurrentPlaying = isCurrent && isPlaying
@@ -152,6 +156,18 @@ export function SongRow({ track, queue, index, onToggleSource, rankMode, selecti
 
       {authenticated && (
         <button
+          onClick={() => setAddToPlOpen(true)}
+          // 与收藏/下载一致：移动端常显，桌面 hover 显现
+          className="shrink-0 p-1 text-muted-foreground opacity-70 transition hover:text-foreground focus-visible:opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-coarse:p-3 pointer-coarse:-m-1.5"
+          aria-label="加入歌单"
+          title="加入歌单"
+        >
+          <ListPlus className="h-4 w-4" />
+        </button>
+      )}
+
+      {authenticated && (
+        <button
           onClick={() =>
             download({
               uid: track.uid,
@@ -193,6 +209,8 @@ export function SongRow({ track, queue, index, onToggleSource, rankMode, selecti
       <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
         {formatTime(track.duration)}
       </span>
+
+      {addToPlOpen && <AddToPlaylistDialog uid={track.uid} onClose={() => setAddToPlOpen(false)} />}
     </div>
   )
 }

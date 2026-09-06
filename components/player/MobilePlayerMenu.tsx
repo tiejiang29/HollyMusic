@@ -10,9 +10,10 @@ import { usePlayerStore } from '@/lib/store/player-store'
 import { ProgressBar } from './ProgressBar'
 import { PlayerButton } from './PlayerButton'
 import { QualityList } from './QualityList'
-import { MoreHorizontal, Repeat, Repeat1, Shuffle, Timer, Volume2, VolumeX, ChevronDown, Download, Loader2 } from 'lucide-react'
+import { MoreHorizontal, Repeat, Repeat1, Shuffle, Timer, Volume2, VolumeX, ChevronDown, Download, Loader2, ListPlus } from 'lucide-react'
 import { QUALITY_LABEL, QUALITY_ORDER, resolveQuality } from '@/lib/quality-options'
 import { useDownload } from '@/hooks/useDownload'
+import { AddToPlaylistDialog } from '../../frontend/src/components/playlists/AddToPlaylistDialog'
 
 export function MobilePlayerMenu() {
   const [open, setOpen] = useState(false)
@@ -32,6 +33,7 @@ export function MobilePlayerMenu() {
   const setVolume = usePlayerStore(s => s.setVolume)
   const toggleMute = usePlayerStore(s => s.toggleMute)
   const { download, downloading, error: downloadError } = useDownload()
+  const [addToPlOpen, setAddToPlOpen] = useState(false)
 
   useEffect(() => {
     if (!open) return
@@ -110,6 +112,18 @@ export function MobilePlayerMenu() {
 
           <button
             type="button"
+            disabled={!currentTrack}
+            onClick={() => { setAddToPlOpen(true); setOpen(false) }}
+            className="flex w-full items-center justify-between rounded-md px-2 py-2.5 text-[11px] hover:bg-accent disabled:opacity-50"
+          >
+            <span className="flex items-center gap-2">
+              <ListPlus className="h-4 w-4" /> 加入歌单
+            </span>
+            <span className="text-[11px] text-muted-foreground">{currentTrack?.name ?? ''}</span>
+          </button>
+
+          <button
+            type="button"
             disabled={!currentTrack || downloading}
             onClick={() =>
               currentTrack &&
@@ -144,6 +158,10 @@ export function MobilePlayerMenu() {
             <ProgressBar value={isMuted ? 0 : volume * 100} onChange={pct => setVolume(pct / 100)} />
           </div>
         </div>
+      )}
+
+      {addToPlOpen && currentTrack && (
+        <AddToPlaylistDialog uid={currentTrack.uid} onClose={() => setAddToPlOpen(false)} />
       )}
     </div>
   )
