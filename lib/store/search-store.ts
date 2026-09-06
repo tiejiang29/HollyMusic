@@ -13,8 +13,6 @@ import { create } from 'zustand'
 import { search } from '@/lib/api/search'
 import type { Song, SourceType } from '@/lib/types/music'
 
-const ALL_SOURCES: SourceType[] = ['tx', 'wy', 'kw', 'kg', 'mg']
-
 interface SearchStore {
   /** 当前输入框文本 */
   keyword: string
@@ -61,40 +59,12 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     set({ loading: true, error: null, reqId })
 
     try {
-      const sources = source === 'all' ? ALL_SOURCES : [source]
-      const responses = await Promise.all(
-        sources.map(s =>
-          search(s, trimmed, 1, 30)
-            .then(r => ({ ok: true as const, list: r.list }))
-            .catch(err => ({ ok: false as const, err }))
-        )
-      )
+      // 单次请求：source=all 由服务端五源汇聚（顺序拼接 + 失败源跳过 + 整体缓存）
+      const r = await search(source, trimmed, 1, 30)
       // 过期请求丢弃
       if (reqId !== get().reqId) return
-      const okLists: Song[][] = []
-      const failErrs: unknown[] = []
-      for (const r of responses) {
-        if (r.ok) okLists.push(r.list)
-        else failErrs.push(r.err)
-      }
-      if (okLists.length === 0) {
-        // 全部源失败：不能伪装成"未找到结果"，用户需要知道是服务/网络问题
-        const raw = failErrs[0] instanceof Error ? failErrs[0].message : ''
-        // fetch/JSON 解析等网络层报错对用户无意义，归一为友好文案；后端业务错误（中文 message）透出
-        const friendly = !raw || /Failed to execute|Network Error|fetch|JSON|ECONN/i.test(raw)
-          ? '网络异常或服务不可用，请稍后重试'
-          : raw
-        set({
-          results: [],
-          loading: false,
-          error: friendly,
-          lastKeyword: trimmed,
-          lastSource: source,
-        })
-        return
-      }
       set({
-        results: okLists.flat(),
+        results: r.list,
         loading: false,
         error: null,
         lastKeyword: trimmed,
@@ -102,9 +72,18 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       })
     } catch (e) {
       if (reqId !== get().reqId) return
+      // 全部源失败（all）或单源失败：不能伪装成"未找到结果"，用户需要知道是服务/网络问题
+      const raw = e instanceof Error ? e.message : ''
+      // fetch/JSON 解析等网络层报错对用户无意义，归一为友好文案；后端业务错误（中文 message）透出
+      const friendly = !raw || /Failed to execute|Network Error|fetch|JSON|ECONN/i.test(raw)
+        ? '网络异常或服务不可用，请稍后重试'
+        : raw
       set({
+        results: [],
         loading: false,
-        error: e instanceof Error ? e.message : '搜索失败',
+        error: friendly,
+        lastKeyword: trimmed,
+        lastSource: source,
       })
     }
   },
