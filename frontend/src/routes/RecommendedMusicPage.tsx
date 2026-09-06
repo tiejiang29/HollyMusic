@@ -31,8 +31,11 @@ const SORTS: Partial<Record<DiscoverySource, { value: DiscoveryPlaylistSort; lab
     { value: 'new', label: '最新' },
   ],
   kg: [
+    { value: 'recommend', label: '推荐' },
     { value: 'hot', label: '最热' },
     { value: 'new', label: '最新' },
+    { value: 'collect', label: '热藏' },
+    { value: 'soar', label: '飙升' },
   ],
   mg: [
     { value: 'recommend', label: '推荐' },
