@@ -60,6 +60,27 @@ data class FavoriteSong(
     val musicInfo: Song? = null,
 )
 
+/** /api/library 音乐库条目（边听边下，服务端持久化） */
+@Serializable
+data class LibrarySong(
+    val id: Long = 0,
+    val name: String = "",
+    val singer: String = "",
+    val album: String? = null,
+    val uid: String? = null,
+    val quality: String? = null,
+    val size: Long? = null,
+    val createdAt: String? = null,
+    val img: String? = null,
+) {
+    fun toSong() = Song(
+        name = name, singer = singer, albumName = album,
+        source = uid?.substringBefore("-") ?: "",
+        songmid = uid?.substringAfter("-") ?: "",
+        uid = uid ?: "lib-$id",
+    )
+}
+
 /** LRC 中的单行歌词 */
 data class LyricLine(val timeMs: Long, val text: String)
 

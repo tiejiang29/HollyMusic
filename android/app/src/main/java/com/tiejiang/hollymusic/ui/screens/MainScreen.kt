@@ -312,16 +312,18 @@ private fun RecommendChannel(
     }
 }
 
-/** 频道：音乐库 = 三色快捷卡 + 收藏列表 */
+/** 频道：音乐库 = 三色快捷卡 + 服务端音乐库歌曲（边听边下） */
 @Composable
 private fun LibraryChannel() {
     val scope = rememberCoroutineScope()
-    var favs by remember { mutableStateOf<List<Song>>(emptyList()) }
+    var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
+    var total by remember { mutableStateOf(0) }
     var loaded by remember { mutableStateOf(false) }
 
     androidx.compose.runtime.LaunchedEffect(Unit) {
         scope.launch {
-            favs = runCatching { Api.favorites() }.getOrDefault(emptyList())
+            runCatching { Api.library() }
+                .onSuccess { (list, t) -> songs = list; total = t }
             loaded = true
         }
     }
@@ -335,27 +337,27 @@ private fun LibraryChannel() {
                 horizontalArrangement = Arrangement.spacedBy(11.dp),
             ) {
                 QuickCard("最近播放", "—", Holly.grad, Modifier.weight(1f)) {}
-                QuickCard("我的收藏", "${favs.size}", Holly.gradBlue, Modifier.weight(1f)) {}
+                QuickCard("我的收藏", "—", Holly.gradBlue, Modifier.weight(1f)) {}
                 QuickCard("已下载", "—", Holly.gradOrange, Modifier.weight(1f)) {}
             }
         }
-        item { SectionHeader("我的收藏") }
-        if (loaded && favs.isEmpty()) {
+        item { SectionHeader("音乐库" + if (total > 0) " · $total 首" else "") }
+        if (loaded && songs.isEmpty()) {
             item {
                 Text(
-                    "还没有收藏，去搜索页收藏喜欢的歌吧",
+                    "音乐库还是空的，播放过的歌会自动入库",
                     fontSize = 13.sp, color = Holly.txt3,
                     modifier = Modifier.padding(18.dp),
                 )
             }
         }
-        itemsIndexed(favs) { i, s ->
+        itemsIndexed(songs) { i, s ->
             val st = PlayerManager.state.collectAsState().value
             SongRow(
                 song = s,
                 isCurrent = st.current?.uid == s.uid,
                 isPlaying = st.playing,
-                onPlay = { PlayerManager.playQueue(favs, i) },
+                onPlay = { PlayerManager.playQueue(songs, i) },
             )
         }
     }
