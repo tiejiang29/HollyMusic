@@ -91,7 +91,7 @@ function hashKey(cacheKey: string): string {
 }
 
 /** contentType → 扩展名（默认 .mp3） */
-function extFromContentType(contentType: string | null | undefined): string {
+export function extFromContentType(contentType: string | null | undefined): string {
   if (!contentType) return '.mp3'
   const ct = contentType.toLowerCase().split(';')[0].trim()
   const map: Record<string, string> = {

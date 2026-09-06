@@ -22,8 +22,8 @@ import path from 'path'
 import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import type { LibrarySong } from '@/lib/generated/prisma'
 import { logger } from '@/lib/logger'
-import { checkTrialAudio } from '@/lib/server/audio-integrity'
-import { getAudioServeConfig, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, removeAudioCacheFiles } from '@/lib/audio-serve'
+import { isIncompleteTrial, parseDurationFromFile } from '@/lib/server/audio-integrity'
+import { getAudioServeConfig, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, removeAudioCacheFiles, extFromContentType } from '@/lib/audio-serve'
 import { sanitizeFilename, extForQuality } from '@/lib/server/download-utils'
 import { QUALITY_ORDER, getAvailableQualities } from '@/lib/quality-options'
 import type { QualityInfo } from '@/lib/types/music'
@@ -132,11 +132,16 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     const srcStat = await fsp.stat(srcPath).catch(() => null)
     if (!srcStat) return { status: 'skip-error', message: '缓存文件不存在' }
 
-    // 实际时长（试听校验会再跑一遍，取 actualSec；拿不到退回元数据 interval）
+    // 时长以文件探测为准（权威值）：kw 等源的 interval 元数据存在脏值
+    // （1-4 秒），旧逻辑在 checkTrialAudio 跳过探测（interval<120）时回退
+    // 脏 interval，导致登记时长错误。interval 仅用于试听比对。
     const intervalSec = parseIntervalToSeconds(musicInfo.interval)
-    const trialCheck = await checkTrialAudio(srcPath, intervalSec || 0)
-    if (trialCheck.trial) return { status: 'skip-error', message: '试听片段，不入库' }
-    const durationSec = trialCheck.actualSec || intervalSec || 0
+    const probedSec = await parseDurationFromFile(srcPath)
+    if (isIncompleteTrial(probedSec ?? 0, intervalSec)) {
+      return { status: 'skip-error', message: '试听片段，不入库' }
+    }
+    // 探测失败时才回退 interval，且拒绝明显脏的小值（<30s 多为元数据错误）
+    const durationSec = probedSec ?? (intervalSec >= 30 ? intervalSec : 0)
 
     const dedupeKey = buildDedupeKey(musicInfo.name, musicInfo.singer)
 
@@ -168,7 +173,10 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     const destDir = path.join(cfg.libraryDir, singerDir, albumDir)
     await fsp.mkdir(destDir, { recursive: true })
 
-    let destName = sanitizeFilename(`${normalizeText(musicInfo.singer)} - ${normalizeText(musicInfo.name)}${extForQuality(quality)}`)
+    // 扩展名按上游实际 contentType（缓存记录里有）：源偶尔把 MV/MP4 当音频链路
+    // 返回，按请求音质定名会得到假的 .flac（内容是 mp4，播放 Content-Type 也错）
+    const ext = extFromContentType(record.contentType) || extForQuality(quality)
+    let destName = sanitizeFilename(`${normalizeText(musicInfo.singer)} - ${normalizeText(musicInfo.name)}${ext}`)
     // 同名冲突：同录音（将替换）外，追加序号
     const replacingIds = sameRecording.map(r => r.id)
     const nameTaken = async (n: string) => {
@@ -281,10 +289,10 @@ export async function findLibrarySong(musicInfo: MusicInfo): Promise<LibrarySong
     if (!(await fileExists(row.filePath))) continue
     // 重建索引生成的条目时长未知（0）→ 懒探测回填一次
     if (row.durationSec === 0) {
-      const probe = await checkTrialAudio(row.filePath, intervalSec || 0)
-      if (probe.actualSec) {
-        await prisma.librarySong.update({ where: { id: row.id }, data: { durationSec: probe.actualSec } }).catch(() => {})
-        row.durationSec = probe.actualSec
+      const probed = await parseDurationFromFile(row.filePath)
+      if (probed) {
+        await prisma.librarySong.update({ where: { id: row.id }, data: { durationSec: probed } }).catch(() => {})
+        row.durationSec = probed
       }
     }
     if (intervalSec > 0 && Math.abs(row.durationSec - intervalSec) <= 4) return row
