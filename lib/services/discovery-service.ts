@@ -1228,6 +1228,93 @@ async function getMgPlaylistTags(): Promise<PlaylistTagsResult> {
   }
 }
 
+// ==================== 大家都在听（五平台热歌榜聚合） + 歌单按类型聚合 ====================
+
+/** 各平台"热歌榜"（酷狗无同名榜，用 TOP500 代替——同为站内热度排序）。 */
+const HOT_BOARD_IDS: Record<DiscoverySource, string> = {
+  tx: '26',
+  wy: '3778678',
+  kw: '16',
+  kg: '8888',
+  mg: '27186466',
+}
+
+export interface TrendingResult {
+  list: Song[]
+  updatedAt: string
+}
+
+/** 跨平台去重键：归一化歌名 | 主歌手（取多歌手串第一个，分隔符与音乐库一致）。 */
+function trendingDedupeKey(name: string, singer: string): string {
+  const first = (singer || '').split(/[、,，/／&＆;；]/)[0] || ''
+  return `${(name || '').toLowerCase().replace(/\s+/g, '')}|${first.toLowerCase().replace(/\s+/g, '')}`
+}
+
+/**
+ * 大家都在听：五平台热歌榜各取前 topPerSource 首，跨平台去重后合成一张歌单。
+ * 榜单详情本身有缓存（CACHE_TTL），聚合结果再缓存一层；单平台失败跳过。
+ */
+export async function getTrending(topPerSource = 10): Promise<TrendingResult> {
+  const safeTop = Math.max(1, Math.min(topPerSource, 30))
+  const cacheKey = `discovery:v1:trending:${safeTop}`
+  const cached = getCached<TrendingResult>(cacheKey)
+  if (cached) return cached
+
+  const settled = await Promise.allSettled(
+    (Object.keys(HOT_BOARD_IDS) as DiscoverySource[]).map(async source => {
+      const detail = await fetchToplistDetail(source, HOT_BOARD_IDS[source])
+      return (detail?.tracks ?? []).slice(0, safeTop)
+    })
+  )
+
+  const seen = new Set<string>()
+  const list: Song[] = []
+  for (const r of settled) {
+    if (r.status !== 'fulfilled') continue
+    for (const song of r.value) {
+      const key = trendingDedupeKey(song.name, song.singer)
+      if (!song.name || seen.has(key)) continue
+      seen.add(key)
+      list.push(song)
+    }
+  }
+
+  const result: TrendingResult = { list, updatedAt: new Date().toISOString() }
+  searchCache.set(cacheKey, result, CACHE_TTL)
+  return result
+}
+
+export interface PlaylistGroup {
+  tag: PlaylistTag
+  playlists: DiscoveryPlaylist[]
+}
+
+/**
+ * 推荐歌单按类型聚合：取该源热门标签（前 8 个），每类拉 perTag 张歌单，
+ * 供移动端首页"分区卡片"一次成型（免客户端逐类请求）。缓存与标签同周期。
+ */
+export async function getPlaylistGroups(source: DiscoverySource = 'tx', perTag = 6): Promise<PlaylistGroup[]> {
+  const safePer = Math.max(1, Math.min(perTag, 12))
+  const cacheKey = `discovery:v1:${source}:playlist-groups:${safePer}`
+  const cached = getCached<PlaylistGroup[]>(cacheKey)
+  if (cached) return cached
+
+  const tags = await getPlaylistTags(source)
+  const hot = tags.hotTag.slice(0, 8)
+  const groups = await Promise.all(hot.map(async tag => {
+    try {
+      const playlists = await getRecommendedPlaylists(source, safePer, 1, { tag: tag.id })
+      return { tag, playlists }
+    } catch {
+      return null // 单类失败跳过，不影响其余分区
+    }
+  }))
+
+  const result = groups.filter((g): g is PlaylistGroup => g !== null && g.playlists.length > 0)
+  if (result.length > 0) searchCache.set(cacheKey, result, TAG_CACHE_TTL)
+  return result
+}
+
 export async function getPlaylistTags(source: DiscoverySource = 'tx'): Promise<PlaylistTagsResult> {
   const cacheKey = `discovery:v1:${source}:playlist-tags`
   const cached = getCached<PlaylistTagsResult>(cacheKey)
