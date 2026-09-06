@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { createReadStream } from 'fs'
+import { stat } from 'fs/promises'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { logger } from '@/lib/logger'
 import { resolveMusicInfoById } from '@/lib/db'
 import { musicSourceManager } from '@/lib/music-source-manager'
 import { audioServe } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
+import { findLibrarySong } from '@/lib/services/music-library'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import type { QualityType } from '@/lib/types/music'
 import {
@@ -40,6 +43,25 @@ import {
  *
  * 鉴权：受 requireUser 保护，未登录返回 401。
  */
+
+
+/** 库内音质是否 ≥ 请求档（QUALITY_ORDER 靠前为高） */
+function qualityRankOk(libraryQuality: string, requested: QualityType): boolean {
+  const order = ['flac24bit', 'flac', '320k', '128k']
+  const li = order.indexOf(libraryQuality)
+  const ri = order.indexOf(requested)
+  return li !== -1 && ri !== -1 && li <= ri
+}
+
+/** 按扩展名给 Content-Type（库内文件无 DB contentType） */
+function contentTypeForPath(filePath: string): string {
+  const map: Record<string, string> = {
+    '.mp3': 'audio/mpeg', '.flac': 'audio/flac', '.m4a': 'audio/mp4',
+    '.aac': 'audio/aac', '.ogg': 'audio/ogg', '.wav': 'audio/wav',
+  }
+  const ext = filePath.slice(filePath.lastIndexOf('.')).toLowerCase()
+  return map[ext] || 'audio/mpeg'
+}
 
 // ============================================================================
 // 配置常量
@@ -89,6 +111,28 @@ async function handleDownloadByUid(
       await musicSourceManager.initialize()
     }
     return musicSourceManager.getMusicUrl(musicInfo, quality)
+  }
+
+  // 3.5 本地优先：音乐库命中（uid 精确 → 跨平台模糊，音质 ≥ 请求档）直接发文件
+  //     复用库内音质构造文件名扩展名（后端组装，不信任前端输入）
+  const libraryRow = await findLibrarySong(musicInfo)
+  if (libraryRow && qualityRankOk(libraryRow.quality, quality)) {
+    const fstat = await stat(libraryRow.filePath).catch(() => null)
+    if (fstat) {
+      const libFilename = sanitizeFilename(
+        buildFilenameFromMusicInfo(musicInfo, libraryRow.quality as QualityType)
+      )
+      const contentType = contentTypeForPath(libraryRow.filePath)
+      logger.info(`[download] library 命中 uid=${uid} file=${libraryRow.filePath}`)
+      return new NextResponse(createReadStream(libraryRow.filePath) as unknown as ReadableStream, {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Content-Length': String(fstat.size),
+          'Content-Disposition': buildContentDisposition(libFilename),
+        },
+      })
+    }
   }
 
   // 4. 确保 audioServe 已初始化（创建缓存目录等）

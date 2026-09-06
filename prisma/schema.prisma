@@ -215,3 +215,33 @@ model RecommendTask {
   @@index([status])
   @@index([createdAt])
 }
+
+/// 音乐库条目：播放/下载完成后从 cache/ 移入 library/ 的持久化正本。
+/// 边听边下：audio-serve 下载完成且完整性校验通过后由 ingestFromCache 移入。
+/// 一首录音只保留一份（dedupeKey+时长容差去重），更高音质到达时替换低档文件。
+model LibrarySong {
+  id          Int      @id @default(autoincrement())
+  /// 去重键：归一化歌名 | 主歌手（跨平台同歌识别；时长容差在查询时判断）
+  dedupeKey   String
+  /// 入库来源 uid（source-存储songmid）；重建索引生成的条目为空串
+  uid         String   @default("")
+  /// 歌曲名（展示用原始值）
+  name        String
+  /// 完整歌手串（浏览页多歌手筛选用）
+  singer      String
+  /// 专辑名（空 → 存 other 目录）
+  album       String   @default("")
+  /// 音质档（128k/320k/flac/flac24bit）
+  quality     String
+  /// 库内绝对路径（library/主歌手/专辑/文件名）
+  filePath    String   @unique
+  /// 文件字节数
+  fileSize    Int
+  /// 实际音频时长（秒）；重建索引未探测时为 0，首次模糊命中时懒探测回填
+  durationSec Float    @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([dedupeKey])
+  @@index([uid])
+  @@index([singer])
+}

@@ -29,10 +29,13 @@ services:
     environment:
       - NODE_ENV=production
       - DATABASE_URL=file:./prisma/data/music.db
-      # 音频磁盘缓存：指向已挂载的 ./cache_data，多用户共享 + Range/seek 支持
+      # 边听边下：cache=下载中转区，library=持久音乐库（歌手/专辑两级目录）。
+      # 两者必须在同一卷（./data）下，入库时 rename 原子移动。
       - ENABLE_FILE_CACHE=true
-      - AUDIO_CACHE_DIR=/app/.cache/audio-cache
-      - AUDIO_CACHE_QUOTA_GB=10
+      - AUDIO_CACHE_DIR=/app/data/cache
+      # 音乐库配额（GB）：满了停止入库并提示，播放不受影响；0 不建议
+      - AUDIO_LIBRARY_DIR=/app/data/library
+      - AUDIO_LIBRARY_QUOTA_GB=20
     volumes:
       # 音源脚本（运行时数据：后台上传/管理的音源脚本，热重载生效）
       - ./custom-sources:/app/custom-sources
@@ -40,8 +43,9 @@ services:
       - ./config:/app/config
       # SQLite 数据库持久化（重要！首次启动自动建库并运行迁移）
       - ./prisma_data:/app/prisma/prisma/data
-      # 音频磁盘缓存目录（对应 AUDIO_CACHE_DIR）
-      - ./cache_data:/app/.cache
+      # 边听边下单卷双目录：cache（下载中转）+ library（持久音乐库正本）。
+      # 旧版 ./cache_data 用户可整体迁移：mv cache_data data/cache（或软链兼容）
+      - ./data:/app/data
       # 日志（可选）
       - ./app_logs:/app/logs
     restart: unless-stopped

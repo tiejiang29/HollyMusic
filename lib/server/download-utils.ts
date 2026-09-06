@@ -348,7 +348,7 @@ function stripHtml(s: string): string {
 }
 
 /** 音质 → 扩展名；FLAC 系用 .flac，其余（mp3 码率档）用 .mp3 */
-function extForQuality(q: QualityType): string {
+export function extForQuality(q: QualityType): string {
   return q === 'flac' || q === 'flac24bit' ? '.flac' : '.mp3'
 }
 
