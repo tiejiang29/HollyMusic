@@ -50,7 +50,11 @@ function NavLink({
       navigate('/login')
       return
     }
-    // react-router 的 <Link> 正常工作，导航是同步的，组件立即切换
+    // 防御：真实点击紧邻 pointerdown 时，React 19 的 startTransition 提交
+    // 大页面树会出现数秒级停顿（实测 dev/生产均可复现）。把导航挪出点击
+    // 事件上下文一个宏任务，绕开该调度坑；URL/组件切换仍即时。
+    e.preventDefault()
+    setTimeout(() => navigate(href), 0)
   }
 
   return (
