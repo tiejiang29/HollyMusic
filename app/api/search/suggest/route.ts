@@ -49,19 +49,21 @@ async function fetchNeteaseSuggest(keyword: string): Promise<SuggestItem[]> {
     } | null
     const r = j?.result
     if (!r) return []
-    const items: SuggestItem[] = []
+    const songs: SuggestItem[] = []
     for (const s of r.songs ?? []) {
       if (!s?.name) continue
       const artist = s.artists?.[0]?.name
-      items.push({ text: artist ? `${s.name} - ${artist}` : s.name, type: 'song' })
+      songs.push({ text: artist ? `${s.name} - ${artist}` : s.name, type: 'song' })
     }
+    const singers: SuggestItem[] = []
     for (const a of r.artists ?? []) {
-      if (a?.name) items.push({ text: a.name, type: 'singer' })
+      if (a?.name) singers.push({ text: a.name, type: 'singer' })
     }
+    const albums: SuggestItem[] = []
     for (const al of r.albums ?? []) {
-      if (al?.name) items.push({ text: al.name, type: 'album' })
+      if (al?.name) albums.push({ text: al.name, type: 'album' })
     }
-    return items
+    return [...singers, ...songs, ...albums]
   } catch {
     return []
   }
@@ -94,7 +96,7 @@ export async function GET(request: NextRequest) {
     const keyword = (new URL(request.url).searchParams.get('keyword') || '').trim().slice(0, 60)
     if (!keyword) return createSuccessResponse<SuggestItem[]>([])
 
-    const cacheKey = `suggest:v1:${keyword}`
+    const cacheKey = `suggest:v2:${keyword}`
     const cached = searchCache.get(cacheKey) as SuggestItem[] | null
     if (cached) return createSuccessResponse(cached)
 
@@ -104,16 +106,21 @@ export async function GET(request: NextRequest) {
       new Promise<[SuggestItem[], SuggestItem[]]>(r => setTimeout(() => [[], []] as [SuggestItem[], SuggestItem[]], OVERALL_BUDGET_MS)),
     ])
 
-    // 去重（文本归一：去空格小写），本地库优先排前
+    // 去重（文本归一：去空格小写）。排序：歌手置顶（人名搜索意图最强，
+    // 也避免被大量歌曲挤出上限）→ 本地音乐库 → 歌曲 → 专辑
     const seen = new Set<string>()
     const items: SuggestItem[] = []
-    for (const item of [...merged[1], ...merged[0]]) {
+    const push = (item: SuggestItem) => {
+      if (items.length >= MAX_ITEMS) return
       const key = item.text.replace(/\s+/g, '').toLowerCase()
-      if (seen.has(key)) continue
+      if (seen.has(key)) return
       seen.add(key)
       items.push(item)
-      if (items.length >= MAX_ITEMS) break
     }
+    for (const item of merged[0].filter(i => i.type === 'singer')) push(item)
+    for (const item of merged[1]) push(item)
+    for (const item of merged[0].filter(i => i.type === 'song')) push(item)
+    for (const item of merged[0].filter(i => i.type === 'album')) push(item)
 
     searchCache.set(cacheKey, items, CACHE_TTL)
     return createSuccessResponse(items)
