@@ -81,6 +81,14 @@ data class LibrarySong(
     )
 }
 
+/** /api/library 歌手聚合（含拼音首字母） */
+@Serializable
+data class SingerGroup(
+    val singer: String = "",
+    val count: Int = 0,
+    val initials: String = "",
+)
+
 /** LRC 中的单行歌词 */
 data class LyricLine(val timeMs: Long, val text: String)
 

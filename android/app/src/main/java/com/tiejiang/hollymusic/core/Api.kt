@@ -242,14 +242,35 @@ object Api {
         return decode(CollectionDetail.serializer(), call(req))
     }
 
-    /** 音乐库歌曲（边听边下，服务端持久化） */
-    suspend fun library(page: Int = 1, pageSize: Int = 100): Pair<List<Song>, Int> {
-        val req = Request.Builder().url("${baseUrl()}/api/library?page=$page&pageSize=$pageSize").get().build()
+    /** 音乐库：歌曲分页 + 歌手聚合；keyword 支持歌名/歌手/拼音首字母，singer 按歌手筛 */
+    data class LibraryResult(
+        val list: List<Song>,
+        val total: Int,
+        val singerGroups: List<com.tiejiang.hollymusic.core.SingerGroup>,
+    )
+
+    suspend fun library(
+        keyword: String = "",
+        singer: String = "",
+        page: Int = 1,
+        pageSize: Int = 100,
+    ): LibraryResult {
+        val url = buildString {
+            append("${baseUrl()}/api/library?page=$page&pageSize=$pageSize")
+            if (keyword.isNotBlank()) append("&keyword=${encode(keyword)}")
+            if (singer.isNotBlank()) append("&singer=${encode(singer)}")
+        }
+        val req = Request.Builder().url(url).get().build()
         val raw = call(req)
         val obj = node(raw)
-        val listJson = obj["list"] ?: return emptyList<Song>() to 0
+        val listJson = obj["list"] ?: return LibraryResult(emptyList(), 0, emptyList())
         val rows = json.decodeFromJsonElement(ListSerializer(LibrarySong.serializer()), listJson)
-        return rows.map { it.toSong() } to int(obj, "total")
+        val groups = obj["singerGroups"]?.let {
+            runCatching {
+                json.decodeFromJsonElement(ListSerializer(SingerGroup.serializer()), it)
+            }.getOrDefault(emptyList())
+        }.orEmpty()
+        return LibraryResult(rows.map { it.toSong() }, int(obj, "total"), groups)
     }
 
     suspend fun favorites(): List<Song> {
