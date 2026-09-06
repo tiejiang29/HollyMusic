@@ -65,8 +65,8 @@ fun LoginScreen(onSuccess: () -> Unit) {
         scope.launch {
             try {
                 Api.login(server, username.trim(), password)
-                Api.cookieSnapshot(server.trim().trimEnd('/'))?.let { (u, s) ->
-                    Settings.saveLogin(ctx, server.trim().trimEnd('/'), username.trim(), u, s)
+                Api.cookieSnapshot(server.trim().trimEnd('/'))?.let { (u, sv, s) ->
+                    Settings.saveLogin(ctx, server.trim().trimEnd('/'), username.trim(), u, sv, s)
                 }
                 onSuccess()
             } catch (e: Exception) {

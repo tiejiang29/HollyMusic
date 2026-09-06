@@ -76,6 +76,7 @@ fun SearchScreen(onBack: () -> Unit) {
     var suggests by remember { mutableStateOf<List<SuggestItem>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
     var searched by remember { mutableStateOf(false) }
+    var searchErr by remember { mutableStateOf<String?>(null) }
     var searchJob by remember { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
     val player = PlayerManager.state.collectAsState().value
@@ -87,9 +88,11 @@ fun SearchScreen(onBack: () -> Unit) {
         searchJob?.cancel()
         scope.launch {
             searching = true
+            searchErr = null
             suggests = emptyList()
             runCatching { Api.search(source, kw) }
                 .onSuccess { (list, t) -> results = list; total = t; searched = true }
+                .onFailure { searchErr = "${it.javaClass.simpleName}: ${it.message}" }
             searching = false
         }
     }
@@ -216,6 +219,12 @@ fun SearchScreen(onBack: () -> Unit) {
             Text(
                 "共 $total 条结果", fontSize = 11.sp, color = Holly.txt3,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+            )
+        }
+        searchErr?.let {
+            Text(
+                it, fontSize = 11.sp, color = Holly.danger,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
             )
         }
 
