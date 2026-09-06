@@ -6,13 +6,13 @@ import { getTrending } from '@/lib/services/discovery-service'
 
 /**
  * GET /api/discover/trending?topPerSource=10 —— 大家都在听
- * 五平台热歌榜各取前 N，跨平台去重合成一张歌单（标准 Song[]，可直接进播放队列）。
+ * 五平台热歌榜各取前 N（默认 20），跨平台去重合成一张歌单（标准 Song[]，可直接进播放队列）。
  */
 export async function GET(request: NextRequest) {
   try {
     await requireUser(request) // 未登录 → AuthError → 401
 
-    const topPerSource = parseInt(request.nextUrl.searchParams.get('topPerSource') || '10', 10)
+    const topPerSource = parseInt(request.nextUrl.searchParams.get('topPerSource') || '20', 10)
     return createSuccessResponse(await getTrending(Number.isFinite(topPerSource) ? topPerSource : 10))
   } catch (error) {
     if (error instanceof AuthError) {
