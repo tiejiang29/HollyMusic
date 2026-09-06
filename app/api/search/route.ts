@@ -1,6 +1,7 @@
 /**
  * 音乐搜索 API
  * GET /api/search?source=kw&keyword=xxx&page=1&limit=30
+ * GET /api/search?source=all&keyword=xxx —— 五源汇聚（服务端并发 + 按固定源顺序拼接）
  *
  * 需登录（requireUser），未登录返回 401。
  * 结果会入库（带 checksum 去重）并附加对外 uid，使前端可直接调封面/歌词/收藏。
@@ -18,12 +19,49 @@ import * as musicSearch from '@/lib/music-core/music-search'
 // 搜索缓存时间：210 分钟
 const SEARCH_CACHE_TTL = 210 * 60 * 1000
 
+/** 与前端 search-store 的 ALL_SOURCES 顺序一致：聚合结果按此顺序拼接。 */
+const ALL_SOURCES: SourceType[] = ['tx', 'wy', 'kw', 'kg', 'mg']
+
+/**
+ * 单源搜索管线：搜索 → 整页入库（单事务）→ 附加 uid → 写单源缓存。
+ * 汇聚模式与单源模式共用，保证入库/缓存行为完全一致。
+ */
+async function searchOneSource(source: SourceType, keyword: string, page: number, limit: number): Promise<SearchResult & { list: Song[] }> {
+  const cacheKey = `search:${source}:${keyword}:${page}:${limit}`
+  const cached = searchCache.get(cacheKey) as (SearchResult & { list: Song[] }) | null
+  if (cached) {
+    logger.debug(`搜索缓存命中: ${cacheKey}`)
+    return cached
+  }
+
+  const result: SearchResult = await musicSearch.search(source, keyword, page, limit)
+
+  // 整页搜索结果在同一事务内顺序写入，避免 SQLite 多写入并发争抢写锁。
+  // 入库失败时不返回或缓存无法被播放、歌词等接口查询到的 uid。
+  try {
+    await upsertMusicInfosInTransaction(result.list)
+  } catch (error) {
+    logger.error('search music info batch upsert failed', error)
+    throw new Error('搜索结果入库失败')
+  }
+
+  const list: Song[] = result.list.map((mi) => ({
+    ...mi,
+    uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}`,
+  }))
+  const enriched = { ...result, list }
+
+  searchCache.set(cacheKey, enriched, SEARCH_CACHE_TTL)
+  logger.debug(`搜索结果已缓存: ${cacheKey} (${enriched.list.length} 条)`)
+  return enriched
+}
+
 export async function GET(request: NextRequest) {
   try {
     await requireUser(request) // 未登录 → AuthError → 401
 
     const searchParams = request.nextUrl.searchParams
-    const source = searchParams.get('source') as SourceType
+    const source = searchParams.get('source') as SourceType | 'all'
     const keyword = searchParams.get('keyword')
     const page = parseInt(searchParams.get('page') || '1')
     const limit = parseInt(searchParams.get('limit') || '30')
@@ -36,50 +74,71 @@ export async function GET(request: NextRequest) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '缺少必填参数: keyword', 400)
     }
 
-    const validSources: SourceType[] = ['kw', 'kg', 'tx', 'wy', 'mg']
-    if (!validSources.includes(source)) {
-      return createErrorResponse(
-        ErrorCodes.SOURCE_NOT_SUPPORTED,
-        `不支持的音源: ${source}，支持: ${validSources.join(', ')}`,
-        400
-      )
+    if (source !== 'all') {
+      const validSources: SourceType[] = ['kw', 'kg', 'tx', 'wy', 'mg']
+      if (!validSources.includes(source)) {
+        return createErrorResponse(
+          ErrorCodes.SOURCE_NOT_SUPPORTED,
+          `不支持的音源: ${source}，支持: all, ${validSources.join(', ')}`,
+          400
+        )
+      }
     }
 
     if (page < 1 || limit < 1 || limit > 100) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '参数错误: page >= 1, 1 <= limit <= 100', 400)
     }
 
-    const cacheKey = `search:${source}:${keyword}:${page}:${limit}`
+    logger.info(`搜索请求: ${source} - ${keyword} (page: ${page})`)
 
-    const cached = searchCache.get(cacheKey)
-    if (cached) {
-      logger.debug(`搜索缓存命中: ${cacheKey}`)
-      return createSuccessResponse(cached)
+    if (source !== 'all') {
+      return createSuccessResponse(await searchOneSource(source, keyword, page, limit))
     }
 
-    logger.info(`搜索请求: ${source} - ${keyword} (page: ${page}, limit: ${limit})`)
-
-    const result: SearchResult = await musicSearch.search(source, keyword, page, limit)
-
-    // 整页搜索结果在同一事务内顺序写入，避免 SQLite 多写入并发争抢写锁。
-    // 入库失败时不返回或缓存无法被播放、歌词等接口查询到的 uid。
-    try {
-      await upsertMusicInfosInTransaction(result.list)
-    } catch (error) {
-      logger.error('search music info batch upsert failed', error)
-      return createErrorResponse(ErrorCodes.INTERNAL_ERROR, '搜索结果入库失败', 500)
+    // ---------- 五源汇聚 ----------
+    // 聚合结果整体缓存；命中时一次返回，未命中才扇出五源。
+    const allCacheKey = `search:all:${keyword}:${page}:${limit}`
+    const cachedAll = searchCache.get(allCacheKey)
+    if (cachedAll) {
+      logger.debug(`搜索缓存命中: ${allCacheKey}`)
+      return createSuccessResponse(cachedAll)
+    }
+    // 并发五源（allSettled），失败源跳过；至少一源成功即返回，
+    // 顺序与前端 ALL_SOURCES 一致（tx→wy→kw→kg→mg 依次拼接）。
+    const settled = await Promise.allSettled(
+      ALL_SOURCES.map(s => searchOneSource(s, keyword, page, limit))
+    )
+    const okResults: Array<SearchResult & { list: Song[] }> = []
+    const failErrs: unknown[] = []
+    settled.forEach((r, i) => {
+      if (r.status === 'fulfilled') okResults.push(r.value)
+      else {
+        failErrs.push(r.reason)
+        logger.warn(`[search all] 源 ${ALL_SOURCES[i]} 失败:`, r.reason instanceof Error ? r.reason.message : r.reason)
+      }
+    })
+    if (okResults.length === 0) {
+      return createErrorResponse(
+        ErrorCodes.SEARCH_FAILED,
+        '所有音源搜索失败，请稍后重试',
+        502
+      )
     }
 
-    const list: Song[] = result.list.map((mi) => ({
-      ...mi,
-      uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}`,
-    }))
-    const enriched = { ...result, list }
+    // 部分源失败时透出失败源列表，客户端可提示"结果不含 xx"
+    const failedSources = ALL_SOURCES.filter((_, i) => settled[i].status === 'rejected')
+    const merged = {
+      list: okResults.flatMap(r => r.list),
+      total: okResults.reduce((sum, r) => sum + (r.total || r.list.length), 0),
+      allPage: Math.max(...okResults.map(r => r.allPage || 1)),
+      page,
+      limit,
+      source: 'all' as const,
+      ...(failedSources.length > 0 ? { failedSources } : {}),
+    }
 
-    searchCache.set(cacheKey, enriched, SEARCH_CACHE_TTL)
-    logger.debug(`搜索结果已缓存: ${cacheKey} (${enriched.list.length} 条)`)
-
-    return createSuccessResponse(enriched)
+    searchCache.set(allCacheKey, merged, SEARCH_CACHE_TTL)
+    return createSuccessResponse(merged)
   } catch (error) {
     if (error instanceof AuthError) {
       return createErrorResponse('UNAUTHORIZED', error.message, 401)

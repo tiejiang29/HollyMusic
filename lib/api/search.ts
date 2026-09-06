@@ -11,11 +11,11 @@ export interface SearchResultData {
   page: number
   allPage: number
   limit: number
-  source: SourceType
+  source: SourceType | 'all'
 }
 
 export function search(
-  source: SourceType,
+  source: SourceType | 'all',
   keyword: string,
   page = 1,
   limit = 30

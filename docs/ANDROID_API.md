@@ -25,9 +25,9 @@
 ## 2. 搜索
 
 - **`GET /api/search?keyword=&source=&page=1&limit=30`**
-  - `source`: `tx | wy | kw | kg | mg`（**无 all**，传 all 会 400 SOURCE_NOT_SUPPORTED）
-  - "全部"由客户端实现：并发五源请求后合并展示（Web 端 search-store 即此做法，单源失败不影响其余）
-  - 返回 `Song[]`
+  - `source`: `all | tx | wy | kw | kg | mg`
+  - **`all` 为服务端五源汇聚**（v1.0.4+）：并发五源、按 tx→wy→kw→kg→mg 顺序拼接、单源失败自动跳过（至少一源成功即返回）、聚合结果整体缓存。部分源失败时响应含 `failedSources: string[]` 可提示"结果不含 xx"；全部失败返回 502。
+  - 返回 `{list: Song[], total, allPage, page, limit, source, failedSources?}`
 - **`GET /api/search/suggest?keyword=`**（v1.0.2+）
   - 输入联想，250ms 防抖由客户端控制；返回 `{text, type: 'singer'|'song'|'album'}[]`，歌手项已置顶
   - 点选歌手项 → 用歌手名再调 `/api/search`
