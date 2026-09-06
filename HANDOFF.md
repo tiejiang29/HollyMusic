@@ -27,6 +27,7 @@ Next.js 16 后端（App Router, standalone 输出，需 --webpack 因 Turbopack 
 3. 大功能先讨论再动手（"先讨论"是高频指令）
 4. GitHub 有 release bot 会提交 CHANGELOG，push 被 reject 时先 `git fetch && git rebase origin/main`
 5. **Web/服务端会话不得动 android/ 目录**（用户明确要求）：不修改、不格式化、不 stage 该目录下任何文件；git 操作避免 stash/checkout/reset 等会波及其工作区的命令（该目录已 .gitignore，属 Android 独立仓库）
+6. **Android 会话不动服务端代码**（用户明确要求，2026-09-06 起）：发现后端 BUG 只检查、定位根因、向用户/后端报告，**不修改**，由后端会话修改（唯一例外 e061bc1 系规则确立前已推送，后端可 review 保留或调整）
 
 ## Android 原生客户端（一期 MVP 已跑通，已拆独立仓库）
 
