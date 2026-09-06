@@ -66,6 +66,12 @@ function makeGetRequest(url: string, headers?: Record<string, string>): NextRequ
   return new NextRequest(new URL(url, 'http://localhost:3000'), { headers })
 }
 
+// --- mock music-library（本地优先播放：默认未命中，走 audioServe 路径） -----
+
+vi.mock('@/lib/services/music-library', () => ({
+  findLibrarySong: vi.fn(async () => null),
+}))
+
 // 延迟导入，确保 vi.mock 先生效
 const { GET } = await import('./route')
 const { audioServe } = await import('@/lib/audio-serve')
