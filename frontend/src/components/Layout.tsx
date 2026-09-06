@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { Home, Search, Heart, ListMusic, History, Music2, LogIn, LogOut, User, ChevronUp, Settings, KeyRound, Shuffle, Trophy, Library } from 'lucide-react'
 import { useAuthStore } from '@/hooks/useAuth'
+import { APP_VERSION } from '@/lib/version'
 
 const nav = [
   { href: '/', label: '首页', icon: Home, protected: false },
@@ -103,6 +104,7 @@ function SidebarContent({ onNavigate }: ContentProps) {
       <div className="flex items-center gap-2 px-3 py-4">
         <Music2 className="h-6 w-6 text-primary" />
         <span className="text-lg font-bold">Holly Music</span>
+        <span className="ml-auto text-[10px] text-muted-foreground/70">v{APP_VERSION}</span>
       </div>
       <nav className="flex flex-col gap-1">
         {nav.map(item => (
