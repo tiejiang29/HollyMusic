@@ -1,6 +1,6 @@
 # HollyMusic 服务端接口文档（Android 客户端用）
 
-> 基线版本：v1.0.4。所有接口均需登录，未登录返回 HTTP 401 + `{"success":false,"error":{"code":"UNAUTHORIZED"}}`。
+> 基线版本：v1.0.6。所有接口均需登录，未登录返回 HTTP 401 + `{"success":false,"error":{"code":"UNAUTHORIZED"}}`。
 > 客户端收到 401 应统一引导到登录页。
 
 ## 通用约定
@@ -57,6 +57,8 @@
 - **`GET /api/discover/toplists?source=&scope=common|full`** —— 排行榜（full=180 榜全量，含 `common` 标记常用榜）
 - **`GET /api/discover/toplists/{id}?source=`** —— 榜单详情 `{..., tracks: Song[]}`
 - **`GET /api/random?size=30`** —— 本地音乐库随机歌曲（做"每日推荐/随便听听"）
+- **`GET /api/discover/trending?topPerSource=10`**（v1.0.6+）—— **大家都在听**：五平台热歌榜各取前 N（tx 热歌榜/wy 热歌榜/kw 热歌榜/kg TOP500/mg 尖叫热歌榜），跨平台去重（归一化歌名+主歌手）合成一张歌单，返回 `{list: Song[], updatedAt}`；全部带 uid 可直接进播放队列；单平台失败自动跳过
+- **`GET /api/discover/playlists/groups?source=tx&perTag=6`**（v1.0.6+）—— **推荐歌单按类型聚合**：该源热门标签前 8 类 × 每类 N 张歌单一次返回 `{tag: {id,name}, playlists: DiscoveryPlaylist[]}[]`，移动端首页"分区卡片"成型接口（免逐类请求）；单类失败跳过
 
 ## 5. 收藏 / 歌单 / 音乐库
 
@@ -91,7 +93,12 @@
 
 ## 版本更新记录（仅列 API 变化）
 
-### v1.0.5（本地已提交，待发布）
+### v1.0.6（本地已提交，待发布）
+- 新增 `GET /api/discover/trending`：大家都在听（五平台热歌榜 top N 聚合 + 跨平台去重）
+- 新增 `GET /api/discover/playlists/groups`：推荐歌单按热门标签类型聚合（8 类 × N 张）
+- 修复：tx/kw 榜单封面全量抓取（e061bc1）+ kw 封面 v9_pic2 兜底（43 榜全量有图）
+
+### v1.0.5
 - `GET /api/search` 新增 `source=local`：本地音乐库搜索（含 `local: true` 标记）
 - 所有平台搜索响应新增 `localList: Song[]` 字段：服务端附带前 8 条本地库匹配，供"本地匹配"置顶区使用
 - `MusicInfo` 类型新增可选 `local?: boolean`（仅运行时标记，不入库）
