@@ -1,9 +1,9 @@
-import { useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useSearch } from '@/hooks/useSearch'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Search, Music, X, CloudOff } from 'lucide-react'
+import { Search, Music, X, CloudOff, ChevronDown } from 'lucide-react'
 import { toTrack } from '@/lib/types/player'
 import type { SourceType } from '@/lib/types/music'
 
@@ -39,6 +39,18 @@ export function SearchPage() {
   }
 
   const tracks = results.map(s => toTrack({ uid: s.uid, musicInfo: s }))
+
+  // ---------- 客户端增量分页 ----------
+  // "全部"源一次拼接 5 平台 ~150+ 行，一次性挂载的大组件树在（真实点击导航
+  // 场景下）会触发数秒级提交延迟；30 行/批增量渲染把挂载树控制在安全量级，
+  // 移动端长列表体验也更优。播放队列仍传完整列表。
+  const PAGE_SIZE = 30
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE)
+  }, [results])
+  const visibleTracks = tracks.slice(0, visibleCount)
+  const remaining = tracks.length - visibleTracks.length
 
   return (
     <div className="p-6">
@@ -100,8 +112,18 @@ export function SearchPage() {
         <LoadingSkeleton />
       ) : error ? (
         <EmptyState icon={CloudOff} title="搜索服务不可用" description={error} />
-      ) : tracks.length > 0 ? (
-        <SongList tracks={tracks} />
+      ) : visibleTracks.length > 0 ? (
+        <>
+          <SongList tracks={visibleTracks} />
+          {remaining > 0 && (
+            <button
+              onClick={() => setVisibleCount(n => n + PAGE_SIZE)}
+              className="mx-auto mt-4 flex items-center gap-1 rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-foreground"
+            >
+              <ChevronDown className="h-4 w-4" /> 加载更多（剩余 {remaining} 首）
+            </button>
+          )}
+        </>
       ) : lastKeyword ? (
         // 用 lastKeyword（最近一次搜索的词）而非输入框实时文本：
         // 输入过程中/清空再输入时不应显示"未找到结果"
