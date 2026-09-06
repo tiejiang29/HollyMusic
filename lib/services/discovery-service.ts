@@ -907,11 +907,18 @@ async function getKgToplistCovers(): Promise<Map<string, string>> {
 async function getKwToplistCovers(): Promise<Map<string, string>> {
   // 全量 43 榜逐个请求（rn=1 轻量 + TTL 缓存）；Android 端榜单卡片依赖封面
   const results = await Promise.allSettled(TOPLIST_BOARDS.kw.map(async board => {
-    const payload = await fetchJson<{ pic?: string }>(`http://kbangserver.kuwo.cn/ksong.s?from=pc&fmt=json&pn=0&rn=1&type=bang&data=content&id=${encodeURIComponent(board.id)}&show_copyright_off=0&pcmp4=1&isbang=1`)
-    return [board.id, normalizeCover(payload.pic || '')] as const
+    const payload = await fetchJson<{ pic?: string; v9_pic2?: string }>(`http://kbangserver.kuwo.cn/ksong.s?from=pc&fmt=json&pn=0&rn=1&type=bang&data=content&id=${encodeURIComponent(board.id)}&show_copyright_off=0&pcmp4=1&isbang=1`)
+    // 多数榜 pic 只回占位目录 URL（残缺/以 / 结尾）；v9_pic2 是客户端封面
+    // （实为代表曲目专辑图，与详情页 tracks[0] 兜底观感一致），路径里的
+    // /albumcover/120/ 是缩略档，同 CDN 支持 500 档，替换后直接可用。
+    const dedicated = normalizeCover(payload.pic || '')
+    const usable = dedicated && !dedicated.endsWith('/')
+      ? dedicated
+      : normalizeCover((payload.v9_pic2 || '').replace('/albumcover/120/', '/albumcover/500/'))
+    return [board.id, usable] as const
   }))
   const covers = collectCovers(results)
-  // 部分榜单只返回残缺的目录 URL（如 .../BangPic/），下发给前端只会 404，剔除后走占位
+  // 仍残缺的目录 URL（如 .../BangPic/）下发给前端只会 404，剔除后走占位
   for (const [id, cover] of covers) {
     if (cover.endsWith('/')) covers.delete(id)
   }
