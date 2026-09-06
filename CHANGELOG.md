@@ -16,6 +16,33 @@
 
 > v0.17.0 之前的完整提交历史可执行 `git log v0.17.0` 查看。
 
+## v1.0.5（2026-09-06）
+
+**完整对比**：[v1.0.4 → v1.0.5](https://github.com/redcatH/HollyMusic/compare/v1.0.4...v1.0.5)
+
+### ✨ 新增功能
+
+- **android**：音乐库频道改为服务端音乐库歌曲（/api/library，边听边下）
+- **android**：音乐库歌手索引 + 搜索（歌手chips筛选、拼音首字母、300ms防抖）
+- **search**：本地音乐库并入搜索（本地Tab + 顶部本地匹配区）
+
+
+### 🐛 问题修复
+
+- **android**：搜索框字被裁半——去掉硬压 46dp（M3 OutlinedTextField 最小高 56dp）
+
+
+### 📝 文档
+
+- **handoff**：工作规则补充——Web/服务端会话不动 android/ 目录
+
+
+### 🔧 工程与依赖
+
+- **release**：同步 v1.0.4 更新日志与版本号
+- Android 客户端拆分至独立仓库 HollyMusic-Android
+
+
 ## v1.0.4（2026-09-06）
 
 **完整对比**：[v1.0.3 → v1.0.4](https://github.com/redcatH/HollyMusic/compare/v1.0.3...v1.0.4)
