@@ -2,7 +2,8 @@ import { searchCache } from '@/lib/cache-manager'
 import { getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import type { MusicInfo, QualityInfo, QualityType, Song } from '@/lib/types/music'
-import { createCipheriv, createHash } from 'crypto'
+import { createCipheriv, createHash, publicEncrypt, randomBytes, constants } from 'crypto'
+import https from 'node:https'
 import { TOPLIST_BOARDS, type ToplistBoardDef } from './toplist-boards'
 
 const QQ_MUSICU_URL = 'https://u.y.qq.com/cgi-bin/musicu.fcg'
@@ -89,6 +90,26 @@ function formatFileSize(bytes: number): string {
 
 function normalizeCover(url: string | undefined): string {
   return url?.replace(/^http:/, 'https:') ?? ''
+}
+
+
+
+/** 原生 https POST 表单（绕开 undici fetch：进程内对照实验用）。 */
+export function httpsPostForm<T>(url: string, body: string, headers: Record<string, string>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, { method: 'POST', headers: { ...headers, 'Content-Length': Buffer.byteLength(body) }, timeout: REQUEST_TIMEOUT }, res => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')) as T) }
+        catch (e) { reject(e instanceof Error ? e : new Error('JSON 解析失败')) }
+      })
+    })
+    req.on('timeout', () => req.destroy(new Error('请求超时')))
+    req.on('error', reject)
+    req.write(body)
+    req.end()
+  })
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -377,6 +398,33 @@ const LINUXAPI_KEY = Buffer.from('rFgB&h#%2?^eDg:Q', 'utf-8')
  * 网易云 linuxapi 加密：AES-128-ECB（NoPadding），输出 hex 大写
  * 用于走 api/linux/forward 通道，支持大歌单和私有歌单
  */
+// ==================== 网易 weapi 加密（照搬 lx musicSdk/wy/utils/crypto.js，PC 客户端协议） ====================
+
+const WY_IV = Buffer.from('0102030405060708')
+const WY_PRESET_KEY = Buffer.from('0CoJUm6Qyw8W8jud')
+const WY_BASE62 = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+const WY_PUBLIC_KEY = ['-----BEGIN PUBLIC KEY-----', 'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDgtQn2JZ34ZC28NWYpAUd98iZ37BUrX/aKzmFbt7clFSs6sXqHauqKWqdtLkF2KexO40H1YTX8z2lSgBBOAxLsvaklV8k4cBFK9snQXE9/DDaFt6Rr7iVZMldczhC0JNgTz+SHXT6CBHuX3e9SdB1Ua44oncaTWz7OBGLbCiK45wIDAQAB', '-----END PUBLIC KEY-----'].join('\n')
+
+/**
+ * 网易 weapi 加密（AES-128-CBC 双层 + RSA NO_PADDING）。
+ * wy 歌单广场（playlist/list）的明文 GET 接口在服务进程内被上游针对性
+ * 返回空（独立进程/浏览器正常，未定位根因），改走 PC 客户端 weapi 通道。
+ */
+export function wyWeapi(object: unknown): { params: string; encSecKey: string } {
+  const text = JSON.stringify(object)
+  const secretKey = Buffer.from(randomBytes(16).map(n => WY_BASE62.charCodeAt(n % 62)))
+  const aes = (buf: Buffer, key: Buffer) => {
+    const cipher = createCipheriv('aes-128-cbc', key, WY_IV)
+    return Buffer.concat([cipher.update(buf), cipher.final()])
+  }
+  // 顺序关键：params 必须用未反转的 secretKey 加密（reverse 原地修改），
+  // encSecKey 的 RSA 明文才是服务端推导出的同一把 key
+  const params = aes(Buffer.from(aes(Buffer.from(text), WY_PRESET_KEY).toString('base64')), secretKey).toString('base64')
+  const padded = Buffer.concat([Buffer.alloc(128 - secretKey.length), secretKey.reverse()])
+  const encSecKey = publicEncrypt({ key: WY_PUBLIC_KEY, padding: constants.RSA_NO_PADDING }, padded).toString('hex')
+  return { params, encSecKey }
+}
+
 function linuxapiEncrypt(obj: unknown): string {
   const text = JSON.stringify(obj)
   const buf = Buffer.from(text, 'utf-8')
@@ -748,8 +796,34 @@ async function getTxPlaylistDetail(id: string, cookie?: string): Promise<Discove
 }
 
 async function getWyRecommendedPlaylists(limit: number, page: number, filter: DiscoveryPlaylistFilter): Promise<DiscoveryPlaylist[]> {
-  const query = new URLSearchParams({ cat: filter.tag || '全部', order: filter.sort === 'hot' ? 'hot' : 'new', limit: String(limit), offset: String((page - 1) * limit) })
-  const payload = await fetchJson<{ playlists?: Array<{ id?: number; name?: string; creator?: { nickname?: string }; description?: string; coverImgUrl?: string; playCount?: number; trackCount?: number }> }>(`https://music.163.com/api/playlist/list?${query}`)
+  // weapi/playlist/list（PC 客户端协议，与洛雪 wy.songList 同款）。
+  // 明文 GET playlist/list 在服务进程内被上游返回 total=0（浏览器/独立进程正常），
+  // linux/forward 转发同样为空；weapi 加密 POST 是另一套风控面，实测可用。
+  const weapiList = async (order: 'hot' | 'new') => {
+    const form = wyWeapi({
+      cat: filter.tag || '全部',
+      order,
+      limit,
+      offset: (page - 1) * limit,
+      total: true,
+    })
+    return httpsPostForm<{ playlists?: Array<{ id?: number; name?: string; creator?: { nickname?: string }; description?: string; coverImgUrl?: string; playCount?: number; trackCount?: number }> }>(
+      'https://music.163.com/weapi/playlist/list',
+      new URLSearchParams(form).toString(),
+      {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Referer: 'https://music.163.com/',
+        Cookie: 'os=pc',
+      },
+    )
+  }
+  // 实测（2026-09-06）：上游 order=new 恒返回 total=0（hot 正常），默认 hot、
+  // 显式 new 为空时回退 hot，待上游恢复后自动生效
+  let payload = await weapiList(filter.sort === 'new' ? 'new' : 'hot')
+  if ((payload.playlists || []).length === 0 && filter.sort === 'new') {
+    payload = await weapiList('hot')
+  }
   return (payload.playlists || []).filter(item => item.id && item.name).map(item => ({
     id: String(item.id),
     name: item.name || '',
@@ -1094,27 +1168,27 @@ export async function getRecommendedPlaylists(source: DiscoverySource = 'tx', li
   if (cached) return cached
   if (source === 'wy') {
     const playlists = await getWyRecommendedPlaylists(safeLimit, safePage, filter)
-    searchCache.set(cacheKey, playlists, CACHE_TTL)
+    if (playlists.length > 0) searchCache.set(cacheKey, playlists, CACHE_TTL)
     return playlists
   }
   if (source === 'kw') {
     const playlists = await getKwRecommendedPlaylists(safeLimit, safePage, filter)
-    searchCache.set(cacheKey, playlists, CACHE_TTL)
+    if (playlists.length > 0) searchCache.set(cacheKey, playlists, CACHE_TTL)
     return playlists
   }
   if (source === 'kg') {
     const playlists = await getKgRecommendedPlaylists(safeLimit, safePage, filter)
-    searchCache.set(cacheKey, playlists, CACHE_TTL)
+    if (playlists.length > 0) searchCache.set(cacheKey, playlists, CACHE_TTL)
     return playlists
   }
   if (source === 'mg') {
     const playlists = await getMgRecommendedPlaylists(safeLimit, safePage, filter)
-    searchCache.set(cacheKey, playlists, CACHE_TTL)
+    if (playlists.length > 0) searchCache.set(cacheKey, playlists, CACHE_TTL)
     return playlists
   }
   if (source === 'tx') {
     const playlists = await getTxRecommendedPlaylists(safeLimit, safePage, filter)
-    searchCache.set(cacheKey, playlists, CACHE_TTL)
+    if (playlists.length > 0) searchCache.set(cacheKey, playlists, CACHE_TTL)
     return playlists
   }
   throw new Error('Unsupported discovery source')
@@ -1254,8 +1328,8 @@ function trendingDedupeKey(name: string, singer: string): string {
  * 大家都在听：五平台热歌榜各取前 topPerSource 首，跨平台去重后合成一张歌单。
  * 榜单详情本身有缓存（CACHE_TTL），聚合结果再缓存一层；单平台失败跳过。
  */
-export async function getTrending(topPerSource = 10): Promise<TrendingResult> {
-  const safeTop = Math.max(1, Math.min(topPerSource, 30))
+export async function getTrending(topPerSource = 20): Promise<TrendingResult> {
+  const safeTop = Math.max(1, Math.min(topPerSource, 50))
   const cacheKey = `discovery:v1:trending:${safeTop}`
   const cached = getCached<TrendingResult>(cacheKey)
   if (cached) return cached
@@ -1280,7 +1354,8 @@ export async function getTrending(topPerSource = 10): Promise<TrendingResult> {
   }
 
   const result: TrendingResult = { list, updatedAt: new Date().toISOString() }
-  searchCache.set(cacheKey, result, CACHE_TTL)
+  // 空列表多半是瞬时失败（冷启动并发触发上游限流），不缓存，下次调用重试
+  if (list.length > 0) searchCache.set(cacheKey, result, CACHE_TTL)
   return result
 }
 
@@ -1289,29 +1364,60 @@ export interface PlaylistGroup {
   playlists: DiscoveryPlaylist[]
 }
 
+/** 跨平台歌单分区类目（顺序即展示顺序）。各平台按名称解析自家 tag id，
+ *  解析不到的平台跳过该类目；wy 的 tag 参数即类目名本身，天然全类目可用。 */
+export const PLAYLIST_CATEGORIES = ['流行', '经典', '儿歌', '摇滚', '民谣', '电子', '国风', 'ACG']
+
+function resolvePlaylistTagId(tags: PlaylistTagsResult, category: string): string | null {
+  const pool = [...tags.hotTag, ...tags.tags.flatMap(g => g.list)]
+  const exact = pool.find(t => t.name === category)
+  if (exact) return exact.id
+  const fuzzy = pool.find(t => t.name.includes(category) || category.includes(t.name))
+  return fuzzy ? fuzzy.id : null
+}
+
 /**
- * 推荐歌单按类型聚合：取该源热门标签（前 8 个），每类拉 perTag 张歌单，
- * 供移动端首页"分区卡片"一次成型（免客户端逐类请求）。缓存与标签同周期。
+ * 推荐歌单按类型聚合（跨平台版）：每个类目从五平台各拉 perPlatform 张歌单
+ * 合并为一个分区（歌单自带 source 字段可标来源），供移动端首页"分区卡片"
+ * 一次成型。单平台/单类失败跳过；缓存与标签同周期。
  */
-export async function getPlaylistGroups(source: DiscoverySource = 'tx', perTag = 6): Promise<PlaylistGroup[]> {
-  const safePer = Math.max(1, Math.min(perTag, 12))
-  const cacheKey = `discovery:v1:${source}:playlist-groups:${safePer}`
+export async function getPlaylistGroups(perPlatform = 3): Promise<PlaylistGroup[]> {
+  const safePer = Math.max(1, Math.min(perPlatform, 10))
+  const cacheKey = `discovery:v1:merged-playlist-groups:${safePer}`
   const cached = getCached<PlaylistGroup[]>(cacheKey)
   if (cached) return cached
 
-  const tags = await getPlaylistTags(source)
-  const hot = tags.hotTag.slice(0, 8)
-  const groups = await Promise.all(hot.map(async tag => {
-    try {
-      const playlists = await getRecommendedPlaylists(source, safePer, 1, { tag: tag.id })
-      return { tag, playlists }
-    } catch {
-      return null // 单类失败跳过，不影响其余分区
-    }
-  }))
+  const sources = Object.keys(HOT_BOARD_IDS) as DiscoverySource[]
+  const tagsBySource = new Map(await Promise.all(
+    sources.map(async s => [s, await getPlaylistTags(s).catch(() => null)] as const)
+  ))
 
-  const result = groups.filter((g): g is PlaylistGroup => g !== null && g.playlists.length > 0)
-  if (result.length > 0) searchCache.set(cacheKey, result, TAG_CACHE_TTL)
+  // 类目分批拉取（每批 2 类 × 5 平台 ≈ 10 并发）：一次性 40+ 并发会触发
+  // 部分上游限流，空结果污染分区
+  const groups: Array<PlaylistGroup | null> = []
+  for (let i = 0; i < PLAYLIST_CATEGORIES.length; i += 2) {
+    const batch = PLAYLIST_CATEGORIES.slice(i, i + 2)
+    const settled = await Promise.all(batch.map(async category => {
+      const fetches = sources.map(async source => {
+        const tags = tagsBySource.get(source)
+        let tagId = tags ? resolvePlaylistTagId(tags, category) : null
+        if (!tagId && source === 'wy') tagId = category // wy tag 参数即类目名
+        if (!tagId) return [] as DiscoveryPlaylist[]
+        try {
+          return await getRecommendedPlaylists(source, safePer, 1, { tag: tagId })
+        } catch {
+          return [] as DiscoveryPlaylist[]
+        }
+      })
+      const playlists = (await Promise.all(fetches)).flat()
+      return playlists.length > 0 ? { tag: { id: category, name: category }, playlists } : null
+    }))
+    groups.push(...settled)
+  }
+
+  const result = groups.filter((g): g is PlaylistGroup => g !== null)
+  // 空结果不缓存；部分成功用短 TTL，单平台瞬时故障 10 分钟内自愈
+  if (result.length > 0) searchCache.set(cacheKey, result, CACHE_TTL)
   return result
 }
 
