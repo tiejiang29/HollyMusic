@@ -98,3 +98,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Android 客户端独立仓库：https://github.com/tiejiang29/HollyMusic-Android
+android/
