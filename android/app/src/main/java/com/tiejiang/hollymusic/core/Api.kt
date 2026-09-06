@@ -242,6 +242,16 @@ object Api {
         return decode(CollectionDetail.serializer(), call(req))
     }
 
+    /** 音乐库歌曲（边听边下，服务端持久化） */
+    suspend fun library(page: Int = 1, pageSize: Int = 100): Pair<List<Song>, Int> {
+        val req = Request.Builder().url("${baseUrl()}/api/library?page=$page&pageSize=$pageSize").get().build()
+        val raw = call(req)
+        val obj = node(raw)
+        val listJson = obj["list"] ?: return emptyList<Song>() to 0
+        val rows = json.decodeFromJsonElement(ListSerializer(LibrarySong.serializer()), listJson)
+        return rows.map { it.toSong() } to int(obj, "total")
+    }
+
     suspend fun favorites(): List<Song> {
         val req = Request.Builder().url("${baseUrl()}/api/favorites?limit=500").get().build()
         val raw = call(req)
