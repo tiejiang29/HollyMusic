@@ -1,0 +1,87 @@
+# HollyMusic 服务端接口文档（Android 客户端用）
+
+> 基线版本：v1.0.3。所有接口均需登录，未登录返回 HTTP 401 + `{"success":false,"error":{"code":"UNAUTHORIZED"}}`。
+> 客户端收到 401 应统一引导到登录页。
+
+## 通用约定
+
+- **Base URL**：用户自配（如 `http://172.16.1.7:3099`），首次启动引导填写并持久化。
+- **响应包装**：`{ "success": boolean, "data": T }`；失败为 `{ "success": false, "error": { "code": string, "message": string } }`。
+- **认证**：登录成功后 Set-Cookie（HttpOnly 会话）。原生端用 OkHttp `CookieJar` 持久化即可跑通全部接口；ExoPlayer 拉音频流的鉴权改造（Bearer token）计划中，改造后中间件将兼容 Cookie 与 `Authorization: Bearer` 两种方式，客户端无需变更登录流程。
+- **uid 格式**：`{source}-{songmid}`，如 `tx-0039MnYb0qxYhV1`。全站统一用它标识一首歌。
+- **音质**：`'128k' | '320k' | 'flac' | 'flac24bit'`。
+- **Song 结构**（搜索/歌单/收藏/随机等所有歌曲列表通用）：`{ uid, name, singer, albumName, source, interval(秒), img, qualitys?: string[], _types?: Record<音质, {size?: number, hash?: string}> }`。
+
+## 1. 认证
+
+| 接口 | 方法 | 参数 | 说明 |
+|---|---|---|---|
+| `/api/auth/login` | POST | body JSON `{username, password}` | 成功设会话 cookie；错误返回 `INVALID_PARAMS 用户名或密码错误` |
+| `/api/auth/me` | GET | - | 当前用户 `{username}`；用于启动时恢复会话 |
+| `/api/auth/heartbeat` | POST | - | 保活 |
+| `/api/auth/logout` | POST | - | 注销 |
+| `/api/auth/change-password` | POST | `{oldPassword, newPassword}` | 改密后旧会话失效 |
+
+## 2. 搜索
+
+- **`GET /api/search?keyword=&source=&page=1&limit=30`**
+  - `source`: `all | tx | wy | kw | kg | mg`（all 聚合五源）
+  - 返回 `Song[]`
+- **`GET /api/search/suggest?keyword=`**（v1.0.2+）
+  - 输入联想，250ms 防抖由客户端控制；返回 `{text, type: 'singer'|'song'|'album'}[]`，歌手项已置顶
+  - 点选歌手项 → 用歌手名再调 `/api/search`
+
+## 3. 播放与歌词
+
+- **`GET /api/audio?uid=&quality=320k`** —— 音频流（ExoPlayer 直接播）
+  - 服务端本地优先（音乐库→缓存→在线），支持 Range/seek，自动试听检测
+  - `quality` 缺省 320k；传用户偏好音质
+- **`GET /api/track?uid=`** —— 单曲详情（含封面/可用音质）
+- **`GET /api/music/alternatives?uid=`** —— 跨源替换候选（可选功能）
+- **`GET /api/lyrics?uid=`** —— `{lyric: LRC文本|null, tlyric: 翻译LRC|null}`
+  - LRC 行级时间戳，纯文本歌单（tx/kw/mg 部分歌曲）`lyric` 为 `[!text]` 前缀
+- **`GET /api/cover/[id]`** / 封面代理；歌单/榜单封面字段给的是完整 URL，直接加载即可（RemoteCover 逻辑已在服务端处理被拦域名）
+
+## 4. 发现页（v1.0.3 广场全量）
+
+- **`GET /api/discover/playlists?source=tx&limit=24&page=1&tag=&sort=&keyword=`** —— 歌单广场列表
+  - `source`: `tx|wy|kw|kg|mg`；`sort`: `recommend|hot|new|collect(热藏)|soar(飙升)`（各源支持档位不同：kg 五档、mg 三档、其余两档）
+  - `tag` 取值来自标签接口的 `hotTag[].id`
+  - 返回 `{id, name, author, description, cover, playCount, songCount?, source}[]`
+- **`GET /api/discover/playlists/tags?source=`** —— 标签（v1.0.3+）
+  - 返回 `{hotTag: {id,name}[], tags: {name, list:{id,name}[]}[]}`；`tags` 可为空数组（wy/kw/kg 只有热门）
+- **`GET /api/discover/playlists/{id}?source=`** —— 歌单详情 `{..., tracks: Song[]}`，tracks 可直接进播放队列
+- **`GET /api/discover/toplists?source=&scope=common|full`** —— 排行榜（full=180 榜全量，含 `common` 标记常用榜）
+- **`GET /api/discover/toplists/{id}?source=`** —— 榜单详情 `{..., tracks: Song[]}`
+- **`GET /api/random?size=30`** —— 本地音乐库随机歌曲（做"每日推荐/随便听听"）
+
+## 5. 收藏 / 歌单 / 音乐库
+
+- **收藏**：
+  - `GET /api/favorites?limit=200&offset=0` → `Song[]`
+  - `POST /api/favorites` body `{id: uid}` 收藏；`DELETE /api/favorites?id=uid` 取消
+  - `GET /api/favorites/check?id=uid` → `{isFavorite: boolean}`
+- **自建歌单**：
+  - `GET /api/playlists` 列表；`POST /api/playlists` `{name}` 新建
+  - `GET /api/playlists/{id}` 详情；`PATCH /api/playlists/{id}` 改名；`DELETE /api/playlists/{id}` 删除
+  - `POST /api/playlists/{id}/songs` body `{uids: string[]}` 批量加歌；`DELETE` 同路径移除
+- **音乐库（边听边下，服务端持久化）**：
+  - `GET /api/library` 列表 + 统计（容量/歌曲数）；`GET /api/library?singerGroups=1` 按歌手分组
+  - `DELETE /api/library/{id}` 删除
+  - Android 下载到本地目录（`Music/HollyMusic/`）由客户端自行管理，不依赖此接口
+
+## 6. 下载（服务端代理流）
+
+- **`GET /api/download?uid=&quality=`** —— 单曲文件流（Content-Disposition 附件）
+- **`GET /api/download/batch?uids=a,b,c`** —— ZIP 流（串行打包，429 表示已有任务进行中）
+
+## 7. 其他
+
+- `GET /api/version` → `{version: "1.0.3"}`（设置页"检查更新"对齐用）
+- `GET /api/health` → 健康检查（配服务器地址时用来连通性测试）
+
+## Android 端建议的请求封装
+
+- 统一 `ApiResult<T>` 解包：`success` 才取 `data`，否则抛业务异常（带 code/message）
+- 401 拦截器 → 跳登录
+- 音频流不走统一解包（是二进制），直接把 URL 交给 ExoPlayer（`DefaultHttpDataSource` 挂同一 CookieJar 或后续的 token header）
