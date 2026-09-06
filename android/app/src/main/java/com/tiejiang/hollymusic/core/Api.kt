@@ -46,6 +46,17 @@ object Api {
     val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
+        .addNetworkInterceptor { chain ->
+            val req = chain.request()
+            if (com.tiejiang.hollymusic.BuildConfig.DEBUG) {
+                android.util.Log.d("HollyApi", "→(wire) ${req.method} ${req.url.encodedPath} Cookie=[${req.header("Cookie") ?: "无"}]")
+            }
+            val resp = chain.proceed(req)
+            if (com.tiejiang.hollymusic.BuildConfig.DEBUG) {
+                android.util.Log.d("HollyApi", "←(wire) ${resp.code} ${req.url.encodedPath}")
+            }
+            resp
+        }
         .cookieJar(object : CookieJar {
             override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
                 synchronized(cookieStore) {
@@ -68,12 +79,13 @@ object Api {
 
     fun coverUrl(uid: String): String = "${baseUrl()}/api/cover/${uid.replace("al-", "")}"
 
-    fun restoreCookies(server: String, user: String, sig: String) {
+    fun restoreCookies(server: String, user: String, sv: String, sig: String) {
         val host = (if (server.startsWith("http")) server else "http://$server")
             .toHttpUrlOrNull()?.host ?: return
         synchronized(cookieStore) {
             cookieStore[host] = listOf(
                 Cookie.Builder().name("holly_user").value(user).domain(host).path("/").build(),
+                Cookie.Builder().name("holly_sv").value(sv).domain(host).path("/").build(),
                 Cookie.Builder().name("holly_sig").value(sig).domain(host).path("/").build(),
             )
         }
@@ -81,12 +93,14 @@ object Api {
 
     fun clearCookies() = synchronized(cookieStore) { cookieStore.clear() }
 
-    fun cookieSnapshot(server: String = Settings.cachedServer): Pair<String, String>? {
+    /** 取当前会话三件套（user, sv, sig)，用于持久化 */
+    fun cookieSnapshot(server: String = Settings.cachedServer): Triple<String, String, String>? {
         val host = server.toHttpUrlOrNull()?.host ?: return null
         val list = synchronized(cookieStore) { cookieStore[host] }.orEmpty()
         val user = list.firstOrNull { it.name == "holly_user" }?.value ?: return null
+        val sv = list.firstOrNull { it.name == "holly_sv" }?.value ?: return null
         val sig = list.firstOrNull { it.name == "holly_sig" }?.value ?: return null
-        return user to sig
+        return Triple(user, sv, sig)
     }
 
     private suspend fun rawCall(request: Request): String = withContext(Dispatchers.IO) {
@@ -113,7 +127,7 @@ object Api {
     private suspend fun call(request: Request): String {
         val body = rawCall(request)
         val env = runCatching { json.decodeFromString(ApiEnvelope.serializer(), body) }
-            .getOrElse { throw ApiException("PARSE", "响应解析失败") }
+            .getOrElse { throw ApiException("PARSE", "响应解析失败: ${body.take(80)}") }
         if (!env.success) throw ApiException(env.error?.code ?: "UNKNOWN", env.error?.message ?: "请求失败")
         return env.data?.toString() ?: "null"
     }
@@ -135,6 +149,17 @@ object Api {
     private fun <T> decode(s: KSerializer<T>, raw: String): T = json.decodeFromString(s, raw)
 
     // ───────────────────────── 业务接口 ─────────────────────────
+
+    /** 启动会话校验：cookie 有效返回用户名，失败抛异常 */
+    suspend fun authMe(): String {
+        val req = Request.Builder().url("${baseUrl()}/api/auth/me").get().build()
+        val obj = node(call(req))
+        return str(obj, "username")
+    }
+
+    /** 音频流地址（服务端本地优先：音乐库→缓存→在线；支持 Range/seek） */
+    fun audioUrl(uid: String, quality: String = Settings.cachedQuality): String =
+        "${baseUrl()}/api/audio?uid=${encode(uid)}&quality=${encode(quality)}"
 
     suspend fun login(serverRaw: String, username: String, password: String) {
         val server = serverRaw.trim().trimEnd('/')

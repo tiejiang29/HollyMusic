@@ -146,31 +146,24 @@ object PlayerManager {
     private fun resolveAndSet(index: Int, playNow: Boolean) {
         val song = _state.value.queue.getOrNull(index) ?: return
         _state.value = _state.value.copy(buffering = true, error = null)
-        scope.launch {
-            try {
-                val url = Api.musicUrl(song)
-                val item = MediaItem.Builder()
-                    .setUri(url)
-                    .setMediaId(song.uid)
-                    .setMediaMetadata(
-                        MediaMetadata.Builder()
-                            .setTitle(song.name)
-                            .setArtist(song.singer)
-                            .setAlbumTitle(song.albumName)
-                            .setArtworkUri(Uri.parse(Api.coverUrl(song.uid)))
-                            .build()
-                    )
+        // 直接播 /api/audio 代理流：服务端本地优先（音乐库→缓存→在线），Range/seek 原生支持，
+        // OkHttp DataSource 与 Api 共享 CookieJar
+        val url = Api.audioUrl(song.uid)
+        val item = MediaItem.Builder()
+            .setUri(url)
+            .setMediaId(song.uid)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(song.name)
+                    .setArtist(song.singer)
+                    .setAlbumTitle(song.albumName)
+                    .setArtworkUri(Uri.parse(Api.coverUrl(song.uid)))
                     .build()
-                val c = controller ?: return@launch
-                c.setMediaItem(item)
-                if (playNow) c.prepareAndPlay() else c.prepare()
-            } catch (e: Exception) {
-                _state.value = _state.value.copy(
-                    buffering = false,
-                    error = e.message ?: "获取播放链接失败",
-                )
-            }
-        }
+            )
+            .build()
+        val c = controller ?: return
+        c.setMediaItem(item)
+        if (playNow) c.prepareAndPlay() else c.prepare()
     }
 
     private fun loadLyrics() {

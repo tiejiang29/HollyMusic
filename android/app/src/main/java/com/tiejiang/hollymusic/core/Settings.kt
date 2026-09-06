@@ -14,6 +14,7 @@ object Settings {
     private val KEY_SERVER = stringPreferencesKey("server_url")
     private val KEY_USERNAME = stringPreferencesKey("username")
     private val KEY_COOKIE_USER = stringPreferencesKey("cookie_holly_user")
+    private val KEY_COOKIE_SV = stringPreferencesKey("cookie_holly_sv")
     private val KEY_COOKIE_SIG = stringPreferencesKey("cookie_holly_sig")
     private val KEY_QUALITY = stringPreferencesKey("quality")
 
@@ -27,14 +28,15 @@ object Settings {
         cachedUsername = p[KEY_USERNAME] ?: ""
         cachedQuality = p[KEY_QUALITY] ?: "flac"
         val user = p[KEY_COOKIE_USER]
+        val sv = p[KEY_COOKIE_SV]
         val sig = p[KEY_COOKIE_SIG]
-        if (!cachedServer.isBlank() && !user.isNullOrBlank() && !sig.isNullOrBlank()) {
-            Api.restoreCookies(cachedServer, user, sig)
+        if (!cachedServer.isBlank() && !user.isNullOrBlank() && !sv.isNullOrBlank() && !sig.isNullOrBlank()) {
+            Api.restoreCookies(cachedServer, user, sv, sig)
         }
     }
 
     /** 登录成功后保存全部状态 */
-    fun saveLogin(ctx: Context, server: String, username: String, user: String, sig: String) {
+    fun saveLogin(ctx: Context, server: String, username: String, user: String, sv: String, sig: String) {
         cachedServer = server
         cachedUsername = username
         runBlocking {
@@ -42,6 +44,7 @@ object Settings {
                 it[KEY_SERVER] = server
                 it[KEY_USERNAME] = username
                 it[KEY_COOKIE_USER] = user
+                it[KEY_COOKIE_SV] = sv
                 it[KEY_COOKIE_SIG] = sig
             }
         }

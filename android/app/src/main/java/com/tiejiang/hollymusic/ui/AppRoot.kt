@@ -33,9 +33,11 @@ fun AppRoot() {
     val nav = rememberNavController()
     var loggedIn by remember { mutableStateOf<Boolean?>(null) }
 
-    // 校验本地 cookie 是否存在（快速判定，不联网校验过期）
+    // 有本地 cookie → 调 /api/auth/me 校验会话有效性（过期则回登录页）
     LaunchedEffect(Unit) {
-        loggedIn = Api.cookieSnapshot() != null
+        loggedIn = if (Api.cookieSnapshot() != null) {
+            runCatching { Api.authMe().isNotBlank() }.getOrDefault(false)
+        } else false
     }
 
     val start = when (loggedIn) {

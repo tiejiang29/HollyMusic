@@ -31,6 +31,12 @@ Next.js 16 后端（App Router, standalone 输出，需 --webpack 因 Turbopack 
 
 用户决定：**Kotlin + Jetpack Compose + Material 3 原生开发，不用 WebView**（嫌 Web UI 上安卓难看）。
 
+### v1.0.3 文档吸收（2026-09-06 完成，docs/ANDROID_API.md）
+
+- **播放链路已改 `/api/audio?uid=&quality=` 代理流**（弃 music-url 直链）：服务端本地优先（音乐库→缓存→在线）+ Range/seek，ExoPlayer 经 OkHttp DataSource 带 Cookie 直播，实测 44.1kHz started
+- **启动会话校验已用 `/api/auth/me`**：cookie 存在→联网校验→过期回登录页
+- 文档与代码三处口径不符（以代码为准）：歌词参数实为 `?id=`（非 uid）、搜索无 `source=all`（只有 kw/kg/tx/wy/mg）、收藏 check 返回 `{starred}`（非 isFavorite）——客户端实现均已按代码口径
+
 ### MVP 状态（2026-09-06 模拟器全链路验证通过 ✅）
 
 **工程**：`D:\dev\HollyMusic\android\`（包名 com.tiejiang.hollymusic，AGP 8.5.2 + Kotlin 2.0.21 + Compose BOM 2024.09 + Media3 1.4.1）
@@ -46,10 +52,14 @@ Next.js 16 后端（App Router, standalone 输出，需 --webpack 因 Turbopack 
 6. MediaSessionService 前台服务已注册（通知栏/锁屏控制待真机验）
 
 **关键坑（已修，新会话别再踩）**：
+- **会话 Cookie 是三件套**：holly_user + **holly_sv**(sessionVersion) + holly_sig，缺 holly_sv 会 401（签名校验不过）。持久化/恢复必须三条全套
+- **/api/auth/me 无会话也返回 200**（data.authenticated=false），判定登录态要看 username/authenticated 字段，不能只看 HTTP 码
 - Compose `padding()` 不允许负值 → 色晕用 `offset()`
 - ApiEnvelope.data 必须声明 `JsonElement?`（服务器 data 是对象，声明 String? 必 PARSE 失败）
 - adb input text 的 `!` 会变形——测试密码避开特殊字符；DEL 连发清空不可靠，输入框一律带 ✕ 清空钮
 - uiautomator dump 会给过期快照，验证以截图/服务器日志/dumpsys audio 为准
+- **OkHttp 应用拦截器(addInterceptor)在 CookieJar 注入 Cookie 头之前执行**——看真实出网头要用 addNetworkInterceptor
+- AGP 8 默认不生成 BuildConfig，要用需 buildFeatures { buildConfig = true }
 
 **临时措施**：端到端测试在本地库插过 emutest 用户（已删）；admin 密码与 config/users.json 不一致（用户改过），真机验收用真实账号
 
