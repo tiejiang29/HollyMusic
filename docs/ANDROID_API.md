@@ -25,7 +25,9 @@
 ## 2. 搜索
 
 - **`GET /api/search?keyword=&source=&page=1&limit=30`**
-  - `source`: `all | tx | wy | kw | kg | mg`
+  - `source`: `all | local | tx | wy | kw | kg | mg`
+  - **`local` 只搜本地音乐库**（v1.0.5+）：name/singer/album contains 匹配，命中条目带 `local: true` 标记（客户端加"本地"徽标）；播放走本地文件不耗流量
+  - **任何平台搜索（单源/all）响应都附带 `localList: Song[]`**（前 8 条本地库匹配，`local: true`）——客户端可在结果顶部展示"本地匹配"区；localList 每次实时查库不缓存，库增删立即可见
   - **`all` 为服务端五源汇聚**（v1.0.4+）：并发五源、按 tx→wy→kw→kg→mg 顺序拼接、单源失败自动跳过（至少一源成功即返回）、聚合结果整体缓存。部分源失败时响应含 `failedSources: string[]` 可提示"结果不含 xx"；全部失败返回 502。
   - 返回 `{list: Song[], total, allPage, page, limit, source, failedSources?}`
 - **`GET /api/search/suggest?keyword=`**（v1.0.2+）
@@ -89,7 +91,12 @@
 
 ## 版本更新记录（仅列 API 变化）
 
-### v1.0.4（本地已提交，待发布）
+### v1.0.5（本地已提交，待发布）
+- `GET /api/search` 新增 `source=local`：本地音乐库搜索（含 `local: true` 标记）
+- 所有平台搜索响应新增 `localList: Song[]` 字段：服务端附带前 8 条本地库匹配，供"本地匹配"置顶区使用
+- `MusicInfo` 类型新增可选 `local?: boolean`（仅运行时标记，不入库）
+
+### v1.0.4
 - `GET /api/search` 新增 `source=all`：**服务端五源汇聚**——并发扇出五源、按 tx→wy→kw→kg→mg 顺序拼接、单源失败自动跳过（至少一源成功即返回）、聚合结果整体缓存 210 分钟
   - 部分源失败时响应新增 `failedSources: string[]`（提示"结果不含 xx"用）
   - 全部源失败返回 502 `SEARCH_FAILED`

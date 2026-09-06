@@ -11,11 +11,13 @@ export interface SearchResultData {
   page: number
   allPage: number
   limit: number
-  source: SourceType | 'all'
+  source: SourceType | 'all' | 'local'
+  /** 平台搜索附带的前几条本地音乐库匹配（source=local 时无此字段） */
+  localList?: Song[]
 }
 
 export function search(
-  source: SourceType | 'all',
+  source: SourceType | 'all' | 'local',
   keyword: string,
   page = 1,
   limit = 30

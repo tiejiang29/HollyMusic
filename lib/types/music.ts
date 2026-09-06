@@ -28,6 +28,8 @@ export interface MusicInfo {
   types: QualityInfo[]
   _types: Record<QualityType, Partial<QualityInfo>>
   typeUrl: Record<string, string>
+  /** 本地音乐库命中标记（搜索结果附加，展示徽标用；不入库） */
+  local?: boolean
   // 特定音源的额外字段
   hash?: string // kg
   copyrightId?: string // mg

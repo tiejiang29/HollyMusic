@@ -122,6 +122,11 @@ export function SongRow({ track, queue, index, onToggleSource, rankMode, selecti
         </div>
         <div className="mt-0.5 flex items-center gap-2">
           <span className="truncate text-xs text-muted-foreground">{track.artist}</span>
+          {track.musicInfo.local === true && (
+            <span className="shrink-0 rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+              本地
+            </span>
+          )}
           <SourceBadge source={track.source} />
         </div>
       </button>
