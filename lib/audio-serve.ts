@@ -801,13 +801,13 @@ class AudioServe {
 // 响应构造（与旧 serve.ts 等价，独立实现避免循环依赖）
 // ============================================================================
 
-interface RangeSpec {
+export interface RangeSpec {
   start: number
   end: number
 }
 
 /** 解析 Range 头。null = 无 Range；'unsatisfiable' = 416；对象 = 有效范围 */
-function parseRange(rangeHeader: string | null, size: number): RangeSpec | 'unsatisfiable' | null {
+export function parseRange(rangeHeader: string | null, size: number): RangeSpec | 'unsatisfiable' | null {
   if (!rangeHeader || !rangeHeader.startsWith('bytes=')) return null
   const spec = rangeHeader.slice(6).trim()
   if (spec.includes(',')) return null
@@ -890,7 +890,7 @@ function wrapFileStream(nodeStream: fs.ReadStream): ReadableStream<Uint8Array> {
   })
 }
 
-function buildPartialResponse(
+export function buildPartialResponse(
   filePath: string,
   size: number,
   contentType: string,
@@ -1028,7 +1028,7 @@ function buildFollowResponse(
   return new Response(stream, { status, headers })
 }
 
-function buildFullResponse(
+export function buildFullResponse(
   filePath: string,
   size: number,
   contentType: string,
@@ -1045,7 +1045,7 @@ function buildFullResponse(
   return new Response(wrapFileStream(stream), { status: 200, headers })
 }
 
-function buildUnsatisfiable(size: number): Response {
+export function buildUnsatisfiable(size: number): Response {
   return new Response(null, {
     status: 416,
     headers: { 'Content-Range': `bytes */${size}` },
@@ -1062,7 +1062,7 @@ async function fileExists(p: string): Promise<boolean> {
 }
 
 /** 删除音频缓存及其同目录的歌词边车文件。 */
-async function removeAudioCacheFiles(audioFilePath: string): Promise<void> {
+export async function removeAudioCacheFiles(audioFilePath: string): Promise<void> {
   await Promise.all([
     fsp.unlink(audioFilePath).catch(() => {}),
     fsp.unlink(getLyricSidecarPath(audioFilePath)).catch(() => {}),

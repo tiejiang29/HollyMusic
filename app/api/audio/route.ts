@@ -23,6 +23,7 @@ import type { QualityType } from '@/lib/types/music'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import { audioServe } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
+import { serveFromLibrary, ingestFromCache } from '@/lib/services/music-library'
 
 function buildErrorResponse(status: number, code: string, message: string): Response {
   return new Response(
@@ -55,6 +56,11 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
     }
 
     const cacheKey = `${musicInfo.source}:${musicInfo.songmid}:${quality}`
+    const rangeHeader = request.headers.get('range')
+
+    // 本地优先 ①：音乐库命中（uid 精确 → 跨平台模糊），库内音质 ≥ 请求档即服务
+    const libraryResp = await serveFromLibrary(musicInfo, quality, rangeHeader, isHead)
+    if (libraryResp) return libraryResp
 
     // URL resolver 下沉到 audioServe 内部：只在真正 miss 时调用一次。
     // 已缓存 / 进行中的请求完全不触发 URL 解析（解决重复打上游问题）。
@@ -65,15 +71,17 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
       return musicSourceManager.getMusicUrl(musicInfo, quality)
     }
 
-    const rangeHeader = request.headers.get('range')
-
     return await audioServe.serve({
       cacheKey,
       upstreamUrlResolver,
       rangeHeader,
       isHead,
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
-      onCached: () => cacheNativeLyricForMusic(musicInfo),
+      // 完成后：歌词预缓存 + 边听边下入库（music-library 内部处理去重/配额）
+      onCached: () => Promise.all([
+        cacheNativeLyricForMusic(musicInfo),
+        ingestFromCache(cacheKey, musicInfo, quality),
+      ]).then(() => {}),
     })
   } catch (error) {
     logger.error('[/api/audio] 失败:', error)
