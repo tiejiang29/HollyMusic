@@ -61,7 +61,7 @@ Next.js 16 后端（App Router, standalone 输出，需 --webpack 因 Turbopack 
 - **OkHttp 应用拦截器(addInterceptor)在 CookieJar 注入 Cookie 头之前执行**——看真实出网头要用 addNetworkInterceptor
 - AGP 8 默认不生成 BuildConfig，要用需 buildFeatures { buildConfig = true }
 
-**临时措施**：端到端测试在本地库插过 emutest 用户（已删）；admin 密码与 config/users.json 不一致（用户改过），真机验收用真实账号
+**测试账号（用户指定，端到端测试一律用它）**：用户名 `test`，密码 `abcd=1234`（本地 :3000 已验证可登录；**NAS :3099 尚未建此账号**，真机验收连 NAS 前需先建号或用真实账号）。adb input text 密码含 `=` 可直传无变形。
 
 ### UI 设计（已定稿 v3.1）
 
