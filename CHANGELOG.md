@@ -16,6 +16,40 @@
 
 > v0.17.0 之前的完整提交历史可执行 `git log v0.17.0` 查看。
 
+## v1.0.4（2026-09-06）
+
+**完整对比**：[v1.0.3 → v1.0.4](https://github.com/redcatH/HollyMusic/compare/v1.0.3...v1.0.4)
+
+### ✨ 新增功能
+
+- **android**：一期 MVP 原生客户端（Compose+Media3），模拟器全链路验证通过
+- **search**：/api/search 支持 source=all 五源服务端汇聚
+- **android**：搜索默认全部档（对接服务端 source=all 五源汇聚）
+- **android**：搜索结果提示失败音源（对接 v1.0.4 failedSources）
+
+
+### 🐛 问题修复
+
+- **android**：会话 Cookie 三件套持久化 + 播放改 /api/audio 代理流
+
+
+### 📝 文档
+
+- **api**：修正与代码实现的三处口径出入
+- **handoff**：记录 Android 端到端测试账号 test（用户指定）
+
+
+### 🔧 工程与依赖
+
+- **release**：v1.0.4 预备 + 接口文档按版本写明更新记录
+- **release**：同步 v1.0.3 更新日志与版本号
+
+
+### 🧩 其他变更
+
+- 同步 v1.0.3 更新日志（release bot）
+
+
 ## v1.0.3（2026-09-06）
 
 **完整对比**：[v1.0.1 → v1.0.3](https://github.com/redcatH/HollyMusic/compare/v1.0.1...v1.0.3)
