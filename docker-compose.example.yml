@@ -1,5 +1,5 @@
 # ============================================================================
-# HollyMusic Docker 部署示例（直接使用 ghcr.io 预构建镜像）
+# HollyMusic Docker 部署示例（直接使用 Docker Hub 预构建镜像）
 #
 # 用法：
 #   1. mkdir holly-music && cd holly-music
@@ -9,8 +9,8 @@
 #   3. 创建 .env（最小配置只需 AUTH_SECRET，生成：openssl rand -hex 32）
 #   4. docker compose up -d，访问 http://localhost:3099
 #
-# 想固定版本？把 image 的 :latest 换成具体 tag（如 :v0.20.1），
-# 见 https://github.com/tiejiang29/HollyMusic/pkgs/container/hollymusic
+# 想固定版本？把 image 的 :latest 换成具体 tag（如 :1.0.0），
+# 可用 tag 见 https://hub.docker.com/r/tiejiang29/hollymusic/tags
 #
 # 注：仓库根目录的 docker-compose.yml 是本地源码构建版（build: .），
 #     适合开发调试；本文件面向直接使用镜像部署的用户。
