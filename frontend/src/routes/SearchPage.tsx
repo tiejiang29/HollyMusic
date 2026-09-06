@@ -13,19 +13,20 @@ interface SuggestItem {
   type: 'song' | 'singer' | 'album'
 }
 
-const SOURCES: { value: SourceType | 'all'; label: string }[] = [
+const SOURCES: { value: SourceType | 'all' | 'local'; label: string }[] = [
   { value: 'all', label: '全部' },
   { value: 'tx', label: 'QQ' },
   { value: 'wy', label: '网易' },
   { value: 'kw', label: '酷我' },
   { value: 'kg', label: '酷狗' },
   { value: 'mg', label: '咪咕' },
+  { value: 'local', label: '本地' },
 ]
 
 export function SearchPage() {
   // keyword/source/results/loading 全部来自 search-store（外部状态）：
   // 离开搜索页再回来时输入框与结果都保留。
-  const { results, loading, error, keyword, lastKeyword, source, setKeyword, setSource, run } = useSearch()
+  const { results, localList, loading, error, keyword, lastKeyword, source, setKeyword, setSource, run } = useSearch()
   const inputRef = useRef<HTMLInputElement>(null)
 
   const submit = (e: React.FormEvent) => {
@@ -34,7 +35,7 @@ export function SearchPage() {
   }
 
   // 与 lx-music 搜索页一致：已有搜索词时切换源自动重搜，否则仅切换选中态
-  const handleSourceChange = (next: SourceType | 'all') => {
+  const handleSourceChange = (next: SourceType | 'all' | 'local') => {
     setSource(next)
     if (keyword.trim()) run(keyword, next)
   }
@@ -224,12 +225,25 @@ export function SearchPage() {
         ))}
       </div>
 
+      {/* 本地匹配区：非"本地"源搜索时，服务端附带的前几条音乐库命中置顶展示 */}
+      {!loading && !error && source !== 'local' && localList.length > 0 && (
+        <div className="mb-4">
+          <div className="mb-1.5 text-xs font-medium text-muted-foreground">
+            本地匹配 <span className="text-primary">（音乐库 {localList.length} 首，播放不耗流量）</span>
+          </div>
+          <SongList tracks={localList.map(s => toTrack({ uid: s.uid, musicInfo: s }))} />
+        </div>
+      )}
+
       {loading ? (
         <LoadingSkeleton />
       ) : error ? (
         <EmptyState icon={CloudOff} title="搜索服务不可用" description={error} />
       ) : visibleTracks.length > 0 ? (
         <>
+          {source !== 'local' && visibleTracks.length > 0 && (
+            <div className="mb-1.5 text-xs font-medium text-muted-foreground">{source === 'all' ? '平台搜索结果' : `${SOURCES.find(s => s.value === source)?.label || ''}搜索结果`}</div>
+          )}
           <SongList tracks={visibleTracks} />
           {remaining > 0 && (
             <button

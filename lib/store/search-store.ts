@@ -17,21 +17,23 @@ interface SearchStore {
   /** 当前输入框文本 */
   keyword: string
   /** 当前选择的音源 */
-  source: SourceType | 'all'
+  source: SourceType | 'all' | 'local'
   /** 最近一次成功搜索使用的关键词（用于区分"未搜索"与"搜索无结果"） */
   lastKeyword: string
   /** 最近一次搜索使用的音源 */
-  lastSource: SourceType | 'all'
+  lastSource: SourceType | 'all' | 'local'
   /** 搜索结果 */
   results: Song[]
+  /** 平台搜索附带的本地音乐库匹配（顶部"本地匹配"区；source=local 时为空） */
+  localList: Song[]
   loading: boolean
   error: string | null
   /** 请求序号，自增用于丢弃过期请求 */
   reqId: number
 
   setKeyword: (kw: string) => void
-  setSource: (s: SourceType | 'all') => void
-  run: (kw: string, source: SourceType | 'all') => Promise<void>
+  setSource: (s: SourceType | 'all' | 'local') => void
+  run: (kw: string, source: SourceType | 'all' | 'local') => Promise<void>
   reset: () => void
 }
 
@@ -41,6 +43,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   lastKeyword: '',
   lastSource: 'all',
   results: [],
+  localList: [],
   loading: false,
   error: null,
   reqId: 0,
@@ -52,7 +55,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   run: async (kw, source) => {
     const trimmed = kw.trim()
     if (!trimmed) {
-      set({ results: [], loading: false, error: null, lastKeyword: '', lastSource: source })
+      set({ results: [], localList: [], loading: false, error: null, lastKeyword: '', lastSource: source })
       return
     }
     const reqId = get().reqId + 1
@@ -65,6 +68,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       if (reqId !== get().reqId) return
       set({
         results: r.list,
+        localList: r.localList || [],
         loading: false,
         error: null,
         lastKeyword: trimmed,
@@ -80,6 +84,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
         : raw
       set({
         results: [],
+        localList: [],
         loading: false,
         error: friendly,
         lastKeyword: trimmed,
@@ -95,6 +100,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       lastKeyword: '',
       lastSource: 'all',
       results: [],
+      localList: [],
       loading: false,
       error: null,
       reqId: 0,

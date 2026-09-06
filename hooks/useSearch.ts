@@ -12,6 +12,7 @@ import type { SourceType } from '@/lib/types/music'
  */
 export function useSearch() {
   const results = useSearchStore(s => s.results)
+  const localList = useSearchStore(s => s.localList)
   const loading = useSearchStore(s => s.loading)
   const error = useSearchStore(s => s.error)
   const keyword = useSearchStore(s => s.keyword)
@@ -22,9 +23,9 @@ export function useSearch() {
   const runStore = useSearchStore(s => s.run)
 
   const run = useCallback(
-    (kw: string, src: SourceType | 'all') => runStore(kw, src),
+    (kw: string, src: SourceType | 'all' | 'local') => runStore(kw, src),
     [runStore]
   )
 
-  return { results, loading, error, keyword, lastKeyword, source, setKeyword, setSource, run }
+  return { results, localList, loading, error, keyword, lastKeyword, source, setKeyword, setSource, run }
 }
