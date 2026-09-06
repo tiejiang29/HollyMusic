@@ -27,29 +27,52 @@ Next.js 16 后端（App Router, standalone 输出，需 --webpack 因 Turbopack 
 3. 大功能先讨论再动手（"先讨论"是高频指令）
 4. GitHub 有 release bot 会提交 CHANGELOG，push 被 reject 时先 `git fetch && git rebase origin/main`
 
-## Android 原生客户端计划（进行中）
+## Android 原生客户端（一期 MVP 已跑通，待真机验收）
 
 用户决定：**Kotlin + Jetpack Compose + Material 3 原生开发，不用 WebView**（嫌 Web UI 上安卓难看）。
 
-### UI 设计阶段（2026-09-06 完成 v3，待用户确认）
+### MVP 状态（2026-09-06 模拟器全链路验证通过 ✅）
 
-- **UI 参照 QQ 音乐 11.0**（uisdc.com/qq-music-2 官方改版文章 + 用户提供的两张 QQ 音乐真实截图）
-- **v3 信息架构（用户指定）**：底部只留「首页/我的」双 tab；首页顶部横滑切换「推荐/音乐库/排行榜/收藏」+ 搜索框；「我的」页 = 用户卡+四入口+最近播放横滑卡+自建/收藏歌单，**设置移到右上角齿轮**；搜索为覆盖式二级页
-- 设计语言：浅色通透 + 荧光绿渐变 #55E6A4→#1FC774 + 轻拟物 + 播放页封面取色魔法渐变（迷你条也随歌取色）
-- 产物：`design/UI-DESIGN.md`（v3 规范）+ `design/prototype/index.html`（原型，单文件双击即看；顶部按钮可切 10 个视图）
-- 已浏览器逐屏截图验证渲染
-- **尚未开始写 Android 工程代码**（用户要求先确认 UI 再动骨架，且"一页一页改"）；android/ 目录还不存在
-- 本地预览：双击 design/prototype/index.html；或 `python -m http.server 8931 --directory design/prototype` → http://localhost:8931/index.html
+**工程**：`D:\dev\HollyMusic\android\`（包名 com.tiejiang.hollymusic，AGP 8.5.2 + Kotlin 2.0.21 + Compose BOM 2024.09 + Media3 1.4.1）
+- 构建：`cd android && gradle assembleDebug`（JAVA_HOME=jdk-17、gradle=D:\dev\gradle-8.9\bin；wrapper 已生成，distributionUrl 指腾讯镜像——services.gradle.org 直连校验会失败）
+- APK：`android/app/build/outputs/apk/debug/app-debug.apk`（约 22MB）
 
-- 播放内核：Media3/ExoPlayer + MediaSessionService（锁屏/通知栏/蓝牙线控/音频焦点全原生）
-- 服务端唯一计划改动：登录接口加发 Bearer token（AUTH_SECRET 签发），中间件兼容 Cookie+Bearer；ExoPlayer 用 header
-- 一期 MVP：服务器配置+登录 → 搜索（含联想）→ 播放页 → 锁屏通知 → 滚动歌词 → 排行榜 → 音乐库 → 收藏 → 单曲下载到 Music/HollyMusic/
-- 二期：歌单管理、批量下载、历史、桌面小组件
-- 里程碑策略：先出最小闭环（骨架+登录+搜索+播放+锁屏通知）真机验证手感，再铺开
-- 包名 com.tiejiang.hollymusic，应用名 HollyMusic
-- 项目放 `D:\dev\HollyMusic\android\`，CI 加 Android 构建出 APK
-- 迭代方式：android-emulator MCP（android_preflight → create_app/build_and_run/screenshot/ui_tap）模拟器自测 → 用户真机验收
-- 服务端 API 关键点：**完整接口文档见 `docs/ANDROID_API.md`**（v1.0.3 基线：搜索/联想/音频流/歌词/广场+标签+榜单/收藏/歌单/音乐库/下载，含参数与响应结构）
+**已验证闭环**（模拟器 medium_phone + 本地 next start :3000，模拟器内用 http://10.0.2.2:3000 访问宿主）：
+1. 登录（服务器/账号/密码，✕ 清空钮）→ Cookie 会话持久化（DataStore），重启免登录 ✅
+2. 首页四频道：推荐（toplists common 卡+playlists 推荐歌单横滑）/ 音乐库（三色快捷卡+收藏）/ 排行榜（toplists full）/ 收藏 ✅
+3. 搜索：5 音源 chips（kw/tx/wy/kg/mg）+ 结果（"jay"→酷我 3294 条真实结果）+ 联想 ✅
+4. 播放：music-url → ExoPlayer（OkHttp DataSource 共享 Cookie）→ AudioTrack 44.1kHz 真实出声 ✅
+5. 迷你播放条随播联动 → 播放页（Palette 封面取色魔法渐变+呼吸封面+进度+左右滑歌词 LRC 滚动）✅
+6. MediaSessionService 前台服务已注册（通知栏/锁屏控制待真机验）
+
+**关键坑（已修，新会话别再踩）**：
+- Compose `padding()` 不允许负值 → 色晕用 `offset()`
+- ApiEnvelope.data 必须声明 `JsonElement?`（服务器 data 是对象，声明 String? 必 PARSE 失败）
+- adb input text 的 `!` 会变形——测试密码避开特殊字符；DEL 连发清空不可靠，输入框一律带 ✕ 清空钮
+- uiautomator dump 会给过期快照，验证以截图/服务器日志/dumpsys audio 为准
+
+**临时措施**：端到端测试在本地库插过 emutest 用户（已删）；admin 密码与 config/users.json 不一致（用户改过），真机验收用真实账号
+
+### UI 设计（已定稿 v3.1）
+
+- **UI 参照 QQ 音乐 11.0**（uisdc.com/qq-music-2 + 用户提供的两张 QQ 音乐真实截图）
+- **v3 信息架构（用户指定）**：底部只留「首页/我的」双 tab；首页顶部横滑切换「推荐/音乐库/排行榜/收藏」+ 搜索框；「我的」= 用户卡（右上角齿轮进设置）；搜索为覆盖式二级页
+- 设计语言：浅色通透 + 荧光绿渐变 #55E6A4→#1FC774 + 轻拟物 + 播放页/迷你条封面取色魔法渐变（androidx.palette 实现）
+- 产物：`design/UI-DESIGN.md`（v3 规范）+ `design/prototype/index.html`（浏览器原型，双击即看）
+
+### 客户端对接口径（与 docs/ANDROID_API.md 一致）
+
+- 统一响应 `{success, data|error:{code,message}}`；登录 `POST /api/auth/login` → Set-Cookie holly_user/holly_sig（HttpOnly，30天）
+- 搜索 `GET /api/search?source=&keyword=&page=&limit=`（source ∈ kw/kg/tx/wy/mg）；联想 `GET /api/search/suggest?keyword=`
+- 播放 `POST /api/music-url {musicInfo, quality}` → `data.url`（相对路径拼 baseUrl）；歌词 `GET /api/lyrics?id=`（LRC 原文）
+- 封面 `GET /api/cover/{uid}`（公开）；榜单 `GET /api/discover/toplists?scope=full`、详情 `/toplists/{id}?source=`
+- 歌单 `GET /api/discover/playlists?limit=`、详情同款；收藏 `GET/POST/DELETE /api/favorites`
+- 音质回退在服务端完成（quality 传首选档即可）
+
+### 二期待做
+
+歌单管理、下载到 Music/HollyMusic/、播放队列 Sheet、播放模式（顺序/单曲/随机）、深色主题、桌面小组件、CI 出 APK、真机验收后适配国产 ROM 后台策略
+- 服务端可选改动：登录接口加发 Bearer token（当前 Cookie 方案已可用，非阻塞）
 
 ## Web 端近期完成（v1.0.2 已含）
 

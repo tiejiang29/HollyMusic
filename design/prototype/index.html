@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HollyMusic Android UI 原型 v3 · QQ音乐 11.0 风格</title>
+<style>
+:root{
+  --green:#1FC774;
+  --green-lt:#55E6A4;
+  --grad:linear-gradient(135deg,#55E6A4,#1FC774);
+  --bg:#F4F6F8;
+  --card:#FFFFFF;
+  --txt:#1B1F28;
+  --txt2:#878D9C;
+  --txt3:#BAC0CB;
+  --shadow:0 4px 18px rgba(27,42,60,.07);
+  --shadow-sm:0 2px 10px rgba(27,42,60,.05);
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-font-smoothing:antialiased}
+body{
+  background:#E9EDF1;color:var(--txt);
+  font-family:"MiSans","HarmonyOS Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  display:flex;flex-direction:column;align-items:center;gap:20px;padding:24px 16px 60px;
+}
+h1{font-size:15px;font-weight:600;color:#5A6474}
+h1 b{color:var(--green)}
+
+/* ── 顶部切换器 ── */
+.switcher{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:680px}
+.switcher button{
+  background:#fff;color:#5A6474;border:none;padding:8px 18px;border-radius:99px;
+  font-size:13px;cursor:pointer;transition:.15s;box-shadow:var(--shadow-sm);
+}
+.switcher button.on{background:var(--grad);color:#fff;font-weight:600;box-shadow:0 4px 14px rgba(31,199,116,.35)}
+
+/* ── 手机壳 ── */
+.phone{
+  width:400px;height:860px;background:var(--bg);border-radius:44px;
+  border:9px solid #17171a;box-shadow:0 30px 80px rgba(0,0,0,.35);
+  overflow:hidden;position:relative;flex:none;
+}
+.statusbar{
+  height:34px;display:flex;justify-content:space-between;align-items:center;
+  padding:0 26px;font-size:12px;color:#3A4150;flex:none;position:relative;z-index:30;
+}
+.statusbar .cam{
+  position:absolute;left:50%;top:9px;transform:translateX(-50%);
+  width:12px;height:12px;border-radius:50%;background:#10131a;border:2px solid #2a2f3a;
+}
+.gesturebar{
+  position:absolute;bottom:7px;left:50%;transform:translateX(-50%);
+  width:110px;height:4px;border-radius:4px;background:rgba(20,30,45,.22);z-index:40;
+}
+.screen{display:none;position:absolute;top:34px;left:0;right:0;bottom:0;flex-direction:column;overflow:hidden}
+.screen.active{display:flex}
+
+/* ── 通用 ── */
+.cover{border-radius:12px;flex:none;display:flex;align-items:center;justify-content:center;
+  font-weight:700;color:#fff;box-shadow:0 3px 10px rgba(27,42,60,.14)}
+.c1{background:linear-gradient(135deg,#55E6A4,#12996A)}
+.c2{background:linear-gradient(135deg,#7FB2FF,#2E62D8)}
+.c3{background:linear-gradient(135deg,#FF8E8E,#D8384E)}
+.c4{background:linear-gradient(135deg,#D9A0F0,#8A3BD0)}
+.c5{background:linear-gradient(135deg,#FFC96B,#DE8A1F)}
+.c6{background:linear-gradient(135deg,#6BD8F0,#1F86C4)}
+.c7{background:linear-gradient(135deg,#A6AEBE,#5B6474)}
+.c8{background:linear-gradient(135deg,#F09FB2,#C4506E)}
+
+.songrow{display:flex;align-items:center;gap:12px;padding:10px 18px;cursor:pointer}
+.songrow:active{background:rgba(27,42,60,.04)}
+.songrow .cover{width:48px;height:48px;font-size:15px;position:relative}
+.songrow .meta{flex:1;min-width:0}
+.songrow .t{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center}
+.songrow .s{font-size:12px;color:var(--txt2);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.songrow .t.playing{color:var(--green)}
+.songrow .more{color:var(--txt3);padding:6px;font-size:18px;letter-spacing:1px}
+.tag{position:absolute;top:-5px;left:-7px;font-size:8px;padding:1px 5px;border-radius:5px;
+  background:var(--grad);color:#fff;font-weight:700;line-height:1.3;box-shadow:0 2px 6px rgba(31,199,116,.4)}
+.tag.trial{background:#C9CFD9;color:#fff;box-shadow:none}
+.badge{font-size:9px;color:#A0A6B3;background:#F1F3F6;border-radius:5px;padding:2px 5px;margin-left:7px;flex:none;font-weight:400}
+
+.wave{display:inline-flex;align-items:flex-end;gap:2px;height:14px;margin-left:6px}
+.wave i{width:3px;background:var(--green);border-radius:2px;animation:wv 1s ease-in-out infinite}
+.wave i:nth-child(1){height:6px;animation-delay:0s}
+.wave i:nth-child(2){height:13px;animation-delay:.25s}
+.wave i:nth-child(3){height:8px;animation-delay:.5s}
+@keyframes wv{0%,100%{transform:scaleY(.5)}50%{transform:scaleY(1)}}
+
+/* ── 底部导航（首页/我的 双 tab） ── */
+.bottombar{
+  position:absolute;left:0;right:0;bottom:0;z-index:35;
+  background:linear-gradient(to top,#F4F6F8 70%,rgba(244,246,248,0));
+  padding:0 0 22px;
+}
+.mini{
+  margin:0 12px 10px;border-radius:99px;
+  display:flex;align-items:center;gap:10px;padding:7px 10px;cursor:pointer;
+  position:relative;overflow:hidden;
+  background:linear-gradient(135deg,#B9EDD4,#8FD8B8);
+  box-shadow:0 6px 22px rgba(31,163,107,.22);
+}
+.mini .cover{width:42px;height:42px;font-size:12px;border-radius:50%;animation:spin 8s linear infinite;
+  box-shadow:0 0 0 3px rgba(255,255,255,.85),0 2px 8px rgba(0,0,0,.18);margin-left:-4px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.mini .m{flex:1;min-width:0}
+.mini .mt{font-size:13px;font-weight:700;color:#153B2A;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mini .mt .vip{font-size:8.5px;color:#8A6A1F;background:linear-gradient(135deg,#FFE9AE,#F5C754);border-radius:4px;padding:1px 4px;margin-left:5px;font-weight:700;vertical-align:1px}
+.mini .ms{font-size:11px;color:rgba(21,59,42,.6);margin-top:2px}
+.mini .btn{width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,.75);
+  display:flex;align-items:center;justify-content:center;color:#153B2A;flex:none}
+.tabs{display:flex;background:#fff;border-radius:26px 26px 0 0;box-shadow:0 -6px 24px rgba(27,42,60,.08);padding:8px 0 2px}
+.tab{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+  color:#A9AFC0;font-size:11px;cursor:pointer}
+.tab svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.7;
+  stroke-linecap:round;stroke-linejoin:round}
+.tab .ic-fill{display:none}
+.tab.on{color:#171C26;font-weight:600}
+.tab.on svg{stroke:#171C26}
+.tab.on .ic-line{display:none}
+.tab.on .ic-fill{display:block}
+.content{flex:1;overflow-y:auto;scrollbar-width:none}
+.content::-webkit-scrollbar{display:none}
+
+/* ── 首页顶部子 tab ── */
+.hometabs{display:flex;gap:26px;padding:12px 20px 0;align-items:baseline}
+.htab{font-size:17px;color:#8A919F;cursor:pointer;position:relative;padding-bottom:9px;font-weight:500}
+.htab.on{color:#171C26;font-weight:800;font-size:19px}
+.htab.on::after{content:"";position:absolute;left:50%;transform:translateX(-50%);bottom:2px;
+  width:20px;height:3.5px;border-radius:3px;background:var(--grad)}
+.htab .cnt{font-size:10px;color:var(--txt3);margin-left:2px;font-weight:400}
+.hsearch{display:flex;align-items:center;gap:10px;padding:6px 18px 12px}
+.hbox{flex:1;display:flex;align-items:center;gap:9px;background:#fff;
+  border-radius:99px;padding:10px 15px;box-shadow:var(--shadow-sm);cursor:pointer}
+.hbox .orb{width:20px;height:20px;border-radius:50%;flex:none;
+  background:conic-gradient(from 210deg,#55E6A4,#3D74E0,#EE9422,#55E6A4);
+  box-shadow:inset 0 0 0 3.5px #fff}
+.hbox .ph{font-size:13.5px;color:#A9AFC0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hbox .ph b{color:#3A4150;font-weight:500}
+.hbox .ph .hot{color:#F0654A;font-size:11px}
+.hbtn{width:40px;height:40px;border-radius:50%;background:var(--grad);flex:none;
+  display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(31,199,116,.4);cursor:pointer}
+.hbtn svg{width:19px;height:19px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round}
+.hpanel{display:none}
+.hpanel.on{display:block}
+
+/* ── 推荐 tab ── */
+.hi{display:flex;align-items:center;gap:11px;padding:4px 18px 12px}
+.hi .ava{width:42px;height:42px;border-radius:50%;padding:2.5px;background:conic-gradient(from 40deg,#F5C754,#F09FB2,#55E6A4,#3D74E0,#F5C754)}
+.hi .ava .in{width:100%;height:100%;border-radius:50%;background:linear-gradient(135deg,#FFC96B,#DE8A1F);
+  display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:16px;border:2px solid #fff}
+.hi .hn{font-size:16px;font-weight:800}
+.hi .hs{font-size:11px;color:var(--txt2);margin-top:2px;display:flex;align-items:center;gap:5px}
+.hi .hs .dot{width:6px;height:6px;border-radius:50%;background:var(--green)}
+.hi .right{margin-left:auto;font-size:12px;color:var(--txt2)}
+.reccards{display:flex;gap:13px;padding:2px 18px 16px;overflow-x:auto;scrollbar-width:none}
+.reccards::-webkit-scrollbar{display:none}
+.rcc{flex:none;width:200px;border-radius:20px;overflow:hidden;cursor:pointer;position:relative;
+  box-shadow:var(--shadow);background:#fff}
+.rcc .rc-top{height:150px;position:relative;padding:16px;display:flex;flex-direction:column}
+.rcc.g1 .rc-top{background:linear-gradient(135deg,#79D8FF,#3D74E0)}
+.rcc.g2 .rc-top{background:linear-gradient(135deg,#FFC96B,#EE6422)}
+.rcc .rc-k{font-size:17px;font-weight:800;color:#fff}
+.rcc .rc-d{font-size:11px;color:rgba(255,255,255,.85);margin-top:6px;line-height:1.5}
+.rcc .rc-play{width:42px;height:42px;border-radius:50%;background:var(--grad);margin-top:auto;
+  display:flex;align-items:center;justify-content:center;box-shadow:0 6px 14px rgba(0,0,0,.2)}
+.rcc .rc-play svg{width:15px;height:15px;fill:#fff;margin-left:2px}
+.rcc .rc-art{position:absolute;right:14px;top:26px;width:96px;height:96px;border-radius:14px;
+  box-shadow:0 10px 22px rgba(0,0,0,.28);transform:rotate(4deg);
+  display:flex;align-items:center;justify-content:center;font-size:30px;color:rgba(255,255,255,.9);font-weight:800}
+.rcc .rc-b{padding:11px 14px 13px}
+.rcc .rc-t{font-size:13.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rcc .rc-s{font-size:11px;color:var(--txt2);margin-top:3px}
+.sechead{display:flex;align-items:center;padding:8px 18px 2px}
+.sechead .st{font-size:17px;font-weight:800}
+.sechead .playall{margin-left:10px;width:34px;height:34px;border-radius:50%;background:#fff;
+  display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow-sm);cursor:pointer}
+.sechead .playall svg{width:13px;height:13px;fill:#171C26;margin-left:1px}
+.sechead .x{margin-left:auto;color:#C9CFD9;font-size:15px}
+.sechead .more2{margin-left:auto;color:#C9CFD9;font-size:16px;cursor:pointer}
+.lovewrap{margin-left:auto;display:flex;align-items:center;gap:3px;color:#A9AFC0;font-size:10.5px;flex:none}
+.lovewrap svg{width:14px;height:14px;fill:none;stroke:#A9AFC0;stroke-width:1.8}
+
+/* ── 音乐库 tab ── */
+.srv{
+  margin:4px 18px 0;display:flex;align-items:center;gap:8px;font-size:12px;color:#3E4554;
+  background:#fff;border-radius:99px;padding:8px 15px;cursor:pointer;box-shadow:var(--shadow-sm);
+}
+.srv .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px rgba(31,199,116,.8)}
+.quick{display:flex;gap:11px;padding:12px 18px 4px}
+.qcard{flex:1;border-radius:20px;padding:15px 0 12px;cursor:pointer;position:relative;overflow:hidden;
+  display:flex;flex-direction:column;align-items:center;gap:7px;color:#fff}
+.qcard.g{background:var(--grad);box-shadow:0 8px 20px rgba(31,199,116,.28),inset 0 -3px 8px rgba(0,70,40,.12),inset 0 3px 8px rgba(255,255,255,.35)}
+.qcard.b{background:linear-gradient(135deg,#8AB4FF,#3D74E0);box-shadow:0 8px 20px rgba(61,116,224,.28),inset 0 -3px 8px rgba(0,30,90,.12),inset 0 3px 8px rgba(255,255,255,.35)}
+.qcard.o{background:linear-gradient(135deg,#FFC96B,#EE9422);box-shadow:0 8px 20px rgba(238,148,34,.28),inset 0 -3px 8px rgba(120,60,0,.12),inset 0 3px 8px rgba(255,255,255,.35)}
+.qcard svg{width:24px;height:24px;fill:none;stroke:#fff;stroke-width:1.9;stroke-linecap:round}
+.qcard .n{font-size:12.5px;font-weight:600}
+.qcard .c{font-size:10px;color:rgba(255,255,255,.75)}
+.qcard::before{content:"";position:absolute;top:-30px;right:-30px;width:80px;height:80px;border-radius:50%;
+  background:rgba(255,255,255,.14)}
+.seclabel{font-size:13.5px;font-weight:700;color:#2A3040;padding:14px 18px 4px;display:flex;align-items:center}
+.seclabel .sub{font-size:11px;color:var(--txt3);font-weight:400;margin-left:8px}
+.seclabel .all{margin-left:auto;font-size:11.5px;color:var(--txt2);font-weight:400;cursor:pointer}
+
+/* ── 排行榜 tab ── */
+.chips{display:flex;gap:8px;padding:6px 18px 12px;overflow-x:auto;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;font-size:12.5px;color:#5A6474;background:#fff;
+  border-radius:99px;padding:6px 16px;cursor:pointer;box-shadow:var(--shadow-sm)}
+.chip.on{color:#fff;background:var(--grad);font-weight:600;box-shadow:0 4px 12px rgba(31,199,116,.35)}
+.topgrid{display:grid;grid-template-columns:1fr 1fr;gap:13px;padding:2px 18px 24px}
+.topcard{background:#fff;border-radius:20px;padding:17px 15px 14px;cursor:pointer;position:relative;
+  box-shadow:var(--shadow)}
+.topcard .tn{font-size:15px;font-weight:700;margin-bottom:10px}
+.topcard .p{font-size:11.5px;color:#5A6474;line-height:2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topcard .p i{font-style:normal;color:var(--txt3);margin-right:8px;font-size:10.5px}
+.topcard .p i.top{color:var(--green);font-weight:800}
+.topcard .play{position:absolute;right:13px;top:15px;width:32px;height:32px;border-radius:50%;
+  background:var(--grad);display:flex;align-items:center;justify-content:center;
+  box-shadow:0 4px 12px rgba(31,199,116,.4)}
+.topcard .play svg{width:13px;height:13px;fill:#fff}
+.topcard.hero{grid-column:1/3;display:flex;flex-direction:column;
+  background:linear-gradient(135deg,#20303F,#3A5468);color:#fff;box-shadow:0 10px 26px rgba(32,48,63,.35)}
+.topcard.hero .tn{font-size:17px}
+.topcard.hero .p{color:rgba(255,255,255,.75)}
+.topcard.hero .p i.top{color:#55E6A4}
+
+/* ── 我的页 ── */
+.myhead{display:flex;align-items:center;justify-content:space-between;padding:14px 18px 8px}
+.myhead h2{font-size:25px;font-weight:800;color:#171C26;position:relative;padding-bottom:4px}
+.myhead h2::after{content:"";position:absolute;left:1px;bottom:-2px;width:34px;height:4px;border-radius:3px;background:var(--grad)}
+.myhead .acts{display:flex;gap:10px}
+.iconbtn{width:40px;height:40px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+  color:#4A5263;cursor:pointer;background:#fff;box-shadow:var(--shadow-sm)}
+.iconbtn:active{background:#EDF0F4}
+.iconbtn svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.mysearch{padding:4px 18px 14px}
+.usercard{margin:0 18px;background:#fff;border-radius:22px;padding:18px 16px 16px;
+  box-shadow:var(--shadow)}
+.uc-top{display:flex;align-items:center;gap:14px}
+.uc-ava{width:56px;height:56px;border-radius:50%;padding:3px;
+  background:conic-gradient(from 40deg,#F5C754,#F09FB2,#55E6A4,#3D74E0,#F5C754);flex:none}
+.uc-ava .in{width:100%;height:100%;border-radius:50%;background:linear-gradient(135deg,#FFC96B,#DE8A1F);
+  display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:21px;border:2.5px solid #fff}
+.uc-name{flex:1}
+.uc-n{font-size:19px;font-weight:800;display:flex;align-items:center;gap:8px}
+.uc-n .out{color:#C9CFD9;font-size:14px}
+.uc-s{font-size:11.5px;color:var(--txt2);margin-top:5px;display:flex;align-items:center;gap:5px}
+.uc-s .dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 6px rgba(31,199,116,.7)}
+.uc-num{text-align:center;flex:none}
+.uc-num b{font-size:22px;font-weight:800;display:block}
+.uc-num span{font-size:10.5px;color:var(--txt2)}
+.uc-acts{display:flex;margin-top:16px;padding-top:14px;border-top:1px solid #F2F4F7}
+.uc-a{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;cursor:pointer}
+.uc-a svg{width:22px;height:22px;fill:none;stroke:#3A4150;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.uc-a .an{font-size:12px;color:#2A3040;font-weight:500}
+.quick2{display:flex;padding:18px 10px 6px}
+.q2{flex:1;display:flex;flex-direction:column;align-items:center;gap:8px;cursor:pointer}
+.q2 svg{width:30px;height:30px;fill:#262C38}
+.q2 .qn{font-size:12.5px;color:#2A3040;font-weight:500}
+.q2 .qc{font-size:10.5px;color:#A9AFC0;margin-top:-4px}
+.rp{display:flex;gap:12px;padding:8px 18px 14px;overflow-x:auto;scrollbar-width:none}
+.rp::-webkit-scrollbar{display:none}
+.rpc{flex:none;width:118px;cursor:pointer}
+.rpc .cover{width:118px;height:118px;border-radius:16px;font-size:26px;position:relative}
+.rpc .corner{position:absolute;left:8px;bottom:8px;width:26px;height:26px;border-radius:50%;
+  background:rgba(255,255,255,.85);display:flex;align-items:center;justify-content:center}
+.rpc .corner svg{width:10px;height:10px;fill:#171C26;margin-left:1px}
+.rpc .rtag{position:absolute;left:8px;top:8px;font-size:9px;color:#fff;background:rgba(0,0,0,.32);
+  border-radius:5px;padding:2px 6px;backdrop-filter:blur(4px)}
+.rpc .rn{font-size:12px;font-weight:600;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pltabs{display:flex;align-items:center;padding:10px 18px 4px}
+.plt{font-size:15px;font-weight:800;color:#171C26;position:relative;padding-bottom:6px}
+.plt::after{content:"";position:absolute;left:50%;transform:translateX(-50%);bottom:0;
+  width:18px;height:3px;border-radius:3px;background:var(--grad)}
+.plt.off{color:#A9AFC0;font-weight:500}
+.plt.off::after{display:none}
+.plt .cnt{font-size:10px;color:#A9AFC0;margin-left:2px;font-weight:400}
+.pltabs .pacts{margin-left:auto;display:flex;gap:16px;color:#8A919F;font-size:17px;align-items:center}
+.plist{padding:4px 0 20px}
+.plrow{display:flex;align-items:center;gap:13px;padding:9px 18px;cursor:pointer}
+.plrow:active{background:rgba(27,42,60,.04)}
+.plrow .cover{width:58px;height:58px;border-radius:12px;font-size:16px;position:relative}
+.plrow .corner{position:absolute;left:5px;bottom:5px;width:20px;height:20px;border-radius:50%;
+  background:rgba(255,255,255,.85);display:flex;align-items:center;justify-content:center}
+.plrow .corner svg{width:8px;height:8px;fill:#171C26;margin-left:1px}
+.plrow .pt{font-size:14.5px;font-weight:700}
+.plrow .ps{font-size:11.5px;color:var(--txt2);margin-top:4px}
+
+/* ── 设置页（右上角进入） ── */
+.subhead{display:flex;align-items:center;gap:12px;padding:14px 18px 8px}
+.subhead h2{font-size:22px;font-weight:800}
+.backbtn{width:38px;height:38px;border-radius:50%;background:#fff;box-shadow:var(--shadow-sm);
+  display:flex;align-items:center;justify-content:center;cursor:pointer}
+.backbtn svg{width:18px;height:18px;fill:none;stroke:#171C26;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.grp{margin:14px 18px 0;background:#fff;border-radius:22px;box-shadow:var(--shadow-sm);overflow:hidden}
+.row{display:flex;align-items:center;gap:12px;padding:14px 16px;cursor:pointer}
+.row:active{background:#F2F4F7}
+.row+.row{border-top:1px solid #F2F4F7}
+.row .ri{width:36px;height:36px;border-radius:12px;background:linear-gradient(135deg,rgba(85,230,164,.22),rgba(31,199,116,.14));
+  display:flex;align-items:center;justify-content:center;flex:none}
+.row .ri svg{width:19px;height:19px;stroke:var(--green);fill:none;stroke-width:1.9;stroke-linecap:round}
+.row .rt{flex:1;font-size:14.5px;font-weight:500;color:#252B38}
+.row .rv{font-size:12px;color:var(--txt3)}
+.row .arr{color:#C9CFD9;font-size:14px}
+.logout{margin:22px 18px;text-align:center;color:#E35D5D;font-size:14.5px;font-weight:600;padding:14px;
+  background:#fff;border-radius:22px;box-shadow:var(--shadow-sm);cursor:pointer}
+
+/* ── 搜索页 ── */
+.searchbar{display:flex;align-items:center;gap:12px;padding:10px 16px 10px}
+.sbox{flex:1;display:flex;align-items:center;gap:8px;background:#fff;
+  border-radius:99px;padding:11px 16px;box-shadow:var(--shadow-sm)}
+.sbox svg{width:17px;height:17px;stroke:var(--txt3);fill:none;stroke-width:2;stroke-linecap:round;flex:none}
+.sbox input{flex:1;background:none;border:none;outline:none;color:var(--txt);font-size:14px}
+.sbox input::placeholder{color:var(--txt3)}
+.sbox .x{color:var(--txt3);font-size:13px}
+.searchbar .go{font-size:14.5px;color:var(--green);font-weight:600;cursor:pointer}
+.rescount{font-size:11px;color:var(--txt3);padding:2px 20px 8px}
+
+/* ── 播放页 ── */
+.playerbg{position:absolute;inset:0;z-index:0;
+  background:
+   radial-gradient(90% 60% at 78% 12%,rgba(255,255,255,.20),transparent 60%),
+   radial-gradient(120% 80% at 18% 82%,rgba(10,40,28,.55),transparent 65%),
+   linear-gradient(168deg,#4FD694 0%,#1FA36B 38%,#14624A 68%,#0D3A2E 100%)}
+.playerbg.purple{background:
+   radial-gradient(90% 60% at 78% 12%,rgba(255,255,255,.18),transparent 60%),
+   radial-gradient(120% 80% at 18% 82%,rgba(30,12,50,.55),transparent 65%),
+   linear-gradient(168deg,#B678E8 0%,#7C3FC4 40%,#452475 70%,#241238 100%)}
+.player{flex:1;display:flex;flex-direction:column;padding:0 26px;position:relative;z-index:1}
+.phead{display:flex;align-items:center;justify-content:space-between;padding:4px 0 8px;position:relative}
+.phead .cc{flex:1;text-align:center}
+.phead .ct{font-size:16px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.phead .cs{font-size:12px;color:rgba(255,255,255,.72);margin-top:3px}
+.phead .iconbtn{color:#fff;background:rgba(255,255,255,.14);box-shadow:none;backdrop-filter:blur(6px)}
+.pbody{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:0}
+.bigcover{
+  width:258px;height:258px;border-radius:30px;position:relative;
+  box-shadow:0 30px 70px rgba(0,0,0,.45),inset 0 2px 10px rgba(255,255,255,.3),inset 0 -4px 12px rgba(0,0,0,.2);
+  animation:breath 4s ease-in-out infinite;
+  display:flex;align-items:center;justify-content:center;font-size:64px;font-weight:700;color:rgba(255,255,255,.95);
+}
+.bigcover::after{content:"";position:absolute;inset:0;border-radius:30px;
+  background:linear-gradient(160deg,rgba(255,255,255,.25),transparent 45%)}
+@keyframes breath{0%,100%{transform:scale(1)}50%{transform:scale(1.018)}}
+.dots{display:flex;gap:7px;margin:24px 0 6px}
+.dots i{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.35)}
+.dots i.on{background:#fff;width:16px;border-radius:3px;transition:.25s}
+.trial{font-size:11.5px;color:#FFE9C2;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);
+  border-radius:99px;padding:4px 14px;margin-top:8px;backdrop-filter:blur(6px)}
+.ctrlzone{width:100%;padding-bottom:30px}
+.prog{display:flex;align-items:center;gap:10px;margin-bottom:20px}
+.prog .tm{font-size:11px;color:rgba(255,255,255,.75);font-variant-numeric:tabular-nums;flex:none}
+.track{flex:1;height:3.5px;background:rgba(255,255,255,.22);border-radius:3px;position:relative}
+.track .fill{position:absolute;left:0;top:0;bottom:0;width:34%;background:linear-gradient(90deg,#8FF0C2,#fff);border-radius:3px}
+.track .knob{position:absolute;left:34%;top:50%;transform:translate(-50%,-50%);
+  width:12px;height:12px;border-radius:50%;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.4)}
+.ctrls{display:flex;align-items:center;justify-content:space-between}
+.ctrls .side{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  color:rgba(255,255,255,.85);cursor:pointer}
+.ctrls svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.ctrls .main{width:76px;height:76px;border-radius:50%;background:#fff;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 12px 34px rgba(0,0,0,.35),inset 0 -3px 8px rgba(0,0,0,.06),inset 0 3px 8px #fff;cursor:pointer}
+.ctrls .main svg{width:30px;height:30px;fill:#123B2B;stroke:none}
+.ctrls .skip svg{width:30px;height:30px;stroke:#fff;fill:#fff}
+
+/* ── 歌词页 ── */
+.lyrics{flex:1;display:flex;flex-direction:column;padding:0 26px;position:relative;z-index:1}
+.lyrlist{flex:1;overflow:hidden;position:relative;
+  -webkit-mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent);
+  mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent)}
+.lyr{ text-align:center;font-size:15px;color:#fff;line-height:1.6;padding:11px 4px;
+  opacity:.38;transition:.3s}
+.lyr.cur{font-size:18px;font-weight:800;color:#fff;opacity:1;transform:scale(1.05);
+  text-shadow:0 2px 18px rgba(255,255,255,.35)}
+.lyr.near{opacity:.72}
+.backcur{position:absolute;bottom:18px;left:50%;transform:translateX(-50%);
+  font-size:11px;color:rgba(255,255,255,.85);background:rgba(255,255,255,.16);
+  border:1px solid rgba(255,255,255,.22);border-radius:99px;padding:5px 14px;backdrop-filter:blur(6px)}
+</style>
+</head>
+<body>
+
+<h1>HollyMusic · Android 原生客户端 UI 原型 v3 <b>（QQ 音乐 11.0 · 双 tab：首页/我的 · 首页顶部四分区切换）</b></h1>
+<div class="switcher">
+  <button data-s="scr-login">登录</button>
+  <button data-s="scr-home" class="on">首页·推荐</button>
+  <button data-h="lib">首页·音乐库</button>
+  <button data-h="top">首页·排行榜</button>
+  <button data-h="fav">首页·收藏</button>
+  <button data-s="scr-mine">我的</button>
+  <button data-s="scr-settings">设置</button>
+  <button data-s="scr-search">搜索</button>
+  <button data-s="scr-play">播放页</button>
+  <button data-s="scr-lyric">歌词页</button>
+</div>
+
+<div class="phone">
+  <div class="statusbar"><span>23:45</span><span class="cam"></span><span>▾ 🔋 82%</span></div>
+
+  <!-- ═══ 登录 ═══ -->
+  <section class="screen" id="scr-login">
+    <div class="login" style="flex:1;display:flex;flex-direction:column;justify-content:center;padding:0 34px;position:relative">
+      <div style="position:absolute;top:-140px;right:-120px;width:340px;height:340px;border-radius:50%;
+        background:radial-gradient(circle at 35% 35%,rgba(85,230,164,.35),rgba(31,199,116,.06) 65%,transparent 70%)"></div>
+      <div style="position:absolute;bottom:-80px;left:-110px;width:280px;height:280px;border-radius:50%;
+        background:radial-gradient(circle at 60% 40%,rgba(127,178,255,.25),rgba(46,98,216,.05) 65%,transparent 70%)"></div>
+      <div style="display:flex;flex-direction:column;align-items:center;gap:16px;margin-bottom:48px;position:relative;z-index:1">
+        <div style="width:88px;height:88px;border-radius:28px;background:var(--grad);
+          display:flex;align-items:center;justify-content:center;
+          box-shadow:0 14px 36px rgba(31,199,116,.4),inset 0 -3px 8px rgba(0,60,35,.18),inset 0 3px 8px rgba(255,255,255,.5)">
+          <svg viewBox="0 0 24 24" width="46" height="46" fill="#fff"><path d="M9 18.5a2.5 2.5 0 1 1-2.5-2.5c.55 0 1.06.18 1.5.48V5.6l9.5-2.1v3.1l-7.5 1.7v8.7c0 .55.5.5.5.5v.9c0 .9-1.5 1.1-1.5 1.1z"/><circle cx="17" cy="16.5" r="2.5"/><path d="M17.5 14.2V8.3l3-.7v3.4l-3 .7z"/></svg>
+        </div>
+        <div style="font-size:23px;font-weight:800;letter-spacing:.5px;color:#1B2230">HollyMusic</div>
+      </div>
+      <div class="fld" style="margin-bottom:16px;position:relative;z-index:1"><label style="display:block;font-size:12px;color:var(--txt2);margin-bottom:7px;padding-left:6px;font-weight:500">服务器地址</label>
+        <input type="url" value="http://172.16.1.7:3099" style="width:100%;background:#fff;border:1.5px solid #E4E8EF;border-radius:16px;padding:14px 16px;font-size:14.5px;color:var(--txt);outline:none;box-shadow:var(--shadow-sm)"></div>
+      <div class="fld" style="margin-bottom:16px;position:relative;z-index:1"><label style="display:block;font-size:12px;color:var(--txt2);margin-bottom:7px;padding-left:6px;font-weight:500">用户名</label>
+        <input type="text" value="tiejiang" style="width:100%;background:#fff;border:1.5px solid #E4E8EF;border-radius:16px;padding:14px 16px;font-size:14.5px;color:var(--txt);outline:none;box-shadow:var(--shadow-sm)"></div>
+      <div class="fld" style="margin-bottom:16px;position:relative;z-index:1"><label style="display:block;font-size:12px;color:var(--txt2);margin-bottom:7px;padding-left:6px;font-weight:500">密码</label>
+        <input type="password" value="········" style="width:100%;background:#fff;border:1.5px solid #E4E8EF;border-radius:16px;padding:14px 16px;font-size:14.5px;color:var(--txt);outline:none;box-shadow:var(--shadow-sm)"></div>
+      <button class="loginbtn" style="width:100%;height:52px;border-radius:99px;background:var(--grad);color:#fff;
+        font-size:16px;font-weight:700;border:none;cursor:pointer;margin-top:12px;position:relative;z-index:1;
+        box-shadow:0 10px 26px rgba(31,199,116,.42),inset 0 -2px 6px rgba(0,70,40,.15),inset 0 2px 6px rgba(255,255,255,.35);letter-spacing:6px">登 录</button>
+      <div style="text-align:center;font-size:11.5px;color:var(--txt3);margin-top:26px;line-height:1.8;position:relative;z-index:1">首次使用请先在服务器管理后台开启账户<br>连接失败？检查服务器地址与端口是否可达</div>
+    </div>
+  </section>
+
+  <!-- ═══ 首页（顶部：推荐/音乐库/排行榜/收藏） ═══ -->
+  <section class="screen active" id="scr-home" data-tab="home">
+    <div class="hometabs">
+      <span class="htab on" onclick="homeTab('rec')">推荐</span>
+      <span class="htab" onclick="homeTab('lib')">音乐库</span>
+      <span class="htab" onclick="homeTab('top')">排行榜</span>
+      <span class="htab" onclick="homeTab('fav')">收藏<span class="cnt">32</span></span>
+    </div>
+    <div class="hsearch">
+      <div class="hbox" onclick="go('scr-search')">
+        <span class="orb"></span>
+        <span class="ph"><b>周杰伦</b> 连续在榜 20 天 <span class="hot">🔥</span></span>
+      </div>
+      <div class="hbtn" onclick="go('scr-search')"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg></div>
+    </div>
+
+    <div class="content">
+      <!-- ── 推荐 ── -->
+      <div class="hpanel on" id="hp-rec">
+        <div class="reccards">
+          <div class="rcc g1">
+            <div class="rc-top">
+              <div class="rc-k">飙升精选</div>
+              <div class="rc-d">本周涨势最猛的<br>20 首新歌</div>
+              <div class="rc-play"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div>
+              <div class="rc-art c4">飙</div>
+            </div>
+            <div class="rc-b"><div class="rc-t">向云端 - 小霞</div><div class="rc-s">飙升榜 · 每日更新</div></div>
+          </div>
+          <div class="rcc g2">
+            <div class="rc-top">
+              <div class="rc-k">热歌 30</div>
+              <div class="rc-d">全网最热<br>每日轮换</div>
+              <div class="rc-play"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div>
+              <div class="rc-art c1">热</div>
+            </div>
+            <div class="rc-b"><div class="rc-t">乌梅子酱 - 李荣浩</div><div class="rc-s">热歌榜 · 今日 30 首</div></div>
+          </div>
+          <div class="rcc g1">
+            <div class="rc-top">
+              <div class="rc-k">华语经典</div>
+              <div class="rc-d">时光淬炼的<br>金曲串烧</div>
+              <div class="rc-play"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div>
+              <div class="rc-art c3">经</div>
+            </div>
+            <div class="rc-b"><div class="rc-t">晴天 - 周杰伦</div><div class="rc-s">华语金曲榜</div></div>
+          </div>
+        </div>
+        <div class="sechead">
+          <span class="st">推荐歌单</span>
+          <span class="more2">›</span>
+        </div>
+        <div class="rp" style="padding-top:4px">
+          <div class="rpc">
+            <div class="cover c1" style="background:var(--grad);font-size:30px">30<div class="rtag">每日更新</div></div>
+            <div class="rn">每日 30 首</div>
+          </div>
+          <div class="rpc">
+            <div class="cover c2">华<div class="rtag">▶ 328万</div></div>
+            <div class="rn">华语经典必听</div>
+          </div>
+          <div class="rpc">
+            <div class="cover c4">雷<div class="rtag">▶ 96万</div></div>
+            <div class="rn">私人雷达</div>
+          </div>
+          <div class="rpc">
+            <div class="cover c6">夜<div class="rtag">▶ 51万</div></div>
+            <div class="rn">深夜循环</div>
+          </div>
+          <div class="rpc">
+            <div class="cover c5">跑<div class="rtag">▶ 44万</div></div>
+            <div class="rn">跑步动感</div>
+          </div>
+          <div class="rpc">
+            <div class="cover c3">欧<div class="rtag">▶ 88万</div></div>
+            <div class="rn">欧美金曲</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── 音乐库 ── -->
+      <div class="hpanel" id="hp-lib">
+        <div class="quick" style="padding-top:4px">
+          <div class="qcard g"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg><span class="n">最近播放</span><span class="c">86 首</span></div>
+          <div class="qcard b"><svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.7-9.3-9A5.2 5.2 0 0 1 12 6.7 5.2 5.2 0 0 1 21.3 11c-1.8 4.3-9.3 9-9.3 9z"/></svg><span class="n">我的收藏</span><span class="c">32 首</span></div>
+          <div class="qcard o"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M8 11.5 12 15.5l4-4"/><path d="M5 19h14"/></svg><span class="n">已下载</span><span class="c">14 首</span></div>
+        </div>
+        <div class="seclabel">我的收藏 <span class="sub">32 首</span><span class="all">全部 ›</span></div>
+        <div class="songrow"><div class="cover c1"><span class="tag">SQ</span>夜</div><div class="meta"><div class="t playing">夜的第七章 <span class="wave"><i></i><i></i><i></i></span></div><div class="s">周杰伦 - 依然范特西</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c2">海</div><div class="meta"><div class="t">海底</div><div class="s">凤凰传奇 - 海底</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c3"><span class="tag trial">试</span>光</div><div class="meta"><div class="t">光年之外</div><div class="s">G.E.M. 邓紫棋 - 光年之外</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c4">起</div><div class="meta"><div class="t">起风了</div><div class="s">买辣椒也用券 - 起风了</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c5">平</div><div class="meta"><div class="t">平凡之路</div><div class="s">朴树 - 猎户星座</div></div><div class="more">⋮</div></div>
+      </div>
+
+      <!-- ── 排行榜 ── -->
+      <div class="hpanel" id="hp-top">
+        <div class="chips">
+          <span class="chip on">官方榜</span><span class="chip">飙升榜</span><span class="chip">热歌榜</span><span class="chip">地区榜</span><span class="chip">语种榜</span><span class="chip">主题榜</span>
+        </div>
+        <div class="topgrid">
+          <div class="topcard hero"><div class="tn">🔥 飙升榜</div>
+            <div class="p"><i class="top">1</i>向云端</div><div class="p"><i class="top">2</i>乌梅子酱</div><div class="p"><i class="top">3</i>我想</div></div>
+          <div class="topcard"><div class="tn">热歌榜</div><div class="play"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div>
+            <div class="p"><i class="top">1</i>起风了</div><div class="p"><i class="top">2</i>平凡之路</div><div class="p"><i class="top">3</i>消愁</div></div>
+          <div class="topcard"><div class="tn">新歌榜</div><div class="play"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div>
+            <div class="p"><i class="top">1</i>如果可以</div><div class="p"><i class="top">2</i>雪 Distance</div><div class="p"><i class="top">3</i>向云端</div></div>
+          <div class="topcard"><div class="tn">华语金曲榜</div><div class="play"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div>
+            <div class="p"><i class="top">1</i>晴天</div><div class="p"><i class="top">2</i>七里香</div><div class="p"><i class="top">3</i>夜曲</div></div>
+          <div class="topcard"><div class="tn">欧美金曲榜</div><div class="play"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div>
+            <div class="p"><i class="top">1</i>Shape of You</div><div class="p"><i class="top">2</i>Someone Like You</div><div class="p"><i class="top">3</i>Counting Stars</div></div>
+        </div>
+      </div>
+
+      <!-- ── 收藏 ── -->
+      <div class="hpanel" id="hp-fav">
+        <div class="chips">
+          <span class="chip on">歌曲</span><span class="chip">歌单</span><span class="chip">专辑</span><span class="chip">歌手</span>
+        </div>
+        <div class="rescount">已收藏 32 首 · 长按可管理</div>
+        <div class="songrow"><div class="cover c1"><span class="tag">SQ</span>夜</div><div class="meta"><div class="t playing">夜的第七章 <span class="wave"><i></i><i></i><i></i></span></div><div class="s">周杰伦 - 依然范特西</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c2">七</div><div class="meta"><div class="t">七里香</div><div class="s">周杰伦 - 七里香</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c3">晴</div><div class="meta"><div class="t">晴天</div><div class="s">周杰伦 - 叶惠美</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c4"><span class="tag">SQ</span>稻</div><div class="meta"><div class="t">稻香</div><div class="s">周杰伦 - 魔杰座</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c5">青</div><div class="meta"><div class="t">青花瓷</div><div class="s">周杰伦 - 我很忙</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c6"><span class="tag trial">试</span>告</div><div class="meta"><div class="t">告白气球</div><div class="s">周杰伦 - 周杰伦的床边故事</div></div><div class="more">⋮</div></div>
+        <div class="songrow"><div class="cover c7">夜</div><div class="meta"><div class="t">夜曲</div><div class="s">周杰伦 - 十一月的萧邦</div></div><div class="more">⋮</div></div>
+      </div>
+    </div>
+
+    <div class="bottombar">
+      <div class="mini" onclick="go('scr-play')">
+        <div class="cover c1">夜</div>
+        <div class="m"><div class="mt">关于我爱你<span class="vip">VIP</span></div><div class="ms">张悬</div></div>
+        <div class="btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="#153B2A"><path d="M8 5h3v14H8zM13 5h3v14h-3z"/></svg></div>
+        <div class="btn"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#153B2A" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h13M4 12h13M4 18h9"/><path d="M20 8l2.5 2L20 12z"/></svg></div>
+      </div>
+      <div class="tabs">
+        <div class="tab on">
+          <svg class="ic-line" viewBox="0 0 24 24"><path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/></svg>
+          <svg class="ic-fill" viewBox="0 0 24 24" fill="#171C26"><path d="M12 3.2 3.5 10.6c-.3.3-.5.7-.5 1.1V20c0 .6.4 1 1 1h5.5v-5.5c0-.8.7-1.5 1.5-1.5h2c.8 0 1.5.7 1.5 1.5V21H20c.6 0 1-.4 1-1v-8.3c0-.4-.2-.8-.5-1.1z"/></svg>
+          首页
+        </div>
+        <div class="tab" onclick="go('scr-mine')">
+          <svg class="ic-line" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>
+          <svg class="ic-fill" viewBox="0 0 24 24" fill="#171C26"><circle cx="12" cy="7.5" r="4.2"/><path d="M12 13.5c-4.4 0-8 2.9-8 6.5 0 .6.4 1 1 1h14c.6 0 1-.4 1-1 0-3.6-3.6-6.5-8-6.5z"/></svg>
+          我的
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 我的 ═══ -->
+  <section class="screen" id="scr-mine" data-tab="mine">
+    <div class="myhead">
+      <h2>我的</h2>
+      <div class="acts">
+        <div class="iconbtn" onclick="go('scr-settings')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7 7 0 0 0-2-1.2L14.2 3h-4l-.4 2.7a7 7 0 0 0-2 1.2l-2.3-1-2 3.4 2 1.5a7 7 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1a7 7 0 0 0 2 1.2l.4 2.7h4l.4-2.7a7 7 0 0 0 2-1.2l2.3 1 2-3.4-2-1.5c.06-.4.1-.8.1-1.2z"/></svg></div>
+      </div>
+    </div>
+    <div class="mysearch">
+      <div class="hbox" onclick="go('scr-search')">
+        <span class="orb"></span>
+        <span class="ph">搜索歌曲、歌手、专辑</span>
+      </div>
+    </div>
+    <div class="content">
+      <div class="usercard">
+        <div class="uc-top">
+          <div class="uc-ava"><div class="in">T</div></div>
+          <div class="uc-name">
+            <div class="uc-n">tiejiang <span class="out">⎋</span></div>
+            <div class="uc-s"><span class="dot"></span>已连接 · 172.16.1.7:3099</div>
+          </div>
+          <div class="uc-num"><b>32</b><span>收藏</span></div>
+        </div>
+        <div class="uc-acts">
+          <div class="uc-a"><svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.7-9.3-9A5.2 5.2 0 0 1 12 6.7 5.2 5.2 0 0 1 21.3 11c-1.8 4.3-9.3 9-9.3 9z"/></svg><span class="an">收藏歌曲</span></div>
+          <div class="uc-a"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M8 11.5 12 15.5l4-4"/><path d="M5 19h14"/></svg><span class="an">下载管理</span></div>
+          <div class="uc-a"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg><span class="an">最近播放</span></div>
+          <div class="uc-a"><svg viewBox="0 0 24 24"><path d="M9 18V6l10 2.5v11"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/></svg><span class="an">我的歌单</span></div>
+        </div>
+      </div>
+
+      <div class="seclabel" style="font-size:17px;font-weight:800">最近播放<span class="all">›</span></div>
+      <div class="rp">
+        <div class="rpc">
+          <div class="cover c7">播<div class="corner"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div></div>
+          <div class="rn">已播歌曲 500</div>
+        </div>
+        <div class="rpc">
+          <div class="cover c2">冒<div class="rtag">专辑</div></div>
+          <div class="rn">冒险精神 (Th…</div>
+        </div>
+        <div class="rpc">
+          <div class="cover c4">A<div class="rtag">歌单</div></div>
+          <div class="rn">A</div>
+        </div>
+        <div class="rpc">
+          <div class="cover c8">启<div class="rtag">专辑</div></div>
+          <div class="rn">启示录</div>
+        </div>
+        <div class="rpc">
+          <div class="cover c5">范<div class="rtag">专辑</div></div>
+          <div class="rn">依然范特西</div>
+        </div>
+      </div>
+
+      <div class="pltabs">
+        <span class="plt">自建歌单<span class="cnt">9</span></span>
+        <span class="plt off" style="margin-left:16px">收藏歌单<span class="cnt">9</span></span>
+        <span class="pacts"><span>＋</span><span>⇥</span><span>›</span></span>
+      </div>
+      <div class="plist">
+        <div class="plrow">
+          <div class="cover c4">A<div class="corner"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div></div>
+          <div><div class="pt">A</div><div class="ps">337 首 · 山阴路的夏天 - 李志</div></div>
+        </div>
+        <div class="plrow">
+          <div class="cover c8">E<div class="corner"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div></div>
+          <div><div class="pt">E</div><div class="ps">146 首 · Hotel - Claire Rosinkranz</div></div>
+        </div>
+        <div class="plrow">
+          <div class="cover c1">夜<div class="corner"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div></div>
+          <div><div class="pt">深夜循环</div><div class="ps">58 首 · 夜的第七章 - 周杰伦</div></div>
+        </div>
+        <div class="plrow">
+          <div class="cover c6">运<div class="corner"><svg viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg></div></div>
+          <div><div class="pt">跑步动感</div><div class="ps">42 首 · 平凡之路 - 朴树</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bottombar">
+      <div class="mini" onclick="go('scr-play')">
+        <div class="cover c1">夜</div>
+        <div class="m"><div class="mt">关于我爱你<span class="vip">VIP</span></div><div class="ms">张悬</div></div>
+        <div class="btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="#153B2A"><path d="M8 5h3v14H8zM13 5h3v14h-3z"/></svg></div>
+        <div class="btn"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#153B2A" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h13M4 12h13M4 18h9"/><path d="M20 8l2.5 2L20 12z"/></svg></div>
+      </div>
+      <div class="tabs">
+        <div class="tab" onclick="go('scr-home')">
+          <svg class="ic-line" viewBox="0 0 24 24"><path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/></svg>
+          <svg class="ic-fill" viewBox="0 0 24 24" fill="#171C26"><path d="M12 3.2 3.5 10.6c-.3.3-.5.7-.5 1.1V20c0 .6.4 1 1 1h5.5v-5.5c0-.8.7-1.5 1.5-1.5h2c.8 0 1.5.7 1.5 1.5V21H20c.6 0 1-.4 1-1v-8.3c0-.4-.2-.8-.5-1.1z"/></svg>
+          首页
+        </div>
+        <div class="tab on">
+          <svg class="ic-line" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>
+          <svg class="ic-fill" viewBox="0 0 24 24" fill="#171C26"><circle cx="12" cy="7.5" r="4.2"/><path d="M12 13.5c-4.4 0-8 2.9-8 6.5 0 .6.4 1 1 1h14c.6 0 1-.4 1-1 0-3.6-3.6-6.5-8-6.5z"/></svg>
+          我的
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 设置（我的→右上角） ═══ -->
+  <section class="screen" id="scr-settings">
+    <div class="subhead">
+      <span class="backbtn" onclick="go('scr-mine')"><svg viewBox="0 0 24 24"><path d="M14 6l-6 6 6 6"/></svg></span>
+      <h2>设置</h2>
+    </div>
+    <div class="content">
+      <div class="grp">
+        <div class="row"><div class="ri"><svg viewBox="0 0 24 24"><path d="M9 18V6l10 2.5v11"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/></svg></div>
+          <div class="rt">音质偏好</div><div class="rv">自动回退 (SQ→HQ→128k)</div><span class="arr">›</span></div>
+        <div class="row"><div class="ri"><svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M8 11.5 12 15.5l4-4"/><path d="M5 19h14"/></svg></div>
+          <div class="rt">下载设置</div><div class="rv">Music/HollyMusic/</div><span class="arr">›</span></div>
+        <div class="row"><div class="ri"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-.3 0-.7-.1-1a5 5 0 0 1-6.9-6.9c-.6-.1-1.3-.1-2-.1z"/></svg></div>
+          <div class="rt">外观</div><div class="rv">浅色 / 深色 / 跟随系统</div><span class="arr">›</span></div>
+      </div>
+      <div class="grp">
+        <div class="row"><div class="ri"><svg viewBox="0 0 24 24"><path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/></svg></div>
+          <div class="rt">服务器管理</div><div class="rv">http://172.16.1.7:3099</div><span class="arr">›</span></div>
+        <div class="row"><div class="ri"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><circle cx="12" cy="16" r=".6"/></svg></div>
+          <div class="rt">关于 HollyMusic</div><div class="rv">v1.0.2</div><span class="arr">›</span></div>
+      </div>
+      <div class="logout">退出登录</div>
+    </div>
+  </section>
+
+  <!-- ═══ 搜索 ═══ -->
+  <section class="screen" id="scr-search">
+    <div class="searchbar">
+      <div class="sbox">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+        <input value="周杰伦" placeholder="搜索歌曲、歌手、专辑"><span class="x">✕</span>
+      </div>
+      <span class="go" onclick="go('scr-home')">取消</span>
+    </div>
+    <div class="chips">
+      <span class="chip on">全部</span><span class="chip">聚合API</span><span class="chip">六音</span><span class="chip">自定义源</span><span class="chip">仅收藏</span>
+    </div>
+    <div class="rescount">共 128 条 · 0.4s</div>
+    <div class="content">
+      <div class="songrow"><div class="cover c1">夜</div><div class="meta"><div class="t playing">夜的第七章 <span class="wave"><i></i><i></i><i></i></span></div><div class="s">周杰伦 · 潘儿 - 依然范特西</div></div><div class="more">⋮</div></div>
+      <div class="songrow"><div class="cover c2">七</div><div class="meta"><div class="t">七里香</div><div class="s">周杰伦 - 七里香</div></div><div class="more">⋮</div></div>
+      <div class="songrow"><div class="cover c3">晴</div><div class="meta"><div class="t">晴天</div><div class="s">周杰伦 - 叶惠美</div></div><div class="more">⋮</div></div>
+      <div class="songrow"><div class="cover c4"><span class="tag">SQ</span>稻</div><div class="meta"><div class="t">稻香</div><div class="s">周杰伦 - 魔杰座</div></div><div class="more">⋮</div></div>
+      <div class="songrow"><div class="cover c5">青</div><div class="meta"><div class="t">青花瓷</div><div class="s">周杰伦 - 我很忙</div></div><div class="more">⋮</div></div>
+      <div class="songrow"><div class="cover c6"><span class="tag trial">试</span>告</div><div class="meta"><div class="t">告白气球</div><div class="s">周杰伦 - 周杰伦的床边故事</div></div><div class="more">⋮</div></div>
+      <div class="songrow"><div class="cover c7">夜</div><div class="meta"><div class="t">夜曲</div><div class="s">周杰伦 - 十一月的萧邦</div></div><div class="more">⋮</div></div>
+      <div class="songrow"><div class="cover c2">龙</div><div class="meta"><div class="t">龙卷风</div><div class="s">周杰伦 - Jay</div></div><div class="more">⋮</div></div>
+    </div>
+    <div class="bottombar">
+      <div class="mini" onclick="go('scr-play')">
+        <div class="cover c1">夜</div>
+        <div class="m"><div class="mt">关于我爱你<span class="vip">VIP</span></div><div class="ms">张悬</div></div>
+        <div class="btn"><svg viewBox="0 0 24 24" width="15" height="15" fill="#153B2A"><path d="M8 5h3v14H8zM13 5h3v14h-3z"/></svg></div>
+        <div class="btn"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#153B2A" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h13M4 12h13M4 18h9"/><path d="M20 8l2.5 2L20 12z"/></svg></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 播放页 ═══ -->
+  <section class="screen" id="scr-play">
+    <div class="playerbg"></div>
+    <div class="player">
+      <div class="phead">
+        <div class="iconbtn" onclick="go('scr-home')"><svg viewBox="0 0 24 24"><path d="M6 10l6 6 6-6"/></svg></div>
+        <div class="cc"><div class="ct">夜的第七章</div><div class="cs">周杰伦 · 潘儿</div></div>
+        <div class="iconbtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg></div>
+      </div>
+      <div class="pbody">
+        <div class="bigcover c1">夜</div>
+        <div class="dots"><i class="on"></i><i onclick="go('scr-lyric')" style="cursor:pointer"></i></div>
+        <div><span class="trial">♪ 试听 30s · 获取完整版 ›</span></div>
+      </div>
+      <div class="ctrlzone">
+        <div class="prog">
+          <span class="tm">01:23</span>
+          <div class="track"><div class="fill"></div><div class="knob"></div></div>
+          <span class="tm">04:05</span>
+        </div>
+        <div class="ctrls">
+          <div class="side"><svg viewBox="0 0 24 24"><path d="M4 9a7 7 0 0 1 12-4"/><path d="M16 2v3.5h-3.5"/><path d="M20 15a7 7 0 0 1-12 4"/><path d="M8 22v-3.5h3.5"/></svg></div>
+          <div class="side skip"><svg viewBox="0 0 24 24"><path d="M18 5l-9 7 9 7zM5.5 5H8v14H5.5z"/></svg></div>
+          <div class="main"><svg viewBox="0 0 24 24"><path d="M8 5h3.2v14H8zM12.8 5H16v14h-3.2z"/></svg></div>
+          <div class="side skip"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7zM16.5 5H19v14h-2.5z"/></svg></div>
+          <div class="side"><svg viewBox="0 0 24 24"><path d="M4 6h13M4 12h13M4 18h9"/><path d="M20 8l2.5 2L20 12z"/></svg></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 歌词页 ═══ -->
+  <section class="screen" id="scr-lyric">
+    <div class="playerbg purple"></div>
+    <div class="lyrics">
+      <div class="phead">
+        <div class="iconbtn" onclick="go('scr-play')"><svg viewBox="0 0 24 24"><path d="M6 10l6 6 6-6"/></svg></div>
+        <div class="cc"><div class="ct">夜的第七章</div><div class="cs">周杰伦 · 潘儿</div></div>
+        <div class="iconbtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg></div>
+      </div>
+      <div class="lyrlist">
+        <div class="lyr">1983年 伦敦 雾都的清晨</div>
+        <div class="lyr near">贝克街旁红色的月光</div>
+        <div class="lyr cur">所有线索都指向 福尔摩斯的回忆</div>
+        <div class="lyr near">石板路有雾 一句对不起</div>
+        <div class="lyr">紫色的项链 是死者留下的谜</div>
+        <div class="lyr">面包屑指引着 真相的距离</div>
+        <div class="lyr">秃鹰盘旋在 泰晤士河的桥上</div>
+        <div class="lyr">侦探的烟斗 冒着紫色的烟</div>
+        <div class="lyr">结局早已注定 无人生还</div>
+        <div class="lyr">一八八三年 一月十二日 事件重演</div>
+        <div class="backcur">回到当前</div>
+      </div>
+      <div class="ctrlzone" style="width:100%">
+        <div class="prog">
+          <span class="tm">01:23</span>
+          <div class="track"><div class="fill"></div><div class="knob"></div></div>
+          <span class="tm">04:05</span>
+        </div>
+        <div class="ctrls">
+          <div class="side"><svg viewBox="0 0 24 24"><path d="M4 9a7 7 0 0 1 12-4"/><path d="M16 2v3.5h-3.5"/><path d="M20 15a7 7 0 0 1-12 4"/><path d="M8 22v-3.5h3.5"/></svg></div>
+          <div class="side skip"><svg viewBox="0 0 24 24"><path d="M18 5l-9 7 9 7zM5.5 5H8v14H5.5z"/></svg></div>
+          <div class="main"><svg viewBox="0 0 24 24"><path d="M8 5h3.2v14H8zM12.8 5H16v14h-3.2z"/></svg></div>
+          <div class="side skip"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7zM16.5 5H19v14h-2.5z"/></svg></div>
+          <div class="side"><svg viewBox="0 0 24 24"><path d="M4 6h13M4 12h13M4 18h9"/><path d="M20 8l2.5 2L20 12z"/></svg></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="gesturebar"></div>
+</div>
+
+<script>
+function go(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  document.querySelectorAll('.switcher button').forEach(b=>b.classList.toggle('on',b.dataset.s===id));
+  window.scrollTo({top:0});
+}
+function homeTab(name){
+  document.querySelectorAll('.hpanel').forEach(p=>p.classList.remove('on'));
+  document.getElementById('hp-'+name).classList.add('on');
+  const names={rec:'rec',lib:'lib',top:'top',fav:'fav'};
+  document.querySelectorAll('.htab').forEach(t=>{
+    t.classList.toggle('on',t.getAttribute('onclick').includes("'"+name+"'"));
+  });
+  const btnMap={rec:'scr-home',lib:null,top:null,fav:null};
+  document.querySelectorAll('.switcher button').forEach(b=>b.classList.remove('on'));
+  if(name==='rec') document.querySelector('[data-s="scr-home"]').classList.add('on');
+  go_screen_keep(name);
+}
+function go_screen_keep(name){/* 首页已激活，无需切换 screen */}
+document.querySelectorAll('.switcher button').forEach(b=>b.onclick=()=>{
+  if(b.dataset.h){ go('scr-home'); homeTab(b.dataset.h); }
+  else go(b.dataset.s);
+});
+</script>
+</body>
+</html>
