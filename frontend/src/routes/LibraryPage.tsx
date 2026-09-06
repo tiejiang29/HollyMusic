@@ -279,9 +279,12 @@ export function LibraryPage() {
               </div>
               <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
                 <span className="truncate">{item.singer}</span>
-                {item.album && <span className="truncate">· {item.album}</span>}
+                {item.album && <span className="truncate md:hidden">· {item.album}</span>}
               </div>
             </button>
+            <span className="hidden w-28 shrink-0 truncate text-xs text-muted-foreground md:block" title={item.album || ''}>
+              {item.album || '—'}
+            </span>
             <span className="w-14 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{formatDuration(item.durationSec)}</span>
             <span className="hidden w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground sm:inline">{formatBytes(item.fileSize)}</span>
 
@@ -354,10 +357,24 @@ export function LibraryPage() {
 
   return (
     <div className="flex flex-col p-6 pb-24 md:h-full md:pb-6">
-      <div className="mb-4 flex items-end justify-between gap-4">
+      <div className="mb-4 flex flex-wrap items-center gap-3">
         <div className="hidden md:block">
           <h1 className="text-2xl font-bold">音乐库</h1>
           <p className="text-sm text-muted-foreground">边听边下的服务器持久化音乐（{stats?.count ?? '…'} 首）</p>
+        </div>
+        <div className="relative min-w-0 flex-1 basis-48 md:ml-auto md:max-w-xs">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <input
+            value={keyword}
+            onChange={e => { setKeyword(e.target.value); setPage(1) }}
+            placeholder="搜索歌名 / 歌手 / 专辑 / 首字母..."
+            className="w-full rounded-full bg-card py-2 pl-10 pr-9 text-sm outline-none ring-1 ring-border focus:ring-primary"
+          />
+          {keyword && (
+            <button onClick={() => setKeyword('')} aria-label="清空" className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+              <X className="h-4 w-4" />
+            </button>
+          )}
         </div>
         <button
           onClick={() => (selecting ? exitSelecting() : setSelecting(true))}
@@ -394,22 +411,6 @@ export function LibraryPage() {
           </div>
         </div>
       )}
-
-      {/* 搜索 */}
-      <div className="relative mb-4 md:max-w-md">
-        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-        <input
-          value={keyword}
-          onChange={e => { setKeyword(e.target.value); setPage(1) }}
-          placeholder="搜索歌名 / 歌手 / 专辑..."
-          className="w-full rounded-full bg-card py-2 pl-10 pr-9 text-sm outline-none ring-1 ring-border focus:ring-primary"
-        />
-        {keyword && (
-          <button onClick={() => setKeyword('')} aria-label="清空" className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-            <X className="h-4 w-4" />
-          </button>
-        )}
-      </div>
 
       <div className="flex min-h-0 flex-1 gap-6">
         {/* 左栏：歌手聚合（移动端隐藏，改用筛选标签） */}
