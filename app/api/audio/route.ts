@@ -4,7 +4,11 @@
  * 设计：URL 解析惰性化——只在「真正 miss」时调用一次上游，由 audioServe 内部进行中去重。
  * 已缓存的请求完全不触发 URL 解析。
  *
- * GET  /api/audio?uid=<source-songmid>&quality=<quality>
+ * 鉴权（2026-09）：登录会话（签名 cookie）优先；匿名仅放行分享落地页
+ * 签发的 st token（HMAC，绑定 uid+quality+时效，见 lib/services/auth.ts）。
+ * 与 /api/music-url、/api/track 等接口口径一致，未认证返回 401。
+ *
+ * GET  /api/audio?uid=<source-songmid>&quality=<quality>[&st=<shareToken>]
  *      - 已完整缓存 → 本地文件 Range（任意 seek，0 次上游调用）
  *      - 进行中 → attach 到内存 entry（0 次上游调用）
  *      - miss → fetch 上游一次（多用户并发也只 1 次）
@@ -22,6 +26,8 @@ import { musicSourceManager } from '@/lib/music-source-manager'
 import type { QualityType } from '@/lib/types/music'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import { audioServe } from '@/lib/audio-serve'
+import { getAuthState } from '@/lib/services/user-context'
+import { verifyShareAudioToken } from '@/lib/services/auth'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { serveFromLibrary, ingestFromCache } from '@/lib/services/music-library'
 
@@ -33,21 +39,31 @@ function buildErrorResponse(status: number, code: string, message: string): Resp
 }
 
 async function handleAudio(request: NextRequest, isHead: boolean): Promise<Response> {
+  const { searchParams } = new URL(request.url)
+  const uid = searchParams.get('uid')
+  const quality = (searchParams.get('quality') || '320k') as QualityType
+
+  if (!uid) {
+    return buildErrorResponse(400, 'INVALID_PARAMS', '缺少必填参数: uid')
+  }
+
+  const validQualities: QualityType[] = ['128k', '320k', 'flac', 'flac24bit']
+  if (!validQualities.includes(quality)) {
+    return buildErrorResponse(400, 'QUALITY_NOT_SUPPORTED', `不支持的音质: ${quality}`)
+  }
+
+  // 鉴权前置：登录会话优先；匿名仅放行分享页签发的 st token（绑定 uid+quality）。
+  // 放在 ensureInitialized 之前，未认证请求不触发磁盘/上游初始化。
+  const authState = await getAuthState(request)
+  if (!authState.authenticated) {
+    const shareToken = searchParams.get('st') ?? ''
+    if (!verifyShareAudioToken(uid, quality, shareToken)) {
+      return buildErrorResponse(401, 'UNAUTHORIZED', '未登录，且未携带有效的分享凭证')
+    }
+  }
+
   try {
     await audioServe.ensureInitialized()
-
-    const { searchParams } = new URL(request.url)
-    const uid = searchParams.get('uid')
-    const quality = (searchParams.get('quality') || '320k') as QualityType
-
-    if (!uid) {
-      return buildErrorResponse(400, 'INVALID_PARAMS', '缺少必填参数: uid')
-    }
-
-    const validQualities: QualityType[] = ['128k', '320k', 'flac', 'flac24bit']
-    if (!validQualities.includes(quality)) {
-      return buildErrorResponse(400, 'QUALITY_NOT_SUPPORTED', `不支持的音质: ${quality}`)
-    }
 
     // 从 DB 解析 uid → MusicInfo（search 时已 upsert，正常流程都有）
     const musicInfo = await resolveMusicInfoById(uid)

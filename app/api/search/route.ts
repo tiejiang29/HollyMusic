@@ -197,11 +197,14 @@ export async function GET(request: NextRequest) {
       return createErrorResponse('UNAUTHORIZED', error.message, 401)
     }
     logger.error('搜索失败:', error)
+    // 兜底：catch 触发即"预期外的程序错误"（DB/缓存/入参等基础设施问题）→ INTERNAL_ERROR。
+    // 真正的"所有源都失败"应在 allSettled 路径上显式 throw 一个语义化错误类，再在此分支路由到 SEARCH_FAILED；
+    // 当前业务代码没有 throw SEARCH_FAILED 的地方，本兜底即按程序错误归类。
     return createErrorResponse(
-      ErrorCodes.SEARCH_FAILED,
+      ErrorCodes.INTERNAL_ERROR,
       error instanceof Error ? error.message : '搜索失败',
       500,
-      error instanceof Error ? error.stack : undefined
+      error instanceof Error ? error.stack : undefined,
     )
   }
 }

@@ -174,3 +174,71 @@ function makeReqWithCookies(cookieHeader: string): NextRequest {
     headers: cookieHeader ? { cookie: cookieHeader } : {},
   })
 }
+
+/**
+ * 分享音频 token（/api/audio 匿名试听旁路）回归守卫：
+ * HMAC 签发/校验往返、uid+quality 绑定、时效、防篡改、密钥隔离。
+ */
+describe('share audio token (lib/services/auth.ts)', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('AUTH_SECRET', 'b'.repeat(40))
+  })
+
+  it('签发/校验往返：同 uid + 同 quality 通过', async () => {
+    const mod = await import('@/lib/services/auth')
+    const token = mod.createShareAudioToken('tx-123456', '320k')
+    expect(token).toMatch(/^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/)
+    expect(mod.verifyShareAudioToken('tx-123456', '320k', token)).toBe(true)
+  })
+
+  it('token 绑定 uid：挪用到其它歌曲被拒', async () => {
+    const mod = await import('@/lib/services/auth')
+    const token = mod.createShareAudioToken('tx-123456', '320k')
+    expect(mod.verifyShareAudioToken('tx-999999', '320k', token)).toBe(false)
+  })
+
+  it('token 绑定 quality：篡改音质被拒（匿名无法借 token 拉无损）', async () => {
+    const mod = await import('@/lib/services/auth')
+    const token = mod.createShareAudioToken('tx-123456', '320k')
+    expect(mod.verifyShareAudioToken('tx-123456', 'flac', token)).toBe(false)
+    expect(mod.verifyShareAudioToken('tx-123456', 'flac24bit', token)).toBe(false)
+  })
+
+  it('过期 token 被拒（e <= now）', async () => {
+    const mod = await import('@/lib/services/auth')
+    expect(mod.verifyShareAudioToken('tx-1', '320k', mod.createShareAudioToken('tx-1', '320k', -60))).toBe(false)
+    expect(mod.verifyShareAudioToken('tx-1', '320k', mod.createShareAudioToken('tx-1', '320k', 0))).toBe(false)
+  })
+
+  it('篡改签名 / 垃圾格式被拒', async () => {
+    const mod = await import('@/lib/services/auth')
+    const token = mod.createShareAudioToken('tx-1', '320k')
+    const [body, sig] = token.split('.')
+    const flipped = sig.slice(0, -1) + (sig.endsWith('0') ? '1' : '0')
+    expect(mod.verifyShareAudioToken('tx-1', '320k', `${body}.${flipped}`)).toBe(false)
+    expect(mod.verifyShareAudioToken('tx-1', '320k', 'garbage')).toBe(false)
+    expect(mod.verifyShareAudioToken('tx-1', '320k', '')).toBe(false)
+    expect(mod.verifyShareAudioToken('tx-1', '320k', `${body}`)).toBe(false)
+  })
+
+  it('域隔离：token 不能冒充 session 签名（反之亦然）', async () => {
+    const mod = await import('@/lib/services/auth')
+    const sessionSig = mod.sign('admin', 0)
+    // session 签名是纯 hex，没有 '.' 分隔 → 直接被 token 格式校验拒绝
+    expect(mod.verifyShareAudioToken('tx-1', '320k', sessionSig)).toBe(false)
+    // 分享 token 含 base64url + '.'，hex 解码后长度对不上 session 签名 → 拒绝
+    expect(mod.verify('admin', mod.createShareAudioToken('tx-1', '320k'), 0)).toBe(false)
+  })
+
+  it('密钥隔离：换 AUTH_SECRET 后旧 token 失效', async () => {
+    vi.stubEnv('AUTH_SECRET', 'a'.repeat(32))
+    const modA = await import('@/lib/services/auth')
+    const token = modA.createShareAudioToken('tx-1', '320k')
+    vi.resetModules()
+    vi.stubEnv('AUTH_SECRET', 'c'.repeat(32))
+    const modC = await import('@/lib/services/auth')
+    expect(modC.verifyShareAudioToken('tx-1', '320k', token)).toBe(false)
+  })
+})

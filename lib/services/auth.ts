@@ -163,5 +163,84 @@ function parseSessionVersion(raw: string): number | null {
   return Number.isSafeInteger(n) ? n : null
 }
 
-const authApi = { sign, verify, createSessionCookies, clearSessionCookies, verifySession }
+// ===== 分享音频 token（/api/audio 匿名试听旁路） =====
+//
+// /api/audio 默认要求登录会话；分享落地页（/api/share）为匿名访客签发本 token
+// 作为唯一旁路。token 绑定 uid + quality + 过期时间，仅够落地页 <audio> 试听：
+// 挪用到其它歌曲 / 其它音质 / 过期后均校验失败。
+//
+// 复用 AUTH_SECRET（与 session 签名同一密钥），域前缀隔离两类签名用途。
+
+/** 分享音频 token 有效期：24 小时（覆盖落地页长时间停留 / 反复重播） */
+const SHARE_AUDIO_TTL_SEC = 24 * 60 * 60
+/** HMAC 域前缀：与 session 签名（username:version 格式）隔离，杜绝跨用途伪造 */
+const SHARE_AUDIO_DOMAIN = 'share-audio:v1'
+
+export interface ShareAudioTokenPayload {
+  /** 绑定的歌曲 uid（source-songmid） */
+  u: string
+  /** 绑定的音质 */
+  q: string
+  /** 过期时间（unix 秒） */
+  e: number
+}
+
+/**
+ * 签发分享音频 token。
+ * 格式：`base64url(JSON payload).hex(HMAC-SHA256)`，自描述 payload 避免分隔符歧义。
+ */
+export function createShareAudioToken(uid: string, quality: string, ttlSec = SHARE_AUDIO_TTL_SEC): string {
+  const payload: ShareAudioTokenPayload = {
+    u: uid,
+    q: quality,
+    e: Math.floor(Date.now() / 1000) + ttlSec,
+  }
+  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+  const sig = hmacShareAudio(body)
+  return `${body}.${sig}`
+}
+
+/**
+ * 校验分享音频 token：格式、签名（恒定时间比较）、uid/quality 绑定、有效期。
+ */
+export function verifyShareAudioToken(uid: string, quality: string, token: string): boolean {
+  if (!uid || !quality || !token) return false
+  const dot = token.lastIndexOf('.')
+  if (dot <= 0 || dot === token.length - 1) return false
+  const body = token.slice(0, dot)
+  const sig = token.slice(dot + 1)
+  if (!/^[0-9a-f]{64}$/.test(sig)) return false
+
+  let payload: ShareAudioTokenPayload
+  try {
+    payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
+  } catch {
+    return false
+  }
+  if (
+    typeof payload !== 'object' || payload === null ||
+    payload.u !== uid || payload.q !== quality ||
+    !Number.isInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000)
+  ) {
+    return false
+  }
+
+  const expected = Buffer.from(hmacShareAudio(body), 'hex')
+  const actual = Buffer.from(sig, 'hex')
+  if (expected.length !== actual.length) return false
+  try {
+    return crypto.timingSafeEqual(expected, actual)
+  } catch {
+    return false
+  }
+}
+
+function hmacShareAudio(body: string): string {
+  return crypto
+    .createHmac('sha256', getAuthSecret())
+    .update(`${SHARE_AUDIO_DOMAIN}:${body}`)
+    .digest('hex')
+}
+
+const authApi = { sign, verify, createSessionCookies, clearSessionCookies, verifySession, createShareAudioToken, verifyShareAudioToken }
 export default authApi

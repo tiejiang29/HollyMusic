@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server'
 import { resolveMusicInfoById } from '@/lib/db'
+import { createShareAudioToken } from '@/lib/services/auth'
 import type { QualityType } from '@/lib/types/music'
 
 /**
@@ -70,9 +71,11 @@ export async function GET(request: NextRequest) {
       interval = mi.interval || ''
       ogImage = `${origin}/api/cover/${encodeURIComponent(uid)}`
       coverSrc = `/api/cover/${encodeURIComponent(uid)}`
-      // 音频流 API 无需鉴权，服务端磁盘缓存 + Range 代理，<audio> 直接 GET
+      // /api/audio 需登录；匿名访客由本页签发短时效 HMAC token（st，绑定 uid+quality，
+      // 24h 有效），仅够落地页 <audio> 试听——挪用/篡改/过期均被 /api/audio 拒绝
       // 按歌曲可用音质选（避免只有 128k 的歌请求 320k 失败）
-      audioSrc = `${origin}/api/audio?uid=${encodeURIComponent(uid)}&quality=${pickShareQuality(mi.types)}`
+      const shareQuality = pickShareQuality(mi.types)
+      audioSrc = `${origin}/api/audio?uid=${encodeURIComponent(uid)}&quality=${encodeURIComponent(shareQuality)}&st=${encodeURIComponent(createShareAudioToken(uid, shareQuality))}`
       const parts: string[] = []
       if (mi.albumName) parts.push(mi.albumName)
       if (SOURCE_LABEL[mi.source]) parts.push(SOURCE_LABEL[mi.source])
