@@ -101,3 +101,7 @@ __pycache__/
 
 # Android 客户端独立仓库：https://github.com/tiejiang29/HollyMusic-Android
 android/
+
+# 本地 dev server 日志
+server-dev.log
+preview-dev.log
