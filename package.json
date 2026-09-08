@@ -1,6 +1,6 @@
 {
   "name": "holly-music",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "private": true,
   "description": "多源在线音乐聚合播放器 · 自部署 · PWA · 移动端友好",
   "license": "MIT",
@@ -35,6 +35,8 @@
     "typecheck": "pnpm -C frontend exec tsc -b && tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest --passWithNoTests",
+    "harvest": "node scripts/harvest-playlists.mjs",
+    "harvest:push": "node scripts/push-music-info.mjs",
     "prisma:generate": "prisma generate",
     "prisma:studio": "prisma studio",
     "prisma:migrate": "prisma migrate dev",
