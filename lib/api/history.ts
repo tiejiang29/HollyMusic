@@ -10,6 +10,8 @@ export interface HistoryEntry {
   songId: string | null
   musicInfo: MusicInfo | null
   playedAt: string
+  /** 累计播放次数（重复播放累加） */
+  playCount: number
 }
 
 export function listHistory(

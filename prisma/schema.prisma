@@ -162,10 +162,12 @@ model PlayHistory {
   songmid     String?
   username    String?
   playedAt    DateTime @default(now())
+  /// 播放次数：首次播放记 1，重复播放累加（与 playedAt 一起构成"常听"信号，供猜我喜欢用）
+  playCount   Int      @default(1)
   clientIp    String?
   userAgent   String?
 
-  // 同一用户同一首歌只保留一条（再次播放更新 playedAt 移到顶部，商业项目主流做法）
+  // 同一用户同一首歌只保留一条（再次播放更新 playedAt 移到顶部并累加 playCount，商业项目主流做法）
   @@unique([username, songmid])
   @@index([playedAt])
   @@index([username])

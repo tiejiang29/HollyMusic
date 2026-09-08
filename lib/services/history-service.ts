@@ -30,6 +30,8 @@ export interface HistoryEntry {
   songId: string | null
   musicInfo: MusicInfo | null
   playedAt: string
+  /** 累计播放次数（重复播放累加），猜我喜欢与前端"常听"展示用 */
+  playCount: number
 }
 
 /**
@@ -52,7 +54,7 @@ export async function reportPlay(username: string, musicInfo: MusicInfo): Promis
     select: { id: true },
   })
 
-  // 3) upsert 历史：已存在则更新 playedAt（移动到顶部），不存在则新建
+  // 3) upsert 历史：已存在则更新 playedAt（移动到顶部）并累加 playCount，不存在则新建
   await prisma.playHistory.upsert({
     where: { username_songmid: { username, songmid: songId } },
     create: {
@@ -63,6 +65,7 @@ export async function reportPlay(username: string, musicInfo: MusicInfo): Promis
     update: {
       playedAt: new Date(),
       musicInfoId: row?.id ?? null,
+      playCount: { increment: 1 },
     },
   })
   logger.debug(`[history] reported play: ${songId} for ${username}`)
@@ -120,6 +123,7 @@ export async function listHistory(
       songId: row.songmid,
       musicInfo,
       playedAt: row.playedAt.toISOString(),
+      playCount: row.playCount,
     })
   }
 
