@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronLeft, ChevronRight, ListMusic, Music, Play, RefreshCw, Search, Trophy } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ListMusic, Music, Play, RefreshCw, Search, Sparkles, Trophy } from 'lucide-react'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
 import { getRecommendedPlaylists, getToplists } from '@/lib/api/discovery'
+import { useGuessStore } from '@/lib/store/guess-store'
+import { usePlayerStore } from '@/lib/store/player-store'
+import { toTrack, type Track } from '@/lib/types/player'
 import type { DiscoveryPlaylist, DiscoveryPlaylistSort, DiscoverySource, DiscoveryToplist } from '@/lib/services/discovery-service'
 
 const CHANNELS: Array<{ source: DiscoverySource; label: string }> = [
@@ -62,6 +65,17 @@ export function HomePage() {
   const [playlistsError, setPlaylistsError] = useState<string | null>(null)
   const toplistRequestId = useRef(0)
   const playlistRequestId = useRef(0)
+
+  // 猜你喜欢：store 状态在组件外，回首页不重复请求；失败（含未登录）整个区块隐藏
+  const guess = useGuessStore()
+  const playTrack = usePlayerStore(s => s.playTrack)
+  useEffect(() => {
+    guess.ensure()
+  }, [guess.ensure])
+  const guessTracks = useMemo<Track[]>(
+    () => guess.songs.map(s => toTrack({ uid: s.uid, musicInfo: s })),
+    [guess.songs],
+  )
 
   const loadToplists = async () => {
     const requestId = ++toplistRequestId.current
@@ -122,6 +136,34 @@ export function HomePage() {
           <button key={channel.source} onClick={() => { setSource(channel.source); setPlaylistPage(1); setCategory(''); setPlaylistSort(PLAYLIST_SORTS[channel.source][0].id); setToplists([]); setPlaylists([]) }} className={`rounded-full px-4 py-2 text-sm transition ${source === channel.source ? 'bg-primary text-primary-foreground' : 'border border-border text-muted-foreground hover:bg-accent hover:text-foreground'}`} role="tab" aria-selected={source === channel.source}>{channel.label}</button>
         ))}
       </div>
+
+      {!guess.failed && (guess.loading || guess.songs.length > 0) && (
+        <section className="mb-10">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-5 w-5 text-primary" />
+              <h2 className="text-lg font-semibold">猜你喜欢</h2>
+              <span className="text-xs text-muted-foreground">{guess.personalized ? '根据你的收藏与播放记录生成，每天一换' : '先听听这些，越听越懂你'}</span>
+            </div>
+            <button onClick={() => void guess.next()} disabled={guess.loading} className="flex items-center gap-1 rounded-full border border-border px-3 py-2 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">
+              <RefreshCw className={`h-4 w-4 ${guess.loading ? 'animate-spin' : ''}`} /> 换一批
+            </button>
+          </div>
+          {guess.loading && guess.songs.length === 0 ? <LoadingSkeleton count={12} /> : (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6">
+              {guessTracks.map((track, i) => (
+                <button key={track.uid} onClick={() => void playTrack(track, guessTracks)} className="group rounded-lg p-2 text-left transition hover:bg-accent/50">
+                  <Cover src={track.musicInfo.img || ''} icon={Music} title={track.name} />
+                  <div className="mt-2 truncate text-sm font-medium group-hover:text-primary">{track.name}</div>
+                  <div className="truncate text-xs text-muted-foreground">{track.artist}</div>
+                  <div className="truncate text-xs text-primary/60">{guess.songs[i]?.reason}</div>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
       <section className="mb-10">
         <div className="mb-3 flex items-center gap-2"><Trophy className="h-5 w-5 text-primary" /><h2 className="text-lg font-semibold">排行榜</h2></div>
         {loadingToplists ? <LoadingSkeleton count={6} /> : toplistsError ? (
