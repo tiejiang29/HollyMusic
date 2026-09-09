@@ -1,6 +1,6 @@
 
 import { useEffect, useState } from 'react'
-import { X, ArrowLeftRight, Loader2, CheckCircle2 } from 'lucide-react'
+import { X, ArrowLeftRight, Loader2, CheckCircle2, Globe } from 'lucide-react'
 import { SourceBadge } from '@/components/shared/SourceBadge'
 import { apiGet, apiPost } from '@/lib/api/client'
 import { toast } from '@/lib/toast'
@@ -40,6 +40,9 @@ export function SourceSwitchDialog({
   const [list, setList] = useState<AlternativeItem[]>([])
   const [loading, setLoading] = useState(true)
   const [replacing, setReplacing] = useState<string | null>(null)
+  const [origin, setOrigin] = useState<'local' | 'upstream'>('upstream')
+  const [searchingMore, setSearchingMore] = useState(false)
+  const [searchedMore, setSearchedMore] = useState(false)
 
   useEffect(() => {
     const params = new URLSearchParams({
@@ -48,8 +51,11 @@ export function SourceSwitchDialog({
       interval: track.musicInfo?.interval ?? '',
       source: track.source,
     })
-    apiGet<{ list: AlternativeItem[] }>(`music/alternatives?${params}`)
-      .then(r => setList(r.list ?? []))
+    apiGet<{ list: AlternativeItem[]; origin?: 'local' | 'upstream' }>(`music/alternatives?${params}`)
+      .then(r => {
+        setList(r.list ?? [])
+        setOrigin(r.origin ?? 'upstream')
+      })
       .catch(err => {
         toast.error(`获取候选失败：${err instanceof Error ? err.message : String(err)}`)
         onClose()
@@ -73,6 +79,34 @@ export function SourceSwitchDialog({
       toast.error(`换源失败：${err instanceof Error ? err.message : String(err)}`)
     } finally {
       setReplacing(null)
+    }
+  }
+
+  // 本地候选之外还想要网上版本：强制实时搜上游，按 uid 去重后追加；失败保留入口可重试
+  const searchMore = async () => {
+    setSearchingMore(true)
+    try {
+      const params = new URLSearchParams({
+        name: track.name,
+        singer: track.artist ?? '',
+        interval: track.musicInfo?.interval ?? '',
+        source: track.source,
+        upstream: '1',
+      })
+      const r = await apiGet<{ list: AlternativeItem[] }>(`music/alternatives?${params}`)
+      const keyOf = (i: AlternativeItem) => `${i.source}-${i.musicInfo.songmid}`
+      const existing = new Set(list.map(keyOf))
+      const fresh = (r.list ?? []).filter(i => !existing.has(keyOf(i)))
+      if (fresh.length === 0) {
+        toast.info('网上没有找到更多版本')
+      } else {
+        setList(prev => [...prev, ...fresh])
+      }
+      setSearchedMore(true)
+    } catch (err) {
+      toast.error(`搜索失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setSearchingMore(false)
     }
   }
 
@@ -134,6 +168,20 @@ export function SourceSwitchDialog({
                 </button>
               )
             })
+          )}
+          {!loading && list.length > 0 && origin === 'local' && !searchedMore && (
+            <button
+              onClick={() => void searchMore()}
+              disabled={replacing !== null || searchingMore}
+              className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs text-muted-foreground transition hover:bg-accent/50 disabled:opacity-50"
+            >
+              {searchingMore ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Globe className="h-3.5 w-3.5" />
+              )}
+              在网上搜更多版本
+            </button>
           )}
         </div>
         <p className="border-t border-border px-4 py-2 text-[11px] text-muted-foreground">

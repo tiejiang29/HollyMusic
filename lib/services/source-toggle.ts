@@ -8,6 +8,9 @@
  */
 
 import * as musicSearch from '@/lib/music-core/music-search'
+import { prisma } from '@/lib/db'
+import { songIdentity } from '@/lib/song-identity'
+import { getSearchSources } from '@/lib/search-config'
 import { logger } from '@/lib/logger'
 import type { MusicInfo, SourceType } from '@/lib/types/music'
 
@@ -100,14 +103,77 @@ export interface AlternativeCandidate {
   intervalMatched: boolean
 }
 
+/** 候选排序：时长精确匹配的排前面，再按平台优先级 */
+function sortCandidates(candidates: AlternativeCandidate[]): AlternativeCandidate[] {
+  const orderIndex = new Map(TOGGLE_SOURCE_ORDER.map((s, i) => [s, i]))
+  return candidates.sort((a, b) => {
+    if (a.intervalMatched !== b.intervalMatched) return a.intervalMatched ? -1 : 1
+    return (orderIndex.get(a.source) ?? 99) - (orderIndex.get(b.source) ?? 99)
+  })
+}
+
 /**
- * 在其他平台搜索同款歌曲，返回全部候选（按平台顺序）。
- * 每平台取前 5 个候选做匹配，避免大歌单关键词命中过多翻唱。
+ * 本地优先：库内已有同款歌（同 identity 分组键）的其它平台副本时直接返回，
+ * 毫秒级命中，不再等上游搜索。identity 由写入路径/回填脚本维护，
+ * 为空的存量行查不到（宁可漏一条，走上游兜底），不影响正确性。
  */
-export async function findAlternatives(musicInfo: MusicInfo): Promise<AlternativeCandidate[]> {
+async function findLocalAlternatives(musicInfo: MusicInfo, intervalSec: number | null): Promise<AlternativeCandidate[]> {
+  const identity = songIdentity(musicInfo)
+  if (identity === '|') return []
+  const enabled = await getSearchSources()
+  // 无启用音源配置（空数组）时只排除当前源；有配置时限定在启用源内
+  const enabledOthers = enabled.length > 0 ? enabled.filter(s => s !== musicInfo.source) : null
+  if (enabledOthers && enabledOthers.length === 0) return []
+  const rows = await prisma.musicInfo.findMany({
+    where: {
+      identity,
+      source: enabledOthers ? { in: enabledOthers } : { not: musicInfo.source },
+    },
+    take: 10,
+  })
+  const candidates: AlternativeCandidate[] = []
+  for (const row of rows) {
+    try {
+      const mi = JSON.parse(row.data ?? '') as MusicInfo
+      candidates.push({
+        musicInfo: mi,
+        source: mi.source ?? row.source,
+        intervalMatched: intervalSec != null && parseIntervalToSeconds(mi.interval) != null,
+      })
+    } catch {
+      // data 列解析失败的行跳过
+    }
+  }
+  return candidates
+}
+
+export interface FindAlternativesResult {
+  candidates: AlternativeCandidate[]
+  /** 候选来源：local=库内同款歌副本，upstream=上游平台实时搜索 */
+  origin: 'local' | 'upstream'
+}
+
+/**
+ * 换源候选：默认本地优先——库内已有同款歌（同 identity 分组键）的其它平台副本时
+ * 直接返回，不再实时搜上游；库内无副本或 opts.forceUpstream 时走上游搜索
+ * （每平台取前 5 个候选做匹配，避免大歌单关键词命中过多翻唱）。
+ */
+export async function findAlternatives(
+  musicInfo: MusicInfo,
+  opts: { forceUpstream?: boolean } = {}
+): Promise<FindAlternativesResult> {
   const { name, singer, source } = musicInfo
-  if (!name) return []
+  if (!name) return { candidates: [], origin: 'upstream' }
   const intervalSec = parseIntervalToSeconds(musicInfo.interval)
+
+  const local = opts.forceUpstream ? [] : await findLocalAlternatives(musicInfo, intervalSec)
+  if (local.length > 0) {
+    logger.info(
+      `[source-toggle] 本地同款歌命中: ${source}-${musicInfo.name}，库内副本 ${local.length} 条，跳过上游搜索`
+    )
+    return { candidates: sortCandidates(local), origin: 'local' }
+  }
+
   const keyword = singer ? `${name} ${singer}` : name
 
   const candidates: AlternativeCandidate[] = []
@@ -135,12 +201,7 @@ export async function findAlternatives(musicInfo: MusicInfo): Promise<Alternativ
   )
 
   // 按平台优先级排序，时长精确匹配的排前面
-  const orderIndex = new Map(TOGGLE_SOURCE_ORDER.map((s, i) => [s, i]))
-  candidates.sort((a, b) => {
-    if (a.intervalMatched !== b.intervalMatched) return a.intervalMatched ? -1 : 1
-    return (orderIndex.get(a.source) ?? 99) - (orderIndex.get(b.source) ?? 99)
-  })
-  return candidates
+  return { candidates: sortCandidates(candidates), origin: 'upstream' }
 }
 
 /**
@@ -150,7 +211,7 @@ export async function findBestAlternative(musicInfo: MusicInfo): Promise<MusicIn
   const key = cacheKey(musicInfo)
   if (toggleCache.has(key)) return toggleCache.get(key) ?? null
 
-  const candidates = await findAlternatives(musicInfo)
+  const { candidates } = await findAlternatives(musicInfo)
   const best = candidates[0]?.musicInfo ?? null
   cacheSet(key, best)
   if (best) {

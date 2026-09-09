@@ -3,6 +3,7 @@ import crypto from 'crypto'
 import { PrismaClient, Prisma } from './generated/prisma'
 import { logger } from './logger'
 import type { MusicInfo } from './types/music'
+import { dedupeByIdentity, songIdentity } from './song-identity'
 
 export const prisma = new PrismaClient()
 
@@ -144,6 +145,8 @@ export async function getMusicInfoListByAlbumId(albumId: string): Promise<MusicI
  * 从 DB 随机抽取 size 首歌曲（还原为 MusicInfo）。
  * 用于 getRandomSongs 接口：从历史搜索/播放入库的曲目中随机推荐。
  * Prisma 不支持随机排序，用原生 SQL ORDER BY RANDOM()。
+ * 超采一倍后按歌曲标识归并同曲多副本（跨音源/同音源多版本），再截取 size，
+ * 保证随机听的列表里同一首歌只出现一次。
  */
 export async function getRandomMusicInfoList(size: number, allowedSources?: string[]): Promise<MusicInfo[]> {
   try {
@@ -153,18 +156,18 @@ export async function getRandomMusicInfoList(size: number, allowedSources?: stri
     // 两种查询都按 allowedSources 过滤为启用音源，保证抽出的歌可播放。
     let rows = allowedSources && allowedSources.length > 0
       ? await prisma.$queryRaw<{ data: string | null }[]>`
-          SELECT data FROM MusicInfo WHERE source IN (${Prisma.join(allowedSources)}) AND isRecommended = 1 ORDER BY RANDOM() LIMIT ${limit}
+          SELECT data FROM MusicInfo WHERE source IN (${Prisma.join(allowedSources)}) AND isRecommended = 1 ORDER BY RANDOM() LIMIT ${limit * 2}
         `
       : await prisma.$queryRaw<{ data: string | null }[]>`
-          SELECT data FROM MusicInfo WHERE isRecommended = 1 ORDER BY RANDOM() LIMIT ${limit}
+          SELECT data FROM MusicInfo WHERE isRecommended = 1 ORDER BY RANDOM() LIMIT ${limit * 2}
         `
     if (rows.length === 0) {
       rows = allowedSources && allowedSources.length > 0
         ? await prisma.$queryRaw<{ data: string | null }[]>`
-            SELECT data FROM MusicInfo WHERE source IN (${Prisma.join(allowedSources)}) ORDER BY RANDOM() LIMIT ${limit}
+            SELECT data FROM MusicInfo WHERE source IN (${Prisma.join(allowedSources)}) ORDER BY RANDOM() LIMIT ${limit * 2}
           `
         : await prisma.$queryRaw<{ data: string | null }[]>`
-            SELECT data FROM MusicInfo ORDER BY RANDOM() LIMIT ${limit}
+            SELECT data FROM MusicInfo ORDER BY RANDOM() LIMIT ${limit * 2}
           `
     }
     const list: MusicInfo[] = []
@@ -176,7 +179,7 @@ export async function getRandomMusicInfoList(size: number, allowedSources?: stri
         // 跳过解析失败的行
       }
     }
-    return list
+    return dedupeByIdentity(list, s => s).slice(0, limit)
   } catch (e) {
     console.warn('getRandomMusicInfoList error', e)
     return []
@@ -380,6 +383,8 @@ async function upsertMusicInfoWithClient(
           songmid: storageSongmid,
           data: dataJson,
           checksum,
+          // 同款歌分组键，供换源按组查本地副本
+          identity: songIdentity(mi),
           // denormalized/searchable fields
           name: mi.name || null,
           singer: mi.singer || null,
@@ -446,6 +451,8 @@ async function upsertMusicInfoWithClient(
       data: {
         data: dataJson,
         checksum,
+        // 上游改名/换歌手时重算，行会自然迁移到正确的同款歌组
+        identity: songIdentity(mi),
         // update denormalized/searchable fields as above
         name: mi.name || null,
         singer: mi.singer || null,

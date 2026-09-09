@@ -26,6 +26,11 @@ model MusicInfo {
   // 是否加入推荐白名单（管理员勾选）。推荐接口只从 true 的歌曲中随机抽取。
   isRecommended Boolean @default(false)
 
+  // 同款歌分组键：归一化(歌名|歌手集合，与顺序无关)。同一首歌的跨音源/同音源多副本
+  // 共享同一值，供换源等场景按组查询。纯函数计算、写入时维护（lib/song-identity.ts）；
+  // NULL = 尚未回填的存量行。
+  identity String?
+
   // Denormalized/searchable fields
   name           String?   // 歌曲名
   singer         String?   // 歌手/艺人
@@ -58,6 +63,7 @@ model MusicInfo {
   @@index([songmid])
   @@index([name])
   @@index([singer])
+  @@index([identity])
   @@index([albumId])
   @@index([albumName])
   @@index([songId])

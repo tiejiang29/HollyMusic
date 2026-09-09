@@ -1,9 +1,11 @@
 /**
  * 换源候选 API
- * GET /api/music/alternatives?name=晴天&singer=周杰伦&interval=04:29&source=kw
+ * GET /api/music/alternatives?name=晴天&singer=周杰伦&interval=04:29&source=kw[&upstream=1]
  *
  * 在「除 source 外」的其他平台按歌名+歌手+时长容差搜索同款歌曲，
  * 返回候选列表（含平台标记），供前端手动换源弹窗使用。
+ * 默认本地优先：库内已有同款歌副本时毫秒级直接返回；`upstream=1` 强制实时搜上游。
+ * 响应 data.origin 标明候选来源：local=库内副本 / upstream=上游搜索结果。
  */
 
 import { NextRequest } from 'next/server'
@@ -28,6 +30,9 @@ export async function GET(request: NextRequest) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '缺少必填参数: name', 400)
     }
 
+    // upstream=1：跳过库内副本，强制实时搜索上游平台（前端"在网上搜更多版本"入口用）
+    const forceUpstream = p.get('upstream') === '1'
+
     // 构造一个"虚拟"musicInfo 驱动匹配逻辑（只需匹配字段）
     const probe = {
       name,
@@ -40,7 +45,7 @@ export async function GET(request: NextRequest) {
       typeUrl: {},
     } as unknown as Parameters<typeof findAlternatives>[0]
 
-    const candidates = await findAlternatives(probe)
+    const { candidates, origin } = await findAlternatives(probe, { forceUpstream })
 
     // 候选入库（复用搜索入库链路），保证前端可直接调封面/歌词/播放
     if (candidates.length > 0) {
@@ -52,6 +57,7 @@ export async function GET(request: NextRequest) {
     }
 
     return createSuccessResponse({
+      origin,
       list: candidates.map(c => ({
         source: c.source,
         intervalMatched: c.intervalMatched,
