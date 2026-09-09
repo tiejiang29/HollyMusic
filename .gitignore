@@ -105,3 +105,7 @@ android/
 # 本地 dev server 日志
 server-dev.log
 preview-dev.log
+
+# 本地维护的运维文档（含部署/运维细节，不进公开仓库）
+/HANDOFF.md
+/docs/ANDROID_API.md
