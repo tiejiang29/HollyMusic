@@ -14,12 +14,18 @@
  * 同一用户同一天结果稳定（"每日"语义），第二天自动换血。
  * 排序后执行歌手多样性约束（每个歌手最多 2 首），分页从完整榜切片。
  *
- * 冷启动兜底：画像为空时回退 getRandomMusicInfoList 两级抽取（白名单 → 全库）。
+ * 冷启动兜底：画像为空时回退随机池——推荐白名单优先，不足 FALLBACK_POOL_TARGET
+ * 从全库确定性补齐；池子按 (username, 当天) 种子洗牌并写入当日缓存，
+ * 与个性化路径共用同一套分页切片，保证同一天内刷新不变、翻页不重叠。
  */
-import { prisma, getRandomMusicInfoList, getStorageSongmidForMusicInfo } from '@/lib/db'
+import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import { getSearchSources } from '@/lib/search-config'
 import { logger } from '@/lib/logger'
+import { dedupeByIdentity, splitSinger, songIdentity } from '@/lib/song-identity'
 import type { MusicInfo, Song } from '@/lib/types/music'
+
+// 同曲归并工具位于 lib/song-identity.ts，此处再导出维持既有引用路径
+export { splitSinger, songIdentity }
 
 // ============ 可调参数 ============
 const FAVORITE_WEIGHT = 5
@@ -38,29 +44,14 @@ const TOP_ALBUMS = 10
 const MAX_CANDIDATES = 300
 /** 完整推荐榜上限（分页从这份榜切片） */
 const MAX_RANKED = 200
+/** 冷启动兜底池目标规模：白名单不足时从全库补齐，支撑整日翻页不重叠 */
+const FALLBACK_POOL_TARGET = 100
 /** 歌手多样性：同一歌手在榜内最多出现次数 */
 const MAX_PER_ARTIST = 2
 /** jitter 幅度：只够打乱同分段位，不影响大局 */
 const JITTER_SCALE = 2
 
-const SINGER_SPLIT_RE = /[、，,;；]+|\s+feat\.?\s+|\s+ft\.?\s+/i
-
 // ============ 纯函数（导出供单测） ============
-
-/** 拆分合唱歌手串 "A、B" / "A, B" / "A feat. B" → 去重后的歌手数组。
- * 刻意不按 "/" 拆：保护 AC/DC 这类名字本身含斜杠的乐队。 */
-export function splitSinger(raw: string | null | undefined): string[] {
-  if (!raw) return []
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const part of raw.split(SINGER_SPLIT_RE)) {
-    const name = part.trim()
-    if (!name || seen.has(name)) continue
-    seen.add(name)
-    out.push(name)
-  }
-  return out
-}
 
 /** FNV-1a 32 位字符串哈希（PRNG 种子用，不涉安全） */
 export function hashSeed(str: string): number {
@@ -98,6 +89,16 @@ export function recencyDecay(playedAt: Date, now = new Date()): number {
   return Math.pow(2, -days / HALF_LIFE_DAYS)
 }
 
+/** Fisher–Yates 洗牌：随机源由调用方注入（mulberry32），同种子同序，不修改原数组 */
+export function shuffle<T>(items: T[], rand: () => number): T[] {
+  const arr = [...items]
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1))
+    ;[arr[i], arr[j]] = [arr[j], arr[i]]
+  }
+  return arr
+}
+
 export interface AffinityContext {
   /** 歌手 → 亲和度 */
   artistAffinity: Map<string, number>
@@ -105,6 +106,8 @@ export interface AffinityContext {
   albumAffinity: Map<string, number>
   /** 已知的歌（历史 ∪ 收藏 ∪ 歌单），排序阶段剔除 */
   knownUids: Set<string>
+  /** 已知歌曲的跨副本标识（songIdentity），听过 A 源副本就不推 B 源同曲 */
+  knownIdentities: Set<string>
   /** 画像里是否至少有一个有效信号 */
   personalized: boolean
 }
@@ -118,6 +121,7 @@ export function rankCandidates(
   opts?: { includePlayed?: boolean },
 ): Array<Song & { reason: string }> {
   const known = opts?.includePlayed ? new Set<string>() : ctx.knownUids
+  const knownSongs = opts?.includePlayed ? new Set<string>() : ctx.knownIdentities
   const rand = mulberry32(hashSeed(`${username}:${date}`))
 
   const scored = candidates
@@ -140,16 +144,19 @@ export function rankCandidates(
       const score = artistSum + albumBonus + rand() * JITTER_SCALE
       return { mi, uid, score, reason: bestArtist }
     })
-    .filter(item => !known.has(item.uid) && item.reason)
+    .filter(item => !known.has(item.uid) && !knownSongs.has(songIdentity(item.mi)) && item.reason)
     .sort((a, b) => b.score - a.score)
+
+  // 同一首歌多副本（跨音源 / 同音源多版本）只保留一份；没封面的副本让位给有封面的
+  const unique = dedupeByIdentity(scored, s => s.mi).sort((a, b) => b.score - a.score)
 
   // 歌手多样性：贪心选取，每个主歌手最多 MAX_PER_ARTIST 首；
   // 被上限卡掉的歌进 deferred，第二轮按分数序补在榜尾——
   // 避免画像里歌手太少时整个榜单被截断到只剩寥寥几首
   const perArtist = new Map<string, number>()
   const ranked: Array<Song & { reason: string }> = []
-  const deferred: typeof scored = []
-  for (const item of scored) {
+  const deferred: typeof unique = []
+  for (const item of unique) {
     if (ranked.length >= MAX_RANKED) break
     const n = (perArtist.get(item.reason) ?? 0) + 1
     if (n > MAX_PER_ARTIST) {
@@ -214,6 +221,7 @@ export async function buildAffinityContext(username: string, userId: number): Pr
   const artistAffinity = new Map<string, number>()
   const albumAffinity = new Map<string, number>()
   const knownUids = new Set<string>()
+  const knownIdentities = new Set<string>()
   let personalized = false
   const now = new Date()
 
@@ -221,6 +229,7 @@ export async function buildAffinityContext(username: string, userId: number): Pr
     for (const artist of splitSinger(mi.singer)) {
       artistAffinity.set(artist, (artistAffinity.get(artist) ?? 0) + weight)
     }
+    knownIdentities.add(songIdentity(mi))
     personalized = true
   }
 
@@ -293,7 +302,7 @@ export async function buildAffinityContext(username: string, userId: number): Pr
     albumAffinity.set(album, ALBUM_BONUS)
   }
 
-  return { artistAffinity, albumAffinity, knownUids, personalized }
+  return { artistAffinity, albumAffinity, knownUids, knownIdentities, personalized }
 }
 
 /** 召回候选：Top 歌手的库内歌 + 亲和专辑的歌，去重后截断 */
@@ -332,11 +341,47 @@ export async function recallCandidates(ctx: AffinityContext, allowedSources: str
   return parsed
 }
 
+/**
+ * 冷启动兜底池：推荐白名单优先，不足 FALLBACK_POOL_TARGET 时按 id 倒序从全库补齐。
+ * 两种取数都是确定性的（不做随机抽样），当日缓存失效或进程重启后重算仍得同一批歌，
+ * 洗牌顺序由 (username, 当天) 种子决定——兜底路径因此与个性化路径一样按日稳定。
+ */
+async function loadFallbackPool(
+  allowedSources: string[],
+): Promise<Array<{ mi: MusicInfo; uid: string }>> {
+  // 与 getRandomMusicInfoList 同语义：空数组视为不过滤音源
+  const srcFilter = allowedSources.length > 0 ? { source: { in: allowedSources } } : {}
+  const parseRows = (rows: Array<{ source: string; songmid: string; data: string | null }>) =>
+    rows.flatMap(row => {
+      try {
+        return [{ mi: JSON.parse(row.data ?? '') as MusicInfo, uid: `${row.source}-${row.songmid}` }]
+      } catch {
+        // data 列解析失败的行跳过
+        return []
+      }
+    })
+
+  const wlRows = await prisma.musicInfo.findMany({ where: { isRecommended: true, ...srcFilter } })
+  let pool = parseRows(wlRows)
+  if (pool.length < FALLBACK_POOL_TARGET) {
+    const restRows = await prisma.musicInfo.findMany({
+      where: { id: { notIn: wlRows.map(r => r.id) }, ...srcFilter },
+      orderBy: { id: 'desc' },
+      take: FALLBACK_POOL_TARGET - pool.length,
+    })
+    pool = pool.concat(parseRows(restRows))
+  }
+
+  // 同一首歌多副本（跨音源 / 同音源多版本）只保留一份；没封面的副本让位给有封面的
+  return dedupeByIdentity(pool, p => p.mi)
+}
+
 // ============ 当日缓存 ============
 
 interface DailyCacheEntry {
   date: string
   ranked: Array<Song & { reason: string }>
+  personalized: boolean
 }
 const dailyCache = new Map<string, DailyCacheEntry>()
 const DAILY_CACHE_MAX = 50
@@ -348,13 +393,17 @@ function readDailyCache(username: string): DailyCacheEntry | null {
   return null
 }
 
-function writeDailyCache(username: string, ranked: Array<Song & { reason: string }>): void {
+function writeDailyCache(
+  username: string,
+  ranked: Array<Song & { reason: string }>,
+  personalized: boolean,
+): void {
   if (dailyCache.size >= DAILY_CACHE_MAX && !dailyCache.has(username)) {
     // 淘汰最早的条目（Map 保持插入序）
     const oldest = dailyCache.keys().next().value
     if (oldest !== undefined) dailyCache.delete(oldest)
   }
-  dailyCache.set(username, { date: dayKey(), ranked })
+  dailyCache.set(username, { date: dayKey(), ranked, personalized })
 }
 
 // ============ 对外入口 ============
@@ -384,26 +433,27 @@ export async function guessYouLike(
 
   const cached = readDailyCache(username)
   let ranked = cached?.ranked
-  let personalized = true
+  // 缓存命中时沿用写入时的标记，否则兜底结果会被误报成画像推荐
+  let personalized = cached?.personalized ?? true
 
   if (!ranked) {
     const allowedSources = getSearchSources()
     const ctx = await buildAffinityContext(username, userId)
-    if (!ctx.personalized) {
+    if (ctx.personalized) {
+      const candidates = await recallCandidates(ctx, allowedSources)
+      ranked = rankCandidates(candidates, ctx, username, date, { includePlayed: opts?.includePlayed })
+      logger.info(`[guess] ${username} 画像就绪: 候选 ${candidates.length} → 榜单 ${ranked.length}`)
+    } else {
       personalized = false
-      // 冷启动：直接随机兜底（不缓存，等画像出现后自然切换）
-      const fallback = await getRandomMusicInfoList(Math.min(size * page, 100), allowedSources)
-      const list = fallback.map(mi => ({
-        ...mi,
-        uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}`,
-        reason: '为你随机推荐',
-      }))
-      return { list: list.slice((page - 1) * size, page * size), page, size, date, personalized }
+      // 冷启动兜底：确定性池 + 洗牌，同样写当日缓存——不缓存的话每次请求
+      // 独立抽样，同一天内刷新会变脸、翻页会重叠，违背"按日稳定"的对外承诺
+      const pool = await loadFallbackPool(allowedSources)
+      ranked = shuffle(pool, mulberry32(hashSeed(`guess-fallback:${username}:${date}`)))
+        .slice(0, FALLBACK_POOL_TARGET)
+        .map(({ mi, uid }) => ({ ...mi, uid, reason: '为你随机推荐' }))
+      logger.info(`[guess] ${username} 冷启动兜底: 池 ${pool.length} → 榜单 ${ranked.length}`)
     }
-    const candidates = await recallCandidates(ctx, allowedSources)
-    ranked = rankCandidates(candidates, ctx, username, date, { includePlayed: opts?.includePlayed })
-    writeDailyCache(username, ranked)
-    logger.info(`[guess] ${username} 画像就绪: 候选 ${candidates.length} → 榜单 ${ranked.length}`)
+    writeDailyCache(username, ranked, personalized)
   }
 
   return {

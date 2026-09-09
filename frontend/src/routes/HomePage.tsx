@@ -153,7 +153,7 @@ export function HomePage() {
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6">
               {guessTracks.map((track, i) => (
                 <button key={track.uid} onClick={() => void playTrack(track, guessTracks)} className="group rounded-lg p-2 text-left transition hover:bg-accent/50">
-                  <Cover src={track.musicInfo.img || ''} icon={Music} title={track.name} />
+                  <Cover src={track.musicInfo.img || `/api/cover/${track.uid}`} icon={Music} title={track.name} />
                   <div className="mt-2 truncate text-sm font-medium group-hover:text-primary">{track.name}</div>
                   <div className="truncate text-xs text-muted-foreground">{track.artist}</div>
                   <div className="truncate text-xs text-primary/60">{guess.songs[i]?.reason}</div>

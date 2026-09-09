@@ -11,6 +11,7 @@ import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { searchCache } from '@/lib/cache-manager'
 import { upsertMusicInfosInTransaction, getStorageSongmidForMusicInfo, getMusicInfo, prisma } from '@/lib/db'
+import { dedupeByIdentity } from '@/lib/song-identity'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import type { SearchResult, SourceType, Song } from '@/lib/types/music'
@@ -83,10 +84,14 @@ async function searchOneSource(source: SourceType, keyword: string, page: number
     throw new Error('搜索结果入库失败')
   }
 
-  const list: Song[] = result.list.map((mi) => ({
-    ...mi,
-    uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}`,
-  }))
+  // 同曲多副本（同源多音质等）只露出一份，优先带封面的副本；入缓存前归并
+  const list: Song[] = dedupeByIdentity(
+    result.list.map((mi) => ({
+      ...mi,
+      uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}`,
+    })),
+    s => s,
+  )
   const enriched = { ...result, list }
 
   searchCache.set(cacheKey, enriched, SEARCH_CACHE_TTL)
@@ -179,8 +184,10 @@ export async function GET(request: NextRequest) {
 
     // 部分源失败时透出失败源列表，客户端可提示"结果不含 xx"
     const failedSources = ALL_SOURCES.filter((_, i) => settled[i].status === 'rejected')
+    // 五源拼接后同一首歌常有跨源副本，归并只露一份（源顺序优先，没封面的让位给有封面的）
+    const mergedList = dedupeByIdentity(okResults.flatMap(r => r.list), s => s)
     const merged = {
-      list: okResults.flatMap(r => r.list),
+      list: mergedList,
       total: okResults.reduce((sum, r) => sum + (r.total || r.list.length), 0),
       allPage: Math.max(...okResults.map(r => r.allPage || 1)),
       page,
