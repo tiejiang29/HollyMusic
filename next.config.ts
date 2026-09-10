@@ -14,6 +14,7 @@ const nextConfig: NextConfig = {
   // - Prisma 客户端 + 查询引擎二进制（自定义 output 路径，.node 不是 JS import）
   // - Prisma CLI（运行时 migrate deploy 需要，但不被 app 代码 import）
   // - needle/tunnel 兜底（serverExternalPackages 在 Turbopack 下追踪不可靠）
+  // - music-core 全目录（runner.js/runner-client.js 由子进程裸 Node 直接执行，不经打包器）
   outputFileTracingIncludes: {
     '/api/**': [
       './lib/generated/prisma/**/*',
@@ -22,6 +23,7 @@ const nextConfig: NextConfig = {
       './node_modules/@prisma/**/*',
       './node_modules/needle/**/*',
       './node_modules/tunnel/**/*',
+      './lib/music-core/**/*',
     ],
     '/rest/**': [
       './lib/generated/prisma/**/*',
