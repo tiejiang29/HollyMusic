@@ -417,4 +417,56 @@ describe('guessYouLike', () => {
     expect(second.list.map(s => s.name)).not.toEqual(first.list.map(s => s.name))
     expect(prisma.playHistory.findMany).toHaveBeenCalledTimes(1)
   })
+
+  it('画像稀疏时榜单枯竭，用兜底池补足到 size 且不混入已知歌/重复歌', async () => {
+    // 画像：仅 1 条收藏（碎碎念-队长），召回只回来 3 首候选
+    const fav = mi({ name: '碎碎念', singer: '队长', songmid: 's1', source: 'tx' })
+    prisma.favorite.findMany.mockResolvedValue([{ itemId: 'tx-s1' }])
+    const recallRows = ['a', 'b', 'c'].map(n => ({
+      source: 'wy', songmid: n,
+      data: JSON.stringify(mi({ name: `召回歌${n}`, singer: '队长', songmid: n })),
+    }))
+    // 兜底池：含收藏歌的跨源副本（knownIdentities 剔除）、与召回歌 c 同曲的副本
+    //（榜内已有同曲剔除），其余 12 首可补；3 + 12 = size(15)
+    const wlRows = [
+      { id: 1, source: 'tx', songmid: 's9', data: JSON.stringify(mi({ name: '碎碎念', singer: '队长', songmid: 's9', source: 'tx' })) },
+      { id: 2, source: 'wy', songmid: 'c', data: JSON.stringify(mi({ name: '召回歌c', singer: '队长', songmid: 'c' })) },
+      ...Array.from({ length: 12 }, (_, i) => ({
+        id: 10 + i, source: 'wy', songmid: `p${i}`,
+        data: JSON.stringify(mi({ name: `补${i}`, singer: `路人${i}`, songmid: `p${i}` })),
+      })),
+    ]
+    prisma.musicInfo.findMany.mockImplementation(async (args?: {
+      where?: { OR?: Array<Record<string, unknown>>; isRecommended?: boolean; id?: { notIn?: number[] } }
+    }) => {
+      // 收藏 uid 解析（source+songmid 复合键）与召回（singer contains）都是 OR 查询，按键形区分
+      const or = args?.where?.OR
+      if (or) {
+        return or.some(cl => 'singer' in cl)
+          ? recallRows
+          : [{ source: 'tx', songmid: 's1', data: JSON.stringify(fav) }]
+      }
+      if (args?.where?.isRecommended === true) return wlRows
+      if (args?.where?.id?.notIn) return []
+      throw new Error('意外的 musicInfo.findMany 调用')
+    })
+
+    const r = await guessYouLike('sparse-user', 8, { size: 15 })
+    expect(r.personalized).toBe(true)
+    expect(r.list).toHaveLength(15)
+    // 前 3 首来自画像召回，后 12 首为随机补足
+    expect(r.list.slice(0, 3).every(s => s.reason === '因为你常听 队长')).toBe(true)
+    const tail = r.list.slice(3)
+    expect(tail).toHaveLength(12)
+    expect(tail.every(s => s.reason === '为你随机推荐')).toBe(true)
+    expect(tail.map(s => s.name).sort()).toEqual(Array.from({ length: 12 }, (_, i) => `补${i}`).sort())
+    // 收藏歌的跨源副本不因补足混入；全榜 uid 不重复
+    expect(r.list.filter(s => s.name === '碎碎念')).toHaveLength(0)
+    expect(new Set(r.list.map(s => s.uid)).size).toBe(15)
+
+    // 同日缓存生效：第二次调用不再查库
+    const calls = prisma.musicInfo.findMany.mock.calls.length
+    await guessYouLike('sparse-user', 8, { size: 15 })
+    expect(prisma.musicInfo.findMany.mock.calls.length).toBe(calls)
+  })
 })

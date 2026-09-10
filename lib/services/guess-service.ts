@@ -16,8 +16,9 @@
  * 排序后执行歌手多样性约束（每个歌手最多 2 首），分页从完整榜切片。
  *
  * 冷启动兜底：画像为空时回退随机池——推荐白名单优先，不足 FALLBACK_POOL_TARGET
- * 从全库确定性补齐；池子按 (username, 当天) 种子洗牌并写入当日缓存，
- * 与个性化路径共用同一套分页切片，保证同一天内刷新不变、翻页不重叠。
+ * 从全库确定性补齐；画像存在但榜单不足请求 size（画像太窄被剔除后枯竭）时，
+ * 用同一池子补足到 size，理由标「为你随机推荐」。池子按 (username, 当天) 种子
+ * 洗牌并写入当日缓存，与个性化路径共用同一套分页切片，保证同一天内刷新不变、翻页不重叠。
  */
 import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import { getSearchSources } from '@/lib/search-config'
@@ -367,6 +368,40 @@ async function loadFallbackPool(
   return dedupeByIdentity(pool, p => p.mi)
 }
 
+/**
+ * 榜单补足：画像歌手/专辑太少时召回有限，再经已知歌剔除与跨源去重，
+ * 榜单可能远短于请求的 size。复用冷启动确定性池补齐——跳过用户已知的歌
+ * （knownUids/knownIdentities）与榜内已有的歌，补进来的都是没听过的；
+ * 洗牌种子含 (username, 当天)，补足结果随当日缓存一起按日稳定。
+ */
+async function topUpRanked(
+  ranked: Array<Song & { reason: string }>,
+  size: number,
+  ctx: AffinityContext,
+  allowedSources: string[],
+  username: string,
+  date: string,
+): Promise<Array<Song & { reason: string }>> {
+  const seenUids = new Set(ranked.map(s => s.uid))
+  const seenIdentities = new Set(
+    ranked.map(s => songIdentity(s)).filter(id => id !== '|'),
+  )
+  const pool = shuffle(
+    await loadFallbackPool(allowedSources),
+    mulberry32(hashSeed(`guess-topup:${username}:${date}`)),
+  )
+  for (const { mi, uid } of pool) {
+    if (ranked.length >= size) break
+    if (ctx.knownUids.has(uid) || seenUids.has(uid)) continue
+    const identity = songIdentity(mi)
+    if (identity !== '|' && (ctx.knownIdentities.has(identity) || seenIdentities.has(identity))) continue
+    seenUids.add(uid)
+    if (identity !== '|') seenIdentities.add(identity)
+    ranked.push({ ...mi, uid, reason: '为你随机推荐' })
+  }
+  return ranked
+}
+
 // ============ 当日缓存 ============
 
 interface DailyCacheEntry {
@@ -434,6 +469,13 @@ export async function guessYouLike(
       const candidates = await recallCandidates(ctx, allowedSources)
       ranked = rankCandidates(candidates, ctx, username, date, { includePlayed: opts?.includePlayed })
       logger.info(`[guess] ${username} 画像就绪: 候选 ${candidates.length} → 榜单 ${ranked.length}`)
+      // 画像太窄时榜单可能远短于请求的 size（召回少 + 已知歌剔除 + 跨源去重），
+      // 用兜底池补足到 size——补足发生在写当日缓存前，当日稳定与翻页语义不受影响
+      if (ranked.length < size) {
+        const before = ranked.length
+        ranked = await topUpRanked(ranked, size, ctx, allowedSources, username, date)
+        logger.info(`[guess] ${username} 榜单补足: ${before} → ${ranked.length}`)
+      }
     } else {
       personalized = false
       // 冷启动兜底：确定性池 + 洗牌，同样写当日缓存——不缓存的话每次请求
