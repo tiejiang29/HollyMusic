@@ -12,4 +12,8 @@ export async function register() {
     .syncUsersFromConfig()
     .then(r => console.info('[startup] config-sync result', r))
     .catch(e => console.warn('[startup] config-sync error', e))
+
+  // 封面自动回填：启动首轮 + 每 6 小时自愈轮（kw/kg/tx 库内空 img 自动补齐）
+  const { startCoverBackfillScheduler } = await import('@/lib/services/cover-backfill')
+  startCoverBackfillScheduler()
 }

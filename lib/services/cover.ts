@@ -37,6 +37,11 @@ export async function getCoverResponse(id: string): Promise<Response> {
     }
 
     try {
+      // 库内已有封面直链（搜索自带或自动回填）时直接抓取，避免每次打上游
+      if (musicInfo.img) {
+        const direct = await fetchImageFromUrl(musicInfo.img)
+        if (direct) return direct
+      }
       const picUrl = await getPicNative(musicInfo)
       if (picUrl) {
         const fetched = await fetchImageFromUrl(picUrl)

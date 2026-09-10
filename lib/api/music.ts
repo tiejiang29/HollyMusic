@@ -24,9 +24,10 @@ export function buildAudioUrl(uid: string, quality: QualityType = '320k'): strin
 /**
  * 构建封面 URL。
  * cacheKey 通常传当前 musicInfo.img：当音源修正专辑图时，浏览器不会继续使用同 UID 的旧封面缓存。
+ * 空串版本号用于清掉历史上 /api/cover 兜底失败被浏览器缓存的默认占位图（服务端已加自动回填）。
  */
 export function buildCoverUrl(uid: string, cacheKey?: string | null): string {
-  const version = cacheKey || '2'
+  const version = cacheKey || '3'
   return `/api/cover/${encodeURIComponent(uid)}?v=${encodeURIComponent(version)}`
 }
 
