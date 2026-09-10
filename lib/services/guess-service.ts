@@ -1,13 +1,14 @@
 /**
  * 猜我喜欢（Guess You Like）推荐服务
  *
- * v1 算法：content-based —— 带时间衰减的歌手亲和度画像 + 本地库召回 +
- * 确定性抖动排序。无 AI、无上游请求、无新表，全部同步计算。
+ * v2 算法：在 v1 content-based 基础上引入歌曲级播放统计（lib/services/play-stats.ts）——
+ * 同一首歌跨音源/同源多副本的播放计数先按歌曲标识合并（totalPlays = Σ 副本计数），
+ * 画像信号全部先落到"这首歌"上，再统一聚合进歌手/专辑亲和度：
  *
- * 画像信号（按强度）：
- *   收藏的歌     权重 5（显式表态，不衰减）
- *   歌单里的歌   权重 3（主动收集，不衰减）
- *   播放过       ln(1 + playCount) × 2^(−距今天数/14)（半衰期 14 天）
+ *   播放   ln(1 + totalPlays) × 2^(−距最近一次天数/14)（半衰期 14 天）
+ *   收藏   权重 5（显式表态，不衰减；同一首歌多份副本只计一次）
+ *   歌单   权重 3（主动收集，不衰减；同上）
+ * 专辑加成 = ALBUM_BONUS × ln(1 + 专辑内歌曲分之和)，重听越狠加成越大。
  *
  * 排序：score = Σ(候选歌匹配到的歌手亲和度) + 专辑亲和加成 + jitter。
  * jitter 用 mulberry32 PRNG，种子 = hash(username + 当天日期)：
@@ -22,6 +23,12 @@ import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import { getSearchSources } from '@/lib/search-config'
 import { logger } from '@/lib/logger'
 import { dedupeByIdentity, splitSinger, songIdentity } from '@/lib/song-identity'
+import {
+  mergePlayRows,
+  loadMusicInfoByIds,
+  loadMusicInfoByUids,
+  loadUnresolvedByUid,
+} from '@/lib/services/play-stats'
 import type { MusicInfo, Song } from '@/lib/types/music'
 
 // 同曲归并工具位于 lib/song-identity.ts，此处再导出维持既有引用路径
@@ -175,48 +182,11 @@ export function rankCandidates(
 
 // ============ IO（画像构建与召回） ============
 
-/** 通过 musicInfoId 批量取 MusicInfo（历史/歌单条目走这条路径） */
-async function loadMusicInfoByIds(ids: number[]): Promise<Map<number, MusicInfo>> {
-  const map = new Map<number, MusicInfo>()
-  if (ids.length === 0) return map
-  const rows = await prisma.musicInfo.findMany({
-    where: { id: { in: ids } },
-  })
-  for (const row of rows) {
-    try {
-      map.set(row.id, JSON.parse(row.data) as MusicInfo)
-    } catch {
-      // data 列解析失败的行跳过
-    }
-  }
-  return map
-}
-
-/** 通过 uid（source-存储songmid）批量取 MusicInfo（收藏没有 musicInfoId 关联） */
-async function loadMusicInfoByUids(uids: string[]): Promise<Map<string, MusicInfo>> {
-  const map = new Map<string, MusicInfo>()
-  if (uids.length === 0) return map
-  const pairs = uids
-    .map(u => {
-      const idx = u.indexOf('-')
-      return idx > 0 ? { source: u.slice(0, idx), songmid: u.slice(idx + 1) } : null
-    })
-    .filter((p): p is { source: string; songmid: string } => p !== null)
-  // 收藏量级为几十，OR 复合键查询安全
-  const rows = await prisma.musicInfo.findMany({
-    where: { OR: pairs.map(p => ({ source: p.source, songmid: p.songmid })) },
-  })
-  for (const row of rows) {
-    try {
-      map.set(`${row.source}-${row.songmid}`, JSON.parse(row.data) as MusicInfo)
-    } catch {
-      // 同上
-    }
-  }
-  return map
-}
-
-/** 构建用户画像：歌手/专辑亲和度 + 已知歌曲集合 */
+/**
+ * 构建用户画像：歌手/专辑亲和度 + 已知歌曲集合。
+ * v2：播放/收藏/歌单三类信号先合并到歌曲级（同一首歌跨副本不再各自为战），
+ * 最后统一聚合进歌手/专辑亲和度。
+ */
 export async function buildAffinityContext(username: string, userId: number): Promise<AffinityContext> {
   const artistAffinity = new Map<string, number>()
   const albumAffinity = new Map<string, number>()
@@ -225,30 +195,51 @@ export async function buildAffinityContext(username: string, userId: number): Pr
   let personalized = false
   const now = new Date()
 
-  const addAffinity = (mi: MusicInfo, weight: number) => {
-    for (const artist of splitSinger(mi.singer)) {
-      artistAffinity.set(artist, (artistAffinity.get(artist) ?? 0) + weight)
-    }
+  // 歌曲级信号表（v2 核心）：合并键 → { 分数, 代表副本 }。
+  // 播放分由 mergePlayRows 结果先写入；收藏/歌单等显式信号对同一首歌
+  // （同一合并键）只加一次——v1 里同一首歌的两份副本会各加一次 5 分
+  const songSignals = new Map<string, { score: number; mi: MusicInfo }>()
+  const explicitSeen = { favorite: new Set<string>(), playlist: new Set<string>() }
+  const signalKey = (mi: MusicInfo) => {
+    const identity = songIdentity(mi)
+    // 歌名歌手都缺失无法归并的行回退副本 uid，避免不同歌落进同一个空键
+    return identity === '|' ? `${mi.source}-${getStorageSongmidForMusicInfo(mi)}` : identity
+  }
+  const addExplicitSignal = (mi: MusicInfo, weight: number, kind: 'favorite' | 'playlist') => {
+    const key = signalKey(mi)
+    const seen = explicitSeen[kind]
+    if (seen.has(key)) return
+    seen.add(key)
+    const cur = songSignals.get(key)
+    if (cur) cur.score += weight
+    else songSignals.set(key, { score: weight, mi })
     knownIdentities.add(songIdentity(mi))
     personalized = true
   }
 
-  // 1) 播放历史：ln(1+playCount) × 时间衰减
+  // 1) 播放历史：副本计数合并 → ln(1+这首歌听的总次数) × 时间衰减
   const history = await prisma.playHistory.findMany({
     where: { username },
     select: { id: true, musicInfoId: true, songmid: true, playCount: true, playedAt: true },
   })
-  const histInfo = await loadMusicInfoByIds(
+  // 已知歌曲先按行收齐：解析失败的行也不进推荐
+  for (const h of history) {
+    if (h.songmid) knownUids.add(h.songmid)
+  }
+  const infoById = await loadMusicInfoByIds(
     history.map(h => h.musicInfoId).filter((id): id is number => id !== null),
   )
-  for (const h of history) {
-    const mi = h.musicInfoId !== null ? histInfo.get(h.musicInfoId) : undefined
-    if (!mi) continue
-    if (h.songmid) knownUids.add(h.songmid)
-    addAffinity(mi, Math.log(1 + h.playCount) * recencyDecay(h.playedAt, now))
+  const infoByUid = await loadUnresolvedByUid(history, infoById)
+  for (const s of mergePlayRows(history, infoById, infoByUid)) {
+    songSignals.set(s.key, {
+      score: Math.log(1 + s.totalPlays) * recencyDecay(s.lastPlayedAt, now),
+      mi: s.mi,
+    })
+    knownIdentities.add(songIdentity(s.mi))
+    personalized = true
   }
 
-  // 2) 收藏：固定权重，不衰减
+  // 2) 收藏：固定权重，不衰减；同一首歌多份副本只计一次显式权重
   const favorites = await prisma.favorite.findMany({
     where: { userId, itemType: 'song' },
     select: { itemId: true },
@@ -257,7 +248,7 @@ export async function buildAffinityContext(username: string, userId: number): Pr
   for (const f of favorites) {
     knownUids.add(f.itemId)
     const mi = favInfo.get(f.itemId)
-    if (mi) addAffinity(mi, FAVORITE_WEIGHT)
+    if (mi) addExplicitSignal(mi, FAVORITE_WEIGHT, 'favorite')
   }
 
   // 3) 用户歌单：固定权重，不衰减
@@ -278,28 +269,28 @@ export async function buildAffinityContext(username: string, userId: number): Pr
       const mi = e.musicInfoId !== null ? entryInfo.get(e.musicInfoId) : undefined
       if (mi) {
         knownUids.add(`${mi.source}-${getStorageSongmidForMusicInfo(mi)}`)
-        addAffinity(mi, PLAYLIST_WEIGHT)
+        addExplicitSignal(mi, PLAYLIST_WEIGHT, 'playlist')
       }
     }
   }
 
-  // 4) 专辑亲和：收藏歌 + 播放次数最多的歌所在专辑
-  const albumSongs: MusicInfo[] = []
-  for (const mi of favInfo.values()) albumSongs.push(mi)
-  const topPlayed = [...histInfo.entries()]
-    .sort((a, b) => {
-      const ha = history.find(h => h.musicInfoId === a[0])?.playCount ?? 0
-      const hb = history.find(h => h.musicInfoId === b[0])?.playCount ?? 0
-      return hb - ha
-    })
-    .slice(0, TOP_ALBUMS)
-  for (const [id] of topPlayed) {
-    const mi = histInfo.get(id)
-    if (mi) albumSongs.push(mi)
+  // 4) 聚合：歌手亲和 = 歌手各歌分数之和；专辑加成 = ALBUM_BONUS × ln(1+专辑Σ)。
+  //    入选专辑按"专辑内已知歌的分数总和"排序取 TOP_ALBUMS——重听越狠加成越大
+  //    （v1 是与强度无关的固定加成）
+  const albumScores = new Map<string, number>()
+  for (const { score, mi } of songSignals.values()) {
+    for (const artist of splitSinger(mi.singer)) {
+      artistAffinity.set(artist, (artistAffinity.get(artist) ?? 0) + score)
+    }
+    if (mi.albumName) {
+      albumScores.set(mi.albumName, (albumScores.get(mi.albumName) ?? 0) + score)
+    }
   }
-  const albumNames = [...new Set(albumSongs.map(mi => mi.albumName).filter((n): n is string => !!n))]
-  for (const album of albumNames.slice(0, TOP_ALBUMS)) {
-    albumAffinity.set(album, ALBUM_BONUS)
+  const topAlbums = [...albumScores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, TOP_ALBUMS)
+  for (const [name, sum] of topAlbums) {
+    albumAffinity.set(name, ALBUM_BONUS * Math.log(1 + sum))
   }
 
   return { artistAffinity, albumAffinity, knownUids, knownIdentities, personalized }

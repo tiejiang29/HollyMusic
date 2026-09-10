@@ -243,8 +243,8 @@ describe('buildAffinityContext', () => {
     expect(ctx.artistAffinity.get('D')).toBe(3)
     // knownUids：历史 songmid + 收藏 itemId + 歌单曲目（songmid 与推导 uid 两份）
     expect(ctx.knownUids).toEqual(new Set(['wy-p1', 'wy-f1', 'wy-pl1']))
-    // 专辑亲和来自收藏
-    expect(ctx.albumAffinity.get('专辑X')).toBe(2)
+    // 专辑加成随歌曲分缩放：收藏分 5 → 2 × ln(1+5)（v1 是固定 2）
+    expect(ctx.albumAffinity.get('专辑X')).toBeCloseTo(2 * Math.log(6), 3)
     // 跨副本已知歌标识同步收集
     expect(ctx.knownIdentities).toEqual(new Set([songIdentity(played), songIdentity(fav), songIdentity(pl)]))
   })
@@ -253,6 +253,58 @@ describe('buildAffinityContext', () => {
     const ctx = await buildAffinityContext('nobody', 2)
     expect(ctx.personalized).toBe(false)
     expect(ctx.artistAffinity.size).toBe(0)
+  })
+
+  it('v2 跨副本合并：同一首歌两个音源的播放合并为一条歌曲信号', async () => {
+    const kwCopy = mi({ name: '晴天', singer: '周杰伦', songmid: 'kw1', source: 'kw', img: 'http://x/kw.jpg' })
+    const wyCopy = mi({ name: '晴天', singer: '周杰伦', songmid: 'w1', source: 'wy' })
+    const t1 = new Date('2026-09-01T10:00:00Z')
+    const t2 = new Date('2026-09-05T10:00:00Z')
+    prisma.playHistory.findMany.mockResolvedValue([
+      { id: 1, musicInfoId: 11, songmid: 'kw-kw1', playCount: 5, playedAt: t1 },
+      { id: 2, musicInfoId: 12, songmid: 'wy-w1', playCount: 3, playedAt: t2 },
+    ])
+    prisma.musicInfo.findMany.mockResolvedValueOnce([
+      { id: 11, source: 'kw', songmid: 'kw1', data: JSON.stringify(kwCopy) },
+      { id: 12, source: 'wy', songmid: 'w1', data: JSON.stringify(wyCopy) },
+    ])
+
+    const ctx = await buildAffinityContext('merge-user', 8)
+    // 合并后 totalPlays=8：ln(9)，而不是逐行累加的 ln(6)+ln(4)（副本不再分散计权）
+    expect(ctx.artistAffinity.get('周杰伦')).toBeCloseTo(Math.log(9) * recencyDecay(t2), 3)
+    // 已知歌曲先按行收齐：解析失败/另一音源的副本也照常排除
+    expect(ctx.knownUids).toEqual(new Set(['kw-kw1', 'wy-w1']))
+  })
+
+  it('v2 收藏同一首歌的多份副本只计一次显式权重', async () => {
+    const f1 = mi({ name: '收藏歌', singer: 'C', songmid: 'f1', source: 'wy' })
+    const f2 = mi({ name: '收藏歌', singer: 'C', songmid: 'f2', source: 'kg' })
+    prisma.favorite.findMany.mockResolvedValue([{ itemId: 'wy-f1' }, { itemId: 'kg-f2' }])
+    // 空历史不触发查询，第一次 findMany 是收藏的 uid 批量解析
+    prisma.musicInfo.findMany.mockResolvedValueOnce([
+      { source: 'wy', songmid: 'f1', data: JSON.stringify(f1) },
+      { source: 'kg', songmid: 'f2', data: JSON.stringify(f2) },
+    ])
+
+    const ctx = await buildAffinityContext('fav-dup-user', 9)
+    expect(ctx.artistAffinity.get('C')).toBe(5) // v1 会是 10
+    // 两份副本都进 knownUids，跨副本排除不受去重计权影响
+    expect(ctx.knownUids).toEqual(new Set(['wy-f1', 'kg-f2']))
+  })
+
+  it('v2 播放行缺失 musicInfoId 时按 songmid 兜底解析', async () => {
+    const orphan = mi({ name: '孤儿歌', singer: 'O', songmid: 'orphan', source: 'wy' })
+    prisma.playHistory.findMany.mockResolvedValue([
+      { id: 1, musicInfoId: null, songmid: 'wy-orphan', playCount: 4, playedAt: new Date() },
+    ])
+    // 没有 id 可查，第一次 findMany 就是 uid 兜底
+    prisma.musicInfo.findMany.mockResolvedValueOnce([
+      { source: 'wy', songmid: 'orphan', data: JSON.stringify(orphan) },
+    ])
+
+    const ctx = await buildAffinityContext('orphan-user', 10)
+    expect(ctx.personalized).toBe(true)
+    expect(ctx.artistAffinity.get('O')).toBeCloseTo(Math.log(5), 3)
   })
 })
 
