@@ -2,8 +2,9 @@
  * 专辑搜索与专辑详情服务（平台能力，遵循 music-core/AGENTS.md：平台适配一律用 TypeScript）
  *
  * 一期覆盖 wy / kw / mg（tx/kg 二期逆向后接入）：
- * - wy 专辑搜索：eapi cloudsearch/pc type=10（与歌曲搜索同一通道，仅换 type）
- *   wy 专辑曲目：明文 GET music.163.com/api/v1/album/{id}（songs 实体与 cloudsearch 同构，
+ * - wy 专辑搜索：明文 GET music.163.com/api/search/get/web type=10（老端点排序远优于
+ *   eapi cloudsearch/pc——后者把官方专辑压到 20 名开外、翻唱杂牌霸榜，实测对比后换端点）
+ *   wy 专辑曲目：明文 GET music.163.com/api/v1/album/{id}（songs 实体与搜索同构，
  *   直接复用 discovery-service 的 toWyMusicInfo）
  * - kw 专辑搜索：r.s 歌曲搜索按 ALBUMID 聚合（www.kuwo.cn/api/www 系列被反爬拦截，
  *   csrf/kw_token 方案实测均返回 "The request is illegal!"，聚合是当前唯一可行方案）
@@ -15,7 +16,7 @@
  *   一期只出卡片，详情返回 unsupported
  */
 
-import { createCipheriv, createHash } from 'crypto'
+import { createHash } from 'crypto'
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
 import type { MusicInfo, Song } from '@/lib/types/music'
@@ -99,18 +100,6 @@ function formatDate(ms: number | undefined): string | undefined {
 
 // ==================== 网易云（wy） ====================
 
-// 与 lib/music-core/wy-eapi.js 一致的 eapi 加密（TS 版）
-const WY_EAPI_KEY = 'e82ckenh8dichen8'
-
-function wyEapi(apiPath: string, object: unknown): string {
-  const text = JSON.stringify(object)
-  const message = `nobody${apiPath}use${text}md5forencrypt`
-  const digest = createHash('md5').update(message).digest('hex')
-  const data = `${apiPath}-36cd479b6b5-${text}-36cd479b6b5-${digest}`
-  const cipher = createCipheriv('aes-128-ecb', Buffer.from(WY_EAPI_KEY), null)
-  return Buffer.concat([cipher.update(Buffer.from(data)), cipher.final()]).toString('hex').toUpperCase()
-}
-
 type WyArtist = { name?: string }
 type WyAlbumCard = {
   id?: number
@@ -127,20 +116,10 @@ function wyAlbumSinger(card: { artist?: WyArtist; artists?: WyArtist[] }): strin
 }
 
 async function searchWyAlbums(keyword: string, page: number, limit: number): Promise<{ list: AlbumSummary[]; total: number }> {
-  // 与歌曲搜索同一 eapi 通道（music-search.js wySearch），type=10 即专辑
-  const apiPath = '/api/cloudsearch/pc'
-  const params = wyEapi(apiPath, { s: keyword, type: 10, limit, total: page === 1, offset: limit * (page - 1) })
+  // 老明文搜索端点：对专辑名精确命中的排序远优于 eapi cloudsearch/pc（后者官方专辑被翻唱压制）。
+  // 实测无需登录态，响应 result.albums 与 eapi 通道同构。
   const result = await fetchJson<{ code?: number; result?: { albums?: WyAlbumCard[]; albumCount?: number } }>(
-    'http://interface.music.163.com/eapi/batch',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Origin': 'https://music.163.com',
-        'Referer': 'https://music.163.com/',
-      },
-      body: new URLSearchParams({ params }).toString(),
-    },
+    `https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=10&limit=${limit}&offset=${limit * (page - 1)}`,
   )
   if (result.code !== 200 || !result.result) throw new Error('网易专辑搜索失败')
 
@@ -190,10 +169,12 @@ async function getWyAlbumTracks(albumId: string): Promise<AlbumDetail> {
 
 /**
  * kw 专辑搜索：r.s 歌曲搜索按 ALBUMID 聚合出专辑卡片。
- * 无直接专辑搜索端点可用（www API 反爬、r.s ft=album 恒空），聚合页内命中数仅作排序参考。
+ * 无直接专辑搜索端点可用（www API 反爬、r.s ft=album 恒空）。
+ * 聚合池取 3 倍卡片数的歌曲结果（上限 60），命中数更接近真实曲目数、专辑覆盖也更全。
  */
 async function searchKwAlbums(keyword: string, page: number, limit: number): Promise<{ list: AlbumSummary[]; total: number }> {
-  const result = await kwSongSearch.search(keyword, page, limit)
+  const aggLimit = Math.min(limit * 3, 60)
+  const result = await kwSongSearch.search(keyword, 1, aggLimit)
   const groups = new Map<string, AlbumSummary>()
   for (const song of result.list) {
     const albumId = song.albumId ? String(song.albumId) : ''
@@ -212,8 +193,10 @@ async function searchKwAlbums(keyword: string, page: number, limit: number): Pro
       trackCount: 1,
     })
   }
-  const list = [...groups.values()].sort((a, b) => (b.trackCount || 0) - (a.trackCount || 0))
-  return { list, total: result.total || list.length }
+  const grouped = [...groups.values()].sort((a, b) => (b.trackCount || 0) - (a.trackCount || 0))
+  // 页窗口：聚合池取自歌曲搜索第 1 页，仅第 1 页卡片可信，后续页返回空避免错位数据
+  const list = page === 1 ? grouped.slice(0, limit) : []
+  return { list, total: grouped.length }
 }
 
 type KwNuxtSong = {
@@ -369,6 +352,60 @@ async function searchMgAlbums(keyword: string, page: number, limit: number): Pro
   }
 }
 
+// ==================== 重排与跨源去重 ====================
+
+const ANONYMOUS_SINGERS = new Set(['', '未知歌手', '账号已注销', '佚名'])
+
+function normalizeForMatch(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, '')
+}
+
+/**
+ * 专辑卡片相关性重排。平台原始排序对“专辑名精确命中”不敏感，翻唱/杂牌常压过官方专辑
+ * （eapi 通道实测官方《叶惠美》排第 20/21）。只重排不过滤，规则：
+ * - 专辑名精确命中置顶，其余保持相对顺序（名称仅“包含”关键词不加分：
+ *   歌手名查询时名字带歌手的精选辑/演唱会合辑会被错误顶起，实测弊大于利）
+ * - 真实歌手名加权，匿名/注销账号压后
+ * - 曲目数分档加权（真专辑通常 ≥5 首，杂牌单曲多为 1 首）
+ * - 同分按发行时间升序：原版必然早于翻唱，最早发行者视为原版
+ */
+function rerankAlbums(list: AlbumSummary[], keyword: string): AlbumSummary[] {
+  const k = normalizeForMatch(keyword)
+  if (!k || list.length < 2) return list
+  const scored = list.map((album, index) => {
+    const name = normalizeForMatch(album.name)
+    let score = 0
+    if (name === k) score += 4
+    if (!ANONYMOUS_SINGERS.has(album.singer.trim())) score += 2
+    const tracks = album.trackCount ?? 0
+    score += tracks >= 5 ? 1 : tracks >= 2 ? 0.5 : 0
+    const parsed = album.publishTime ? Date.parse(album.publishTime) : NaN
+    return { album, index, score, publishMs: Number.isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed }
+  })
+  return scored
+    .sort((a, b) => b.score - a.score || a.publishMs - b.publishMs || a.index - b.index)
+    .map(s => s.album)
+}
+
+/** 跨源同名同歌手专辑合并（all 模式）：先到先得（源顺序 wy→kw→mg），缺失字段由后源回填 */
+function dedupeAlbums(list: AlbumSummary[]): AlbumSummary[] {
+  const byKey = new Map<string, AlbumSummary>()
+  const result: AlbumSummary[] = []
+  for (const album of list) {
+    const key = `${normalizeForMatch(album.name)}|${normalizeForMatch(album.singer)}`
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, album)
+      result.push(album)
+      continue
+    }
+    if (!existing.img && album.img) existing.img = album.img
+    if (!existing.publishTime && album.publishTime) existing.publishTime = album.publishTime
+    if (!existing.trackCount && album.trackCount) existing.trackCount = album.trackCount
+  }
+  return result
+}
+
 // ==================== 统一入口 ====================
 
 const albumSearchers: Record<AlbumSource, (keyword: string, page: number, limit: number) => Promise<{ list: AlbumSummary[]; total: number }>> = {
@@ -390,14 +427,14 @@ export async function searchAlbums(
   page = 1,
   limit = 20,
 ): Promise<AlbumSearchResult> {
-  const cacheKey = `album:v1:search:${source}:${keyword}:${page}:${limit}`
+  const cacheKey = `album:v3:search:${source}:${keyword}:${page}:${limit}`
   const cached = searchCache.get(cacheKey) as AlbumSearchResult | undefined
   if (cached) return cached
 
   if (source !== 'all') {
     const result = await albumSearchers[source](keyword, page, limit)
     const enriched: AlbumSearchResult = {
-      list: result.list,
+      list: rerankAlbums(result.list, keyword),
       total: result.total,
       page,
       allPage: Math.ceil(result.total / limit),
@@ -408,7 +445,7 @@ export async function searchAlbums(
     return enriched
   }
 
-  // 三源汇聚：allSettled 按固定源顺序拼接，失败源跳过并透出
+  // 三源汇聚：allSettled 按固定源顺序拼接，失败源跳过并透出；同名同歌手专辑跨源去重
   const settled = await Promise.allSettled(
     ALBUM_SOURCES.map(s => albumSearchers[s](keyword, page, limit)),
   )
@@ -423,11 +460,11 @@ export async function searchAlbums(
   })
   if (okLists.length === 0) throw new Error('所有音源专辑搜索失败')
 
-  const list = okLists.flat()
-  const total = settled.reduce((sum, r) => sum + (r.status === 'fulfilled' ? r.value.total : 0), 0)
+  // 跨源去重后整体重排，让精确命中的官方专辑置顶
+  const ranked = rerankAlbums(dedupeAlbums(okLists.flat()), keyword)
   const merged: AlbumSearchResult = {
-    list,
-    total,
+    list: ranked,
+    total: ranked.length,
     page,
     allPage: Math.max(1, ...settled.map(r => r.status === 'fulfilled' ? Math.ceil(r.value.total / limit) : 1)),
     limit,
@@ -443,7 +480,7 @@ export async function getAlbumTracks(source: AlbumSource, albumId: string): Prom
   const fetcher = albumTrackFetchers[source]
   if (!fetcher) throw new AlbumTracksUnsupportedError(source)
 
-  const cacheKey = `album:v1:tracks:${source}:${albumId}`
+  const cacheKey = `album:v2:tracks:${source}:${albumId}`
   const cached = searchCache.get(cacheKey) as AlbumDetail | undefined
   if (cached) return cached
 

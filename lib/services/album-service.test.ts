@@ -82,7 +82,7 @@ describe('isAlbumSource / ALBUM_SOURCES', () => {
 })
 
 describe('searchAlbums wy', () => {
-  const eapiPayload = {
+  const plainPayload = {
     code: 200,
     result: {
       albumCount: 2,
@@ -93,23 +93,44 @@ describe('searchAlbums wy', () => {
     },
   }
 
-  it('解析 eapi type=10 响应并缓存', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(eapiPayload))
+  it('走明文 search/get/web 端点并缓存', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(plainPayload))
 
     const result = await searchAlbums('wy', '周杰伦', 1, 20)
 
-    expect(fetchMock.mock.calls[0][0]).toBe('http://interface.music.163.com/eapi/batch')
-    const init = fetchMock.mock.calls[0][1]
-    expect(init.method).toBe('POST')
-    expect(new URLSearchParams(init.body).get('params')).toBeTruthy()
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `https://music.163.com/api/search/get/web?s=${encodeURIComponent('周杰伦')}&type=10&limit=20&offset=0`,
+    )
     expect(result.list[0]).toMatchObject({
       source: 'wy', albumId: '101', name: '叶惠美', singer: '周杰伦', img: 'http://p1.music.126.net/a.jpg',
       publishTime: '2003-06-30', trackCount: 11,
     })
     expect(result.total).toBe(2)
     expect(set).toHaveBeenCalledWith(
-      'album:v1:search:wy:周杰伦:1:20', result, expect.any(Number),
+      'album:v3:search:wy:周杰伦:1:20', result, expect.any(Number),
     )
+  })
+
+  it('重排：精确命中的官方专辑压过翻唱杂牌', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      code: 200,
+      result: {
+        albumCount: 3,
+        albums: [
+          // 封面杂牌：同名但曲目多、发行晚
+          { id: 901, name: '叶惠美', publishTime: 1600000000000, size: 18, artist: { name: '王珏子乔' } },
+          // 匿名账号上传
+          { id: 902, name: '叶惠美', artist: { name: '账号已注销' } },
+          // 官方原版：上游排最后
+          { id: 903, name: '叶惠美', publishTime: 1056931200000, size: 11, artist: { name: '周杰伦' } },
+        ],
+      },
+    }))
+
+    const result = await searchAlbums('wy', '叶惠美', 1, 20)
+
+    // 官方原版与同名翻唱同分（7），按发行时间升序原版置顶；匿名账号压底
+    expect(result.list.map(a => a.albumId)).toEqual(['903', '901', '902'])
   })
 
   it('缓存命中时不请求上游', async () => {
@@ -129,7 +150,7 @@ describe('searchAlbums wy', () => {
 })
 
 describe('searchAlbums kw（歌曲搜索按专辑聚合）', () => {
-  it('按 albumId 分组并按命中数排序', async () => {
+  it('3 倍池聚合、按 albumId 分组并按命中数排序', async () => {
     kwSearch.mockResolvedValueOnce({
       total: 5,
       list: [
@@ -143,12 +164,14 @@ describe('searchAlbums kw（歌曲搜索按专辑聚合）', () => {
 
     const result = await searchAlbums('kw', '歌手')
 
-    expect(kwSearch).toHaveBeenCalledWith('歌手', 1, 20)
+    // 聚合池 = 3 倍卡片数（20×3=60，上限 60）
+    expect(kwSearch).toHaveBeenCalledWith('歌手', 1, 60)
     expect(result.list).toEqual([
       { source: 'kw', albumId: '88', name: '热门专辑', singer: '歌手', img: null, trackCount: 3 },
       { source: 'kw', albumId: '77', name: '冷门专辑', singer: '歌手', img: null, trackCount: 1 },
     ])
-    expect(result.total).toBe(5)
+    // total 为聚合出的专辑组数（歌曲总数对专辑搜索无意义）
+    expect(result.total).toBe(2)
   })
 })
 
@@ -202,6 +225,34 @@ describe('searchAlbums all（三源汇聚）', () => {
 
     await expect(searchAlbums('all', 'x')).rejects.toThrow('所有音源专辑搜索失败')
   })
+
+  it('同名同歌手跨源合并，缺失字段由后源回填', async () => {
+    // wy 无封面；kw 同专辑；mg 带封面 + 一张独占专辑
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      code: 200,
+      result: { albumCount: 1, albums: [{ id: 101, name: '叶惠美', artist: { name: '周杰伦' }, size: 11 }] },
+    }))
+    kwSearch.mockResolvedValueOnce({
+      total: 1,
+      list: [{ songmid: 'a', singer: '周杰伦', albumId: '88', albumName: '叶惠美' }],
+    })
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      code: '000000',
+      albumResultData: {
+        totalCount: '2',
+        result: [
+          { id: '9001', name: '叶惠美', singer: '周杰伦', imgItems: [{ img: 'http://d.musicapp.migu.cn/cover.jpg', imgSizeType: '03' }] },
+          { id: '9002', name: '咪咕独占', singer: '周杰伦' },
+        ],
+      },
+    }))
+
+    const result = await searchAlbums('all', '叶惠美')
+
+    expect(result.list.map(a => `${a.source}:${a.name}`)).toEqual(['wy:叶惠美', 'mg:咪咕独占'])
+    expect(result.list[0]).toMatchObject({ source: 'wy', img: 'http://d.musicapp.migu.cn/cover.jpg', trackCount: 11 })
+    expect(result.total).toBe(2)
+  })
 })
 
 describe('getAlbumTracks wy', () => {
@@ -225,7 +276,7 @@ describe('getAlbumTracks wy', () => {
     })
     expect(result.list.map(s => s.uid)).toEqual(['wy-1', 'wy-2'])
     expect(result.list[0]).toMatchObject({ name: '以父之名', albumId: '101', albumName: '叶惠美' })
-    expect(set).toHaveBeenCalledWith('album:v1:tracks:wy:101', result, expect.any(Number))
+    expect(set).toHaveBeenCalledWith('album:v2:tracks:wy:101', result, expect.any(Number))
   })
 
   it('空曲目不写缓存', async () => {
