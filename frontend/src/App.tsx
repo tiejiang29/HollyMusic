@@ -28,6 +28,7 @@ import { SearchPage } from './routes/SearchPage'
 import { FavoritesPage } from './routes/FavoritesPage'
 import { PlaylistsPage } from './routes/PlaylistsPage'
 import { PlaylistDetailPage } from './routes/PlaylistDetailPage'
+import { AlbumDetailPage } from './routes/AlbumDetailPage'
 import { AiPlaylistPage } from './routes/AiPlaylistPage'
 import { HistoryPage } from './routes/HistoryPage'
 import { LoginPage } from './routes/LoginPage'
@@ -165,6 +166,7 @@ export function App() {
             <Route path="/playlists/ai-create" element={<AiPlaylistPage />} />
             <Route path="/playlists/:id/ai-add" element={<AiPlaylistPage />} />
             <Route path="/playlists/:id" element={<PlaylistDetailPage />} />
+            <Route path="/album/:source/:albumId" element={<AlbumDetailPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/admin" element={<AdminPage />} />
             <Route path="/admin/users" element={<AdminUsersPage />} />

@@ -88,8 +88,13 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(2)}M`
 }
 
-function normalizeCover(url: string | undefined): string {
+export function normalizeCover(url: string | undefined): string {
   return url?.replace(/^http:/, 'https:') ?? ''
+}
+
+export function normalizeMgCover(url: string | undefined): string {
+  if (!url) return ''
+  return normalizeCover(/^https?:/.test(url) ? url : `https://d.musicapp.migu.cn${url}`)
 }
 
 
@@ -181,7 +186,7 @@ async function enrichSongs(rawSongs: QQSong[]): Promise<Song[]> {
   return enrichMusicInfos(songs)
 }
 
-async function enrichMusicInfos(musicInfos: MusicInfo[]): Promise<Song[]> {
+export async function enrichMusicInfos(musicInfos: MusicInfo[]): Promise<Song[]> {
   // 事务失败时直接向上抛出：不能把未入库、无法播放的歌曲缓存为成功详情。
   await upsertMusicInfosInTransaction(musicInfos)
   return musicInfos.map(musicInfo => ({
@@ -198,7 +203,7 @@ type WyArtist = { name?: string }
 type WyAlbum = { id?: number; name?: string; picUrl?: string }
 type WyQuality = { size?: number }
 
-function toWyMusicInfo(raw: {
+export function toWyMusicInfo(raw: {
   id?: number; name?: string; ar?: WyArtist[]; artists?: WyArtist[]; al?: WyAlbum; album?: WyAlbum
   pc?: { ar?: string; sn?: string; alb?: string }
   dt?: number; duration?: number
@@ -238,7 +243,7 @@ function toWyMusicInfo(raw: {
   }
 }
 
-function toKwMusicInfo(raw: {
+export function toKwMusicInfo(raw: {
   id?: string | number; name?: string; artist?: string; album?: string; albumid?: string | number
   duration?: string | number; pic?: string; formats?: string
 }): MusicInfo | null {
@@ -345,11 +350,6 @@ type MgSong = {
   lrcUrl?: string
   mrcUrl?: string
   trcUrl?: string
-}
-
-function normalizeMgCover(url: string | undefined): string {
-  if (!url) return ''
-  return normalizeCover(/^https?:/.test(url) ? url : `https://d.musicapp.migu.cn${url}`)
 }
 
 function toMgMusicInfo(raw: MgSong): MusicInfo | null {

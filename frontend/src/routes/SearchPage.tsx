@@ -3,10 +3,13 @@ import { useSearch } from '@/hooks/useSearch'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { AlbumGrid } from '@@/components/shared/AlbumGrid'
 import { Search, Music, X, CloudOff, ChevronDown, User, Disc3 } from 'lucide-react'
 import { toTrack } from '@/lib/types/player'
 import type { SourceType } from '@/lib/types/music'
 import { apiGet } from '@/lib/api/client'
+import { isAlbumSearchSource, type SearchMode } from '@/lib/store/search-store'
+import type { AlbumSource } from '@/lib/api/album'
 
 interface SuggestItem {
   text: string
@@ -23,21 +26,63 @@ const SOURCES: { value: SourceType | 'all' | 'local'; label: string }[] = [
   { value: 'local', label: '本地' },
 ]
 
+/** 专辑搜索音源（一期 wy/kw/mg） */
+const ALBUM_SOURCES: { value: AlbumSource | 'all'; label: string }[] = [
+  { value: 'all', label: '全部' },
+  { value: 'wy', label: '网易' },
+  { value: 'kw', label: '酷我' },
+  { value: 'mg', label: '咪咕' },
+]
+
+const ALBUM_SOURCE_LABELS: Record<AlbumSource, string> = { wy: '网易', kw: '酷我', mg: '咪咕' }
+
 export function SearchPage() {
-  // keyword/source/results/loading 全部来自 search-store（外部状态）：
+  // keyword/source/mode/results/loading 全部来自 search-store（外部状态）：
   // 离开搜索页再回来时输入框与结果都保留。
-  const { results, localList, loading, error, keyword, lastKeyword, source, setKeyword, setSource, run } = useSearch()
+  const {
+    results, localList, albums, albumFailedSources, mode,
+    loading, error, keyword, lastKeyword, source,
+    setKeyword, setSource, setMode, run, runAlbum,
+  } = useSearch()
   const inputRef = useRef<HTMLInputElement>(null)
+
+  /** 按当前结果类型分发：专辑模式只走 wy/kw/mg/all，其余源回退"全部" */
+  const doSearch = (kw: string, src: SourceType | 'all' | 'local') => {
+    if (mode === 'album') {
+      runAlbum(kw, isAlbumSearchSource(src) ? src : 'all')
+    } else {
+      run(kw, src)
+    }
+  }
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    run(keyword, source)
+    doSearch(keyword, source)
   }
 
   // 与 lx-music 搜索页一致：已有搜索词时切换源自动重搜，否则仅切换选中态
   const handleSourceChange = (next: SourceType | 'all' | 'local') => {
     setSource(next)
-    if (keyword.trim()) run(keyword, next)
+    if (keyword.trim()) doSearch(keyword, next)
+  }
+
+  // 切换结果类型（歌曲 | 专辑）：有关键词立即按新模式重搜，无关键词清掉旧模式遗留结果
+  const handleModeChange = (next: SearchMode) => {
+    if (next === mode) return
+    setMode(next)
+    const kw = keyword.trim()
+    if (!kw) {
+      if (next === 'album') run('', 'all')
+      else runAlbum('', 'all')
+      return
+    }
+    if (next === 'album') {
+      const src: AlbumSource | 'all' = isAlbumSearchSource(source) ? source : 'all'
+      if (src !== source) setSource('all')
+      runAlbum(kw, src)
+    } else {
+      run(kw, source)
+    }
   }
 
   const clearKeyword = () => {
@@ -89,7 +134,7 @@ export function SearchPage() {
     appliedSuggest.current = text
     setKeyword(text)
     closeSuggest()
-    run(text, source)
+    doSearch(text, source)
   }
 
   const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -203,12 +248,31 @@ export function SearchPage() {
         </button>
       </form>
 
+      {/* 结果类型：歌曲 | 专辑 */}
+      <div role="tablist" aria-label="结果类型" className="mb-3 flex gap-2">
+        {([['song', '歌曲'], ['album', '专辑']] as const).map(([m, label]) => (
+          <button
+            key={m}
+            role="tab"
+            aria-selected={mode === m}
+            onClick={() => handleModeChange(m)}
+            className={`rounded-full px-3.5 py-1.5 text-sm transition-colors ${
+              mode === m
+                ? 'bg-primary text-primary-foreground'
+                : 'bg-card text-muted-foreground ring-1 ring-border hover:text-foreground'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       <div
         role="tablist"
         aria-label="音源"
         className="mb-6 flex gap-2 overflow-x-auto pb-1"
       >
-        {SOURCES.map(s => (
+        {(mode === 'album' ? ALBUM_SOURCES : SOURCES).map(s => (
           <button
             key={s.value}
             role="tab"
@@ -225,8 +289,8 @@ export function SearchPage() {
         ))}
       </div>
 
-      {/* 本地匹配区：非"本地"源搜索时，服务端附带的前几条音乐库命中置顶展示 */}
-      {!loading && !error && source !== 'local' && localList.length > 0 && (
+      {/* 本地匹配区（仅歌曲模式）：非"本地"源搜索时，服务端附带的前几条音乐库命中置顶展示 */}
+      {!loading && !error && mode === 'song' && source !== 'local' && localList.length > 0 && (
         <div className="mb-4">
           <div className="mb-1.5 text-xs font-medium text-muted-foreground">
             本地匹配 <span className="text-primary">（音乐库 {localList.length} 首，播放不耗流量）</span>
@@ -239,6 +303,22 @@ export function SearchPage() {
         <LoadingSkeleton />
       ) : error ? (
         <EmptyState icon={CloudOff} title="搜索服务不可用" description={error} />
+      ) : mode === 'album' ? (
+        albums.length > 0 ? (
+          <>
+            {albumFailedSources.length > 0 && (
+              <div className="mb-2 text-xs text-muted-foreground">
+                部分音源失败，结果不含{' '}
+                {albumFailedSources.map(s => ALBUM_SOURCE_LABELS[s]).join('、')}
+              </div>
+            )}
+            <AlbumGrid albums={albums} />
+          </>
+        ) : lastKeyword ? (
+          <EmptyState icon={Search} title="未找到专辑" description={`没有找到与“${lastKeyword}”相关的专辑`} />
+        ) : (
+          <EmptyState icon={Disc3} title="开始搜索" description="输入专辑名或歌手名开始探索" />
+        )
       ) : visibleTracks.length > 0 ? (
         <>
           {source !== 'local' && visibleTracks.length > 0 && (
