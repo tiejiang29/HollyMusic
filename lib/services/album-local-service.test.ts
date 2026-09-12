@@ -26,6 +26,10 @@ insTrack.run(Buffer.from(GID_HEX, 'hex'), 1, 1, '以父之名', '以父之名', 
 insTrack.run(Buffer.from(GID_HEX, 'hex'), 1, 2, '懦夫', '懦夫', 218000, 2)
 insTrack.run(Buffer.from(GID_HEX, 'hex'), 1, 2, '「以父之名」之罗马巡礼', '以父之名之罗马巡礼', 590000, 3) // 同碟位附加曲，应去重
 insTrack.run(Buffer.from(GID_HEX, 'hex'), 1, 3, '晴天', '晴天', null, 4) // 无时长
+// 范特西 3 首（随机池过滤要求去重曲目数 ≥ 3）
+insTrack.run(Buffer.from(GID3_HEX, 'hex'), 1, 1, '爱在西元前', '爱在西元前', 234000, 5)
+insTrack.run(Buffer.from(GID3_HEX, 'hex'), 1, 2, '简单爱', '简单爱', 270000, 6)
+insTrack.run(Buffer.from(GID3_HEX, 'hex'), 1, 3, '双截棍', '双截棍', 201000, 7)
 
 process.env.ALBUM_DB_PATH = join(dir, 'albums.db')
 process.env.ALBUM_TRACKS_DB_PATH = join(dir, 'tracks.db')
@@ -79,10 +83,12 @@ describe('album-local-service（fixture SQLite）', () => {
     expect(tracks[2].secs).toBeNull()
   })
 
-  it('随机专辑返回指定数量且字段完整', () => {
+  it('随机专辑过滤杂牌（歌手缺失/曲目<3），返回指定数量', () => {
     const list = randomLocalAlbums(2)
+    // fixture 中仅叶惠美/范特西达标（叶惠美美 0 曲被滤）
     expect(list).toHaveLength(2)
-    expect(list[0]).toMatchObject({ gid: expect.any(String), title: expect.any(String), artist: expect.any(String) })
+    expect(list[0]).toMatchObject({ gid: expect.any(String), artist: '周杰伦', trackCount: expect.any(Number) })
+    expect(list.every(a => a.trackCount >= 3)).toBe(true)
   })
 
   it('画像推荐：命中歌手的专辑优先，不足补随机', async () => {

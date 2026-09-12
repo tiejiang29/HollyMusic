@@ -117,18 +117,30 @@ export function searchLocalAlbums(keyword: string, limit = 30): LocalAlbum[] {
   return [...merged.values()]
 }
 
-/** 随机专辑（本地专辑板块"随便听听"） */
+/** 随机专辑（本地专辑板块"随便听听"）：超采后过滤杂牌（歌手缺失/曲目过少的专辑几乎无法在线落歌） */
 export function randomLocalAlbums(size = 20): LocalAlbum[] {
   const db = getAlbumsDb()
-  if (!db) return []
-  const cap = Math.max(1, Math.min(size, 50))
-  const rows = db.prepare('SELECT gid,title,artist FROM albums ORDER BY RANDOM() LIMIT ?').all(cap)
-  const result = rows.map(r => rowToAlbum(r as { gid: Uint8Array; title: string; artist: string }))
   const tdb = getTracksDb()
-  if (tdb) {
-    for (const album of result) {
-      album.trackCount = tdb.prepare('SELECT COUNT(DISTINCT disc || char(45) || position) AS n FROM album_tracks WHERE rg_gid=?').get(uuidToBuffer(album.gid))?.n ?? 0
-    }
+  if (!db || !tdb) return []
+  const cap = Math.max(1, Math.min(size, 50))
+  // 两步查询（albums/tracks 是两个库文件，无法跨库 JOIN）：
+  // 超采 3 倍 → 歌手非空 → 批量取去重曲目数 → 过滤 ≥ 3（1-2 曲的多为单曲凑数/噪声，在线倒查命中率极低）
+  const rows = db.prepare(
+    "SELECT gid,title,artist FROM albums WHERE artist IS NOT NULL AND artist != '' ORDER BY RANDOM() LIMIT ?",
+  ).all(cap * 3) as Array<{ gid: Uint8Array; title: string; artist: string }>
+  if (rows.length === 0) return []
+  const placeholders = rows.map(() => '?').join(',')
+  const countRows = tdb.prepare(
+    `SELECT rg_gid, COUNT(DISTINCT disc || char(45) || position) AS n FROM album_tracks WHERE rg_gid IN (${placeholders}) GROUP BY rg_gid`,
+  ).all(...rows.map(r => Buffer.from(r.gid))) as Array<{ rg_gid: Uint8Array; n: number }>
+  const nByGid = new Map(countRows.map(c => [gidToUuid(c.rg_gid), c.n]))
+  const result: LocalAlbum[] = []
+  for (const row of rows) {
+    const album = rowToAlbum(row)
+    const n = nByGid.get(album.gid) ?? 0
+    if (n < 3) continue
+    result.push({ ...album, trackCount: n })
+    if (result.length >= cap) break
   }
   return result
 }
