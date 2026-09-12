@@ -1,7 +1,7 @@
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ChevronLeft, ChevronRight, Link2, Music, RefreshCw, X } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight, ListFilter, Link2, Music, RefreshCw, X } from 'lucide-react'
 import { getPlaylistTags, getRecommendedPlaylists } from '@/lib/api/discovery'
 import type { DiscoveryPlaylist, DiscoveryPlaylistSort, DiscoverySource, PlaylistTagsResult } from '@/lib/services/discovery-service'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
@@ -16,7 +16,7 @@ const SOURCES: { value: DiscoverySource; label: string }[] = [
   { value: 'mg', label: '咪咕' },
 ]
 
-/** 各源支持的排序（与洛雪 sortList 对齐：kg/mg 上游只有最热/最新两档） */
+/** 各源支持的排序（与洛雪 sortList 对齐：kw 三档 默认/最新/最热；kg/mg 上游档位不同） */
 const SORTS: Partial<Record<DiscoverySource, { value: DiscoveryPlaylistSort; label: string }[]>> = {
   tx: [
     { value: 'hot', label: '最热' },
@@ -27,8 +27,9 @@ const SORTS: Partial<Record<DiscoverySource, { value: DiscoveryPlaylistSort; lab
     { value: 'new', label: '最新' },
   ],
   kw: [
-    { value: 'hot', label: '最热' },
+    { value: 'recommend', label: '默认' },
     { value: 'new', label: '最新' },
+    { value: 'hot', label: '最热' },
   ],
   kg: [
     { value: 'recommend', label: '推荐' },
@@ -63,6 +64,7 @@ export function RecommendedMusicPage() {
   const [error, setError] = useState<string | null>(null)
   const [tags, setTags] = useState<PlaylistTagsResult | null>(null)
   const [openListOpen, setOpenListOpen] = useState(false)
+  const [tagPanelOpen, setTagPanelOpen] = useState(true)
   const reqId = useRef(0)
 
   const load = useCallback(async (src: DiscoverySource, s: DiscoveryPlaylistSort, t: string | null, p: number) => {
@@ -105,10 +107,19 @@ export function RecommendedMusicPage() {
     setSource(next)
   }
   const chooseTag = (id: string | null) => {
-    if (id === tag) return
-    setTag(id)
+    // 点已选中的标签 = 取消选择回到默认
+    setTag(id === tag ? null : id)
     setPage(1)
   }
+
+  // 已选标签的显示名（热门与分组里各找一遍；找不到说明已清空）
+  const selectedTagName = useMemo(() => {
+    if (!tag || !tags) return null
+    return tags.hotTag.find(t => t.id === tag)?.name
+      ?? tags.tags.flatMap(g => g.list).find(t => t.id === tag)?.name
+      ?? null
+  }, [tag, tags])
+  const hasTagData = !!tags && (tags.hotTag.length > 0 || tags.tags.length > 0)
 
   return (
     <div className="p-4 md:p-6">
@@ -145,30 +156,9 @@ export function RecommendedMusicPage() {
         </div>
       </div>
 
-      {/* 热门标签横排（可横滑，对齐洛雪 tag-list） */}
-      {tags && tags.hotTag.length > 0 && (
-        <div className="mb-3 flex items-center gap-2 overflow-x-auto pb-1">
-          <button
-            onClick={() => chooseTag(null)}
-            className={`shrink-0 rounded-full px-3 py-1 text-xs transition-colors ${tag === null ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
-          >
-            全部
-          </button>
-          {tags.hotTag.map(t => (
-            <button
-              key={t.id}
-              onClick={() => chooseTag(t.id)}
-              className={`shrink-0 rounded-full px-3 py-1 text-xs transition-colors ${tag === t.id ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
-            >
-              {t.name}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* 排序（对齐洛雪 sort-tab） */}
-      {(SORTS[source] || []).length > 1 && (
-        <div className="mb-4 flex gap-4 border-b border-border pb-2">
+      {/* 排序 tab + 分类面板开关（对齐洛雪：排序左、分类右） */}
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="flex gap-4 border-b border-border pb-2">
           {(SORTS[source] || []).map(s => (
             <button
               key={s.value}
@@ -177,6 +167,63 @@ export function RecommendedMusicPage() {
             >
               {s.label}
             </button>
+          ))}
+        </div>
+        {hasTagData && (
+          <button
+            onClick={() => setTagPanelOpen(v => !v)}
+            className="flex shrink-0 items-center gap-1 rounded-full border border-border px-3 py-1.5 text-sm hover:bg-accent"
+            aria-expanded={tagPanelOpen}
+          >
+            <ListFilter className="h-4 w-4" />
+            分类{selectedTagName ? `：${selectedTagName}` : ''}
+            <ChevronDown className={`h-4 w-4 transition-transform ${tagPanelOpen ? 'rotate-180' : ''}`} />
+          </button>
+        )}
+      </div>
+
+      {/* 分类面板：默认 + 热门标签 + 分组标签（对齐洛雪 tag 面板，单选） */}
+      {tagPanelOpen && hasTagData && tags && (
+        <div className="mb-4 space-y-2.5 rounded-lg bg-card p-3 ring-1 ring-border">
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              onClick={() => chooseTag(null)}
+              className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === null ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
+            >
+              默认
+            </button>
+          </div>
+          {tags.hotTag.length > 0 && (
+            <div>
+              <div className="mb-1 text-xs text-muted-foreground">热门标签</div>
+              <div className="flex flex-wrap gap-1.5">
+                {tags.hotTag.map(t => (
+                  <button
+                    key={t.id}
+                    onClick={() => chooseTag(t.id)}
+                    className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === t.id ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
+                  >
+                    {t.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {tags.tags.map(group => (
+            <div key={group.name}>
+              <div className="mb-1 text-xs text-muted-foreground">{group.name}</div>
+              <div className="flex flex-wrap gap-1.5">
+                {group.list.map(t => (
+                  <button
+                    key={t.id}
+                    onClick={() => chooseTag(t.id)}
+                    className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === t.id ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
+                  >
+                    {t.name}
+                  </button>
+                ))}
+              </div>
+            </div>
           ))}
         </div>
       )}
