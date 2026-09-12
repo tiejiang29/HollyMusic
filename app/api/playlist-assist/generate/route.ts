@@ -12,6 +12,7 @@
 import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse } from '@/lib/api-response'
 import { requireUser, AuthError } from '@/lib/services/user-context'
+import { RateLimiter } from '@/lib/server/download-utils'
 import { callAI, extractJSON } from '@/lib/services/ai-helper'
 import {
   DEFAULT_PROMPT_SYSTEM,
@@ -19,9 +20,15 @@ import {
 } from '@/lib/recommend-defaults'
 import { logger } from '@/lib/logger'
 
+// 每用户每小时 10 次：AI 生成是真实计费的 LLM 调用，防误操作循环/重试风暴烧 key
+const aiRateLimiter = new RateLimiter(60 * 60 * 1000, 10)
+
 export async function POST(request: NextRequest) {
   try {
-    await requireUser(request)
+    const authUser = await requireUser(request)
+    if (!aiRateLimiter.check(`ai-playlist:${authUser.username}`)) {
+      return createErrorResponse('RATE_LIMITED', 'AI 生成请求过于频繁（每小时最多 10 次），请稍后再试', 429)
+    }
 
     const apiKey = process.env.OPENAI_API_KEY || ''
     const baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'

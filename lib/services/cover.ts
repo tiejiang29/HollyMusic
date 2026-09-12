@@ -13,11 +13,35 @@ import { logger } from '../logger'
 // 原生封面获取模块（参考 lx-music 各源 pic 实现）
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { getPic: getPicNative } = require('../music-core/music-pic')
+import { searchCache } from '@/lib/cache-manager'
 
 /**
  * 获取指定歌曲的封面图响应。
  * id 为 source-{存储songmid}；查 DB → 原生模块取封面 URL → 抓取图片；失败回退默认图。
  */
+// getPic 在途合并 + 短缓存：并发同曲封面请求共享一次上游签名调用
+// （原实现无合并，网页端 + Subsonic 同时放/前端快速重挂载会把同一签名请求发多次）
+const PIC_URL_CACHE_TTL = 10 * 60 * 1000
+const picInFlight = new Map<string, Promise<string | null>>()
+
+function getPicCoalesced(musicInfo: { source: string; songmid: string }): Promise<string | null> {
+  const key = `${musicInfo.source}-${musicInfo.songmid}`
+  const cacheKey = `cover:pic:${key}`
+  const cached = searchCache.get(cacheKey) as string | null
+  if (cached) return Promise.resolve(cached)
+  const existing = picInFlight.get(key)
+  if (existing) return existing
+  const task = getPicNative(musicInfo)
+    .then((url: string | null) => {
+      // 只缓存命中结果；null（上游无封面）不缓存，由在途合并兜并发
+      if (url) searchCache.set(cacheKey, url, PIC_URL_CACHE_TTL)
+      return url
+    })
+    .finally(() => picInFlight.delete(key))
+  picInFlight.set(key, task)
+  return task
+}
+
 export async function getCoverResponse(id: string): Promise<Response> {
   try {
     if (!id) return serveDefaultCoverArt()
@@ -42,7 +66,7 @@ export async function getCoverResponse(id: string): Promise<Response> {
         const direct = await fetchImageFromUrl(musicInfo.img)
         if (direct) return direct
       }
-      const picUrl = await getPicNative(musicInfo)
+      const picUrl = await getPicCoalesced(musicInfo)
       if (picUrl) {
         const fetched = await fetchImageFromUrl(picUrl)
         if (fetched) return fetched
