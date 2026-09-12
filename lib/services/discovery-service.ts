@@ -3,7 +3,7 @@ import { getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/
 import { logger } from '@/lib/logger'
 import type { MusicInfo, QualityInfo, QualityType, Song } from '@/lib/types/music'
 import { createCipheriv, createHash, publicEncrypt, randomBytes, constants } from 'crypto'
-import https from 'node:https'
+import { httpsPostForm, nativeGetJson } from './upstream-http'
 import { TOPLIST_BOARDS, type ToplistBoardDef } from './toplist-boards'
 
 const QQ_MUSICU_URL = 'https://u.y.qq.com/cgi-bin/musicu.fcg'
@@ -99,23 +99,8 @@ export function normalizeMgCover(url: string | undefined): string {
 
 
 
-/** 原生 https POST 表单（绕开 undici fetch：进程内对照实验用）。 */
-export function httpsPostForm<T>(url: string, body: string, headers: Record<string, string>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const req = https.request(url, { method: 'POST', headers: { ...headers, 'Content-Length': Buffer.byteLength(body) }, timeout: REQUEST_TIMEOUT }, res => {
-      const chunks: Buffer[] = []
-      res.on('data', (chunk: Buffer) => chunks.push(chunk))
-      res.on('end', () => {
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')) as T) }
-        catch (e) { reject(e instanceof Error ? e : new Error('JSON 解析失败')) }
-      })
-    })
-    req.on('timeout', () => req.destroy(new Error('请求超时')))
-    req.on('error', reject)
-    req.write(body)
-    req.end()
-  })
-}
+/** 原生 http/https 请求工具（绕开 undici fetch 的场景），实现见 upstream-http.ts */
+export { httpsPostForm, nativeGetJson }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController()
@@ -845,7 +830,9 @@ async function getKwRecommendedPlaylists(limit: number, page: number, filter: Di
     if (payload.code !== 200 || !['43', '10000'].includes(digest || '')) throw new Error('酷我未返回分类歌单')
     return entries.filter(item => item.id && item.name).map(item => ({ id: String(item.id), name: item.name || '', author: item.uname || '酷我音乐', description: item.desc || '', cover: normalizeCover(item.img), playCount: Number(item.listencnt) || 0, songCount: Number(item.total) || 0, source: 'kw' }))
   }
-  const query = new URLSearchParams({ loginUid: '0', loginSid: '0', appUid: '76039576', pn: String(page), rn: String(limit), order: filter.sort === 'hot' ? 'hot' : 'new' })
+  // 洛雪 kw 三档：默认（recommend，不传 order）/ 最新 / 最热
+  const query = new URLSearchParams({ loginUid: '0', loginSid: '0', appUid: '76039576', pn: String(page), rn: String(limit) })
+  if (filter.sort === 'hot' || filter.sort === 'new') query.set('order', filter.sort)
   const payload = await fetchJson<{ code?: number; data?: { data?: Array<{ id?: string | number; name?: string; uname?: string; desc?: string; img?: string; listencnt?: string | number; total?: string | number }> } }>(`http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList?${query}`)
   const entries = payload.data?.data || []
   if (payload.code !== 200) throw new Error('酷我未返回推荐歌单')
@@ -1255,13 +1242,38 @@ async function getTxPlaylistTags(): Promise<PlaylistTagsResult> {
 }
 
 async function getWyPlaylistTags(): Promise<PlaylistTagsResult> {
-  // music.163.com/api/playlist/hottags 明文 GET（洛雪走 weapi；linux/forward 对该接口返回 400，明文实测可用）
-  const payload = await fetchJson<{ code?: number; tags?: Array<{ playlistTag?: { name?: string } }> }>('https://music.163.com/api/playlist/hottags', { headers: { Referer: 'https://music.163.com/' } })
-  if (payload.code !== 200) throw new Error('网易未返回热门标签')
-  return {
-    hotTag: (payload.tags || []).map(t => ({ id: t.playlistTag?.name || '', name: t.playlistTag?.name || '' })).filter(t => t.name).slice(0, 10),
-    tags: [], // 分类全量目录对 UI 无用，只保留热门标签（与洛雪广场页高频用法一致）
+  // 热门：music.163.com/api/playlist/hottags 明文 GET（洛雪走 weapi；linux/forward 对该接口返回 400，明文实测可用）
+  // 分类：api/playlist/catalogue 返回 5 组 70 个完整目录（语种/风格/场景/情感/主题），
+  // wy 的 tag 参数即类目名本身，直接以名称作 id 直传列表接口
+  const hotPayload = await fetchJson<{ code?: number; tags?: Array<{ playlistTag?: { name?: string } }> }>('https://music.163.com/api/playlist/hottags', { headers: { Referer: 'https://music.163.com/' } })
+  if (hotPayload.code !== 200) throw new Error('网易未返回热门标签')
+  const hotTag = (hotPayload.tags || []).map(t => ({ id: t.playlistTag?.name || '', name: t.playlistTag?.name || '' })).filter(t => t.name).slice(0, 10)
+
+  // 目录失败不致命：退回仅热门标签（历史行为）
+  let tags: PlaylistTagsResult['tags'] = []
+  try {
+    const catalogue = await fetchJson<{
+      code?: number
+      categories?: Record<string, string>
+      sub?: Array<{ name?: string; category?: number }>
+    }>('https://music.163.com/api/playlist/catalogue', { headers: { Referer: 'https://music.163.com/' } })
+    const byCategory = new Map<number, Array<{ id: string; name: string }>>()
+    for (const item of catalogue.sub || []) {
+      if (!item.name || item.category == null) continue
+      const list = byCategory.get(item.category) ?? []
+      list.push({ id: item.name, name: item.name })
+      byCategory.set(item.category, list)
+    }
+    tags = Object.entries(catalogue.categories || {})
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .flatMap(([key, name]) => {
+        const list = byCategory.get(Number(key)) || []
+        return list.length > 0 ? [{ name, list }] : []
+      })
+  } catch (error) {
+    logger.warn('[discovery] 网易歌单分类目录获取失败，仅返回热门标签:', error instanceof Error ? error.message : error)
   }
+  return { hotTag, tags }
 }
 
 async function getKwPlaylistTags(): Promise<PlaylistTagsResult> {
@@ -1269,9 +1281,34 @@ async function getKwPlaylistTags(): Promise<PlaylistTagsResult> {
   const payload = await fetchJson<{ code?: number; data?: Array<{ data?: Array<{ id?: number | string; digest?: number | string; name?: string }> }> }>('http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmTagList?loginUid=0&loginSid=0&appUid=76039576')
   if (payload.code !== 200) throw new Error('酷我未返回标签')
   const items = payload.data?.[0]?.data || []
+
+  // 完整标签树：同域 getTagList（洛雪 kw.songList tagsUrl），8 组约 70 个
+  // （专区/主题/心情/场景/年代/曲风流派/语言）。该端点对服务进程内的 undici fetch
+  // 返回空（与 wy playlist/list 同一现象），走原生 http 模块；失败不致命，退回仅热门标签。
+  let tags: PlaylistTagsResult['tags'] = []
+  try {
+    const tree = await nativeGetJson<{
+      code?: number
+      data?: Array<{ name?: string; data?: Array<{ id?: number | string; digest?: number | string; name?: string }> | { data?: Array<{ id?: number | string; digest?: number | string; name?: string }> } }>
+    }>('http://wapi.kuwo.cn/api/pc/classify/playlist/getTagList?loginUid=0&loginSid=0&appUid=76039576&prod=h5&version=1')
+    tags = (tree.data || [])
+      .map(col => {
+        // 实测 col.data 直接是条目数组；兼容 { data: [...] } 包装形态
+        const rawItems = Array.isArray(col.data) ? col.data : col.data?.data
+        return {
+          name: col.name || '',
+          list: (rawItems || [])
+            .filter(item => item.id != null && item.digest != null && item.name)
+            .map(item => ({ id: `${item.id}-${item.digest}`, name: item.name || '' })),
+        }
+      })
+      .filter(g => g.name && g.list.length > 0)
+  } catch (error) {
+    logger.warn('[discovery] 酷我标签树获取失败，仅返回热门标签:', error instanceof Error ? error.message : error)
+  }
   return {
     hotTag: items.slice(0, 10).map(item => ({ id: `${item.id}-${item.digest}`, name: item.name || '' })).filter(t => t.name),
-    tags: [],
+    tags,
   }
 }
 

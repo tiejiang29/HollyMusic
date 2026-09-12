@@ -16,11 +16,10 @@
  *   一期只出卡片，详情返回 unsupported
  */
 
-import { createHash } from 'crypto'
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
 import type { MusicInfo, Song } from '@/lib/types/music'
-import { kw as kwSongSearch } from '@/lib/music-core/music-search'
+import { createMgSignature, kw as kwSongSearch } from '@/lib/music-core/music-search'
 import {
   enrichMusicInfos,
   normalizeCover,
@@ -295,14 +294,7 @@ async function getKwAlbumTracks(albumId: string): Promise<AlbumDetail> {
 
 // ==================== 咪咕（mg） ====================
 
-// 与 music-search.js createMgSignature 一致（同一端点必须同一签名口径）
-function mgSignature(time: string, keyword: string): { sign: string; deviceId: string } {
-  const deviceId = '963B7AA0D21511ED807EE5846EC87D20'
-  const sign = createHash('md5')
-    .update(`${keyword}6cdc72a439cef99a3418d2a78aa28c73yyapp2d16148780a1dcc7408e06336b98cfd50${deviceId}${time}`)
-    .digest('hex')
-  return { sign, deviceId }
-}
+// 签名复用 music-core 的 createMgSignature（同一端点必须同一签名口径）
 
 type MgAlbumCard = {
   id?: string | number
@@ -321,7 +313,7 @@ function pickMgAlbumImg(card: MgAlbumCard): string | undefined {
 
 async function searchMgAlbums(keyword: string, page: number, limit: number): Promise<{ list: AlbumSummary[]; total: number }> {
   const time = Date.now().toString()
-  const { sign, deviceId } = mgSignature(time, keyword)
+  const { sign, deviceId } = createMgSignature(time, keyword)
   // 与歌曲搜索同一 searchAll 端点，searchSwitch 打开 album、关闭 song
   const searchSwitch = encodeURIComponent(JSON.stringify({ song: 0, album: 1, singer: 0, tagSong: 0, mvSong: 0, bestShow: 0, songlist: 0, lyricSong: 0 }))
   const url = `https://jadeite.migu.cn/music_search/v3/search/searchAll?isCorrect=0&isCopyright=1&searchSwitch=${searchSwitch}&pageSize=${limit}&text=${encodeURIComponent(keyword)}&pageNo=${page}&sort=0&sid=USS`

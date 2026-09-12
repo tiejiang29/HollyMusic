@@ -8,7 +8,11 @@ const { get, set, kwSearch } = vi.hoisted(() => ({
 
 vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
 vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
-vi.mock('@/lib/music-core/music-search', () => ({ kw: { search: kwSearch } }))
+// 真实 createMgSignature + mock kw 搜索（签名口径变化时测试能暴露）
+vi.mock('@/lib/music-core/music-search', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/music-core/music-search')>()
+  return { ...actual, kw: { search: kwSearch } }
+})
 vi.mock('@/lib/services/discovery-service', () => ({
   // 与真实实现同构的最小映射：保留入参结构并附加 uid
   toWyMusicInfo: vi.fn((raw: {
