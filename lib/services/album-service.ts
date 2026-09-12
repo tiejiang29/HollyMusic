@@ -21,7 +21,7 @@ import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
 import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums, type LocalAlbumTrack } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
 import { appleT2S, getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs, searchItunesAlbums } from '@/lib/services/itunes-service'
-import { getWikiExtract } from '@/lib/services/wiki-service'
+import { getWikiExtract, getArtistProfile, getAlbumProfile, type ArtistProfile, type AlbumProfile } from '@/lib/services/wiki-service'
 
 /** 专辑详情（含已入库曲目）缓存 */
 const ALBUM_TRACKS_CACHE_TTL = 60 * 60 * 1000
@@ -133,7 +133,7 @@ async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise
 }
 
 export interface AlbumDetail {
-  album: { source: string; albumId: string; name: string; singer: string; img?: string | null; publishTime?: string; trackCount?: number; bio?: string | null }
+  album: { source: string; albumId: string; name: string; singer: string; img?: string | null; publishTime?: string; trackCount?: number; bio?: string | null; profile?: AlbumProfile | null }
   list: Song[]
 }
 
@@ -257,6 +257,7 @@ async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gi
   // Apple 增强（缓存命中时近零成本；失败静默）
   const apple = await getAppleAlbumMeta(localTitle, localArtist).catch(() => ({ img: null as string | null, year: undefined as string | undefined }))
   const bio = await getWikiExtract(localTitle, 'album').catch(() => null)
+  const profile = await getAlbumProfile(localTitle, gid).catch(() => null)
   return {
     album: {
       source: 'local',
@@ -267,13 +268,14 @@ async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gi
       publishTime: apple.year,
       trackCount: tracks.length,
       bio,
+      profile,
     },
     list,
   }
 }
 
 export interface LocalAlbumDetail {
-  album: { gid: string; name: string; singer: string; trackCount: number; img: string | null; year?: string; bio?: string | null }
+  album: { gid: string; name: string; singer: string; trackCount: number; img: string | null; year?: string; bio?: string | null; profile?: AlbumProfile | null }
   list: Song[]
 }
 
@@ -292,6 +294,7 @@ export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumD
       img: detail.album.img ?? null,
       year: detail.album.publishTime,
       bio: detail.album.bio ?? null,
+      profile: detail.album.profile ?? null,
     },
     list: detail.list,
   }
@@ -316,6 +319,8 @@ export interface AppleArtistDetail {
     genre?: string
     /** 维基简介（简体，best-effort：未配置 WIKI_PROXY_URL 或条目不存在时缺省） */
     bio?: string | null
+    /** Wikidata 结构化档案（出生/职业/流派/唱片公司，best-effort） */
+    profile?: ArtistProfile | null
     /** 头像（Apple 歌手实体无照片，取首张专辑封面） */
     img: string | null
   }
@@ -354,9 +359,10 @@ export async function getAppleArtistDetail(artistId: string): Promise<AppleArtis
   // 头像 = 首张专辑封面（Apple 歌手实体无照片）
   const img = albums.find(a => a.img)?.img ?? null
   const bio = await getWikiExtract(info.name, 'artist').catch(() => null)
+  const profile = await getArtistProfile(info.name).catch(() => null)
 
   const detail: AppleArtistDetail = {
-    artist: { artistId: info.artistId, name: info.name, genre: info.genre, bio, img },
+    artist: { artistId: info.artistId, name: info.name, genre: info.genre, bio, profile, img },
     hotSongs,
     albums,
   }
@@ -418,7 +424,7 @@ export async function searchAlbums(keyword: string, limit = 30): Promise<{
 // ==================== Apple 专辑详情（平台卡片渠道） ====================
 
 export interface AppleAlbumDetail {
-  album: { name: string; singer: string; year?: string; img: string | null; trackCount: number; collectionId: string; bio?: string | null }
+  album: { name: string; singer: string; year?: string; img: string | null; trackCount: number; collectionId: string; bio?: string | null; profile?: AlbumProfile | null }
   list: Song[]
 }
 
@@ -440,6 +446,7 @@ export async function getAppleAlbumDetail(collectionId: string): Promise<AppleAl
   }
 
   const bio = await getWikiExtract(itunes.album.title, 'album').catch(() => null)
+  const profile = await getAlbumProfile(itunes.album.title).catch(() => null)
   const detail: AppleAlbumDetail = {
     album: {
       collectionId,
@@ -449,6 +456,7 @@ export async function getAppleAlbumDetail(collectionId: string): Promise<AppleAl
       img: itunes.album.img ?? albumCoverFromSongs(list),
       trackCount: itunes.tracks.length,
       bio,
+      profile,
     },
     list,
   }

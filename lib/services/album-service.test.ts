@@ -37,7 +37,11 @@ vi.mock('@/lib/services/itunes-service', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/services/itunes-service')>()
   return { ...actual, getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs: vi.fn(), searchItunesAlbums }
 })
-vi.mock('@/lib/services/wiki-service', () => ({ getWikiExtract: vi.fn(async () => null) }))
+vi.mock('@/lib/services/wiki-service', () => ({
+  getWikiExtract: vi.fn(async () => null),
+  getArtistProfile: vi.fn(async () => null),
+  getAlbumProfile: vi.fn(async () => null),
+}))
 
 const { getLocalAlbumDetailByGid, getAlbumCover, getAppleAlbumDetail, searchAlbums } = await import('./album-service')
 

@@ -105,6 +105,16 @@ export function ArtistDetailPage() {
         </div>
       </div>
 
+      {/* Wikidata 档案 chips（可选） */}
+      {artist.profile && (
+        <div className="mb-3 flex flex-wrap gap-1.5 text-xs">
+          {artist.profile.birthDate && <span className="rounded-md bg-card px-2 py-1 text-muted-foreground ring-1 ring-border">出生 {artist.profile.birthDate}</span>}
+          {(artist.profile.occupations || []).slice(0, 4).map(o => <span key={o} className="rounded-md bg-card px-2 py-1 text-muted-foreground ring-1 ring-border">{o}</span>)}
+          {(artist.profile.genres || []).slice(0, 4).map(g => <span key={g} className="rounded-md bg-primary/10 px-2 py-1 text-primary ring-1 ring-primary/30">{g}</span>)}
+          {(artist.profile.recordLabels || []).slice(0, 3).map(l => <span key={l} className="rounded-md bg-card px-2 py-1 text-muted-foreground ring-1 ring-border">{l}</span>)}
+        </div>
+      )}
+
       {/* 简介（维基，可选） */}
       {artist.bio && (
         <details className="mb-6 rounded-lg bg-card p-4 ring-1 ring-border" open>

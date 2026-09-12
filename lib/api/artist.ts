@@ -11,6 +11,23 @@ export interface ArtistSummary {
   genre?: string
 }
 
+export interface ArtistProfile {
+  qid: string
+  birthDate?: string
+  occupations?: string[]
+  genres?: string[]
+  recordLabels?: string[]
+  nationality?: string
+}
+
+export interface AlbumProfile {
+  qid: string
+  verified?: boolean
+  releaseDate?: string
+  genres?: string[]
+  recordLabels?: string[]
+}
+
 export interface ArtistDetailData {
   artist: {
     artistId: string
@@ -18,6 +35,8 @@ export interface ArtistDetailData {
     genre?: string
     /** 维基简介（简体，未配置代理或条目不存在时缺省） */
     bio?: string | null
+    /** Wikidata 结构化档案（best-effort） */
+    profile?: ArtistProfile | null
     /** 头像（首张专辑封面，Apple 歌手实体无照片） */
     img: string | null
   }

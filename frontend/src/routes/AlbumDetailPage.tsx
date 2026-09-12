@@ -126,6 +126,7 @@ export function AlbumDetailPage() {
   }
 
   const album = detail.album
+  const profile = (album as { profile?: { releaseDate?: string; genres?: string[]; recordLabels?: string[] } | null }).profile
 
   return (
     <div className="p-6">
@@ -194,6 +195,14 @@ export function AlbumDetailPage() {
           >
             <Download className="h-4 w-4" /> 下载选中
           </button>
+        </div>
+      )}
+
+      {profile && (profile.releaseDate || (profile.genres || []).length > 0 || (profile.recordLabels || []).length > 0) && (
+        <div className="mb-4 flex flex-wrap gap-1.5 text-xs">
+          {profile.releaseDate && <span className="rounded-md bg-card px-2 py-1 text-muted-foreground ring-1 ring-border">发行 {profile.releaseDate}</span>}
+          {(profile.genres || []).slice(0, 3).map(g => <span key={g} className="rounded-md bg-primary/10 px-2 py-1 text-primary ring-1 ring-primary/30">{g}</span>)}
+          {(profile.recordLabels || []).slice(0, 3).map(l => <span key={l} className="rounded-md bg-card px-2 py-1 text-muted-foreground ring-1 ring-border">{l}</span>)}
         </div>
       )}
 
