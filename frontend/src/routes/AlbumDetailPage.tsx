@@ -4,7 +4,7 @@ import { CheckSquare, Disc3, Download, Play, RefreshCw, X } from 'lucide-react'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
+import { AlbumCover } from '@@/components/shared/AlbumCover'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
@@ -105,13 +105,9 @@ export function AlbumDetailPage() {
   return (
     <div className="p-6">
       <div className="mb-6 flex items-end gap-4">
-        {album.img ? (
-          <RemoteCoverImage src={album.img} alt="" className="h-32 w-32 shrink-0 rounded-lg object-cover shadow-lg" />
-        ) : (
-          <div className="flex h-32 w-32 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary/50 to-primary/10 shadow-lg">
-            <Disc3 className="h-12 w-12 text-primary-foreground/80" />
-          </div>
-        )}
+        <div className="h-32 w-32 shrink-0 overflow-hidden rounded-lg shadow-lg">
+          <AlbumCover gid={gid} alt={album?.name} className="h-full w-full" />
+        </div>
         <div className="min-w-0 flex-1">
           <p className="text-sm text-muted-foreground">专辑</p>
           <h1 className="truncate text-3xl font-bold">{album.name}</h1>
