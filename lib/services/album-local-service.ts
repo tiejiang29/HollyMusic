@@ -13,7 +13,6 @@ import { DatabaseSync } from 'node:sqlite'
 import path from 'node:path'
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
-import { buildAffinityContext, dayKey } from './guess-service'
 
 // 库文件随仓库分发（album-db/），Docker 镜像构建时 COPY 进 /app/album-db；
 // 服务以项目根为工作目录，路径相对 cwd 解析；可用环境变量覆盖。
@@ -115,93 +114,6 @@ export function searchLocalAlbums(keyword: string, limit = 30): LocalAlbum[] {
   for (const row of db.prepare('SELECT gid,title,artist FROM albums WHERE title LIKE ? LIMIT ?').all(`%${k}%`, cap)) push(row as { gid: Uint8Array; title: string; artist: string })
   for (const row of db.prepare('SELECT gid,title,artist FROM albums WHERE artist LIKE ? ORDER BY title LIMIT ?').all(`%${k}%`, cap)) push(row as { gid: Uint8Array; title: string; artist: string })
   return [...merged.values()]
-}
-
-/** 随机专辑（本地专辑板块"随便听听"）：超采后过滤杂牌（歌手缺失/曲目过少的专辑几乎无法在线落歌） */
-export function randomLocalAlbums(size = 20): LocalAlbum[] {
-  const db = getAlbumsDb()
-  const tdb = getTracksDb()
-  if (!db || !tdb) return []
-  const cap = Math.max(1, Math.min(size, 50))
-  // 两步查询（albums/tracks 是两个库文件，无法跨库 JOIN）：
-  // 超采 3 倍 → 歌手非空 → 批量取去重曲目数 → 过滤 ≥ 3（1-2 曲的多为单曲凑数/噪声，在线倒查命中率极低）
-  const rows = db.prepare(
-    "SELECT gid,title,artist FROM albums WHERE artist IS NOT NULL AND artist != '' ORDER BY RANDOM() LIMIT ?",
-  ).all(cap * 3) as Array<{ gid: Uint8Array; title: string; artist: string }>
-  if (rows.length === 0) return []
-  const placeholders = rows.map(() => '?').join(',')
-  const countRows = tdb.prepare(
-    `SELECT rg_gid, COUNT(DISTINCT disc || char(45) || position) AS n FROM album_tracks WHERE rg_gid IN (${placeholders}) GROUP BY rg_gid`,
-  ).all(...rows.map(r => Buffer.from(r.gid))) as Array<{ rg_gid: Uint8Array; n: number }>
-  const nByGid = new Map(countRows.map(c => [gidToUuid(c.rg_gid), c.n]))
-  const result: LocalAlbum[] = []
-  for (const row of rows) {
-    const album = rowToAlbum(row)
-    const n = nByGid.get(album.gid) ?? 0
-    if (n < 3) continue
-    result.push({ ...album, trackCount: n })
-    if (result.length >= cap) break
-  }
-  return result
-}
-
-/** 画像推荐每个歌手最多入选的专辑数：保证一屏的歌手多样性（周杰伦 33 张专辑不能占满整屏） */
-const RECOMMEND_ALBUMS_PER_ARTIST = 2
-
-/** 画像推荐专辑：用户画像 top 歌手 → 本地库这些歌手的专辑洗牌；画像为空回退随机 */
-export async function recommendLocalAlbums(username: string, userId: number, size = 12): Promise<{ list: LocalAlbum[]; personalized: boolean }> {
-  const cap = Math.max(1, Math.min(size, 30))
-  const cacheKey = `album-local:recommend:${username}:${cap}:${dayKey()}`
-  const cached = searchCache.get(cacheKey) as { list: LocalAlbum[]; personalized: boolean } | null
-  if (cached) return cached
-
-  const db = getAlbumsDb()
-  if (!db) return { list: [], personalized: false }
-
-  let artists: Array<{ name: string; weight: number }> = []
-  try {
-    const ctx = await buildAffinityContext(username, userId)
-    artists = [...ctx.artistAffinity.entries()]
-      .map(([name, weight]) => ({ name, weight }))
-      .sort((a, b) => b.weight - a.weight)
-      .slice(0, 30)
-  } catch (error) {
-    logger.warn('[album-local] 用户画像构建失败，回退随机:', error instanceof Error ? error.message : error)
-  }
-
-  const merged = new Map<string, LocalAlbum>()
-  const tdb = getTracksDb()
-  for (const artist of artists) {
-    if (merged.size >= cap * 2) break
-    const rows = db.prepare('SELECT gid,title,artist FROM albums WHERE artist=? ORDER BY title LIMIT ?').all(artist.name, RECOMMEND_ALBUMS_PER_ARTIST)
-    for (const row of rows) {
-      const album = rowToAlbum(row as { gid: Uint8Array; title: string; artist: string })
-      if (!merged.has(album.gid)) {
-        if (tdb) album.trackCount = tdb.prepare('SELECT COUNT(DISTINCT disc || char(45) || position) AS n FROM album_tracks WHERE rg_gid=?').get(uuidToBuffer(album.gid))?.n ?? 0
-        merged.set(album.gid, album)
-      }
-    }
-  }
-  // 确定性洗牌（种子=用户名+当天），同一天刷新不变
-  const seed = `${username}:${dayKey()}`
-  let state = 0
-  for (const ch of seed) state = (state * 31 + ch.codePointAt(0)!) >>> 0
-  const rand = () => {
-    state = (state * 1664525 + 1013904223) >>> 0
-    return state / 0x100000000
-  }
-  const personalizedList = [...merged.values()].sort(() => rand() - 0.5).slice(0, cap)
-
-  if (personalizedList.length >= Math.min(cap, 5)) {
-    const result = { list: personalizedList, personalized: true }
-    searchCache.set(cacheKey, result, 30 * 60 * 1000)
-    return result
-  }
-
-  // 画像覆盖不足 → 随机兜底
-  const fallback = { list: randomLocalAlbums(cap), personalized: false }
-  searchCache.set(cacheKey, fallback, 30 * 60 * 1000)
-  return fallback
 }
 
 /** 按卡片名+歌手查本地库（详情倒查入口）：归一化精确匹配优先，标题命中再比对歌手 */

@@ -37,8 +37,6 @@ process.env.ALBUM_TRACKS_DB_PATH = join(dir, 'tracks.db')
 const {
   suggestLocalAlbums,
   searchLocalAlbums,
-  randomLocalAlbums,
-  recommendLocalAlbums,
   findLocalAlbum,
   findLocalAlbumByGid,
   getLocalAlbumTracks,
@@ -83,20 +81,7 @@ describe('album-local-service（fixture SQLite）', () => {
     expect(tracks[2].secs).toBeNull()
   })
 
-  it('随机专辑过滤杂牌（歌手缺失/曲目<3），返回指定数量', () => {
-    const list = randomLocalAlbums(2)
-    // fixture 中仅叶惠美/范特西达标（叶惠美美 0 曲被滤）
-    expect(list).toHaveLength(2)
-    expect(list[0]).toMatchObject({ gid: expect.any(String), artist: '周杰伦', trackCount: expect.any(Number) })
-    expect(list.every(a => a.trackCount >= 3)).toBe(true)
-  })
 
-  it('画像推荐：命中歌手的专辑优先，不足补随机', async () => {
-    const { list, personalized } = await recommendLocalAlbums('admin', 1, 2)
-    expect(list.length).toBeLessThanOrEqual(2)
-    expect(typeof personalized).toBe('boolean')
-    // fixture 中周杰伦有 4 行 → 画像歌手"周杰伦"应命中（若画作为空则走随机，仍返回列表）
-  })
 
   it('未知 gid 返回 null/空', () => {
     expect(findLocalAlbumByGid('ffffffff-ffff-ffff-ffff-ffffffffffff')).toBeNull()

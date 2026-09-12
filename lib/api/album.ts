@@ -1,8 +1,8 @@
 /**
  * 专辑板块 API（本地中文专辑库）
  *
- * 搜索/联想/随机/画像推荐/详情倒查全部走 /api/album/local/*，
- * 专辑卡片以 MB release-group UUID（gid）为稳定 id，详情可播。
+ * 搜索/联想/详情倒查走 /api/album/local/*，专辑卡片以 MB release-group UUID（gid）为稳定 id；
+ * 本地未命中时搜索接口自动附带平台兜底结果（platformList，wy 专辑卡片）。
  */
 
 import { apiGet } from './client'
@@ -26,30 +26,49 @@ export interface LocalAlbumDetailData {
   unsupported?: boolean
 }
 
-export interface AlbumRecommendResult {
-  list: LocalAlbumSummary[]
-  /** false = 画像不足回退随机 */
-  personalized: boolean
+/** 平台专辑详情（兜底）：本地优先尝试（name/singer），未命中走平台原生详情 */
+export interface PlatformAlbumDetailData {
+  album: { source: 'wy' | 'kw' | 'mg'; albumId: string; name: string; singer: string; img?: string | null; publishTime?: string; trackCount?: number }
+  list: Song[]
+  /** 该源无可用详情端点（mg） */
+  unsupported?: boolean
 }
 
-/** 专辑搜索：专辑名包含 + 歌手包含，gid 去重 */
-export function searchLocalAlbums(keyword: string, limit = 30): Promise<{ list: LocalAlbumSummary[] }> {
+export type AlbumSource = 'wy' | 'kw' | 'mg'
+
+export function getPlatformAlbumTracks(
+  source: AlbumSource,
+  albumId: string,
+  opts: { name?: string; singer?: string } = {}
+): Promise<PlatformAlbumDetailData> {
+  return apiGet('album/tracks', { source, albumId, ...opts })
+}
+
+export interface PlatformAlbumSummary {
+  source: 'wy'
+  albumId: string
+  name: string
+  singer: string
+  img?: string | null
+  publishTime?: string
+  trackCount?: number
+}
+
+export interface AlbumSearchResult {
+  /** 本地专辑库命中（gid 卡片，详情走本地倒查） */
+  list: LocalAlbumSummary[]
+  /** 本地未命中时自动回退的平台搜索结果（卡片走平台详情兜底） */
+  platformList: PlatformAlbumSummary[]
+}
+
+/** 专辑搜索：本地专辑库优先，本地未命中自动去网易平台搜专辑 */
+export function searchAlbums(keyword: string, limit = 30): Promise<AlbumSearchResult> {
   return apiGet('album/local/search', { keyword, limit })
 }
 
 /** 专辑名前缀联想（毫秒级，搜索框输入联想用） */
 export function suggestLocalAlbums(keyword: string, limit = 10): Promise<{ list: LocalAlbumSummary[] }> {
   return apiGet('album/local/suggest', { keyword, limit })
-}
-
-/** 随机专辑（"随便听听"） */
-export function getRandomAlbums(size = 20): Promise<{ list: LocalAlbumSummary[] }> {
-  return apiGet('album/local/random', { size })
-}
-
-/** 画像推荐专辑（用户画像 top 歌手 → 本地库专辑；画像不足回退随机） */
-export function getRecommendedAlbums(size = 20): Promise<AlbumRecommendResult> {
-  return apiGet('album/local/recommend', { size })
 }
 
 /** 专辑详情：本地曲目表 → 逐首在线搜曲 → 可播放 Song[] */

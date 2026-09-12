@@ -1,49 +1,65 @@
 import { useEffect, useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { CheckSquare, Disc3, Download, Play, RefreshCw, X } from 'lucide-react'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { AlbumCover } from '@@/components/shared/AlbumCover'
+import { SourceBadge } from '@/components/shared/SourceBadge'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
-import { getLocalAlbumTracks } from '@/lib/api/album'
+import { getLocalAlbumTracks, getPlatformAlbumTracks, type AlbumSource } from '@/lib/api/album'
+import type { Song } from '@/lib/types/music'
 
+/** 专辑详情页（双模式）：gid = 本地专辑库倒查；source+albumId = 平台专辑详情兜底。 */
 export function AlbumDetailPage() {
-  const { gid = '' } = useParams<{ gid: string }>()
-  const [detail, setDetail] = useState<Awaited<ReturnType<typeof getLocalAlbumTracks>> | null>(null)
+  const { gid = '', source = '', albumId = '' } = useParams<{ gid: string; source: string; albumId: string }>()
+  const [searchParams] = useSearchParams()
+  const name = searchParams.get('name') || undefined
+  const singer = searchParams.get('singer') || undefined
+  const isLocal = !!gid
+
+  const [detail, setDetail] = useState<{
+    album: { name: string; singer: string; trackCount?: number; img?: string | null; source?: string; albumId?: string }
+    list: Song[]
+  } | null>(null)
+  const [unsupported, setUnsupported] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
 
   const load = async () => {
-    if (!gid) {
-      setDetail(null)
-      setError('缺少专辑标识')
-      setLoading(false)
+    if (isLocal) {
+      setLoading(true); setError(null); setUnsupported(false)
+      try {
+        const r = await getLocalAlbumTracks(gid)
+        setDetail(r.album ? { album: r.album, list: r.list } : null)
+        setUnsupported(!r.album)
+      } catch (err) {
+        setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
+      } finally { setLoading(false) }
       return
     }
-    setLoading(true)
-    setError(null)
+    const validSource = ['wy', 'kw', 'mg'].includes(source) && albumId
+    if (!validSource) { setDetail(null); setError('不支持的音源'); setLoading(false); return }
+    setLoading(true); setError(null); setUnsupported(false)
     try {
-      const result = await getLocalAlbumTracks(gid)
-      setDetail(result)
+      const r = await getPlatformAlbumTracks(source as AlbumSource, albumId, { name, singer })
+      setDetail({ album: r.album, list: r.list })
+      setUnsupported(!!r.unsupported)
     } catch (err) {
-      setDetail(null)
-      setError(err instanceof Error ? err.message : '专辑详情获取失败')
-    } finally {
-      setLoading(false)
-    }
+      setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
+    } finally { setLoading(false) }
   }
 
   useEffect(() => {
     void load()
-    // gid 变化时重新请求；load 是本组件内函数，无需作为依赖项。
+    // 参数变化时重新请求；load 是本组件内函数，无需作为依赖项。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gid])
+  }, [gid, source, albumId, name, singer])
 
   const tracks: Track[] = (detail?.list ?? []).map(song => toTrack({ uid: song.uid, musicInfo: song }))
 
@@ -79,13 +95,13 @@ export function AlbumDetailPage() {
 
   if (loading) return <div className="p-6"><LoadingSkeleton /></div>
 
-  if (!detail || detail.unsupported || detail.list.length === 0) {
+  if (!detail || unsupported || tracks.length === 0) {
     return (
       <div className="p-6">
         <EmptyState
           icon={Disc3}
-          title={detail?.unsupported ? '本地专辑库未收录该专辑' : error ? '专辑详情获取失败' : '专辑暂无可播放曲目'}
-          description={error || (detail?.unsupported ? '换个关键词搜索，或浏览推荐/随机专辑' : '部分曲目未能匹配到可播放版本')}
+          title={unsupported ? '本地专辑库未收录该专辑' : error ? '专辑详情获取失败' : '专辑暂无可播放曲目'}
+          description={error || (unsupported ? '部分曲目未能匹配到可播放版本' : '稍后重试或换个专辑')}
         />
         <div className="text-center">
           <button
@@ -100,19 +116,28 @@ export function AlbumDetailPage() {
   }
 
   const album = detail.album
-  const partial = album.trackCount > tracks.length
 
   return (
     <div className="p-6">
       <div className="mb-6 flex items-end gap-4">
         <div className="h-32 w-32 shrink-0 overflow-hidden rounded-lg shadow-lg">
-          <AlbumCover gid={gid} alt={album?.name} className="h-full w-full" />
+          {isLocal ? (
+            <AlbumCover gid={gid} alt={album.name} className="h-full w-full" />
+          ) : album.img ? (
+            <img src={album.img} alt={album.name} className="h-full w-full object-cover" onError={e => { e.currentTarget.style.display = 'none' }} />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
+              <Disc3 className="h-12 w-12 text-primary-foreground/80" />
+            </div>
+          )}
         </div>
         <div className="min-w-0 flex-1">
-          <p className="text-sm text-muted-foreground">专辑</p>
+          <p className="flex items-center gap-2 text-sm text-muted-foreground">
+            专辑 {!isLocal && album.source && <SourceBadge source={album.source as 'wy' | 'kw' | 'mg'} />}
+          </p>
           <h1 className="truncate text-3xl font-bold">{album.name}</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {album.singer} · {partial ? `可播 ${tracks.length}/${album.trackCount} 首` : `${tracks.length} 首`}
+            {album.singer} · {tracks.length} 首
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <button

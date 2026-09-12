@@ -2,32 +2,31 @@
  * 专辑服务（本地中文专辑库为核心）
  *
  * 架构（2026-09 重构）：
- * - 专辑板块数据源 = 本地中文专辑库（album-local-service.ts，2.4 万张简体专辑 + 曲目表），
- *   搜索/联想/随机/画像推荐/详情倒查全部走本地库，见 /api/album/local/* 路由
+ * - 专辑搜索 = 本地中文专辑库（album-local-service.ts，2.4 万张简体专辑）优先；
+ *   本地未命中自动回退网易平台专辑搜索（platformList），保证冷门/外语专辑也能搜到
  * - 专辑详情 = 本地曲目表 → 逐首落歌：
  *   逐首在线搜曲按 tx→kw→kg→mg→wy 顺序（网易搜索通道被翻唱污染放最后），
  *   歌名+歌手+时长三重校验（±8s），并发 4；命中的走搜索同款入库管道（uid 可播）。
  *   单源搜索管线复用 song-search-service 的 searchOneSource（入库/缓存行为与搜索一致）
  * - 在线详情兜底：wy/kw 走平台原生详情端点；mg 无可用端点 → unsupported。
  *   广场卡片把 专辑名+歌手 作为 name/singer 传入即可触发本地优先。
- *
- * 平台专辑搜索适配器（wy/kw/mg 三源卡片汇聚）已随架构调整移除。
  */
 
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
 import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
-import { findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks, normalizeAlbumText, type LocalAlbumTrack } from '@/lib/services/album-local-service'
+import { findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums, type LocalAlbumTrack } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
 import {
   enrichMusicInfos,
-  getTrending,
   normalizeCover,
   toKwMusicInfo,
   toWyMusicInfo,
 } from '@/lib/services/discovery-service'
 
 const REQUEST_TIMEOUT = 8_000
+/** 平台专辑搜索缓存（关键词页级） */
+const ALBUM_SEARCH_CACHE_TTL = 30 * 60 * 1000
 /** 专辑详情（含已入库曲目）缓存 */
 const ALBUM_TRACKS_CACHE_TTL = 60 * 60 * 1000
 
@@ -224,56 +223,73 @@ export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumD
   }
 }
 
-// ==================== 热门专辑（热歌榜反推） ====================
+// ==================== 专辑搜索（本地优先 + 平台兜底） ====================
 
-/** 热门专辑：五平台热歌榜反推——榜单上的歌必属热门专辑，匹配回本地库即"既热门又能播" */
-export interface HotAlbumSummary {
-  gid: string
-  title: string
-  artist: string
+export interface PlatformAlbumSummary {
+  source: AlbumSource
+  albumId: string
+  name: string
+  singer: string
+  img?: string | null
+  publishTime?: string
   trackCount?: number
-  /** 该专辑在热歌榜上的歌曲数（排序依据） */
-  hotSongs: number
 }
 
-export async function getHotLocalAlbums(size = 12): Promise<HotAlbumSummary[]> {
-  const cacheKey = `album:hot:${size}`
-  const cached = searchCache.get(cacheKey) as HotAlbumSummary[] | null
+type WyAlbumCard = {
+  id?: number
+  name?: string
+  picUrl?: string
+  size?: number
+  publishTime?: number
+  artist?: { name?: string }
+  artists?: Array<{ name?: string }>
+}
+
+/** 网易平台专辑搜索（明文 search/get/web type=10）：本地库未命中时的兜底源，响应与 eapi 通道同构 */
+async function searchWyPlatformAlbums(keyword: string, limit: number): Promise<PlatformAlbumSummary[]> {
+  const result = await fetchJson<{ code?: number; result?: { albums?: WyAlbumCard[]; albumCount?: number } }>(
+    `https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=10&limit=${limit}`,
+  )
+  if (result.code !== 200 || !result.result) throw new Error('网易专辑搜索失败')
+  return (result.result.albums || [])
+    .filter(a => a.id && a.name)
+    .map(a => ({
+      source: 'wy' as const,
+      albumId: String(a.id),
+      name: a.name || '',
+      singer: wyAlbumSinger(a),
+      img: normalizeCover(a.picUrl) || null,
+      publishTime: formatDate(a.publishTime),
+      trackCount: a.size,
+    }))
+}
+
+/**
+ * 专辑搜索（组合）：本地中文专辑库优先；本地未命中自动回退网易平台专辑搜索。
+ * 返回 list（本地，gid 卡片）与 platformList（平台卡片，仅本地未命中时非空）。
+ */
+export async function searchAlbums(keyword: string, limit = 30): Promise<{
+  list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>
+  platformList: PlatformAlbumSummary[]
+}> {
+  const k = keyword.trim()
+  if (!k) return { list: [], platformList: [] }
+  const cacheKey = `album:v3:combined:${k}:${limit}`
+  const cached = searchCache.get(cacheKey) as { list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>; platformList: PlatformAlbumSummary[] } | null
   if (cached) return cached
 
-  // 热歌池（discovery 层自带缓存，无额外上游成本）
-  const trending = await getTrending(30).catch(error => {
-    logger.warn('[album] 热歌池获取失败，热门专辑返回空:', error instanceof Error ? error.message : error)
-    return { list: [] as Song[] }
-  })
-
-  // 按（专辑名|首歌手）聚合上榜歌曲
-  const grouped = new Map<string, { title: string; artist: string; hotSongs: number }>()
-  for (const song of trending.list) {
-    const albumName = song.albumName || ''
-    if (!albumName || albumName === '未知专辑') continue
-    const artist = (song.singer || '').split(/[、,，/／&＆;；]/)[0] || ''
-    if (!artist || artist === 'Various Artists') continue
-    const key = `${normalizeAlbumText(albumName)}|${normalizeAlbumText(artist)}`
-    const entry = grouped.get(key) ?? { title: albumName, artist, hotSongs: 0 }
-    entry.hotSongs++
-    grouped.set(key, entry)
+  const list = searchLocalAlbums(k, limit)
+  let platformList: PlatformAlbumSummary[] = []
+  if (list.length === 0) {
+    // 本地未命中 → 平台兜底（失败静默，返回空平台列表）
+    try {
+      platformList = await searchWyPlatformAlbums(k, limit)
+    } catch (error) {
+      logger.warn('[album] 平台专辑搜索兜底失败:', error instanceof Error ? error.message : error)
+    }
   }
-
-  // 逐张匹配回本地库（本地查询毫秒级）
-  const matched: HotAlbumSummary[] = []
-  for (const entry of grouped.values()) {
-    const hit = findLocalAlbum(entry.title, entry.artist)
-    if (hit) matched.push({ gid: hit.gid, title: hit.title, artist: hit.artist, hotSongs: entry.hotSongs })
-  }
-  matched.sort((a, b) => b.hotSongs - a.hotSongs)
-
-  // 回填曲目数
-  const result = matched.slice(0, Math.max(1, Math.min(size, 50))).map(a => {
-    const album = findLocalAlbumByGid(a.gid)
-    return { ...a, trackCount: album?.trackCount }
-  })
-  searchCache.set(cacheKey, result, 60 * 60 * 1000)
+  const result = { list, platformList }
+  searchCache.set(cacheKey, result, ALBUM_SEARCH_CACHE_TTL)
   return result
 }
 

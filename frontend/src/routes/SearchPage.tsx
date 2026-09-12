@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useSearch } from '@/hooks/useSearch'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
@@ -29,7 +30,7 @@ export function SearchPage() {
   // keyword/source/mode/results/loading 全部来自 search-store（外部状态）：
   // 离开搜索页再回来时输入框与结果都保留。
   const {
-    results, localList, albums, mode,
+    results, localList, albums, platformAlbums, mode,
     loading, error, keyword, lastKeyword, source,
     setKeyword, setSource, setMode, run, runAlbum,
   } = useSearch()
@@ -291,13 +292,46 @@ export function SearchPage() {
       ) : error ? (
         <EmptyState icon={CloudOff} title="搜索服务不可用" description={error} />
       ) : mode === 'album' ? (
-        albums.length > 0 ? (
+        albums.length > 0 || platformAlbums.length > 0 ? (
           <>
-            <div className="mb-2 text-xs text-muted-foreground">本地专辑库 · 搜索专辑名或歌手名</div>
-            <AlbumGrid albums={albums} />
+            {albums.length > 0 && (
+              <>
+                <div className="mb-2 text-xs text-muted-foreground">本地专辑库 · 搜索专辑名或歌手名</div>
+                <AlbumGrid albums={albums} />
+              </>
+            )}
+            {platformAlbums.length > 0 && (
+              <>
+                <div className="mb-2 mt-6 text-xs text-muted-foreground">
+                  {albums.length > 0 ? '平台结果（本地库未收录）' : '平台专辑结果'} <span className="text-primary">网易</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                  {platformAlbums.map(a => (
+                    <Link
+                      key={`wy-${a.albumId}`}
+                      to={`/album/wy/${a.albumId}?name=${encodeURIComponent(a.name)}&singer=${encodeURIComponent(a.singer)}`}
+                      className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
+                    >
+                      <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
+                        {a.img ? (
+                          <img src={a.img} alt={a.name} loading="lazy" className="h-full w-full object-cover transition group-hover:scale-105" onError={e => { e.currentTarget.style.display = 'none' }} />
+                        ) : (
+                          <Disc3 className="h-10 w-10 text-primary/70" />
+                        )}
+                        <span className="absolute right-1.5 top-1.5" />
+                      </div>
+                      <div className="truncate text-sm font-medium">{a.name}</div>
+                      <div className="truncate text-xs text-muted-foreground">
+                        {a.singer}{a.trackCount ? ` · ${a.trackCount} 首` : ''}
+                      </div>
+                    </Link>
+                  ))}
+                </div>
+              </>
+            )}
           </>
         ) : lastKeyword ? (
-          <EmptyState icon={Search} title="未找到专辑" description={`本地专辑库没有找到与“${lastKeyword}”相关的专辑`} />
+          <EmptyState icon={Search} title="未找到专辑" description={`没有找到与“${lastKeyword}”相关的专辑`} />
         ) : (
           <EmptyState icon={Disc3} title="开始搜索" description="输入专辑名或歌手名，探索本地专辑库" />
         )
