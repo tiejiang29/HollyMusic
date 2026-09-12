@@ -38,6 +38,14 @@ export interface DiscoveryPlaylist {
 export type DiscoveryPlaylistSort = 'recommend' | 'hot' | 'new' | 'collect' | 'soar'
 export interface DiscoveryPlaylistFilter { tag?: string; sort?: DiscoveryPlaylistSort; keyword?: string }
 
+/** 歌单不可访问（如 QQ 隐私歌单：作者设为私有，匿名/他人账号均不可见）——路由层转 404 + 明确文案 */
+export class PlaylistUnavailableError extends Error {
+  constructor(message = '该歌单不存在或作者已设为隐私') {
+    super(message)
+    this.name = 'PlaylistUnavailableError'
+  }
+}
+
 /** 发现页支持的音乐平台。 */
 export type DiscoverySource = 'tx' | 'wy' | 'kw' | 'kg' | 'mg'
 
@@ -758,6 +766,8 @@ async function getTxPlaylistDetail(id: string, cookie?: string): Promise<Discove
   })
   const payload = await fetchJson<{
     code?: number
+    subcode?: number
+    msg?: string
     cdlist?: Array<{ dissname?: string; logo?: string; desc?: string; nickname?: string; songlist?: QQSong[] }>
   }>(`https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?${query}`, {
     headers: {
@@ -766,6 +776,9 @@ async function getTxPlaylistDetail(id: string, cookie?: string): Promise<Discove
       Referer: `https://y.qq.com/n/yqq/playsquare/${encodeURIComponent(id)}.html`,
     },
   })
+  // 隐私歌单：上游返回 {"code":0,"subcode":4000,"msg":"check privacy error!"}——
+  // 作者设为私有的热门歌单匿名不可见，实测换移动端端点/分享页同样被拒，只能明确报错
+  if (payload.code === 0 && payload.subcode === 4000) throw new PlaylistUnavailableError()
   const info = payload.cdlist?.[0]
   const songs = info?.songlist || []
   if (payload.code !== 0 || songs.length === 0) return null

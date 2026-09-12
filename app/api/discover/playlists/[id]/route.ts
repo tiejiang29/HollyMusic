@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server'
 import { createErrorResponse, createSuccessResponse, ErrorCodes } from '@/lib/api-response'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
-import { getRecommendedPlaylistDetail, isDiscoverySource } from '@/lib/services/discovery-service'
+import { getRecommendedPlaylistDetail, isDiscoverySource, PlaylistUnavailableError } from '@/lib/services/discovery-service'
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -17,6 +17,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   } catch (error) {
     if (error instanceof AuthError) {
       return createErrorResponse('UNAUTHORIZED', error.message, 401)
+    }
+    if (error instanceof PlaylistUnavailableError) {
+      // QQ 隐私歌单等：明确 404 文案，客户端提示换歌单
+      return createErrorResponse(ErrorCodes.CONFIG_NOT_FOUND, error.message, 404)
     }
     logger.error('[api/discover/playlists/[id]] error:', error)
     return createErrorResponse(ErrorCodes.INTERNAL_ERROR, '获取推荐歌单详情失败', 500)

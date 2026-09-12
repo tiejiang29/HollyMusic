@@ -14,7 +14,7 @@ vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: 
 // kw 标签树走原生 http 模块（绕开 undici fetch），测试中替换为受控 mock
 vi.mock('./upstream-http', () => ({ nativeGetJson, httpsPostForm: vi.fn() }))
 
-const { getPlaylistTags, getRecommendedPlaylists, getRecommendedPlaylistDetail } = await import('./discovery-service')
+const { getPlaylistTags, getRecommendedPlaylists, getRecommendedPlaylistDetail, PlaylistUnavailableError } = await import('./discovery-service')
 
 describe('getRecommendedPlaylistDetail', () => {
   afterEach(() => {
@@ -100,6 +100,19 @@ describe('getRecommendedPlaylistDetail', () => {
     }))
 
     await expect(getRecommendedPlaylistDetail('tx', 'failed-transaction-playlist')).rejects.toBe(databaseError)
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('tx 隐私歌单（subcode 4000）抛 PlaylistUnavailableError', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ code: 0, subcode: 4000, msg: 'check privacy error!' }),
+    }))
+
+    await expect(getRecommendedPlaylistDetail('tx', 'privacy-playlist')).rejects.toBeInstanceOf(PlaylistUnavailableError)
+    await getRecommendedPlaylistDetail('tx', 'privacy-playlist-2').catch((e: Error) => {
+      expect(e.message).toContain('隐私')
+    })
     expect(set).not.toHaveBeenCalled()
   })
 })
