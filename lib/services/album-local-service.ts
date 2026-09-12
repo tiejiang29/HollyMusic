@@ -146,8 +146,8 @@ export function randomLocalAlbums(size = 20): LocalAlbum[] {
 }
 
 /** 画像推荐专辑：用户画像 top 歌手 → 本地库这些歌手的专辑洗牌；画像为空回退随机 */
-export async function recommendLocalAlbums(username: string, userId: number, size = 20): Promise<{ list: LocalAlbum[]; personalized: boolean }> {
-  const cap = Math.max(1, Math.min(size, 50))
+export async function recommendLocalAlbums(username: string, userId: number, size = 12): Promise<{ list: LocalAlbum[]; personalized: boolean }> {
+  const cap = Math.max(1, Math.min(size, 30))
   const cacheKey = `album-local:recommend:${username}:${cap}:${dayKey()}`
   const cached = searchCache.get(cacheKey) as { list: LocalAlbum[]; personalized: boolean } | null
   if (cached) return cached
