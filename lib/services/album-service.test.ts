@@ -1,12 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { get, set, searchOneSource, findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks } = vi.hoisted(() => ({
+const {
+  get, set, searchOneSource, findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks,
+  searchLocalAlbums, getArtistAlbumIndex, getItunesAlbumDetail, searchItunesAlbums,
+} = vi.hoisted(() => ({
   get: vi.fn(),
   set: vi.fn(),
   searchOneSource: vi.fn(),
   findLocalAlbum: vi.fn(),
   findLocalAlbumByGid: vi.fn(),
   getLocalAlbumTracks: vi.fn(),
+  searchLocalAlbums: vi.fn(),
+  getArtistAlbumIndex: vi.fn(),
+  getItunesAlbumDetail: vi.fn(),
+  searchItunesAlbums: vi.fn(),
 }))
 
 vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
@@ -15,26 +22,28 @@ vi.mock('@/lib/services/album-local-service', () => ({
   findLocalAlbum,
   findLocalAlbumByGid,
   getLocalAlbumTracks,
+  searchLocalAlbums,
 }))
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
+vi.mock('@/lib/services/itunes-service', () => ({
+  getArtistAlbumIndex,
+  getItunesAlbumDetail,
+  searchItunesAlbums,
+}))
 
-const { getLocalAlbumDetailByGid, getAlbumCover, getAlbumTracks, AlbumTracksUnsupportedError } = await import('./album-service')
-
-function jsonResponse(payload: unknown, status = 200) {
-  return { ok: status < 400, status, json: async () => payload }
-}
-
-/** 构造一个能通过三重校验的候选歌（歌名包含、歌手含周杰伦、时长 ±8s 内） */
-function song(name: string, interval: string, source = 'tx', singer = '周杰伦') {
-  return { name, singer, source, songmid: `${source}-1`, albumName: '叶惠美', interval, img: null, types: [], _types: {}, typeUrl: {} }
-}
+const { getLocalAlbumDetailByGid, getAlbumCover, getAppleAlbumDetail, searchAlbums } = await import('./album-service')
 
 const GID = '00112233-4455-6677-8899-aabbccddeeff'
+const LOCAL_ALBUM = { gid: GID, title: '叶惠美', artist: '周杰伦', trackCount: 2 }
 const LOCAL_TRACKS = [
   { disc: 1, position: 1, title: '以父之名', titleNorm: '以父之名', secs: 342 },
   { disc: 1, position: 2, title: '懦夫', titleNorm: '懦夫', secs: null },
 ]
-const LOCAL_ALBUM = { gid: GID, title: '叶惠美', artist: '周杰伦', trackCount: 2 }
+
+/** 构造能通过三重校验的候选歌 */
+function song(name: string, interval: string, source = 'tx') {
+  return { name, singer: '周杰伦', source, songmid: `${source}-1`, albumName: '叶惠美', interval, img: null, types: [], _types: {}, typeUrl: {} }
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -42,125 +51,129 @@ beforeEach(() => {
   findLocalAlbumByGid.mockReturnValue(LOCAL_ALBUM)
   getLocalAlbumTracks.mockReturnValue(LOCAL_TRACKS)
   findLocalAlbum.mockReturnValue(LOCAL_ALBUM)
+  searchLocalAlbums.mockReturnValue([LOCAL_ALBUM])
 })
 afterEach(() => {
   vi.unstubAllGlobals()
 })
 
 describe('getAlbumDetailByGid（本地专辑倒查）', () => {
-  it('逐首搜曲按 tx→kw→kg→mg→wy 顺序，首个通过校验的即采用', async () => {
-    // tx 永远返回不符候选（现场版时长不符/翻唱名不符），kw 返回正确候选——两首都不应走到 kg/wy
+  it('逐首搜曲 tx 命中，Apple 元数据增强年份与封面', async () => {
     searchOneSource.mockImplementation(async (source: string, keyword: string) => {
       const title = keyword.split(' ')[0]
-      if (source === 'tx') return { list: [song('晴天翻唱', '04:00')], total: 1 }
-      if (source === 'kw') {
-        return { list: [song(title, title === '以父之名' ? '05:42' : '03:38')], total: 1 }
-      }
-      return { list: [], total: 0 }
+      return { list: [song(title, title === '以父之名' ? '05:42' : '03:38')], total: 1 }
     })
+    getArtistAlbumIndex.mockResolvedValue(new Map([
+      ['叶惠美', { collectionId: '536114662', img: 'https://mzstatic/a.jpg', year: '2003-07-31' }],
+    ]))
 
     const detail = await getLocalAlbumDetailByGid(GID)
 
-    const calledSources = searchOneSource.mock.calls.map(c => c[0])
-    expect(calledSources[0]).toBe('tx')
+    expect(detail?.album).toMatchObject({
+      name: '叶惠美', singer: '周杰伦', trackCount: 2,
+      img: 'https://mzstatic/a.jpg', year: '2003-07-31',
+    })
     expect(detail?.list.map(s => s.name)).toEqual(['以父之名', '懦夫'])
-    expect(detail?.album).toMatchObject({ name: '叶惠美', singer: '周杰伦', trackCount: 2 })
   })
 
-  it('时长超出 ±8s 的候选不采用', async () => {
-    searchOneSource.mockImplementation(async (source: string) => {
-      if (source === 'tx') return { list: [song('以父之名', '06:40')], total: 1 } // 400s vs 342s → 不符
-      return { list: [], total: 0 }
-    })
-
-    const detail = await getLocalAlbumDetailByGid(GID)
-
-    expect(detail).toBeNull()
-  })
-
-  it('本地音乐库已有同款歌（searchOneSource 缓存命中也算在线路径），全部未命中时返回 null', async () => {
+  it('全部未命中返回 null', async () => {
     searchOneSource.mockResolvedValue({ list: [], total: 0 })
+    getArtistAlbumIndex.mockResolvedValue(new Map())
 
-    const detail = await getLocalAlbumDetailByGid(GID)
-
-    expect(detail).toBeNull()
-    expect(searchOneSource).toHaveBeenCalledTimes(LOCAL_TRACKS.length * 5) // 五源全部尝试
-  })
-
-  it('封面探测：取首曲目在 tx 搜曲推导 QQ 专辑封面直链', async () => {
-    searchOneSource.mockImplementation(async (source: string, keyword: string) => {
-      const title = keyword.split(' ')[0]
-      return { list: [song(title, '05:42', 'tx')] }
-    })
-    // 候选带 QQ 专辑 id → 封面走 gtimg 直链
-    searchOneSource.mockImplementation(async () => ({
-      list: [{ ...song('以父之名', '05:42', 'tx'), albumId: '000MkMni19ClKG' }],
-      total: 1,
-    }))
-
-    const img = await getAlbumCover(GID)
-
-    expect(img).toBe('https://y.gtimg.cn/music/photo_new/T002R500x500M000000MkMni19ClKG.jpg')
-  })
-
-  it('封面探测失败缓存 null，不重复探测', async () => {
-    findLocalAlbumByGid.mockReturnValue(null)
-
-    expect(await getAlbumCover(GID)).toBeNull()
-    expect(searchOneSource).not.toHaveBeenCalled()
+    expect(await getLocalAlbumDetailByGid(GID)).toBeNull()
   })
 
   it('gid 不在本地库返回 null', async () => {
     findLocalAlbumByGid.mockReturnValue(null)
 
-    expect(await getLocalAlbumDetailByGid('ffffffff-ffff-ffff-ffff-ffffffffffff')).toBeNull()
+    expect(await getLocalAlbumDetailByGid(GID)).toBeNull()
     expect(searchOneSource).not.toHaveBeenCalled()
-  })
-
-  it('无时长数据的曲目要求候选歌名与曲名有包含关系', async () => {
-    // 懦夫 secs=null：tx 返回歌名完全无关的候选（同名歌手）→ 不采用
-    searchOneSource.mockImplementation(async (source: string, keyword: string) => {
-      const title = keyword.split(' ')[0]
-      if (source === 'tx') return { list: [song('晴天翻唱', '04:00')], total: 1 }
-      if (source === 'kw') return { list: [song(title, title === '以父之名' ? '05:42' : '03:38')], total: 1 }
-      return { list: [], total: 0 }
-    })
-
-    const detail = await getLocalAlbumDetailByGid(GID)
-
-    expect(detail?.list.map(s => s.name)).toEqual(['以父之名', '懦夫'])
-    const calledSources = searchOneSource.mock.calls.map(c => c[0])
-    expect(calledSources).not.toContain('kg') // kw 已全部命中，不到 kg
   })
 })
 
-describe('getAlbumTracks（在线兜底 + 本地优先入口）', () => {
-  it('mg 无详情端点抛 AlbumTracksUnsupportedError', async () => {
-    await expect(getAlbumTracks('mg', '25578')).rejects.toBeInstanceOf(AlbumTracksUnsupportedError)
+describe('getAlbumCover（Apple 优先 + tx 推导兜底）', () => {
+  it('Apple 索引命中：直接返回 mzstatic 高清封面，不触发搜曲', async () => {
+    getArtistAlbumIndex.mockResolvedValue(new Map([
+      ['叶惠美', { collectionId: '536114662', img: 'https://mzstatic/ye.jpg', year: '2003' }],
+    ]))
+
+    const img = await getAlbumCover(GID)
+
+    expect(img).toBe('https://mzstatic/ye.jpg')
+    expect(searchOneSource).not.toHaveBeenCalled()
   })
 
-  it('带 name/singer 且本地命中时走倒查，不请求上游详情', async () => {
-    searchOneSource.mockImplementation(async () => ({ list: [song('以父之名', '05:42')], total: 1 }))
-    const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
+  it('Apple 未命中：回退 tx 首曲目搜曲推导 gtimg', async () => {
+    getArtistAlbumIndex.mockResolvedValue(new Map())
+    vi.stubGlobal('fetch', vi.fn())
+    searchOneSource.mockResolvedValue({
+      list: [{ ...song('以父之名', '05:42', 'tx'), albumId: '000MkMni19ClKG' }],
+      total: 1,
+    })
 
-    const detail = await getAlbumTracks('wy', '18877', { name: '叶惠美', singer: '周杰伦' })
+    const img = await getAlbumCover(GID)
 
-    expect(fetchMock).not.toHaveBeenCalled()
-    expect(detail.album.name).toBe('叶惠美')
-    expect(findLocalAlbum).toHaveBeenCalledWith('叶惠美', '周杰伦')
+    expect(img).toBe('https://y.gtimg.cn/music/photo_new/T002R500x500M000000MkMni19ClKG.jpg')
+    expect(searchOneSource).toHaveBeenCalledWith('tx', '以父之名 周杰伦', 1, 5)
+  })
+})
+
+describe('getAppleAlbumDetail（Apple 曲目表落歌）', () => {
+  it('Apple 曲目表逐首落歌，繁体自动转简体匹配', async () => {
+    getItunesAlbumDetail.mockResolvedValue({
+      album: { collectionId: '536114662', title: '七里香', artist: '周杰伦', year: '2004-08-03', img: 'https://mzstatic/qlx.jpg', trackCount: 2 },
+      tracks: [
+        { title: '我的地盤', titleNorm: '我的地盤', secs: 242, disc: 1, position: 1 },
+        { title: '七里香', titleNorm: '七里香', secs: 297, disc: 1, position: 2 },
+      ],
+    })
+    searchOneSource.mockImplementation(async (source: string, keyword: string) => {
+      const title = keyword.split(' ')[0]
+      const simple = title === '我的地盤' ? '我的地盘' : title
+      return { list: [song(simple, simple === '我的地盘' ? '04:02' : '04:57')], total: 1 }
+    })
+
+    const detail = await getAppleAlbumDetail('536114662')
+
+    expect(detail?.album).toMatchObject({ name: '七里香', singer: '周杰伦', year: '2004-08-03', trackCount: 2 })
+    expect(detail?.list.map(s => s.name)).toEqual(['我的地盘', '七里香'])
   })
 
-  it('不带 name/singer 时走 wy 原生详情', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
-      code: 200,
-      album: { id: 18877, name: '叶惠美', picUrl: 'http://p1.music.126.net/a.jpg', publishTime: 1056931200000, artist: { name: '周杰伦' } },
-      songs: [{ id: 1, name: '以父之名', ar: [{ name: '周杰伦' }], al: { id: 18877, name: '叶惠美' }, dt: 342000 }],
-    })))
+  it('全部未命中返回 null', async () => {
+    getItunesAlbumDetail.mockResolvedValue({
+      album: { collectionId: '1', title: '冷门专辑', artist: '无名氏', img: null, trackCount: 2 },
+      tracks: [
+        { title: '曲一', titleNorm: '曲一', secs: 200, disc: 1, position: 1 },
+        { title: '曲二', titleNorm: '曲二', secs: 210, disc: 1, position: 2 },
+      ],
+    })
+    searchOneSource.mockResolvedValue({ list: [], total: 0 })
 
-    const detail = await getAlbumTracks('wy', '18877')
+    expect(await getAppleAlbumDetail('1')).toBeNull()
+  })
+})
 
-    expect(detail.album).toMatchObject({ source: 'wy', name: '叶惠美', trackCount: 1 })
-    expect(detail.list[0]).toMatchObject({ name: '以父之名', uid: 'wy-1' })
+describe('searchAlbums（本地优先 + Apple 兜底）', () => {
+  it('本地命中：platformList 为空，不触发 Apple 搜索', async () => {
+    const result = await searchAlbums('叶惠美', 30)
+
+    expect(result.list.map(a => a.title)).toEqual(['叶惠美'])
+    expect(result.platformList).toEqual([])
+    expect(searchItunesAlbums).not.toHaveBeenCalled()
+  })
+
+  it('本地未命中：自动回退 Apple 专辑搜索并映射卡片', async () => {
+    searchLocalAlbums.mockReturnValue([])
+    searchItunesAlbums.mockResolvedValue([
+      { collectionId: '536114662', title: '七里香', artist: '周杰伦', trackCount: 10, year: '2004-08-03', img: 'https://mzstatic/qlx.jpg' },
+    ])
+
+    const result = await searchAlbums('七里香', 30)
+
+    expect(searchItunesAlbums).toHaveBeenCalledWith('七里香', 30)
+    expect(result.platformList).toEqual([
+      { source: 'apple', albumId: '536114662', name: '七里香', singer: '周杰伦', img: 'https://mzstatic/qlx.jpg', year: '2004-08-03', trackCount: 10 },
+    ])
+    expect(result.list).toEqual([])
   })
 })

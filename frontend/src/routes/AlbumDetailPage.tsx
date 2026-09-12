@@ -5,12 +5,11 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { AlbumCover } from '@@/components/shared/AlbumCover'
-import { SourceBadge } from '@/components/shared/SourceBadge'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
-import { getLocalAlbumTracks, getPlatformAlbumTracks, type AlbumSource } from '@/lib/api/album'
+import { getLocalAlbumTracks, getAppleAlbumTracks } from '@/lib/api/album'
 import type { Song } from '@/lib/types/music'
 
 /** 专辑详情页（双模式）：gid = 本地专辑库倒查；source+albumId = 平台专辑详情兜底。 */
@@ -43,16 +42,19 @@ export function AlbumDetailPage() {
       } finally { setLoading(false) }
       return
     }
-    const validSource = ['wy', 'kw', 'mg'].includes(source) && albumId
-    if (!validSource) { setDetail(null); setError('不支持的音源'); setLoading(false); return }
-    setLoading(true); setError(null); setUnsupported(false)
-    try {
-      const r = await getPlatformAlbumTracks(source as AlbumSource, albumId, { name, singer })
-      setDetail({ album: r.album, list: r.list })
-      setUnsupported(!!r.unsupported)
-    } catch (err) {
-      setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
-    } finally { setLoading(false) }
+    // Apple 平台专辑（搜索兜底卡片）：Apple 曲目表 → 逐首落歌
+    if (source === 'apple' && albumId) {
+      setLoading(true); setError(null); setUnsupported(false)
+      try {
+        const r = await getAppleAlbumTracks(albumId)
+        setDetail({ album: r.album, list: r.list })
+        setUnsupported(!!r.unsupported)
+      } catch (err) {
+        setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
+      } finally { setLoading(false) }
+      return
+    }
+    setDetail(null); setError('不支持的音源'); setLoading(false)
   }
 
   useEffect(() => {
@@ -133,7 +135,7 @@ export function AlbumDetailPage() {
         </div>
         <div className="min-w-0 flex-1">
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
-            专辑 {!isLocal && album.source && <SourceBadge source={album.source as 'wy' | 'kw' | 'mg'} />}
+            专辑
           </p>
           <h1 className="truncate text-3xl font-bold">{album.name}</h1>
           <p className="mt-1 text-sm text-muted-foreground">

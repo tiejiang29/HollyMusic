@@ -26,31 +26,26 @@ export interface LocalAlbumDetailData {
   unsupported?: boolean
 }
 
-/** 平台专辑详情（兜底）：本地优先尝试（name/singer），未命中走平台原生详情 */
-export interface PlatformAlbumDetailData {
-  album: { source: 'wy' | 'kw' | 'mg'; albumId: string; name: string; singer: string; img?: string | null; publishTime?: string; trackCount?: number }
+/** Apple 专辑详情：Apple 曲目表（繁→简）→ 逐首在线搜曲落歌 → 可播放 Song[] */
+export interface AppleAlbumDetailData {
+  album: { collectionId: string; name: string; singer: string; year?: string; img: string | null; trackCount: number }
   list: Song[]
-  /** 该源无可用详情端点（mg） */
+  /** collectionId 无效时为 true */
   unsupported?: boolean
 }
 
-export type AlbumSource = 'wy' | 'kw' | 'mg'
-
-export function getPlatformAlbumTracks(
-  source: AlbumSource,
-  albumId: string,
-  opts: { name?: string; singer?: string } = {}
-): Promise<PlatformAlbumDetailData> {
-  return apiGet('album/tracks', { source, albumId, ...opts })
+export function getAppleAlbumTracks(collectionId: string): Promise<AppleAlbumDetailData> {
+  return apiGet('album/apple/tracks', { collectionId })
 }
 
 export interface PlatformAlbumSummary {
-  source: 'wy'
+  source: 'apple'
+  /** Apple collectionId */
   albumId: string
   name: string
   singer: string
   img?: string | null
-  publishTime?: string
+  year?: string
   trackCount?: number
 }
 
