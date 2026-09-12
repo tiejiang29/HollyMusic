@@ -487,30 +487,36 @@ class AudioServe {
         `[AudioServe] start ${cacheKey} size=${size} type=${entry.contentType}`
       )
 
-      // 边下边写盘
+      // 边下边写盘（错误路径销毁句柄并清半成品，避免 Windows 文件锁与孤儿文件删不掉）
       const writeStream = fs.createWriteStream(entry.paths.filePath)
-      const reader = resp.body?.getReader()
-      if (!reader) throw new Error('upstream body empty')
-
       try {
-        for (;;) {
-          const { done, value } = await reader.read()
-          if (done) break
-          // 每收到一块数据就续期 stall 定时器（慢速但持续的下载不误杀）
-          refreshTimer()
-          await new Promise<void>((resolve, reject) => {
-            writeStream.write(value, err => (err ? reject(err) : resolve()))
-          })
-          entry.downloadedBytes += value.length
-          entry.emitter.emit('progress', entry.downloadedBytes)
-        }
-      } finally {
-        await reader.cancel().catch(() => {})
-      }
+        const reader = resp.body?.getReader()
+        if (!reader) throw new Error('upstream body empty')
 
-      await new Promise<void>((resolve, reject) => {
-        writeStream.end((err: Error | null) => (err ? reject(err) : resolve()))
-      })
+        try {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            // 每收到一块数据就续期 stall 定时器（慢速但持续的下载不误杀）
+            refreshTimer()
+            await new Promise<void>((resolve, reject) => {
+              writeStream.write(value, err => (err ? reject(err) : resolve()))
+            })
+            entry.downloadedBytes += value.length
+            entry.emitter.emit('progress', entry.downloadedBytes)
+          }
+        } finally {
+          await reader.cancel().catch(() => {})
+        }
+
+        await new Promise<void>((resolve, reject) => {
+          writeStream.end((err: Error | null) => (err ? reject(err) : resolve()))
+        })
+      } catch (downloadError) {
+        writeStream.destroy()
+        await fsp.unlink(entry.paths.filePath).catch(() => {})
+        throw downloadError
+      }
 
       // 校验大小
       if (entry.downloadedBytes !== entry.size) {
@@ -858,33 +864,62 @@ export function parseRange(rangeHeader: string | null, size: number): RangeSpec 
  * 3. 底层 'error' 先于 'end' 触发时，通过 controller.error() 优雅传递给下游
  */
 function wrapFileStream(nodeStream: fs.ReadStream): ReadableStream<Uint8Array> {
-  // 底层流已绑定的 error 事件（防止 destroy 后再抛）
-  let errored = false
-  nodeStream.on('error', () => {
-    errored = true
-  })
+  // pull 模式实现真背压：消费者（响应流）就绪才触发 pull 从底层流 read，
+  // 队列积压时 pull 不被调用、底层流保持 paused，内存占用受 ReadableStream
+  // 高水位约束（原实现的 pause()+nextTick(resume) 等于从不暂停，慢客户端
+  // 拉大文件时整个文件会堆进内存）
+  let ended = false
+  let streamError: Error | undefined
+  let wakeup: (() => void) | undefined
+
+  const onReadable = () => wakeup?.()
+  const onEnd = () => {
+    ended = true
+    wakeup?.()
+  }
+  const onError = (err: Error) => {
+    streamError = err
+    ended = true
+    wakeup?.()
+  }
+  nodeStream.on('readable', onReadable)
+  nodeStream.on('end', onEnd)
+  nodeStream.on('error', onError)
 
   return new ReadableStream<Uint8Array>({
-    start(controller) {
-      nodeStream.on('data', chunk => {
-        // backpressure：队列满时暂停，drain 后恢复
-        if (!controller.desiredSize || controller.desiredSize <= 0) {
-          nodeStream.pause()
-          // drain 只在非 flowing 模式下触发，这里用 nextTick 恢复
-          process.nextTick(() => nodeStream.resume())
+    pull(controller) {
+      return new Promise<void>((resolve, reject) => {
+        const attempt = () => {
+          if (streamError) {
+            reject(streamError)
+            return
+          }
+          const chunk = nodeStream.read()
+          // fs.ReadStream 的 chunk 是 Buffer（Uint8Array 子类），直接 enqueue
+          if (chunk !== null) {
+            controller.enqueue(chunk as Uint8Array)
+            resolve()
+            return
+          }
+          if (ended) {
+            controller.close()
+            resolve()
+            return
+          }
+          // 数据未就绪：挂起等 readable/end/error 任一事件再续读
+          wakeup = () => {
+            wakeup = undefined
+            attempt()
+          }
         }
-        // fs.ReadStream 的 chunk 是 Buffer（Uint8Array 子类），直接 enqueue
-        controller.enqueue(chunk as Uint8Array)
-      })
-      nodeStream.on('end', () => {
-        if (!errored) controller.close()
-      })
-      nodeStream.on('error', err => {
-        controller.error(err)
+        attempt()
       })
     },
     cancel() {
-      // 客户端断连：销毁底层流，吞掉 destroy 触发的 error
+      // 客户端断连：解绑事件并销毁底层流
+      nodeStream.off('readable', onReadable)
+      nodeStream.off('end', onEnd)
+      nodeStream.off('error', onError)
       nodeStream.destroy()
     },
   })

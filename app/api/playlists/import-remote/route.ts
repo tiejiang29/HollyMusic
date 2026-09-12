@@ -54,29 +54,41 @@ function parsePlaylistUrl(url: string): { source: DiscoverySource; id: string } 
 
 /**
  * 短链解析：App 分享出来的往往是短链（如 163cn.tv/xxx、t1.kugou.com/xxx），
- * 服务端 GET 跟随跳转，用最终落地地址重新识别歌单。
- * 自部署单管理实例场景；不做内网地址过滤（与洛雪音源脚本的既有权限面一致）。
+ * 服务端手动跟随跳转，用最终落地地址重新识别歌单。
+ * 安全：逐跳校验公网地址（assertPublicHttpUrl，与订阅校验同口径），拒绝本机/私网/无法解析目标。
  */
 async function resolveShareUrl(url: string): Promise<string | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 8000)
   try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 8000)
-    try {
-      const resp = await fetch(url, {
-        redirect: 'follow',
+    let currentUrl = url
+    const MAX_REDIRECTS = 6
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      await assertPublicHttpUrl(currentUrl)
+      const resp = await fetch(currentUrl, {
+        redirect: 'manual',
         signal: controller.signal,
         headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 13) Mobile' },
       })
-      return resp.url || null
-    } finally {
-      clearTimeout(timer)
+      if (resp.status >= 300 && resp.status < 400) {
+        const location = resp.headers.get('location')
+        await resp.body?.cancel().catch(() => {})
+        if (!location) return null
+        currentUrl = new URL(location, currentUrl).toString()
+        continue
+      }
+      return currentUrl
     }
+    return null
   } catch {
     return null
+  } finally {
+    clearTimeout(timer)
   }
 }
 
 import { createHash } from 'crypto'
+import { assertPublicHttpUrl } from '@/lib/services/source-manager-service'
 
 /**
  * 酷狗移动端 API 签名（从洛雪 musicSdk/kg/util.js 逆向）

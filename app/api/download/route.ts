@@ -10,6 +10,7 @@ import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { findLibrarySong, shouldServeLibraryFile } from '@/lib/services/music-library'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import type { QualityType } from '@/lib/types/music'
+import { assertPublicHttpUrl } from '@/lib/services/source-manager-service'
 import {
   isValidUrl,
   extractDomain,
@@ -191,21 +192,53 @@ async function handleDownloadByUrl(
     return NextResponse.json({ error: '不支持的下载域名' }, { status: 403 })
   }
 
-  const upstreamHeaders = buildUpstreamHeaders(url)
   // header 阶段限时 UPSTREAM_TIMEOUT_MS；header 返回后转为 body 阶段的
   // stall 续期（每收到一块数据续期），慢速但持续的传输不误杀，真 stall 才中止
   const controller = new AbortController()
   const stallTimer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
   if (stallTimer.unref) stallTimer.unref()
 
-  let remoteResponse: Response
+  // 私网/本机地址拦截（无论白名单如何配置都强制生效，关闭认证后 SSRF 面）
   try {
-    remoteResponse = await fetch(url, {
-      headers: upstreamHeaders,
-      signal: controller.signal,
-    })
+    await assertPublicHttpUrl(url)
+  } catch (e) {
+    logger.warn(`[download] 地址被私网拦截 url=${url.slice(0, 120)} ip=${clientIP}:`, e instanceof Error ? e.message : e)
+    return NextResponse.json({ error: '不允许的下载地址' }, { status: 403 })
+  }
+
+  // 手动跟随重定向：逐跳校验目标地址，防止公网 URL 302 跳私网
+  let remoteResponse: Response | undefined
+  let currentUrl = url
+  try {
+    const MAX_REDIRECTS = 5
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      await assertPublicHttpUrl(currentUrl)
+      const resp = await fetch(currentUrl, {
+        headers: buildUpstreamHeaders(currentUrl),
+        signal: controller.signal,
+        redirect: 'manual',
+      })
+      if (resp.status >= 300 && resp.status < 400) {
+        const location = resp.headers.get('location')
+        await resp.body?.cancel().catch(() => {})
+        if (!location) {
+          return NextResponse.json({ error: '下载源重定向地址无效' }, { status: 502 })
+        }
+        currentUrl = new URL(location, currentUrl).toString()
+        continue
+      }
+      remoteResponse = resp
+      break
+    }
+    if (!remoteResponse) {
+      return NextResponse.json({ error: '下载源重定向次数过多' }, { status: 502 })
+    }
   } catch (e) {
     clearTimeout(stallTimer)
+    if (e instanceof Error && e.message.includes('不允许访问')) {
+      logger.warn(`[download] 重定向跳私网被拦 url=${url.slice(0, 120)} → ${currentUrl.slice(0, 120)} ip=${clientIP}`)
+      return NextResponse.json({ error: '不允许的下载地址' }, { status: 403 })
+    }
     const err = e as Error
     const isTimeout =
       err.name === 'TimeoutError' ||

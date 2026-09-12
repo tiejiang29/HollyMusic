@@ -172,8 +172,7 @@ export async function GET(request: NextRequest) {
     return createErrorResponse(
       ErrorCodes.INTERNAL_ERROR,
       error instanceof Error ? error.message : '搜索失败',
-      500,
-      error instanceof Error ? error.stack : undefined,
+      500
     )
   }
 }

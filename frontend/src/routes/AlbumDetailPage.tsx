@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { CheckSquare, Disc3, Download, Play, RefreshCw, X } from 'lucide-react'
 import { SongList } from '@/components/shared/SongList'
@@ -27,19 +27,25 @@ export function AlbumDetailPage() {
   const [unsupported, setUnsupported] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // 请求序号：快速导航 X→Y 时丢弃 X 的晚到响应
+  const reqIdRef = useRef(0)
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
 
   const load = async () => {
+    const reqId = ++reqIdRef.current
+    const stale = () => reqId !== reqIdRef.current
     if (isLocal) {
       setLoading(true); setError(null); setUnsupported(false)
       try {
         const r = await getLocalAlbumTracks(gid)
+        if (stale()) return
         setDetail(r.album ? { album: r.album, list: r.list } : null)
         setUnsupported(!r.album)
       } catch (err) {
+        if (stale()) return
         setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
-      } finally { setLoading(false) }
+      } finally { if (!stale()) setLoading(false) }
       return
     }
     // Apple 平台专辑（搜索兜底卡片）：Apple 曲目表 → 逐首落歌
@@ -47,11 +53,13 @@ export function AlbumDetailPage() {
       setLoading(true); setError(null); setUnsupported(false)
       try {
         const r = await getAppleAlbumTracks(albumId)
+        if (stale()) return
         setDetail({ album: r.album, list: r.list })
         setUnsupported(!!r.unsupported)
       } catch (err) {
+        if (stale()) return
         setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
-      } finally { setLoading(false) }
+      } finally { if (!stale()) setLoading(false) }
       return
     }
     setDetail(null); setError('不支持的音源'); setLoading(false)

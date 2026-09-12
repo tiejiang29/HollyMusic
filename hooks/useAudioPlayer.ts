@@ -284,12 +284,19 @@ export function useAudioPlayer(opts: UseAudioPlayerOptions) {
 
   const startProgress = useCallback(() => {
     if (rafRef.current !== undefined) return
+    // 250ms 节流：60fps 全量回调会让进度条/歌词每帧重渲染、mediaSession
+    // 每帧 setPositionState（移动端耗电）；4Hz 对进度条与歌词高亮已足够流畅，
+    // seek 之类的时间跳变会立即跨过阈值触发上报
+    let lastEmitted = -1
     const loop = () => {
       const audio = audioRef.current
       if (!audio) return
       // readyState > 0 才有有效 currentTime
       if (audio.readyState > 0) {
-        optsRef.current.onTimeUpdate?.(audio.currentTime)
+        if (lastEmitted < 0 || Math.abs(audio.currentTime - lastEmitted) >= 0.25) {
+          lastEmitted = audio.currentTime
+          optsRef.current.onTimeUpdate?.(audio.currentTime)
+        }
       }
       if (!audio.paused && !audio.ended) {
         rafRef.current = requestAnimationFrame(loop)

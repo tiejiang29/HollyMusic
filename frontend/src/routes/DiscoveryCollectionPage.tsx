@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { Music, Play, RefreshCw } from 'lucide-react'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -20,17 +20,24 @@ export function DiscoveryCollectionPage({ kind }: { kind: 'toplists' | 'playlist
   const [error, setError] = useState<string | null>(null)
   const playTrack = usePlayerStore(s => s.playTrack)
 
+  // 请求序号：快速导航 X→Y 时丢弃 X 的晚到响应
+  const reqIdRef = useRef(0)
+
   const load = async () => {
+    const reqId = ++reqIdRef.current
+    const stale = () => reqId !== reqIdRef.current
     setLoading(true)
     setError(null)
     try {
       const result = kind === 'toplists' ? await getToplistDetail(source, id) : await getRecommendedPlaylistDetail(source, id)
+      if (stale()) return
       setDetail(result)
     } catch (err) {
+      if (stale()) return
       setDetail(null)
       setError(err instanceof Error ? err.message : '加载失败')
     } finally {
-      setLoading(false)
+      if (!stale()) setLoading(false)
     }
   }
 

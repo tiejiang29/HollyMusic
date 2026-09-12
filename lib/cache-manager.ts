@@ -5,6 +5,9 @@
 
 import type { CacheEntry } from './types/music'
 
+/** 缓存条目容量上限（按插入序 FIFO 淘汰） */
+const MAX_ENTRIES = 2000
+
 export class CacheManager<T = unknown> {
   private cache: Map<string, CacheEntry<T>>
   private hits: number = 0
@@ -45,6 +48,14 @@ export class CacheManager<T = unknown> {
    * @param ttl 过期时间（毫秒）
    */
   set(key: string, data: T, ttl: number): void {
+    // 容量上限：超限按插入序淘汰最老条目（防匿名/半公开接口无限制造缓存键打满内存）
+    if (this.cache.size >= MAX_ENTRIES && !this.cache.has(key)) {
+      let toEvict = this.cache.size - MAX_ENTRIES + 1
+      for (const oldest of this.cache.keys()) {
+        if (toEvict-- <= 0) break
+        this.cache.delete(oldest)
+      }
+    }
     const entry: CacheEntry<T> = {
       data,
       expireAt: Date.now() + ttl,

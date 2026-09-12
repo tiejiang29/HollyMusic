@@ -34,8 +34,7 @@ export async function GET() {
     return createErrorResponse(
       ErrorCodes.INTERNAL_ERROR,
       error instanceof Error ? error.message : '健康检查失败',
-      500,
-      error instanceof Error ? error.stack : undefined
+      500
     )
   }
 }

@@ -266,6 +266,32 @@ function isPublicIp(address: string): boolean {
   return false
 }
 
+/** 校验 http(s) URL 拒绝本机/私网/无法解析地址（防 SSRF），供下载回源与分享短链解析复用。 */
+export async function assertPublicHttpUrl(value: string): Promise<URL> {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('无效的 URL')
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error('仅支持 HTTP 或 HTTPS')
+  }
+  if (url.username || url.password) {
+    throw new Error('URL 不能包含账号信息')
+  }
+  if (url.hostname.toLowerCase() === 'localhost') {
+    throw new Error('不允许访问本机或内网地址')
+  }
+  const addresses = net.isIP(url.hostname)
+    ? [{ address: url.hostname }]
+    : await dns.lookup(url.hostname, { all: true, verbatim: true }).catch(() => [])
+  if (addresses.length === 0 || addresses.some(({ address }) => !isPublicIp(address))) {
+    throw new Error('不允许访问本机、内网或无法解析的地址')
+  }
+  return url
+}
+
 /** 校验远程订阅地址，拒绝本机及私网地址，避免管理员接口成为 SSRF 入口。 */
 async function validateSubscriptionUrl(value: string): Promise<URL> {
   let url: URL

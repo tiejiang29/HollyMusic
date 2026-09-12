@@ -97,8 +97,7 @@ export async function POST(request: NextRequest) {
     return createErrorResponse(
       errorCode,
       errorMessage,
-      500,
-      error instanceof Error ? error.stack : undefined
+      500
     )
   }
 }
