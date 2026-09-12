@@ -100,18 +100,33 @@ export function suggestLocalAlbums(keyword: string, limit = 10): LocalAlbum[] {
 }
 
 /** 专辑搜索：前缀命中优先，补标题包含 + 歌手包含（2.4 万行全表扫本地无压力），gid 去重 */
+/**
+ * 标题命中噪声过滤：用户以歌手名搜索时（如"周深"），标题碰巧含该词但歌手字段
+ * 完全无关的杂牌合集（MB 数据常见）会被推到前排——标题命中仅在以下任一成立时保留：
+ * 关键词很短（≤3 字符，截断风险高）、标题精确等于关键词、或歌手字段也含关键词（同人专辑）。
+ */
+function titleHitRelevant(title: string, artist: string, keyword: string): boolean {
+  // 标题精确等于关键词（如搜"叶惠美"命中专辑《叶惠美》），或歌手字段也含关键词
+  // （如搜"周杰伦"命中《周杰伦的床边故事》，歌手就是周杰伦）——其余标题 LIKE 命中视为噪声
+  if (normalizeAlbumText(title) === normalizeAlbumText(keyword)) return true
+  return normalizeAlbumText(artist).includes(normalizeAlbumText(keyword))
+}
+
 export function searchLocalAlbums(keyword: string, limit = 30): LocalAlbum[] {
   const db = getAlbumsDb()
   const k = keyword.trim()
   if (!db || !k) return []
   const cap = Math.max(1, Math.min(limit, 50))
   const merged = new Map<string, LocalAlbum>()
-  const push = (row: { gid: Uint8Array; title: string; artist: string }) => {
+  // 标题命中（前缀与 LIKE 一视同仁）需过相关性滤网；被滤空时组合搜索层会自动落 Apple 兜底，
+  // 因此激进过滤是安全的（如"七里"滤掉本地《七里香》→ Apple 搜"七里"照样返回同名专辑卡）
+  const push = (row: { gid: Uint8Array; title: string; artist: string }, fromTitle = false) => {
     const album = rowToAlbum(row)
+    if (fromTitle && !titleHitRelevant(album.title, album.artist, k)) return
     if (!merged.has(album.gid) && merged.size < cap) merged.set(album.gid, album)
   }
-  for (const row of db.prepare('SELECT gid,title,artist FROM albums WHERE title>=? AND title<? ORDER BY title LIMIT ?').all(k, upperBound(k), cap)) push(row as { gid: Uint8Array; title: string; artist: string })
-  for (const row of db.prepare('SELECT gid,title,artist FROM albums WHERE title LIKE ? LIMIT ?').all(`%${k}%`, cap)) push(row as { gid: Uint8Array; title: string; artist: string })
+  for (const row of db.prepare('SELECT gid,title,artist FROM albums WHERE title>=? AND title<? ORDER BY title LIMIT ?').all(k, upperBound(k), cap)) push(row as { gid: Uint8Array; title: string; artist: string }, true)
+  for (const row of db.prepare('SELECT gid,title,artist FROM albums WHERE title LIKE ? LIMIT ?').all(`%${k}%`, cap)) push(row as { gid: Uint8Array; title: string; artist: string }, true)
   for (const row of db.prepare('SELECT gid,title,artist FROM albums WHERE artist LIKE ? ORDER BY title LIMIT ?').all(`%${k}%`, cap)) push(row as { gid: Uint8Array; title: string; artist: string })
   return [...merged.values()]
 }

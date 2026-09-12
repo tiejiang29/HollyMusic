@@ -223,6 +223,11 @@ export async function getAlbumCover(gid: string): Promise<string | null> {
   const album = findLocalAlbumByGid(gid)
   let img: string | null = null
   if (album) {
+    // ⓪ 详情缓存借用（零成本）：用户点开过详情（落歌完成）时封面已算好缓存
+    const detail = searchCache.get(`album:v3:local:${gid}`) as { album?: { img?: string | null } } | null
+    img = detail?.album?.img ?? null
+  }
+  if (!img && album) {
     // ① Apple：歌手专辑索引按专辑名匹配 → 600x600 高清
     const apple = await getAppleAlbumMeta(album.title, album.artist).catch(() => ({ img: null as string | null }))
     img = apple.img ?? null
@@ -281,11 +286,16 @@ export interface LocalAlbumDetail {
 
 /** 按 gid 解析本地专辑为可播放歌单（安卓专辑板块详情用） */
 export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumDetail | null> {
+  // 详情缓存（落歌昂贵，二次打开秒回；封面探测接口也借这份缓存取 img）
+  const cacheKey = `album:v3:local:${gid}`
+  const cached = searchCache.get(cacheKey) as LocalAlbumDetail | null
+  if (cached) return cached
+
   const album = findLocalAlbumByGid(gid)
   if (!album) return null
   const detail = await buildLocalAlbumDetail(album.title, album.artist, album.gid)
   if (!detail) return null
-  return {
+  const result: LocalAlbumDetail = {
     album: {
       gid: album.gid,
       name: album.title,
@@ -298,6 +308,8 @@ export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumD
     },
     list: detail.list,
   }
+  searchCache.set(cacheKey, result, ALBUM_TRACKS_CACHE_TTL)
+  return result
 }
 
 // ==================== 歌手详情（Apple） ====================

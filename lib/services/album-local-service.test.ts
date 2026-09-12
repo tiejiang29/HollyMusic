@@ -57,8 +57,8 @@ describe('album-local-service（fixture SQLite）', () => {
 
   it('搜索合并前缀/标题包含/歌手包含并按 gid 去重', () => {
     const list = searchLocalAlbums('叶惠美', 30)
-    // 精确行 + LIKE 行重复 gid 去重后：叶惠美、叶惠美美
-    expect(list.map(a => a.title)).toEqual(['叶惠美', '叶惠美美'])
+    // 精确命中保留；《叶惠美美》非精确且歌手不含关键词 → 滤（Apple 兜底接管）
+    expect(list.map(a => a.title)).toEqual(['叶惠美'])
     const byArtist = searchLocalAlbums('周杰伦', 30)
     expect(byArtist.map(a => a.title)).toContain('范特西')
   })
