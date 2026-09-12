@@ -10,12 +10,15 @@
  */
 
 import { DatabaseSync } from 'node:sqlite'
+import path from 'node:path'
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
 import { buildAffinityContext, dayKey } from './guess-service'
 
-const ALBUM_DB_PATH = process.env.ALBUM_DB_PATH || 'D:/mbdump/albums_cn_simp.db'
-const TRACKS_DB_PATH = process.env.ALBUM_TRACKS_DB_PATH || 'D:/mbdump/album_tracks_cn_simp.db'
+// 库文件随仓库分发（album-db/），Docker 镜像构建时 COPY 进 /app/album-db；
+// 服务以项目根为工作目录，路径相对 cwd 解析；可用环境变量覆盖。
+const ALBUM_DB_PATH = process.env.ALBUM_DB_PATH || path.join(process.cwd(), 'album-db', 'albums_cn_simp.db')
+const TRACKS_DB_PATH = process.env.ALBUM_TRACKS_DB_PATH || path.join(process.cwd(), 'album-db', 'album_tracks_cn_simp.db')
 
 export interface LocalAlbum {
   /** MB release-group UUID（带横杠） */

@@ -57,6 +57,8 @@ next-env.d.ts
 *.db
 *.db-journal
 *.db-wal
+# 例外：本地中文专辑库（MusicBrainz 派生只读库，随仓库分发、打包进 Docker 镜像）
+!album-db/*.db
 *.db-shm
 /prisma/prisma/
 

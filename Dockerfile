@@ -124,6 +124,9 @@ COPY --from=backend-builder /app/prisma ./prisma
 
 # ---------- 业务配置与音源 ----------
 COPY --from=backend-builder /app/config ./config
+
+# ---------- 本地中文专辑库（MusicBrainz 派生只读库，仓库内随源码分发） ----------
+COPY --from=backend-builder /app/album-db ./album-db
 # 兜底：users.json 含初始密码，绝不允许随镜像分发（若构建期生成，密码会出现在公开构建日志）
 RUN rm -f /app/config/users.json
 # custom-sources 是运行时用户数据目录（被 .gitignore 忽略，源码与 CI 中均不存在），
