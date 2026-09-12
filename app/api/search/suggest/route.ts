@@ -118,8 +118,13 @@ export async function GET(request: NextRequest) {
   try {
     await requireUser(request)
 
-    const keyword = (new URL(request.url).searchParams.get('keyword') || '').trim().slice(0, 60)
+    const params = new URL(request.url).searchParams
+    const keyword = (params.get('keyword') || '').trim().slice(0, 60)
     if (!keyword) return createSuccessResponse<SuggestItem[]>([])
+
+    // 类型过滤（type=song|artist|album；缺省不过滤保持旧行为）。
+    // artist 复用五源歌手联想（网易 suggest 的 singer 项），album 复用本地专辑前缀联想。
+    const type = params.get('type') || ''
 
     const cacheKey = `suggest:v3:${keyword}`
     const cached = searchCache.get(cacheKey) as SuggestItem[] | null
@@ -156,6 +161,9 @@ export async function GET(request: NextRequest) {
     for (const item of wySuggest.filter(i => i.type === 'album')) push(item)
 
     searchCache.set(cacheKey, items, CACHE_TTL)
+    if (type === 'artist') return createSuccessResponse(items.filter(i => i.type === 'singer'))
+    if (type === 'album') return createSuccessResponse(items.filter(i => i.type === 'album'))
+    if (type === 'song') return createSuccessResponse(items.filter(i => i.type === 'song'))
     return createSuccessResponse(items)
   } catch (error) {
     if (error instanceof AuthError) {

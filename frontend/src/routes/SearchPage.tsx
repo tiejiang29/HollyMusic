@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useSearch } from '@/hooks/useSearch'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
@@ -27,19 +27,28 @@ const SOURCES: { value: SourceType | 'all' | 'local'; label: string }[] = [
 ]
 
 export function SearchPage() {
+  const navigate = useNavigate()
   // keyword/source/mode/results/loading 全部来自 search-store（外部状态）：
   // 离开搜索页再回来时输入框与结果都保留。
   const {
-    results, localList, albums, platformAlbums, mode,
+    results, localList, albums, platformAlbums, artists, mode,
     loading, error, keyword, lastKeyword, source,
-    setKeyword, setSource, setMode, run, runAlbum,
+    setKeyword, setSource, setMode, run, runAlbum, runArtist,
   } = useSearch()
+  const artistNavigateRef = useRef(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  /** 按当前结果类型分发：专辑模式走本地专辑库（无音源维度） */
+  /** 按当前结果类型分发：专辑=本地库+Apple兜底；歌手=Apple歌手卡；歌曲=五源 */
   const doSearch = (kw: string, src: SourceType | 'all' | 'local') => {
+    artistNavigateRef.current = false
     if (mode === 'album') {
       runAlbum(kw)
+    } else if (mode === 'artist') {
+      const trimmed = kw.trim()
+      if (trimmed) {
+        artistNavigateRef.current = true // 单结果直进详情（见下方渲染分支）
+        runArtist(trimmed)
+      }
     } else {
       run(kw, src)
     }
@@ -56,18 +65,23 @@ export function SearchPage() {
     if (keyword.trim()) doSearch(keyword, next)
   }
 
-  // 切换结果类型（歌曲 | 专辑）：有关键词立即按新模式重搜，无关键词清掉旧模式遗留结果
+  // 切换结果类型（歌曲 | 歌手 | 专辑）：有关键词立即按新模式重搜，无关键词清掉旧模式遗留结果
   const handleModeChange = (next: SearchMode) => {
     if (next === mode) return
     setMode(next)
+    artistNavigateRef.current = false
     const kw = keyword.trim()
     if (!kw) {
       if (next === 'album') run('', 'all')
+      else if (next === 'artist') runArtist('')
       else runAlbum('')
       return
     }
     if (next === 'album') {
       runAlbum(kw)
+    } else if (next === 'artist') {
+      artistNavigateRef.current = true
+      runArtist(kw)
     } else {
       run(kw, source)
     }
@@ -238,7 +252,7 @@ export function SearchPage() {
 
       {/* 结果类型：歌曲 | 专辑 */}
       <div role="tablist" aria-label="结果类型" className="mb-3 flex gap-2">
-        {([['song', '歌曲'], ['album', '专辑']] as const).map(([m, label]) => (
+        {([['song', '歌曲'], ['artist', '歌手'], ['album', '专辑']] as const).map(([m, label]) => (
           <button
             key={m}
             role="tab"
@@ -258,7 +272,7 @@ export function SearchPage() {
       <div
         role="tablist"
         aria-label="音源"
-        className={`mb-6 flex gap-2 overflow-x-auto pb-1 ${mode === 'album' ? 'hidden' : ''}`}
+        className={`mb-6 flex gap-2 overflow-x-auto pb-1 ${mode !== 'song' ? 'hidden' : ''}`}
       >
         {SOURCES.map(s => (
           <button
@@ -291,6 +305,33 @@ export function SearchPage() {
         <LoadingSkeleton />
       ) : error ? (
         <EmptyState icon={CloudOff} title="搜索服务不可用" description={error} />
+      ) : mode === 'artist' ? (
+        !loading && artists.length === 1 && artistNavigateRef.current ? (
+          // 单一歌手结果：自动跳进详情（完整包：简介+热门歌+专辑）
+          (() => {
+            queueMicrotask(() => navigate(`/artist/apple/${artists[0].artistId}`))
+            return <LoadingSkeleton />
+          })()
+        ) : artists.length > 0 ? (
+          <>
+            <div className="mb-2 text-xs text-muted-foreground">歌手 · Apple 数据源</div>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+              {artists.map(a => (
+                <Link key={a.artistId} to={`/artist/apple/${a.artistId}`} className="group flex flex-col items-center gap-2 rounded-lg p-3 hover:bg-accent/40">
+                  <div className="flex h-20 w-20 items-center justify-center rounded-full bg-gradient-to-br from-primary/40 to-primary/10 transition group-hover:scale-105">
+                    <User className="h-9 w-9 text-primary/80" />
+                  </div>
+                  <div className="max-w-full truncate text-sm font-medium">{a.name}</div>
+                  {a.genre && <div className="max-w-full truncate text-xs text-muted-foreground">{a.genre}</div>}
+                </Link>
+              ))}
+            </div>
+          </>
+        ) : lastKeyword ? (
+          <EmptyState icon={Search} title="未找到歌手" description={`没有找到与“${lastKeyword}”相关的歌手`} />
+        ) : (
+          <EmptyState icon={User} title="搜索歌手" description="输入歌手名，查看简介、热门歌曲与专辑" />
+        )
       ) : mode === 'album' ? (
         albums.length > 0 || platformAlbums.length > 0 ? (
           <>

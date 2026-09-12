@@ -15,6 +15,7 @@ export function useSearch() {
   const localList = useSearchStore(s => s.localList)
   const albums = useSearchStore(s => s.albums)
   const platformAlbums = useSearchStore(s => s.platformAlbums)
+  const artists = useSearchStore(s => s.artists)
   const mode = useSearchStore(s => s.mode)
   const loading = useSearchStore(s => s.loading)
   const error = useSearchStore(s => s.error)
@@ -26,6 +27,7 @@ export function useSearch() {
   const setMode = useSearchStore(s => s.setMode)
   const runStore = useSearchStore(s => s.run)
   const runAlbumStore = useSearchStore(s => s.runAlbum)
+  const runArtistStore = useSearchStore(s => s.runArtist)
 
   const run = useCallback(
     (kw: string, src: SourceType | 'all' | 'local') => runStore(kw, src),
@@ -37,9 +39,14 @@ export function useSearch() {
     [runAlbumStore]
   )
 
+  const runArtist = useCallback(
+    (kw: string) => runArtistStore(kw),
+    [runArtistStore]
+  )
+
   return {
-    results, localList, albums, platformAlbums, mode,
+    results, localList, albums, platformAlbums, artists, mode,
     loading, error, keyword, lastKeyword, source,
-    setKeyword, setSource, setMode, run, runAlbum,
+    setKeyword, setSource, setMode, run, runAlbum, runArtist,
   }
 }

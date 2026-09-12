@@ -14,6 +14,8 @@ import { getMusicInfo, prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { searchOneSource } from '@/lib/services/song-search-service'
+import { searchItunesArtists } from '@/lib/services/itunes-service'
+import { searchAlbums } from '@/lib/services/album-service'
 import { dedupeByIdentity } from '@/lib/song-identity'
 import type { SearchResult, SourceType, Song } from '@/lib/types/music'
 
@@ -72,11 +74,23 @@ export async function GET(request: NextRequest) {
     const limit = parseInt(searchParams.get('limit') || '30')
 
     // 参数验证
-    if (!source) {
-      return createErrorResponse(ErrorCodes.INVALID_PARAMS, '缺少必填参数: source', 400)
-    }
     if (!keyword) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '缺少必填参数: keyword', 400)
+    }
+
+    // ---------- 类型分支：artist / album（type 缺省 = song，走原有五源逻辑，安卓零改动） ----------
+    const type = searchParams.get('type') || 'song'
+    if (type === 'artist') {
+      const list = await searchItunesArtists(keyword, 10)
+      return createSuccessResponse({ type, list })
+    }
+    if (type === 'album') {
+      const result = await searchAlbums(keyword, 30)
+      return createSuccessResponse({ type, list: result.list, platformList: result.platformList })
+    }
+
+    if (!source) {
+      return createErrorResponse(ErrorCodes.INVALID_PARAMS, '缺少必填参数: source', 400)
     }
 
     if (source !== 'all' && source !== 'local') {

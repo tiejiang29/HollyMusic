@@ -15,10 +15,13 @@
 
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
-import type { Song, SourceType } from '@/lib/types/music'
+import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
+import { songIdentity } from '@/lib/song-identity'
+import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
 import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums, type LocalAlbumTrack } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
-import { getArtistAlbumIndex, getItunesAlbumDetail, searchItunesAlbums } from '@/lib/services/itunes-service'
+import { getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs, searchItunesAlbums } from '@/lib/services/itunes-service'
+import { getWikiExtract } from '@/lib/services/wiki-service'
 
 /** 专辑详情（含已入库曲目）缓存 */
 const ALBUM_TRACKS_CACHE_TTL = 60 * 60 * 1000
@@ -54,8 +57,27 @@ function durationMatches(interval: string | undefined, secs: number | null): boo
   return Math.abs(dur - secs) <= 8
 }
 
-/** 单首曲目跨源搜曲：按 RESOLVE_SOURCE_ORDER 依次尝试，歌名+歌手+时长三重校验 */
+/** 本地音乐库优先：identity 同款歌命中直接返回库内条目（零上游成本，毫秒级）。
+ *  与换源接口 findLocalAlternatives 同一套机制（MusicInfo.identity 分组键）。 */
+async function resolveFromLocalLibrary(title: string, artist: string): Promise<Song | null> {
+  const identity = songIdentity({ name: title, singer: artist })
+  if (identity === '|') return null
+  try {
+    const row = await prisma.musicInfo.findFirst({ where: { identity } })
+    if (!row) return null
+    const mi = JSON.parse(row.data ?? '') as MusicInfo
+    return { ...mi, uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}` }
+  } catch (error) {
+    logger.debug('[album] 本地库 identity 查询失败（跳过）:', error instanceof Error ? error.message : error)
+    return null
+  }
+}
+
+/** 单首曲目跨源搜曲：本地库 identity 优先 → 在线按 RESOLVE_SOURCE_ORDER 依次尝试（三重校验） */
 async function resolveLocalTrack(track: LocalAlbumTrack, artist: string): Promise<Song | null> {
+  const localFit = await resolveFromLocalLibrary(track.title, artist)
+  if (localFit) return localFit
+
   const keyword = `${track.title} ${artist}`
   // 有时长数据时时长是主要消歧信号（繁简/异体歌名差异靠它兜住）；
   // 无时长数据（约 22% 曲目）时长无法参与，改为要求候选歌名与曲名有包含关系
@@ -92,7 +114,7 @@ async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise
 }
 
 export interface AlbumDetail {
-  album: { source: string; albumId: string; name: string; singer: string; img?: string | null; publishTime?: string; trackCount?: number }
+  album: { source: string; albumId: string; name: string; singer: string; img?: string | null; publishTime?: string; trackCount?: number; bio?: string | null }
   list: Song[]
 }
 
@@ -169,6 +191,7 @@ async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gi
   }
   // Apple 增强（缓存命中时近零成本；失败静默）
   const apple = await getAppleAlbumMeta(localTitle, localArtist).catch(() => ({ img: null as string | null, year: undefined as string | undefined }))
+  const bio = await getWikiExtract(localTitle, 'album').catch(() => null)
   return {
     album: {
       source: 'local',
@@ -178,13 +201,14 @@ async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gi
       img: apple.img ?? albumCoverFromSongs(list),
       publishTime: apple.year,
       trackCount: tracks.length,
+      bio,
     },
     list,
   }
 }
 
 export interface LocalAlbumDetail {
-  album: { gid: string; name: string; singer: string; trackCount: number; img: string | null; year?: string }
+  album: { gid: string; name: string; singer: string; trackCount: number; img: string | null; year?: string; bio?: string | null }
   list: Song[]
 }
 
@@ -202,9 +226,77 @@ export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumD
       trackCount: album.trackCount ?? detail.list.length,
       img: detail.album.img ?? null,
       year: detail.album.publishTime,
+      bio: detail.album.bio ?? null,
     },
     list: detail.list,
   }
+}
+
+// ==================== 歌手详情（Apple） ====================
+
+export interface ArtistAlbumCard {
+  source: 'apple'
+  albumId: string
+  name: string
+  artist: string
+  year?: string
+  img: string | null
+  trackCount?: number
+}
+
+export interface AppleArtistDetail {
+  artist: {
+    artistId: string
+    name: string
+    genre?: string
+    /** 维基简介（简体，best-effort：未配置 WIKI_PROXY_URL 或条目不存在时缺省） */
+    bio?: string | null
+    /** 头像（Apple 歌手实体无照片，取首张专辑封面） */
+    img: string | null
+  }
+  /** 热门歌曲（Apple 热门度排序，本地库优先落歌，可播） */
+  hotSongs: Song[]
+  /** 专辑卡片（点进走 /api/album/apple/tracks） */
+  albums: ArtistAlbumCard[]
+}
+
+/** Apple 歌手详情：热门歌（本地优先落歌）+ 专辑列表 + 维基简介。结果缓存 1h。 */
+export async function getAppleArtistDetail(artistId: string): Promise<AppleArtistDetail | null> {
+  const cacheKey = `album:v1:artist:${artistId}`
+  const cached = searchCache.get(cacheKey) as AppleArtistDetail | null
+  if (cached) return cached
+
+  const info = await getItunesArtistSongs(artistId)
+  if (!info) return null
+
+  // 热门歌：本地库 identity 优先 → 在线五源（与专辑详情同一落歌管道）
+  const resolved = await mapPool(info.songs, 4, song =>
+    resolveLocalTrack({ title: song.title, titleNorm: song.titleNorm, secs: song.secs, disc: 1, position: 0 }, info.name))
+  const hotSongs = resolved.filter((x): x is Song => x !== null)
+
+  // 专辑列表（复用歌手专辑索引，缓存 24h）
+  const index = await getArtistAlbumIndex(info.name)
+  const albums: ArtistAlbumCard[] = [...index.entries()].map(([title, meta]) => ({
+    source: 'apple' as const,
+    albumId: meta.collectionId,
+    name: title,
+    artist: info.name,
+    year: meta.year,
+    img: meta.img ?? null,
+    trackCount: undefined,
+  }))
+
+  // 头像 = 首张专辑封面（Apple 歌手实体无照片）
+  const img = albums.find(a => a.img)?.img ?? null
+  const bio = await getWikiExtract(info.name, 'artist').catch(() => null)
+
+  const detail: AppleArtistDetail = {
+    artist: { artistId: info.artistId, name: info.name, genre: info.genre, bio, img },
+    hotSongs,
+    albums,
+  }
+  searchCache.set(cacheKey, detail, ALBUM_TRACKS_CACHE_TTL)
+  return detail
 }
 
 // ==================== 专辑搜索（本地优先 + Apple 兜底） ====================
@@ -261,7 +353,7 @@ export async function searchAlbums(keyword: string, limit = 30): Promise<{
 // ==================== Apple 专辑详情（平台卡片渠道） ====================
 
 export interface AppleAlbumDetail {
-  album: { name: string; singer: string; year?: string; img: string | null; trackCount: number; collectionId: string }
+  album: { name: string; singer: string; year?: string; img: string | null; trackCount: number; collectionId: string; bio?: string | null }
   list: Song[]
 }
 
@@ -282,6 +374,7 @@ export async function getAppleAlbumDetail(collectionId: string): Promise<AppleAl
     return null
   }
 
+  const bio = await getWikiExtract(itunes.album.title, 'album').catch(() => null)
   const detail: AppleAlbumDetail = {
     album: {
       collectionId,
@@ -290,6 +383,7 @@ export async function getAppleAlbumDetail(collectionId: string): Promise<AppleAl
       year: itunes.album.year,
       img: itunes.album.img ?? albumCoverFromSongs(list),
       trackCount: itunes.tracks.length,
+      bio,
     },
     list,
   }

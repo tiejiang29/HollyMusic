@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   get, set, searchOneSource, findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks,
   searchLocalAlbums, getArtistAlbumIndex, getItunesAlbumDetail, searchItunesAlbums,
+  dbFindFirst, dbGetStorageSongmid,
 } = vi.hoisted(() => ({
   get: vi.fn(),
   set: vi.fn(),
@@ -14,9 +15,15 @@ const {
   getArtistAlbumIndex: vi.fn(),
   getItunesAlbumDetail: vi.fn(),
   searchItunesAlbums: vi.fn(),
+  dbFindFirst: vi.fn(),
+  dbGetStorageSongmid: vi.fn((mi: { songmid: string }) => mi.songmid),
 }))
 
 vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
+vi.mock('@/lib/db', () => ({
+  prisma: { musicInfo: { findFirst: dbFindFirst } },
+  getStorageSongmidForMusicInfo: dbGetStorageSongmid,
+}))
 vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
 vi.mock('@/lib/services/album-local-service', () => ({
   findLocalAlbum,
@@ -28,8 +35,10 @@ vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
 vi.mock('@/lib/services/itunes-service', () => ({
   getArtistAlbumIndex,
   getItunesAlbumDetail,
+  getItunesArtistSongs: vi.fn(),
   searchItunesAlbums,
 }))
+vi.mock('@/lib/services/wiki-service', () => ({ getWikiExtract: vi.fn(async () => null) }))
 
 const { getLocalAlbumDetailByGid, getAlbumCover, getAppleAlbumDetail, searchAlbums } = await import('./album-service')
 
@@ -48,6 +57,7 @@ function song(name: string, interval: string, source = 'tx') {
 beforeEach(() => {
   vi.clearAllMocks()
   get.mockReturnValue(undefined)
+  dbFindFirst.mockResolvedValue(null)
   findLocalAlbumByGid.mockReturnValue(LOCAL_ALBUM)
   getLocalAlbumTracks.mockReturnValue(LOCAL_TRACKS)
   findLocalAlbum.mockReturnValue(LOCAL_ALBUM)
@@ -74,6 +84,19 @@ describe('getAlbumDetailByGid（本地专辑倒查）', () => {
       img: 'https://mzstatic/a.jpg', year: '2003-07-31',
     })
     expect(detail?.list.map(s => s.name)).toEqual(['以父之名', '懦夫'])
+  })
+
+  it('本地音乐库 identity 命中优先：零上游请求直接返回可播条目', async () => {
+    dbFindFirst.mockImplementation(async ({ where }: { where: { identity: string } }) => {
+      const name = where.identity.split('|')[0]
+      if (!name) return null
+      return { data: JSON.stringify({ name, singer: '周杰伦', source: 'kw', songmid: '999', interval: '342', types: [], _types: {}, typeUrl: {} }) }
+    })
+
+    const detail = await getLocalAlbumDetailByGid(GID)
+
+    expect(searchOneSource).not.toHaveBeenCalled() // 全部走库，零上游
+    expect(detail?.list[0]).toMatchObject({ name: '以父之名', uid: 'kw-999' })
   })
 
   it('全部未命中返回 null', async () => {

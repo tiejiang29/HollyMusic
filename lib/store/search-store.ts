@@ -13,10 +13,11 @@
 import { create } from 'zustand'
 import { search } from '@/lib/api/search'
 import { searchAlbums, type LocalAlbumSummary, type PlatformAlbumSummary } from '@/lib/api/album'
+import { searchArtists, type ArtistSummary } from '@/lib/api/artist'
 import type { Song, SourceType } from '@/lib/types/music'
 
 /** 搜索结果类型：歌曲 | 专辑 */
-export type SearchMode = 'song' | 'album'
+export type SearchMode = 'song' | 'artist' | 'album'
 
 interface SearchStore {
   /** 当前输入框文本 */
@@ -35,8 +36,10 @@ interface SearchStore {
   localList: Song[]
   /** 专辑搜索结果（mode=album，本地专辑库命中） */
   albums: LocalAlbumSummary[]
-  /** 平台兜底结果（本地未命中时自动搜索，wy 专辑卡片） */
+  /** 平台兜底结果（本地未命中时自动搜索，Apple 专辑卡片） */
   platformAlbums: PlatformAlbumSummary[]
+  /** 歌手搜索结果（mode=artist，Apple 歌手卡片） */
+  artists: ArtistSummary[]
   loading: boolean
   error: string | null
   /** 请求序号，自增用于丢弃过期请求 */
@@ -47,6 +50,7 @@ interface SearchStore {
   setMode: (m: SearchMode) => void
   run: (kw: string, source: SourceType | 'all' | 'local') => Promise<void>
   runAlbum: (kw: string) => Promise<void>
+  runArtist: (kw: string) => Promise<void>
   reset: () => void
 }
 
@@ -68,6 +72,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   localList: [],
   albums: [],
   platformAlbums: [],
+  artists: [],
   loading: false,
   error: null,
   reqId: 0,
@@ -145,6 +150,24 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     }
   },
 
+  runArtist: async (kw) => {
+    const trimmed = kw.trim()
+    if (!trimmed) {
+      set({ artists: [], loading: false, error: null, lastKeyword: '' })
+      return
+    }
+    const reqId = get().reqId + 1
+    set({ loading: true, error: null, reqId })
+    try {
+      const r = await searchArtists(trimmed)
+      if (reqId !== get().reqId) return
+      set({ artists: r.list || [], loading: false, error: null, lastKeyword: trimmed })
+    } catch (e) {
+      if (reqId !== get().reqId) return
+      set({ artists: [], loading: false, error: toFriendlyError(e), lastKeyword: trimmed })
+    }
+  },
+
   reset: () =>
     set({
       keyword: '',
@@ -156,6 +179,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       localList: [],
       albums: [],
       platformAlbums: [],
+      artists: [],
       loading: false,
       error: null,
       reqId: 0,

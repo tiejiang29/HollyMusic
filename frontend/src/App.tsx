@@ -29,6 +29,7 @@ import { FavoritesPage } from './routes/FavoritesPage'
 import { PlaylistsPage } from './routes/PlaylistsPage'
 import { PlaylistDetailPage } from './routes/PlaylistDetailPage'
 import { AlbumDetailPage } from './routes/AlbumDetailPage'
+import { ArtistDetailPage } from './routes/ArtistDetailPage'
 import { AiPlaylistPage } from './routes/AiPlaylistPage'
 import { HistoryPage } from './routes/HistoryPage'
 import { LoginPage } from './routes/LoginPage'
@@ -166,6 +167,7 @@ export function App() {
             <Route path="/playlists/ai-create" element={<AiPlaylistPage />} />
             <Route path="/playlists/:id/ai-add" element={<AiPlaylistPage />} />
             <Route path="/playlists/:id" element={<PlaylistDetailPage />} />
+            <Route path="/artist/apple/:artistId" element={<ArtistDetailPage />} />
             <Route path="/album/:gid" element={<AlbumDetailPage />} />
             <Route path="/album/:source/:albumId" element={<AlbumDetailPage />} />
             <Route path="/history" element={<HistoryPage />} />

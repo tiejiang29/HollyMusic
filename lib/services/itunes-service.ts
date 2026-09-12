@@ -124,6 +124,38 @@ export async function searchItunesAlbums(keyword: string, limit = 30): Promise<I
   return list
 }
 
+export interface ItunesArtistCard {
+  /** Apple artistId（歌手详情 lookup 用） */
+  artistId: string
+  /** 简体歌手名 */
+  name: string
+  /** 主要流派（如 華語流行樂 → 华语流行乐） */
+  genre?: string
+}
+
+/** Apple 歌手搜索（entity=musicArtist，country=tw；繁体自动转简体） */
+export async function searchItunesArtists(keyword: string, limit = 10): Promise<ItunesArtistCard[]> {
+  const k = keyword.trim()
+  if (!k) return []
+  const cacheKey = `itunes:artistSearch:${k}:${limit}`
+  const cached = searchCache.get(cacheKey) as ItunesArtistCard[] | null
+  if (cached) return cached
+
+  const cap = Math.max(1, Math.min(limit, 25))
+  const data = await polite(() => fetchItunesJson(
+    `https://itunes.apple.com/search?term=${encodeURIComponent(k)}&country=tw&media=music&entity=musicArtist&limit=${cap}`,
+  ))
+  const list = ((data.results || []) as unknown as Array<{ artistId?: number | string; artistName?: string; primaryGenreName?: string }>)
+    .filter(a => a.artistId && a.artistName)
+    .map(a => ({
+      artistId: String(a.artistId),
+      name: appleT2S(a.artistName),
+      genre: a.primaryGenreName ? appleT2S(a.primaryGenreName) : undefined,
+    }))
+  searchCache.set(cacheKey, list, CACHE_TTL)
+  return list
+}
+
 /**
  * 歌手专辑索引：attribute=artistTerm 一次拿该歌手全部专辑（最多 200），
  * 按"简体专辑名"归一化为键（封面/年份查询用）。缓存 24h。
@@ -156,6 +188,50 @@ export async function getArtistAlbumIndex(artist: string): Promise<Map<string, {
   }
   searchCache.set(cacheKey, index, CACHE_TTL)
   return index
+}
+
+export interface ItunesArtistInfo {
+  artistId: string
+  /** 简体歌手名 */
+  name: string
+  genre?: string
+  /** 热门歌曲（Apple 排序即热门度；歌名简体、含时长毫秒转秒） */
+  songs: Array<{ title: string; titleNorm: string; secs: number | null; artist: string }>
+}
+
+/** Apple 歌手热门歌曲：lookup?id={artistId}&entity=song（返回歌手对象 + 热门曲目）。缓存 24h。 */
+export async function getItunesArtistSongs(artistId: string): Promise<ItunesArtistInfo | null> {
+  const cacheKey = `itunes:artistSongs:${artistId}`
+  const cached = searchCache.get(cacheKey) as ItunesArtistInfo | null
+  if (cached) return cached
+
+  const data = await polite(() => fetchItunesJson(
+    `https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=song&limit=25&country=tw`,
+  ))
+  const results = (data.results || []) as unknown as Array<{ wrapperType?: string; artistType?: string; artistId?: number | string; artistName?: string; primaryGenreName?: string; kind?: string; trackName?: string; trackTimeMillis?: number }>
+  const artist = results.find(r => r.wrapperType === 'artist' && r.artistName)
+  if (!artist) {
+    logger.warn(`[itunes] artistId ${artistId} 未找到歌手`)
+    return null
+  }
+  const info: ItunesArtistInfo = {
+    artistId: String(artist.artistId ?? artistId),
+    name: appleT2S(artist.artistName),
+    genre: artist.primaryGenreName ? appleT2S(artist.primaryGenreName) : undefined,
+    songs: results
+      .filter(r => r.kind === 'song' && r.trackName)
+      .map(r => {
+        const title = appleT2S(r.trackName)
+        return {
+          title,
+          titleNorm: title.toLowerCase().replace(/[^\p{L}\p{N}]/gu, ''),
+          secs: r.trackTimeMillis ? Math.round(r.trackTimeMillis / 1000) : null,
+          artist: appleT2S(artist.artistName),
+        }
+      }),
+  }
+  searchCache.set(cacheKey, info, CACHE_TTL)
+  return info
 }
 
 export interface ItunesAlbumDetail {

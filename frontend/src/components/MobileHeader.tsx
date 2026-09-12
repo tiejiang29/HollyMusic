@@ -4,6 +4,7 @@ import { Menu, Music2 } from 'lucide-react'
 const TITLES: Array<{ match: string; title: string }> = [
   { match: '/admin/users', title: '用户管理' },
   { match: '/playlists/', title: '歌单详情' },
+    { match: '/artist/', title: '歌手详情' },
   { match: '/album/', title: '专辑详情' },
   { match: '/playlists', title: '我的歌单' },
   { match: '/favorites', title: '我的收藏' },
