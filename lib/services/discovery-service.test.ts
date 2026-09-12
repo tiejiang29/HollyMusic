@@ -186,6 +186,30 @@ describe('getPlaylistTags（wy/kw 完整标签树）', () => {
     expect(result.hotTag).toEqual([{ id: '1265-10000', name: '经典' }])
     expect(result.tags).toEqual([])
   })
+
+  it('kg 返回热门标签 + tagids 分组（getSpecial 不带 cdn 参数）', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        status: 1,
+        data: {
+          hotTag: { data: { a: { special_id: 12, special_name: '经典' }, b: { special_name: '无id脏数据' } } },
+          tagids: {
+            风格: { data: [{ id: 1, name: '流行' }, { id: 2, name: '摇滚' }, { name: '无id脏数据' }] },
+            空组: { data: [] },
+          },
+        },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await getPlaylistTags('kg')
+
+    const url = new URL(fetchMock.mock.calls[0][0] as string)
+    expect(url.searchParams.has('cdn')).toBe(false)
+    expect(result.hotTag).toEqual([{ id: '12', name: '经典' }])
+    expect(result.tags).toEqual([{ name: '风格', list: [{ id: '1', name: '流行' }, { id: '2', name: '摇滚' }] }])
+  })
 })
 
 describe('getRecommendedPlaylists kw 排序档位', () => {

@@ -1313,15 +1313,30 @@ async function getKwPlaylistTags(): Promise<PlaylistTagsResult> {
 }
 
 async function getKgPlaylistTags(): Promise<PlaylistTagsResult> {
-  // www2.kugou.kugou.com getSpecial?is_smarty=1：实测返回 JSON，
-  // data.hotTag.data 为按键索引对象（special_id 即广场列表的 c= 参数）。
-  const payload = await fetchJson<{ status?: number; data?: { hotTag?: { data?: Record<string, { special_id?: string | number; special_name?: string }> } } }>('http://www2.kugou.kugou.com/yueku/v9/special/getSpecial?is_smarty=1&cdn=cdn')
-  const items = Object.values(payload.data?.hotTag?.data || {})
-  const tags = items
+  // www2.kugou.kugou.com getSpecial?is_smarty=1（洛雪 kg.songList getTags 同款，注意不能带 cdn 参数，
+  // 带了会拿不到 tagids）：hotTag.data 为按键索引对象（special_id 即广场列表的 c= 参数），
+  // tagids 为分组标签树 { 组名: { data: [{ id, name, pname }] } }
+  const payload = await fetchJson<{
+    status?: number
+    data?: {
+      hotTag?: { data?: Record<string, { special_id?: string | number; special_name?: string }> }
+      tagids?: Record<string, { data?: Array<{ id?: number | string; name?: string }> }>
+    }
+  }>('http://www2.kugou.kugou.com/yueku/v9/special/getSpecial?is_smarty=1&')
+  if (payload.status !== 1) throw new Error('酷狗未返回标签')
+  const hotItems = Object.values(payload.data?.hotTag?.data || {})
+  const hotTag = hotItems
     .map(item => ({ id: String(item.special_id ?? ''), name: item.special_name || '' }))
     .filter(t => t.id && t.name)
-  if (tags.length === 0) throw new Error('酷狗未返回标签')
-  return { hotTag: tags.slice(0, 10), tags: [] }
+  if (hotTag.length === 0) throw new Error('酷狗未返回标签')
+  const tagids = payload.data?.tagids || {}
+  const tags = Object.entries(tagids)
+    .map(([name, group]) => ({
+      name,
+      list: (group?.data || []).map(item => ({ id: String(item.id ?? ''), name: item.name || '' })).filter(t => t.id && t.name),
+    }))
+    .filter(g => g.name && g.list.length > 0)
+  return { hotTag: hotTag.slice(0, 10), tags }
 }
 
 async function getMgPlaylistTags(): Promise<PlaylistTagsResult> {
