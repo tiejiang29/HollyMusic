@@ -145,6 +145,9 @@ export function randomLocalAlbums(size = 20): LocalAlbum[] {
   return result
 }
 
+/** 画像推荐每个歌手最多入选的专辑数：保证一屏的歌手多样性（周杰伦 33 张专辑不能占满整屏） */
+const RECOMMEND_ALBUMS_PER_ARTIST = 2
+
 /** 画像推荐专辑：用户画像 top 歌手 → 本地库这些歌手的专辑洗牌；画像为空回退随机 */
 export async function recommendLocalAlbums(username: string, userId: number, size = 12): Promise<{ list: LocalAlbum[]; personalized: boolean }> {
   const cap = Math.max(1, Math.min(size, 30))
@@ -170,7 +173,7 @@ export async function recommendLocalAlbums(username: string, userId: number, siz
   const tdb = getTracksDb()
   for (const artist of artists) {
     if (merged.size >= cap * 2) break
-    const rows = db.prepare('SELECT gid,title,artist FROM albums WHERE artist=? ORDER BY title LIMIT ?').all(artist.name, 10)
+    const rows = db.prepare('SELECT gid,title,artist FROM albums WHERE artist=? ORDER BY title LIMIT ?').all(artist.name, RECOMMEND_ALBUMS_PER_ARTIST)
     for (const row of rows) {
       const album = rowToAlbum(row as { gid: Uint8Array; title: string; artist: string })
       if (!merged.has(album.gid)) {
