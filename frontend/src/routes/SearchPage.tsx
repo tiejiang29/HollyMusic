@@ -115,7 +115,15 @@ export function SearchPage() {
     if (appliedSuggest.current !== null) appliedSuggest.current = null
     const timer = setTimeout(() => {
       const reqId = ++suggestReqId.current
-      apiGet<SuggestItem[]>(`search/suggest?keyword=${encodeURIComponent(kw)}`)
+      // 联想按结果类型取对应语料：专辑=本地专辑库前缀（与专辑搜索同一语料），
+      // 歌手=五源歌手联想，歌曲=原有网易+本地库联想
+      const fetcher: Promise<SuggestItem[]> = mode === 'album'
+        ? apiGet<{ list: Array<{ gid: string; title: string; artist: string }> }>('album/local/suggest', { keyword: kw, limit: 8 })
+            .then(r => (r.list || []).map(a => ({ text: a.title, type: 'album' as const })))
+        : mode === 'artist'
+          ? apiGet<SuggestItem[]>('search/suggest', { keyword: kw, type: 'artist' })
+          : apiGet<SuggestItem[]>('search/suggest', { keyword: kw })
+      fetcher
         .then(items => {
           if (reqId !== suggestReqId.current) return
           setSuggestions(items)
@@ -125,7 +133,7 @@ export function SearchPage() {
         .catch(() => {})
     }, 250)
     return () => clearTimeout(timer)
-  }, [keyword])
+  }, [keyword, mode])
 
   const closeSuggest = () => {
     setSuggestOpen(false)
