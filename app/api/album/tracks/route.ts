@@ -1,10 +1,12 @@
 /**
  * 专辑曲目详情 API
- * GET /api/album/tracks?source=wy&albumId=xxx
+ * GET /api/album/tracks?source=wy&albumId=xxx[&name=专辑名&singer=歌手]
  *
  * 需登录（requireUser），未登录返回 401。
+ * name/singer（来自广场卡片）提供时走本地专辑库优先：曲目表逐首在线搜曲（tx→kw→kg→mg→wy，
+ * 歌名+歌手+时长三重校验）；本地未命中回退平台详情（wy/kw 原生端点；mg 详情端点已失效，
+ * 返回 unsupported: true）。
  * 曲目走搜索同款入库管道（upsert + uid），播放/下载/收藏/封面/歌词等接口可直接使用。
- * 一期支持 wy / kw；mg 的专辑曲目端点已失效，返回 unsupported: true（专辑卡片仍可搜）。
  */
 
 import { NextRequest } from 'next/server'
@@ -20,6 +22,8 @@ export async function GET(request: NextRequest) {
     const searchParams = request.nextUrl.searchParams
     const source = searchParams.get('source') as AlbumSource | null
     const albumId = searchParams.get('albumId')
+    const name = searchParams.get('name') || undefined
+    const singer = searchParams.get('singer') || undefined
 
     // 参数验证
     if (!source) {
@@ -37,7 +41,7 @@ export async function GET(request: NextRequest) {
     }
 
     logger.info(`专辑详情请求: ${source} - ${albumId}`)
-    const detail = await getAlbumTracks(source, albumId)
+    const detail = await getAlbumTracks(source, albumId, { name, singer })
     return createSuccessResponse({ album: detail.album, list: detail.list })
   } catch (error) {
     if (error instanceof AuthError) {

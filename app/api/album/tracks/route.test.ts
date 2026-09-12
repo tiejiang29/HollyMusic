@@ -45,10 +45,15 @@ describe('GET /api/album/tracks', () => {
     const response = await GET(makeRequest('source=wy&albumId=123'))
 
     expect(response.status).toBe(200)
-    expect(getAlbumTracks).toHaveBeenCalledWith('wy', '123')
+    expect(getAlbumTracks).toHaveBeenCalledWith('wy', '123', { name: undefined, singer: undefined })
     const { album, list } = (await response.json()).data
     expect(album.albumId).toBe('123')
     expect(list.map((s: { uid: string }) => s.uid)).toEqual(['wy-1', 'wy-2'])
+  })
+
+  it('name/singer 直传给本地倒查入口', async () => {
+    await GET(makeRequest('source=wy&albumId=18877&name=叶惠美&singer=周杰伦'))
+    expect(getAlbumTracks).toHaveBeenCalledWith('wy', '18877', { name: '叶惠美', singer: '周杰伦' })
   })
 
   it('缺少 albumId 返回 400', async () => {

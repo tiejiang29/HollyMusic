@@ -166,7 +166,7 @@ export function App() {
             <Route path="/playlists/ai-create" element={<AiPlaylistPage />} />
             <Route path="/playlists/:id/ai-add" element={<AiPlaylistPage />} />
             <Route path="/playlists/:id" element={<PlaylistDetailPage />} />
-            <Route path="/album/:source/:albumId" element={<AlbumDetailPage />} />
+            <Route path="/album/:gid" element={<AlbumDetailPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/admin" element={<AdminPage />} />
             <Route path="/admin/users" element={<AdminUsersPage />} />

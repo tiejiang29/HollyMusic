@@ -8,8 +8,7 @@ import { Search, Music, X, CloudOff, ChevronDown, User, Disc3 } from 'lucide-rea
 import { toTrack } from '@/lib/types/player'
 import type { SourceType } from '@/lib/types/music'
 import { apiGet } from '@/lib/api/client'
-import { isAlbumSearchSource, type SearchMode } from '@/lib/store/search-store'
-import type { AlbumSource } from '@/lib/api/album'
+import { type SearchMode } from '@/lib/store/search-store'
 
 interface SuggestItem {
   text: string
@@ -26,30 +25,20 @@ const SOURCES: { value: SourceType | 'all' | 'local'; label: string }[] = [
   { value: 'local', label: '本地' },
 ]
 
-/** 专辑搜索音源（一期 wy/kw/mg） */
-const ALBUM_SOURCES: { value: AlbumSource | 'all'; label: string }[] = [
-  { value: 'all', label: '全部' },
-  { value: 'wy', label: '网易' },
-  { value: 'kw', label: '酷我' },
-  { value: 'mg', label: '咪咕' },
-]
-
-const ALBUM_SOURCE_LABELS: Record<AlbumSource, string> = { wy: '网易', kw: '酷我', mg: '咪咕' }
-
 export function SearchPage() {
   // keyword/source/mode/results/loading 全部来自 search-store（外部状态）：
   // 离开搜索页再回来时输入框与结果都保留。
   const {
-    results, localList, albums, albumFailedSources, mode,
+    results, localList, albums, mode,
     loading, error, keyword, lastKeyword, source,
     setKeyword, setSource, setMode, run, runAlbum,
   } = useSearch()
   const inputRef = useRef<HTMLInputElement>(null)
 
-  /** 按当前结果类型分发：专辑模式只走 wy/kw/mg/all，其余源回退"全部" */
+  /** 按当前结果类型分发：专辑模式走本地专辑库（无音源维度） */
   const doSearch = (kw: string, src: SourceType | 'all' | 'local') => {
     if (mode === 'album') {
-      runAlbum(kw, isAlbumSearchSource(src) ? src : 'all')
+      runAlbum(kw)
     } else {
       run(kw, src)
     }
@@ -73,13 +62,11 @@ export function SearchPage() {
     const kw = keyword.trim()
     if (!kw) {
       if (next === 'album') run('', 'all')
-      else runAlbum('', 'all')
+      else runAlbum('')
       return
     }
     if (next === 'album') {
-      const src: AlbumSource | 'all' = isAlbumSearchSource(source) ? source : 'all'
-      if (src !== source) setSource('all')
-      runAlbum(kw, src)
+      runAlbum(kw)
     } else {
       run(kw, source)
     }
@@ -270,9 +257,9 @@ export function SearchPage() {
       <div
         role="tablist"
         aria-label="音源"
-        className="mb-6 flex gap-2 overflow-x-auto pb-1"
+        className={`mb-6 flex gap-2 overflow-x-auto pb-1 ${mode === 'album' ? 'hidden' : ''}`}
       >
-        {(mode === 'album' ? ALBUM_SOURCES : SOURCES).map(s => (
+        {SOURCES.map(s => (
           <button
             key={s.value}
             role="tab"
@@ -306,18 +293,13 @@ export function SearchPage() {
       ) : mode === 'album' ? (
         albums.length > 0 ? (
           <>
-            {albumFailedSources.length > 0 && (
-              <div className="mb-2 text-xs text-muted-foreground">
-                部分音源失败，结果不含{' '}
-                {albumFailedSources.map(s => ALBUM_SOURCE_LABELS[s]).join('、')}
-              </div>
-            )}
+            <div className="mb-2 text-xs text-muted-foreground">本地专辑库 · 搜索专辑名或歌手名</div>
             <AlbumGrid albums={albums} />
           </>
         ) : lastKeyword ? (
-          <EmptyState icon={Search} title="未找到专辑" description={`没有找到与“${lastKeyword}”相关的专辑`} />
+          <EmptyState icon={Search} title="未找到专辑" description={`本地专辑库没有找到与“${lastKeyword}”相关的专辑`} />
         ) : (
-          <EmptyState icon={Disc3} title="开始搜索" description="输入专辑名或歌手名开始探索" />
+          <EmptyState icon={Disc3} title="开始搜索" description="输入专辑名或歌手名，探索本地专辑库" />
         )
       ) : visibleTracks.length > 0 ? (
         <>

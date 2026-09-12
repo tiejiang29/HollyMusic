@@ -1,7 +1,6 @@
 
 import { useCallback } from 'react'
 import { useSearchStore } from '@/lib/store/search-store'
-import type { AlbumSource } from '@/lib/api/album'
 import type { SourceType } from '@/lib/types/music'
 
 /**
@@ -15,7 +14,6 @@ export function useSearch() {
   const results = useSearchStore(s => s.results)
   const localList = useSearchStore(s => s.localList)
   const albums = useSearchStore(s => s.albums)
-  const albumFailedSources = useSearchStore(s => s.albumFailedSources)
   const mode = useSearchStore(s => s.mode)
   const loading = useSearchStore(s => s.loading)
   const error = useSearchStore(s => s.error)
@@ -34,12 +32,12 @@ export function useSearch() {
   )
 
   const runAlbum = useCallback(
-    (kw: string, src: AlbumSource | 'all') => runAlbumStore(kw, src),
+    (kw: string) => runAlbumStore(kw),
     [runAlbumStore]
   )
 
   return {
-    results, localList, albums, albumFailedSources, mode,
+    results, localList, albums, mode,
     loading, error, keyword, lastKeyword, source,
     setKeyword, setSource, setMode, run, runAlbum,
   }

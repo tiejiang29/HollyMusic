@@ -1,41 +1,36 @@
 /**
- * 专辑搜索与专辑详情服务（平台能力，遵循 music-core/AGENTS.md：平台适配一律用 TypeScript）
+ * 专辑服务（本地中文专辑库为核心）
  *
- * 一期覆盖 wy / kw / mg（tx/kg 二期逆向后接入）：
- * - wy 专辑搜索：明文 GET music.163.com/api/search/get/web type=10（老端点排序远优于
- *   eapi cloudsearch/pc——后者把官方专辑压到 20 名开外、翻唱杂牌霸榜，实测对比后换端点）
- *   wy 专辑曲目：明文 GET music.163.com/api/v1/album/{id}（songs 实体与搜索同构，
- *   直接复用 discovery-service 的 toWyMusicInfo）
- * - kw 专辑搜索：r.s 歌曲搜索按 ALBUMID 聚合（www.kuwo.cn/api/www 系列被反爬拦截，
- *   csrf/kw_token 方案实测均返回 "The request is illegal!"，聚合是当前唯一可行方案）
- *   kw 专辑曲目：GET www.kuwo.cn/album/{id} 服务端渲染页，window.__NUXT__ 为自执行函数
- *   表达式，Node 内 new Function 求值后取 data[0].albumInfo.musiclist（实测含全量字段）
- * - mg 专辑搜索：searchAll 接口 searchSwitch 打开 album 开关（与歌曲搜索同一端点同签名；
- *   注意专辑数据在 albumResultData.result，扁平数组，id 字段名为 id）
- *   mg 专辑曲目：暂不支持——remoting/album_detail_api 系列已全部失效（SPA 壳/路由不支持），
- *   一期只出卡片，详情返回 unsupported
+ * 架构（2026-09 重构）：
+ * - 专辑板块数据源 = 本地中文专辑库（album-local-service.ts，2.4 万张简体专辑 + 曲目表），
+ *   搜索/联想/随机/画像推荐/详情倒查全部走本地库，见 /api/album/local/* 路由
+ * - 专辑详情 = 本地曲目表 → 逐首落歌：
+ *   逐首在线搜曲按 tx→kw→kg→mg→wy 顺序（网易搜索通道被翻唱污染放最后），
+ *   歌名+歌手+时长三重校验（±8s），并发 4；命中的走搜索同款入库管道（uid 可播）。
+ *   单源搜索管线复用 song-search-service 的 searchOneSource（入库/缓存行为与搜索一致）
+ * - 在线详情兜底：wy/kw 走平台原生详情端点；mg 无可用端点 → unsupported。
+ *   广场卡片把 专辑名+歌手 作为 name/singer 传入即可触发本地优先。
+ *
+ * 平台专辑搜索适配器（wy/kw/mg 三源卡片汇聚）已随架构调整移除。
  */
 
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
-import type { MusicInfo, Song } from '@/lib/types/music'
-import { createMgSignature, kw as kwSongSearch } from '@/lib/music-core/music-search'
+import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
+import { findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks, type LocalAlbumTrack } from '@/lib/services/album-local-service'
+import { searchOneSource } from '@/lib/services/song-search-service'
 import {
   enrichMusicInfos,
   normalizeCover,
-  normalizeMgCover,
   toKwMusicInfo,
   toWyMusicInfo,
 } from '@/lib/services/discovery-service'
 
 const REQUEST_TIMEOUT = 8_000
-/** 专辑搜索卡片缓存（关键词页级） */
-const ALBUM_SEARCH_CACHE_TTL = 30 * 60 * 1000
 /** 专辑详情（含已入库曲目）缓存 */
 const ALBUM_TRACKS_CACHE_TTL = 60 * 60 * 1000
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-const MG_UA = 'Mozilla/5.0 (Linux; U; Android 11.0.0; zh-cn; MI 11 Build/OPR1.170623.032) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30'
 
 export type AlbumSource = 'wy' | 'kw' | 'mg'
 export const ALBUM_SOURCES: AlbumSource[] = ['wy', 'kw', 'mg']
@@ -50,9 +45,7 @@ export interface AlbumSummary {
   name: string
   singer: string
   img?: string | null
-  /** 发行日期（YYYY-MM-DD，取不到时缺省） */
   publishTime?: string
-  /** 曲目数（kw 聚合来源时为该页命中数，仅参考） */
   trackCount?: number
 }
 
@@ -61,26 +54,13 @@ export interface AlbumDetail {
   list: Song[]
 }
 
-/** 该源暂不支持专辑曲目（卡片可搜，详情待上游端点），由路由层转为 unsupported 响应 */
+/** 该源暂不支持专辑曲目（mg 上游端点失效），由路由层转为 unsupported 响应 */
 export class AlbumTracksUnsupportedError extends Error {
   constructor(source: AlbumSource) {
     super(`${source} 暂不支持专辑曲目`)
     this.name = 'AlbumTracksUnsupportedError'
   }
 }
-
-export interface AlbumSearchResult {
-  list: AlbumSummary[]
-  total: number
-  page: number
-  allPage: number
-  limit: number
-  source: AlbumSource | 'all'
-  /** all 模式下失败的源 */
-  failedSources?: AlbumSource[]
-}
-
-// ==================== 通用 HTTP ====================
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -97,44 +77,122 @@ function formatDate(ms: number | undefined): string | undefined {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
-// ==================== 网易云（wy） ====================
+// ==================== 本地专辑详情（主路径） ====================
+
+// 逐首搜曲的源顺序（按搜曲可靠性排序：网易搜索通道被翻唱污染排最后）
+const RESOLVE_SOURCE_ORDER: SourceType[] = ['tx', 'kw', 'kg', 'mg', 'wy']
+
+function normText(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+}
+
+/** 歌手比对：归一化包含（西方名按空格拆 token） */
+function singerMatches(singer: string | undefined, artist: string): boolean {
+  const s = normText(singer || '')
+  const a = normText(artist)
+  if (!a) return true
+  if (s.includes(a)) return true
+  return a.split(/\s+/).filter(t => t.length >= 2).some(t => s.includes(t))
+}
+
+/** 时长比对：'mm:ss' 或秒字符串 → 秒，±8s 容差；无时长数据时仅歌手比对兜底 */
+function durationMatches(interval: string | undefined, secs: number | null): boolean {
+  if (!secs) return true
+  const raw = (interval || '').trim()
+  if (!raw) return true
+  let dur = 0
+  if (raw.includes(':')) {
+    for (const part of raw.split(':')) dur = dur * 60 + Number(part)
+  } else {
+    dur = Number(raw)
+  }
+  if (!Number.isFinite(dur) || dur <= 0) return true
+  return Math.abs(dur - secs) <= 8
+}
+
+/** 单首曲目跨源搜曲：按 RESOLVE_SOURCE_ORDER 依次尝试，歌名+歌手+时长三重校验 */
+async function resolveLocalTrack(track: LocalAlbumTrack, artist: string): Promise<Song | null> {
+  const keyword = `${track.title} ${artist}`
+  // 有时长数据时时长是主要消歧信号（繁简/异体歌名差异靠它兜住）；
+  // 无时长数据（约 22% 曲目）时长无法参与，改为要求候选歌名与曲名有包含关系
+  const titleNorm = normText(track.title)
+  for (const source of RESOLVE_SOURCE_ORDER) {
+    try {
+      const result = await searchOneSource(source, keyword, 1, 10)
+      const hit = result.list.find(s => {
+        if (!singerMatches(s.singer, artist)) return false
+        if (track.secs != null) return durationMatches(s.interval, track.secs)
+        const candName = normText(s.name || '')
+        return !!candName && (candName.includes(titleNorm) || titleNorm.includes(candName))
+      })
+      if (hit) return hit
+    } catch (error) {
+      logger.debug(`[album] 逐首搜曲源 ${source} 失败:`, error instanceof Error ? error.message : error)
+    }
+  }
+  return null
+}
+
+/** 有界并发池：逐首搜曲并发 4，避免打爆上游 */
+async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length)
+  let index = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (index < items.length) {
+      const current = index++
+      results[current] = await fn(items[current])
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
+/** 本地专辑倒查：曲目表逐首在线搜曲，返回可播放歌单与专辑元信息（封面取首个命中歌曲） */
+async function buildLocalAlbumDetail(source: AlbumSource, albumId: string, localTitle: string, localArtist: string, gid: string): Promise<AlbumDetail | null> {
+  const tracks = getLocalAlbumTracks(gid)
+  if (tracks.length === 0) return null
+  const resolved = await mapPool(tracks, 4, track => resolveLocalTrack(track, localArtist))
+  const list = resolved.filter((s): s is Song => s !== null)
+  if (list.length === 0) {
+    logger.warn(`[album] 本地专辑《${localTitle}》逐首匹配全部失败，回退在线详情`)
+    return null
+  }
+  return {
+    album: {
+      source,
+      albumId,
+      name: localTitle,
+      singer: localArtist,
+      img: list.find(s => s.img)?.img ?? null,
+      trackCount: tracks.length,
+    },
+    list,
+  }
+}
+
+export interface LocalAlbumDetail {
+  album: { gid: string; name: string; singer: string; trackCount: number; img: string | null }
+  list: Song[]
+}
+
+/** 按 gid 解析本地专辑为可播放歌单（安卓专辑板块详情用） */
+export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumDetail | null> {
+  const album = findLocalAlbumByGid(gid)
+  if (!album) return null
+  const detail = await buildLocalAlbumDetail('mg', gid, album.title, album.artist, album.gid)
+  if (!detail) return null
+  return {
+    album: { gid: album.gid, name: album.title, singer: album.artist, trackCount: album.trackCount ?? detail.list.length, img: detail.album.img ?? null },
+    list: detail.list,
+  }
+}
+
+// ==================== 在线详情兜底（平台卡片渠道） ====================
 
 type WyArtist = { name?: string }
-type WyAlbumCard = {
-  id?: number
-  name?: string
-  picUrl?: string
-  size?: number
-  publishTime?: number
-  artist?: WyArtist
-  artists?: WyArtist[]
-}
 
 function wyAlbumSinger(card: { artist?: WyArtist; artists?: WyArtist[] }): string {
   return card.artist?.name || (card.artists || []).map(a => a.name || '').filter(Boolean).join('、') || '未知歌手'
-}
-
-async function searchWyAlbums(keyword: string, page: number, limit: number): Promise<{ list: AlbumSummary[]; total: number }> {
-  // 老明文搜索端点：对专辑名精确命中的排序远优于 eapi cloudsearch/pc（后者官方专辑被翻唱压制）。
-  // 实测无需登录态，响应 result.albums 与 eapi 通道同构。
-  const result = await fetchJson<{ code?: number; result?: { albums?: WyAlbumCard[]; albumCount?: number } }>(
-    `https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=10&limit=${limit}&offset=${limit * (page - 1)}`,
-  )
-  if (result.code !== 200 || !result.result) throw new Error('网易专辑搜索失败')
-
-  const albums = (result.result.albums || []).filter(a => a.id && a.name)
-  return {
-    total: result.result.albumCount || 0,
-    list: albums.map(a => ({
-      source: 'wy' as const,
-      albumId: String(a.id),
-      name: a.name || '',
-      singer: wyAlbumSinger(a),
-      img: normalizeCover(a.picUrl) || null,
-      publishTime: formatDate(a.publishTime),
-      trackCount: a.size,
-    })),
-  }
 }
 
 async function getWyAlbumTracks(albumId: string): Promise<AlbumDetail> {
@@ -162,40 +220,6 @@ async function getWyAlbumTracks(albumId: string): Promise<AlbumDetail> {
     },
     list,
   }
-}
-
-// ==================== 酷我（kw） ====================
-
-/**
- * kw 专辑搜索：r.s 歌曲搜索按 ALBUMID 聚合出专辑卡片。
- * 无直接专辑搜索端点可用（www API 反爬、r.s ft=album 恒空）。
- * 聚合池取 3 倍卡片数的歌曲结果（上限 60），命中数更接近真实曲目数、专辑覆盖也更全。
- */
-async function searchKwAlbums(keyword: string, page: number, limit: number): Promise<{ list: AlbumSummary[]; total: number }> {
-  const aggLimit = Math.min(limit * 3, 60)
-  const result = await kwSongSearch.search(keyword, 1, aggLimit)
-  const groups = new Map<string, AlbumSummary>()
-  for (const song of result.list) {
-    const albumId = song.albumId ? String(song.albumId) : ''
-    if (!albumId || !song.albumName) continue
-    const existing = groups.get(albumId)
-    if (existing) {
-      existing.trackCount = (existing.trackCount || 0) + 1
-      continue
-    }
-    groups.set(albumId, {
-      source: 'kw',
-      albumId,
-      name: song.albumName,
-      singer: song.singer || '未知歌手',
-      img: null,
-      trackCount: 1,
-    })
-  }
-  const grouped = [...groups.values()].sort((a, b) => (b.trackCount || 0) - (a.trackCount || 0))
-  // 页窗口：聚合池取自歌曲搜索第 1 页，仅第 1 页卡片可信，后续页返回空避免错位数据
-  const list = page === 1 ? grouped.slice(0, limit) : []
-  return { list, total: grouped.length }
 }
 
 type KwNuxtSong = {
@@ -292,193 +316,50 @@ async function getKwAlbumTracks(albumId: string): Promise<AlbumDetail> {
   }
 }
 
-// ==================== 咪咕（mg） ====================
-
-// 签名复用 music-core 的 createMgSignature（同一端点必须同一签名口径）
-
-type MgAlbumCard = {
-  id?: string | number
-  name?: string
-  singer?: string
-  publishDate?: string
-  imgItems?: Array<{ img?: string; imgSizeType?: string }>
-}
-
-function pickMgAlbumImg(card: MgAlbumCard): string | undefined {
-  const items = card.imgItems || []
-  return items.find(i => i.imgSizeType === '03')?.img
-    || items[items.length - 1]?.img
-    || items[0]?.img
-}
-
-async function searchMgAlbums(keyword: string, page: number, limit: number): Promise<{ list: AlbumSummary[]; total: number }> {
-  const time = Date.now().toString()
-  const { sign, deviceId } = createMgSignature(time, keyword)
-  // 与歌曲搜索同一 searchAll 端点，searchSwitch 打开 album、关闭 song
-  const searchSwitch = encodeURIComponent(JSON.stringify({ song: 0, album: 1, singer: 0, tagSong: 0, mvSong: 0, bestShow: 0, songlist: 0, lyricSong: 0 }))
-  const url = `https://jadeite.migu.cn/music_search/v3/search/searchAll?isCorrect=0&isCopyright=1&searchSwitch=${searchSwitch}&pageSize=${limit}&text=${encodeURIComponent(keyword)}&pageNo=${page}&sort=0&sid=USS`
-  const result = await fetchJson<{ code?: string; albumResultData?: { totalCount?: string | number; result?: MgAlbumCard[] } }>(url, {
-    headers: {
-      uiVersion: 'A_music_3.6.1',
-      deviceId,
-      timestamp: time,
-      sign,
-      channel: '0146921',
-      'User-Agent': MG_UA,
-    },
-  })
-  if (result.code !== '000000' || !result.albumResultData) throw new Error('咪咕专辑搜索失败')
-
-  // 注意：专辑数据在 albumResultData.result（扁平数组），与歌曲搜索的 resultList 二维数组不同
-  const cards = (result.albumResultData.result || []).filter(c => c.id && c.name)
-  return {
-    total: Number(result.albumResultData.totalCount) || 0,
-    list: cards.map(c => ({
-      source: 'mg' as const,
-      albumId: String(c.id),
-      name: c.name || '',
-      singer: c.singer || '未知歌手',
-      img: normalizeMgCover(pickMgAlbumImg(c)) || null,
-      publishTime: c.publishDate || undefined,
-    })),
-  }
-}
-
-// ==================== 重排与跨源去重 ====================
-
-const ANONYMOUS_SINGERS = new Set(['', '未知歌手', '账号已注销', '佚名'])
-
-function normalizeForMatch(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, '')
-}
-
-/**
- * 专辑卡片相关性重排。平台原始排序对“专辑名精确命中”不敏感，翻唱/杂牌常压过官方专辑
- * （eapi 通道实测官方《叶惠美》排第 20/21）。只重排不过滤，规则：
- * - 专辑名精确命中置顶，其余保持相对顺序（名称仅“包含”关键词不加分：
- *   歌手名查询时名字带歌手的精选辑/演唱会合辑会被错误顶起，实测弊大于利）
- * - 真实歌手名加权，匿名/注销账号压后
- * - 曲目数分档加权（真专辑通常 ≥5 首，杂牌单曲多为 1 首）
- * - 同分按发行时间升序：原版必然早于翻唱，最早发行者视为原版
- */
-function rerankAlbums(list: AlbumSummary[], keyword: string): AlbumSummary[] {
-  const k = normalizeForMatch(keyword)
-  if (!k || list.length < 2) return list
-  const scored = list.map((album, index) => {
-    const name = normalizeForMatch(album.name)
-    let score = 0
-    if (name === k) score += 4
-    if (!ANONYMOUS_SINGERS.has(album.singer.trim())) score += 2
-    const tracks = album.trackCount ?? 0
-    score += tracks >= 5 ? 1 : tracks >= 2 ? 0.5 : 0
-    const parsed = album.publishTime ? Date.parse(album.publishTime) : NaN
-    return { album, index, score, publishMs: Number.isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed }
-  })
-  return scored
-    .sort((a, b) => b.score - a.score || a.publishMs - b.publishMs || a.index - b.index)
-    .map(s => s.album)
-}
-
-/** 跨源同名同歌手专辑合并（all 模式）：先到先得（源顺序 wy→kw→mg），缺失字段由后源回填 */
-function dedupeAlbums(list: AlbumSummary[]): AlbumSummary[] {
-  const byKey = new Map<string, AlbumSummary>()
-  const result: AlbumSummary[] = []
-  for (const album of list) {
-    const key = `${normalizeForMatch(album.name)}|${normalizeForMatch(album.singer)}`
-    const existing = byKey.get(key)
-    if (!existing) {
-      byKey.set(key, album)
-      result.push(album)
-      continue
-    }
-    if (!existing.img && album.img) existing.img = album.img
-    if (!existing.publishTime && album.publishTime) existing.publishTime = album.publishTime
-    if (!existing.trackCount && album.trackCount) existing.trackCount = album.trackCount
-  }
-  return result
-}
-
-// ==================== 统一入口 ====================
-
-const albumSearchers: Record<AlbumSource, (keyword: string, page: number, limit: number) => Promise<{ list: AlbumSummary[]; total: number }>> = {
-  wy: searchWyAlbums,
-  kw: searchKwAlbums,
-  mg: searchMgAlbums,
-}
-
 const albumTrackFetchers: Partial<Record<AlbumSource, (albumId: string) => Promise<AlbumDetail>>> = {
   wy: getWyAlbumTracks,
   kw: getKwAlbumTracks,
   // mg 暂无可用专辑曲目端点，缺省 → AlbumTracksUnsupportedError
 }
 
-/** 专辑搜索（单源或三源汇聚）。卡片不入库；曲目在专辑详情时才落库。 */
-export async function searchAlbums(
-  source: AlbumSource | 'all',
-  keyword: string,
-  page = 1,
-  limit = 20,
-): Promise<AlbumSearchResult> {
-  const cacheKey = `album:v3:search:${source}:${keyword}:${page}:${limit}`
-  const cached = searchCache.get(cacheKey) as AlbumSearchResult | undefined
-  if (cached) return cached
-
-  if (source !== 'all') {
-    const result = await albumSearchers[source](keyword, page, limit)
-    const enriched: AlbumSearchResult = {
-      list: rerankAlbums(result.list, keyword),
-      total: result.total,
-      page,
-      allPage: Math.ceil(result.total / limit),
-      limit,
-      source,
-    }
-    searchCache.set(cacheKey, enriched, ALBUM_SEARCH_CACHE_TTL)
-    return enriched
-  }
-
-  // 三源汇聚：allSettled 按固定源顺序拼接，失败源跳过并透出；同名同歌手专辑跨源去重
-  const settled = await Promise.allSettled(
-    ALBUM_SOURCES.map(s => albumSearchers[s](keyword, page, limit)),
-  )
-  const okLists: AlbumSummary[][] = []
-  const failedSources: AlbumSource[] = []
-  settled.forEach((r, i) => {
-    if (r.status === 'fulfilled') okLists.push(r.value.list)
-    else {
-      failedSources.push(ALBUM_SOURCES[i])
-      logger.warn(`[album] 源 ${ALBUM_SOURCES[i]} 专辑搜索失败:`, r.reason instanceof Error ? r.reason.message : r.reason)
-    }
-  })
-  if (okLists.length === 0) throw new Error('所有音源专辑搜索失败')
-
-  // 跨源去重后整体重排，让精确命中的官方专辑置顶
-  const ranked = rerankAlbums(dedupeAlbums(okLists.flat()), keyword)
-  const merged: AlbumSearchResult = {
-    list: ranked,
-    total: ranked.length,
-    page,
-    allPage: Math.max(1, ...settled.map(r => r.status === 'fulfilled' ? Math.ceil(r.value.total / limit) : 1)),
-    limit,
-    source: 'all',
-    ...(failedSources.length > 0 ? { failedSources } : {}),
-  }
-  searchCache.set(cacheKey, merged, ALBUM_SEARCH_CACHE_TTL)
-  return merged
+/** 专辑曲目详情。默认本地专辑库优先（曲目表逐首在线搜曲），本地未命中回退平台详情。 */
+export interface AlbumTracksOptions {
+  /** 广场卡片上的专辑名/歌手——本地库匹配用，缺省时直接走在线详情 */
+  name?: string
+  singer?: string
 }
 
-/** 专辑曲目详情。曲目走搜索同款入库管道（upsert + uid），播放/下载/收藏直接可用。 */
-export async function getAlbumTracks(source: AlbumSource, albumId: string): Promise<AlbumDetail> {
-  const fetcher = albumTrackFetchers[source]
-  if (!fetcher) throw new AlbumTracksUnsupportedError(source)
-
-  const cacheKey = `album:v2:tracks:${source}:${albumId}`
+export async function getAlbumTracks(source: AlbumSource, albumId: string, opts: AlbumTracksOptions = {}): Promise<AlbumDetail> {
+  const name = opts.name?.trim() || ''
+  const singer = opts.singer?.trim() || ''
+  const cacheKey = `album:v5:tracks:${source}:${albumId}:${name}:${singer}`
   const cached = searchCache.get(cacheKey) as AlbumDetail | undefined
   if (cached) return cached
 
+  // 本地专辑库优先：卡片名+歌手命中 → 曲目表逐首搜曲（构造可播歌单）
+  if (name && singer) {
+    try {
+      const localAlbum = findLocalAlbum(name, singer)
+      if (localAlbum) {
+        const detail = await buildLocalAlbumDetail(source, albumId, localAlbum.title, localAlbum.artist, localAlbum.gid)
+        if (detail) {
+          searchCache.set(cacheKey, detail, ALBUM_TRACKS_CACHE_TTL)
+          return detail
+        }
+        logger.warn(`[album] 本地专辑《${localAlbum.title}》逐首匹配失败，回退在线详情`)
+      }
+    } catch (error) {
+      logger.warn('[album] 本地专辑倒查失败，回退在线详情:', error instanceof Error ? error.message : error)
+    }
+  }
+
+  // 在线兜底：wy/kw 有原生详情端点；mg 无（上游失效）→ unsupported
+  const fetcher = albumTrackFetchers[source]
+  if (!fetcher) throw new AlbumTracksUnsupportedError(source)
+
   const detail = await fetcher(albumId)
   if (detail.list.length > 0) {
-    searchCache.set(cacheKey, detail, ALBUM_TRACKS_CACHE_TTL)
+    searchCache.set(`album:v5:tracks:${source}:${albumId}::`, detail, ALBUM_TRACKS_CACHE_TTL)
   }
   return detail
 }

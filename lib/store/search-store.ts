@@ -3,7 +3,7 @@
  *
  * 状态放在组件外部 store：离开搜索页再回来时不会丢失数据，输入框/源/结果都保留。
  * - run(keyword, source)：歌曲搜索，过期请求会被丢弃（reqId 自增）
- * - runAlbum(keyword, source)：专辑搜索（mode=album 时使用，音源仅 wy/kw/mg/all）
+ * - runAlbum(keyword)：专辑搜索（mode=album 时使用，本地专辑库，无音源维度）
  * - setKeyword / setSource / setMode：仅更新输入态，不触发请求
  * - reset：清空（注销或切换用户时调用）
  *
@@ -12,19 +12,11 @@
 
 import { create } from 'zustand'
 import { search } from '@/lib/api/search'
-import { searchAlbums } from '@/lib/api/album'
-import type { AlbumSource, AlbumSummary } from '@/lib/api/album'
+import { searchLocalAlbums, type LocalAlbumSummary } from '@/lib/api/album'
 import type { Song, SourceType } from '@/lib/types/music'
 
 /** 搜索结果类型：歌曲 | 专辑 */
 export type SearchMode = 'song' | 'album'
-
-/** 专辑搜索可用音源（一期 wy/kw/mg） */
-const ALBUM_SOURCE_VALUES: AlbumSource[] = ['wy', 'kw', 'mg']
-
-export function isAlbumSearchSource(s: SourceType | 'all' | 'local'): s is AlbumSource | 'all' {
-  return s === 'all' || ALBUM_SOURCE_VALUES.includes(s as AlbumSource)
-}
 
 interface SearchStore {
   /** 当前输入框文本 */
@@ -41,10 +33,8 @@ interface SearchStore {
   results: Song[]
   /** 平台搜索附带的本地音乐库匹配（顶部"本地匹配"区；source=local 时为空） */
   localList: Song[]
-  /** 专辑搜索结果（mode=album） */
-  albums: AlbumSummary[]
-  /** 专辑搜索失败的源（all 模式下部分源失败时提示） */
-  albumFailedSources: AlbumSource[]
+  /** 专辑搜索结果（mode=album，本地专辑库） */
+  albums: LocalAlbumSummary[]
   loading: boolean
   error: string | null
   /** 请求序号，自增用于丢弃过期请求 */
@@ -54,7 +44,7 @@ interface SearchStore {
   setSource: (s: SourceType | 'all' | 'local') => void
   setMode: (m: SearchMode) => void
   run: (kw: string, source: SourceType | 'all' | 'local') => Promise<void>
-  runAlbum: (kw: string, source: AlbumSource | 'all') => Promise<void>
+  runAlbum: (kw: string) => Promise<void>
   reset: () => void
 }
 
@@ -75,7 +65,6 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   results: [],
   localList: [],
   albums: [],
-  albumFailedSources: [],
   loading: false,
   error: null,
   reqId: 0,
@@ -122,35 +111,31 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     }
   },
 
-  runAlbum: async (kw, source) => {
+  runAlbum: async (kw) => {
     const trimmed = kw.trim()
     if (!trimmed) {
-      set({ albums: [], albumFailedSources: [], loading: false, error: null, lastKeyword: '', lastSource: source })
+      set({ albums: [], loading: false, error: null, lastKeyword: '' })
       return
     }
     const reqId = get().reqId + 1
     set({ loading: true, error: null, reqId })
 
     try {
-      const r = await searchAlbums(source, trimmed, 1, 30)
+      const r = await searchLocalAlbums(trimmed, 30)
       if (reqId !== get().reqId) return
       set({
         albums: r.list,
-        albumFailedSources: r.failedSources || [],
         loading: false,
         error: null,
         lastKeyword: trimmed,
-        lastSource: source,
       })
     } catch (e) {
       if (reqId !== get().reqId) return
       set({
         albums: [],
-        albumFailedSources: [],
         loading: false,
         error: toFriendlyError(e),
         lastKeyword: trimmed,
-        lastSource: source,
       })
     }
   },
@@ -165,7 +150,6 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       results: [],
       localList: [],
       albums: [],
-      albumFailedSources: [],
       loading: false,
       error: null,
       reqId: 0,

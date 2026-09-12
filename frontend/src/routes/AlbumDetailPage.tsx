@@ -5,36 +5,31 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
-import { SourceBadge } from '@/components/shared/SourceBadge'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
-import { getAlbumTracks, type AlbumSource } from '@/lib/api/album'
-
-const ALBUM_SOURCE_SET: AlbumSource[] = ['wy', 'kw', 'mg']
+import { getLocalAlbumTracks } from '@/lib/api/album'
 
 export function AlbumDetailPage() {
-  const { source = '', albumId = '' } = useParams<{ source: string; albumId: string }>()
-  const [detail, setDetail] = useState<Awaited<ReturnType<typeof getAlbumTracks>> | null>(null)
+  const { gid = '' } = useParams<{ gid: string }>()
+  const [detail, setDetail] = useState<Awaited<ReturnType<typeof getLocalAlbumTracks>> | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
 
-  const validSource = ALBUM_SOURCE_SET.includes(source as AlbumSource)
-
   const load = async () => {
-    if (!validSource || !albumId) {
+    if (!gid) {
       setDetail(null)
-      setError('不支持的音源')
+      setError('缺少专辑标识')
       setLoading(false)
       return
     }
     setLoading(true)
     setError(null)
     try {
-      const result = await getAlbumTracks(source as AlbumSource, albumId)
+      const result = await getLocalAlbumTracks(gid)
       setDetail(result)
     } catch (err) {
       setDetail(null)
@@ -46,9 +41,9 @@ export function AlbumDetailPage() {
 
   useEffect(() => {
     void load()
-    // source / albumId 变化时重新请求；load 是本组件内函数，无需作为依赖项。
+    // gid 变化时重新请求；load 是本组件内函数，无需作为依赖项。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [source, albumId])
+  }, [gid])
 
   const tracks: Track[] = (detail?.list ?? []).map(song => toTrack({ uid: song.uid, musicInfo: song }))
 
@@ -89,8 +84,8 @@ export function AlbumDetailPage() {
       <div className="p-6">
         <EmptyState
           icon={Disc3}
-          title={detail?.unsupported ? '该音源暂不支持专辑详情' : error ? '专辑详情获取失败' : '专辑不存在或暂无曲目'}
-          description={error || (detail?.unsupported ? '咪咕专辑卡片可直接搜索，详情待上游接口恢复' : '稍后重试或换个音源搜索')}
+          title={detail?.unsupported ? '本地专辑库未收录该专辑' : error ? '专辑详情获取失败' : '专辑暂无可播放曲目'}
+          description={error || (detail?.unsupported ? '换个关键词搜索，或浏览推荐/随机专辑' : '部分曲目未能匹配到可播放版本')}
         />
         <div className="text-center">
           <button
@@ -105,11 +100,12 @@ export function AlbumDetailPage() {
   }
 
   const album = detail.album
+  const partial = album.trackCount > tracks.length
 
   return (
     <div className="p-6">
       <div className="mb-6 flex items-end gap-4">
-        {album?.img ? (
+        {album.img ? (
           <RemoteCoverImage src={album.img} alt="" className="h-32 w-32 shrink-0 rounded-lg object-cover shadow-lg" />
         ) : (
           <div className="flex h-32 w-32 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary/50 to-primary/10 shadow-lg">
@@ -117,14 +113,10 @@ export function AlbumDetailPage() {
           </div>
         )}
         <div className="min-w-0 flex-1">
-          <p className="flex items-center gap-2 text-sm text-muted-foreground">
-            专辑 {album && <SourceBadge source={album.source} />}
-          </p>
-          <h1 className="truncate text-3xl font-bold">{album?.name || '未知专辑'}</h1>
+          <p className="text-sm text-muted-foreground">专辑</p>
+          <h1 className="truncate text-3xl font-bold">{album.name}</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {album?.singer}
-            {album?.publishTime ? ` · ${album.publishTime.slice(0, 4)}` : ''}
-            {` · ${tracks.length} 首`}
+            {album.singer} · {partial ? `可播 ${tracks.length}/${album.trackCount} 首` : `${tracks.length} 首`}
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <button
