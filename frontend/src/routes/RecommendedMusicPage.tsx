@@ -64,7 +64,7 @@ export function RecommendedMusicPage() {
   const [error, setError] = useState<string | null>(null)
   const [tags, setTags] = useState<PlaylistTagsResult | null>(null)
   const [openListOpen, setOpenListOpen] = useState(false)
-  const [tagPanelOpen, setTagPanelOpen] = useState(true)
+  const [tagPanelOpen, setTagPanelOpen] = useState(false)
   const reqId = useRef(0)
 
   const load = useCallback(async (src: DiscoverySource, s: DiscoveryPlaylistSort, t: string | null, p: number) => {
@@ -107,9 +107,10 @@ export function RecommendedMusicPage() {
     setSource(next)
   }
   const chooseTag = (id: string | null) => {
-    // 点已选中的标签 = 取消选择回到默认
+    // 点已选中的标签 = 取消选择回到默认；选完自动收起面板
     setTag(id === tag ? null : id)
     setPage(1)
+    setTagPanelOpen(false)
   }
 
   // 已选标签的显示名（热门与分组里各找一遍；找不到说明已清空）
@@ -170,63 +171,67 @@ export function RecommendedMusicPage() {
           ))}
         </div>
         {hasTagData && (
-          <button
-            onClick={() => setTagPanelOpen(v => !v)}
-            className="flex shrink-0 items-center gap-1 rounded-full border border-border px-3 py-1.5 text-sm hover:bg-accent"
-            aria-expanded={tagPanelOpen}
-          >
-            <ListFilter className="h-4 w-4" />
-            分类{selectedTagName ? `：${selectedTagName}` : ''}
-            <ChevronDown className={`h-4 w-4 transition-transform ${tagPanelOpen ? 'rotate-180' : ''}`} />
-          </button>
+          <div className="relative shrink-0">
+            <button
+              onClick={() => setTagPanelOpen(v => !v)}
+              className="flex items-center gap-1 rounded-full border border-border px-3 py-1.5 text-sm hover:bg-accent"
+              aria-expanded={tagPanelOpen}
+            >
+              <ListFilter className="h-4 w-4" />
+              分类{selectedTagName ? `：${selectedTagName}` : ''}
+              <ChevronDown className={`h-4 w-4 transition-transform ${tagPanelOpen ? 'rotate-180' : ''}`} />
+            </button>
+            {tagPanelOpen && (
+              <>
+                {/* 浮层：点击面板外任意处关闭 */}
+                <div className="fixed inset-0 z-40" onClick={() => setTagPanelOpen(false)} />
+                <div className="absolute right-0 top-full z-50 mt-2 max-h-[65vh] w-[min(880px,calc(100vw-3rem))] space-y-2.5 overflow-y-auto rounded-lg bg-card p-4 shadow-xl ring-1 ring-border">
+                  <div className="flex flex-wrap gap-1.5">
+                    <button
+                      onClick={() => chooseTag(null)}
+                      className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === null ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
+                    >
+                      默认
+                    </button>
+                  </div>
+                  {tags && tags.hotTag.length > 0 && (
+                    <div>
+                      <div className="mb-1 text-xs text-muted-foreground">热门标签</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {tags.hotTag.map(t => (
+                          <button
+                            key={t.id}
+                            onClick={() => chooseTag(t.id)}
+                            className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === t.id ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
+                          >
+                            {t.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {tags?.tags.map(group => (
+                    <div key={group.name}>
+                      <div className="mb-1 text-xs text-muted-foreground">{group.name}</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {group.list.map(t => (
+                          <button
+                            key={t.id}
+                            onClick={() => chooseTag(t.id)}
+                            className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === t.id ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
+                          >
+                            {t.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         )}
       </div>
-
-      {/* 分类面板：默认 + 热门标签 + 分组标签（对齐洛雪 tag 面板，单选） */}
-      {tagPanelOpen && hasTagData && tags && (
-        <div className="mb-4 space-y-2.5 rounded-lg bg-card p-3 ring-1 ring-border">
-          <div className="flex flex-wrap gap-1.5">
-            <button
-              onClick={() => chooseTag(null)}
-              className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === null ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
-            >
-              默认
-            </button>
-          </div>
-          {tags.hotTag.length > 0 && (
-            <div>
-              <div className="mb-1 text-xs text-muted-foreground">热门标签</div>
-              <div className="flex flex-wrap gap-1.5">
-                {tags.hotTag.map(t => (
-                  <button
-                    key={t.id}
-                    onClick={() => chooseTag(t.id)}
-                    className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === t.id ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
-                  >
-                    {t.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          {tags.tags.map(group => (
-            <div key={group.name}>
-              <div className="mb-1 text-xs text-muted-foreground">{group.name}</div>
-              <div className="flex flex-wrap gap-1.5">
-                {group.list.map(t => (
-                  <button
-                    key={t.id}
-                    onClick={() => chooseTag(t.id)}
-                    className={`rounded-md px-2.5 py-1 text-xs transition-colors ${tag === t.id ? 'bg-primary/15 font-medium text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground ring-1 ring-border hover:text-foreground'}`}
-                  >
-                    {t.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
 
       {/* 歌单卡片网格 */}
       {loading ? (
