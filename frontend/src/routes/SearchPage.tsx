@@ -362,12 +362,13 @@ export function SearchPage() {
                       className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
                     >
                       <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
-                        {a.img ? (
-                          <img src={a.img} alt={a.name} loading="lazy" className="h-full w-full object-cover transition group-hover:scale-105" onError={e => { e.currentTarget.style.display = 'none' }} />
-                        ) : (
-                          <Disc3 className="h-10 w-10 text-primary/70" />
-                        )}
-                        <span className="absolute right-1.5 top-1.5" />
+                        <img
+                          src={`/api/album/apple/cover?collectionId=${a.albumId}`}
+                          alt={a.name}
+                          loading="lazy"
+                          className="h-full w-full object-cover transition group-hover:scale-105"
+                          onError={e => { e.currentTarget.style.display = 'none' }}
+                        />
                       </div>
                       <div className="truncate text-sm font-medium">{a.name}</div>
                       <div className="truncate text-xs text-muted-foreground">

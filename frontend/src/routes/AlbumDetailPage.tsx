@@ -133,11 +133,16 @@ export function AlbumDetailPage() {
         <div className="h-32 w-32 shrink-0 overflow-hidden rounded-lg shadow-lg">
           {isLocal ? (
             <AlbumCover gid={gid} alt={album.name} className="h-full w-full" />
-          ) : album.img ? (
-            <img src={album.img} alt={album.name} className="h-full w-full object-cover" onError={e => { e.currentTarget.style.display = 'none' }} />
           ) : (
-            <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
-              <Disc3 className="h-12 w-12 text-primary-foreground/80" />
+            // Apple 专辑封面（服务端中转）；渐变+图标垫底，加载失败时露出占位
+            <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
+              <Disc3 className="absolute h-12 w-12 text-primary-foreground/80" />
+              <img
+                src={`/api/album/apple/cover?collectionId=${albumId}`}
+                alt={album.name}
+                className="relative h-full w-full object-cover"
+                onError={e => { e.currentTarget.style.display = 'none' }}
+              />
             </div>
           )}
         </div>
