@@ -20,6 +20,12 @@ export function ArtistDetailPage() {
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
   const reqIdRef = useRef(0)
+  // 头像三级降级：维基头像（服务端代理转发）→ 首专辑封面 → 占位。
+  // 有简介=维基条目存在（基本都有头像）才尝试维基，否则直接从专辑封面起。
+  const [avatarStage, setAvatarStage] = useState<'wiki' | 'album'>('album')
+  useEffect(() => {
+    setAvatarStage(detail?.artist.bio ? 'wiki' : 'album')
+  }, [detail?.artist.name, detail?.artist.bio])
 
   const load = async () => {
     const reqId = ++reqIdRef.current
@@ -67,7 +73,14 @@ export function ArtistDetailPage() {
     <div className="p-6">
       {/* 歌手头部 */}
       <div className="mb-6 flex items-end gap-4">
-        {artist.img ? (
+        {avatarStage === 'wiki' ? (
+          <img
+            src={`/api/artist/avatar?name=${encodeURIComponent(artist.name)}`}
+            alt={artist.name}
+            className="h-32 w-32 shrink-0 rounded-full object-cover shadow-lg"
+            onError={() => setAvatarStage('album')}
+          />
+        ) : artist.img ? (
           <RemoteCoverImage src={artist.img} alt="" className="h-32 w-32 shrink-0 rounded-full object-cover shadow-lg" />
         ) : (
           <div className="flex h-32 w-32 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-primary/50 to-primary/10 shadow-lg">
