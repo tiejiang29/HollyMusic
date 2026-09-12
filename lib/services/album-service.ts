@@ -147,7 +147,43 @@ async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise
   return results
 }
 
-/** 本地专辑倒查：曲目表逐首在线搜曲，返回可播放歌单与专辑元信息（封面取首个命中歌曲） */
+/** 从落歌结果推导专辑封面：优先歌曲自带封面；tx 副本用 albumId 拼 QQ 专辑封面直链 */
+export function albumCoverFromSongs(list: Song[]): string | null {
+  for (const s of list) {
+    if (s.img) return s.img
+    if (s.source === 'tx' && s.albumId) {
+      return `https://y.gtimg.cn/music/photo_new/T002R500x500M000${s.albumId}.jpg`
+    }
+  }
+  return null
+}
+
+/** 专辑封面探测：取专辑首曲目在 tx 搜一曲（搜索缓存 210min，与详情复用同一缓存键），
+ *  推导专辑封面 URL。给专辑卡片列表懒加载封面用。 */
+export async function getAlbumCover(gid: string): Promise<string | null> {
+  const cacheKey = `album:cover:${gid}`
+  // 注意 searchCache.get 未命中返回 null（与"已探测且无封面"不可区分），
+  // 因此无封面结果不写缓存——重复探测由 searchOneSource 的搜索缓存兜底，近乎零成本
+  const cached = searchCache.get(cacheKey) as string | null
+  if (cached) return cached
+
+  const album = findLocalAlbumByGid(gid)
+  const tracks = album ? getLocalAlbumTracks(gid) : []
+  let img: string | null = null
+  const first = tracks[0]
+  if (album && first) {
+    try {
+      const result = await searchOneSource('tx', `${first.title} ${album.artist}`, 1, 5)
+      img = albumCoverFromSongs(result.list)
+    } catch (error) {
+      logger.debug('[album] 封面探测失败:', error instanceof Error ? error.message : error)
+    }
+  }
+  if (img) searchCache.set(cacheKey, img, 24 * 60 * 60 * 1000)
+  return img
+}
+
+/** 本地专辑倒查：曲目表逐首在线搜曲，返回可播放歌单与专辑元信息（封面从落歌结果推导） */
 async function buildLocalAlbumDetail(source: AlbumSource, albumId: string, localTitle: string, localArtist: string, gid: string): Promise<AlbumDetail | null> {
   const tracks = getLocalAlbumTracks(gid)
   if (tracks.length === 0) return null
@@ -163,7 +199,7 @@ async function buildLocalAlbumDetail(source: AlbumSource, albumId: string, local
       albumId,
       name: localTitle,
       singer: localArtist,
-      img: list.find(s => s.img)?.img ?? null,
+      img: albumCoverFromSongs(list),
       trackCount: tracks.length,
     },
     list,

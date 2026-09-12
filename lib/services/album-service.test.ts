@@ -18,7 +18,7 @@ vi.mock('@/lib/services/album-local-service', () => ({
 }))
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
 
-const { getLocalAlbumDetailByGid, getAlbumTracks, AlbumTracksUnsupportedError } = await import('./album-service')
+const { getLocalAlbumDetailByGid, getAlbumCover, getAlbumTracks, AlbumTracksUnsupportedError } = await import('./album-service')
 
 function jsonResponse(payload: unknown, status = 200) {
   return { ok: status < 400, status, json: async () => payload }
@@ -85,6 +85,29 @@ describe('getAlbumDetailByGid（本地专辑倒查）', () => {
 
     expect(detail).toBeNull()
     expect(searchOneSource).toHaveBeenCalledTimes(LOCAL_TRACKS.length * 5) // 五源全部尝试
+  })
+
+  it('封面探测：取首曲目在 tx 搜曲推导 QQ 专辑封面直链', async () => {
+    searchOneSource.mockImplementation(async (source: string, keyword: string) => {
+      const title = keyword.split(' ')[0]
+      return { list: [song(title, '05:42', 'tx')] }
+    })
+    // 候选带 QQ 专辑 id → 封面走 gtimg 直链
+    searchOneSource.mockImplementation(async () => ({
+      list: [{ ...song('以父之名', '05:42', 'tx'), albumId: '000MkMni19ClKG' }],
+      total: 1,
+    }))
+
+    const img = await getAlbumCover(GID)
+
+    expect(img).toBe('https://y.gtimg.cn/music/photo_new/T002R500x500M000000MkMni19ClKG.jpg')
+  })
+
+  it('封面探测失败缓存 null，不重复探测', async () => {
+    findLocalAlbumByGid.mockReturnValue(null)
+
+    expect(await getAlbumCover(GID)).toBeNull()
+    expect(searchOneSource).not.toHaveBeenCalled()
   })
 
   it('gid 不在本地库返回 null', async () => {
