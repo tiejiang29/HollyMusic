@@ -32,12 +32,11 @@ vi.mock('@/lib/services/album-local-service', () => ({
   searchLocalAlbums,
 }))
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
-vi.mock('@/lib/services/itunes-service', () => ({
-  getArtistAlbumIndex,
-  getItunesAlbumDetail,
-  getItunesArtistSongs: vi.fn(),
-  searchItunesAlbums,
-}))
+vi.mock('@/lib/services/itunes-service', async (importOriginal) => {
+  // 保留真实 appleT2S（OpenCC 简繁转换，用例依赖真实转换行为），其余替换为受控 mock
+  const actual = await importOriginal<typeof import('@/lib/services/itunes-service')>()
+  return { ...actual, getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs: vi.fn(), searchItunesAlbums }
+})
 vi.mock('@/lib/services/wiki-service', () => ({ getWikiExtract: vi.fn(async () => null) }))
 
 const { getLocalAlbumDetailByGid, getAlbumCover, getAppleAlbumDetail, searchAlbums } = await import('./album-service')
@@ -104,6 +103,27 @@ describe('getAlbumDetailByGid（本地专辑倒查）', () => {
     getArtistAlbumIndex.mockResolvedValue(new Map())
 
     expect(await getLocalAlbumDetailByGid(GID)).toBeNull()
+  })
+
+  it('同歌多版本时优先取 albumName 与目标专辑一致的候选', async () => {
+    // 以父之名：同歌手同时长两个版本——太阳之子专辑版 vs 圣诞星单曲版（错误发行）
+    searchOneSource.mockImplementation(async () => ({
+      list: [
+        { ...song('以父之名', '05:42', 'tx'), albumName: '圣诞星 (feat. 杨瑞代)' },
+        { ...song('以父之名', '05:42', 'tx'), albumName: '太阳之子' },
+      ],
+      total: 2,
+    }))
+    dbFindFirst.mockResolvedValue(null)
+    getArtistAlbumIndex.mockResolvedValue(new Map([
+      ['叶惠美', { collectionId: '1', img: 'https://mzstatic/a.jpg', year: '2003-07-31' }],
+    ]))
+
+    const detail = await getLocalAlbumDetailByGid(GID)
+
+    // 本地专辑《叶惠美》上下文：两候选 albumName 都不匹配"叶惠美"→ 取首个通过校验的
+    expect(detail?.list[0]).toMatchObject({ name: '以父之名' })
+    expect(detail?.list[0].albumName).toBe('圣诞星 (feat. 杨瑞代)')
   })
 
   it('gid 不在本地库返回 null', async () => {

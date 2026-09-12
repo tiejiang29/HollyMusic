@@ -20,7 +20,7 @@ import { songIdentity } from '@/lib/song-identity'
 import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
 import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums, type LocalAlbumTrack } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
-import { getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs, searchItunesAlbums } from '@/lib/services/itunes-service'
+import { appleT2S, getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs, searchItunesAlbums } from '@/lib/services/itunes-service'
 import { getWikiExtract } from '@/lib/services/wiki-service'
 
 /** 专辑详情（含已入库曲目）缓存 */
@@ -58,12 +58,17 @@ function durationMatches(interval: string | undefined, secs: number | null): boo
 }
 
 /** 本地音乐库优先：identity 同款歌命中直接返回库内条目（零上游成本，毫秒级）。
- *  与换源接口 findLocalAlternatives 同一套机制（MusicInfo.identity 分组键）。 */
+ *  与换源接口 findLocalAlternatives 同一套机制（MusicInfo.identity 分组键）。
+ *  双 identity 尝试：妳→你 变体在前（平台入库曲名多为"你"），原样在后（兼容存量行）。 */
 async function resolveFromLocalLibrary(title: string, artist: string): Promise<Song | null> {
-  const identity = songIdentity({ name: title, singer: artist })
-  if (identity === '|') return null
+  const identityVariant = songIdentity({ name: title.replace(/妳/g, '你'), singer: artist })
+  const identityRaw = songIdentity({ name: title, singer: artist })
+  if (identityVariant === '|' && identityRaw === '|') return null
   try {
-    const row = await prisma.musicInfo.findFirst({ where: { identity } })
+    const row = (await prisma.musicInfo.findFirst({ where: { identity: identityVariant } }))
+      ?? (identityVariant !== identityRaw
+        ? await prisma.musicInfo.findFirst({ where: { identity: identityRaw } })
+        : null)
     if (!row) return null
     const mi = JSON.parse(row.data ?? '') as MusicInfo
     return { ...mi, uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}` }
@@ -73,25 +78,39 @@ async function resolveFromLocalLibrary(title: string, artist: string): Promise<S
   }
 }
 
-/** 单首曲目跨源搜曲：本地库 identity 优先 → 在线按 RESOLVE_SOURCE_ORDER 依次尝试（三重校验） */
-async function resolveLocalTrack(track: LocalAlbumTrack, artist: string): Promise<Song | null> {
+/** 单首曲目跨源搜曲：本地库 identity 优先 → 在线按 RESOLVE_SOURCE_ORDER 依次尝试。
+ *  候选校验（三重，歌名始终参与）：歌手归一化匹配 + 歌名简繁归一双向包含 + 时长 ±8s
+ *  （无时长数据时歌名+歌手即通过）。带专辑上下文时优先取 albumName 一致的专辑版本，
+ *  平台只收单曲版本时回退首个通过校验的候选（同一首歌、不同发行）。 */
+async function resolveLocalTrack(track: LocalAlbumTrack, artist: string, albumTitle?: string): Promise<Song | null> {
   const localFit = await resolveFromLocalLibrary(track.title, artist)
   if (localFit) return localFit
 
   const keyword = `${track.title} ${artist}`
-  // 有时长数据时时长是主要消歧信号（繁简/异体歌名差异靠它兜住）；
-  // 无时长数据（约 22% 曲目）时长无法参与，改为要求候选歌名与曲名有包含关系
-  const titleNorm = normText(track.title)
+  // 歌名归一化：OpenCC 简繁 + 妳→你（异体字 OpenCC 不转，"妳听得到/你听得到"会一字之差漏配）
+  const normalizeName = (v: string | null | undefined) => normText(appleT2S(v || '').replace(/妳/g, '你'))
+  const titleNorm = normalizeName(track.title)
+  const albumNorm = albumTitle ? normalizeName(albumTitle) : null
+  const passes = (s: Song) => {
+    if (!singerMatches(s.singer, artist)) return false
+    const candName = normalizeName(s.name)
+    if (!candName || (!candName.includes(titleNorm) && !titleNorm.includes(candName))) return false
+    if (track.secs != null) return durationMatches(s.interval, track.secs)
+    return true
+  }
   for (const source of RESOLVE_SOURCE_ORDER) {
     try {
       const result = await searchOneSource(source, keyword, 1, 10)
-      const hit = result.list.find(s => {
-        if (!singerMatches(s.singer, artist)) return false
-        if (track.secs != null) return durationMatches(s.interval, track.secs)
-        const candName = normText(s.name || '')
-        return !!candName && (candName.includes(titleNorm) || titleNorm.includes(candName))
-      })
-      if (hit) return hit
+      const candidates = result.list.filter(passes)
+      if (candidates.length === 0) continue
+      if (albumNorm) {
+        const albumHit = candidates.find(s => {
+          const candAlbum = normalizeName(s.albumName)
+          return !!candAlbum && (candAlbum.includes(albumNorm) || albumNorm.includes(candAlbum))
+        })
+        if (albumHit) return albumHit
+      }
+      return candidates[0]
     } catch (error) {
       logger.debug(`[album] 逐首搜曲源 ${source} 失败:`, error instanceof Error ? error.message : error)
     }
@@ -183,7 +202,7 @@ export async function getAlbumCover(gid: string): Promise<string | null> {
 async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gid: string): Promise<AlbumDetail | null> {
   const tracks = getLocalAlbumTracks(gid)
   if (tracks.length === 0) return null
-  const resolved = await mapPool(tracks, 4, track => resolveLocalTrack(track, localArtist))
+  const resolved = await mapPool(tracks, 4, track => resolveLocalTrack(track, localArtist, localTitle))
   const list = resolved.filter((s): s is Song => s !== null)
   if (list.length === 0) {
     logger.warn(`[album] 本地专辑《${localTitle}》逐首匹配全部失败`)
@@ -367,7 +386,7 @@ export async function getAppleAlbumDetail(collectionId: string): Promise<AppleAl
   if (!itunes || itunes.tracks.length === 0) return null
 
   const resolved = await mapPool(itunes.tracks, 4, track =>
-    resolveLocalTrack({ title: track.title, titleNorm: track.titleNorm, secs: track.secs, disc: track.disc, position: track.position }, itunes.album.artist))
+    resolveLocalTrack({ title: track.title, titleNorm: track.titleNorm, secs: track.secs, disc: track.disc, position: track.position }, itunes.album.artist, itunes.album.title))
   const list = resolved.filter((s): s is Song => s !== null)
   if (list.length === 0) {
     logger.warn(`[album] Apple 专辑《${itunes.album.title}》逐首匹配全部失败`)
