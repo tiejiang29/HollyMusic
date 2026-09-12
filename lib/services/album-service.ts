@@ -17,10 +17,11 @@
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
 import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
-import { findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks, type LocalAlbumTrack } from '@/lib/services/album-local-service'
+import { findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks, normalizeAlbumText, type LocalAlbumTrack } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
 import {
   enrichMusicInfos,
+  getTrending,
   normalizeCover,
   toKwMusicInfo,
   toWyMusicInfo,
@@ -221,6 +222,59 @@ export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumD
     album: { gid: album.gid, name: album.title, singer: album.artist, trackCount: album.trackCount ?? detail.list.length, img: detail.album.img ?? null },
     list: detail.list,
   }
+}
+
+// ==================== 热门专辑（热歌榜反推） ====================
+
+/** 热门专辑：五平台热歌榜反推——榜单上的歌必属热门专辑，匹配回本地库即"既热门又能播" */
+export interface HotAlbumSummary {
+  gid: string
+  title: string
+  artist: string
+  trackCount?: number
+  /** 该专辑在热歌榜上的歌曲数（排序依据） */
+  hotSongs: number
+}
+
+export async function getHotLocalAlbums(size = 12): Promise<HotAlbumSummary[]> {
+  const cacheKey = `album:hot:${size}`
+  const cached = searchCache.get(cacheKey) as HotAlbumSummary[] | null
+  if (cached) return cached
+
+  // 热歌池（discovery 层自带缓存，无额外上游成本）
+  const trending = await getTrending(30).catch(error => {
+    logger.warn('[album] 热歌池获取失败，热门专辑返回空:', error instanceof Error ? error.message : error)
+    return { list: [] as Song[] }
+  })
+
+  // 按（专辑名|首歌手）聚合上榜歌曲
+  const grouped = new Map<string, { title: string; artist: string; hotSongs: number }>()
+  for (const song of trending.list) {
+    const albumName = song.albumName || ''
+    if (!albumName || albumName === '未知专辑') continue
+    const artist = (song.singer || '').split(/[、,，/／&＆;；]/)[0] || ''
+    if (!artist || artist === 'Various Artists') continue
+    const key = `${normalizeAlbumText(albumName)}|${normalizeAlbumText(artist)}`
+    const entry = grouped.get(key) ?? { title: albumName, artist, hotSongs: 0 }
+    entry.hotSongs++
+    grouped.set(key, entry)
+  }
+
+  // 逐张匹配回本地库（本地查询毫秒级）
+  const matched: HotAlbumSummary[] = []
+  for (const entry of grouped.values()) {
+    const hit = findLocalAlbum(entry.title, entry.artist)
+    if (hit) matched.push({ gid: hit.gid, title: hit.title, artist: hit.artist, hotSongs: entry.hotSongs })
+  }
+  matched.sort((a, b) => b.hotSongs - a.hotSongs)
+
+  // 回填曲目数
+  const result = matched.slice(0, Math.max(1, Math.min(size, 50))).map(a => {
+    const album = findLocalAlbumByGid(a.gid)
+    return { ...a, trackCount: album?.trackCount }
+  })
+  searchCache.set(cacheKey, result, 60 * 60 * 1000)
+  return result
 }
 
 // ==================== 在线详情兜底（平台卡片渠道） ====================

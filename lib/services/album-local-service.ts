@@ -83,12 +83,12 @@ function upperBound(prefix: string): string {
 }
 
 /** 卡片名/歌手与本地库比对的归一化：只保留字母数字与 CJK（去空白标点），小写 */
-export function normalizeAlbumText(value: string): string {
-  return value.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+export function normalizeAlbumText(value: string | null | undefined): string {
+  return (value || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
 }
 
-function rowToAlbum(row: { gid: Uint8Array; title: string; artist: string }): LocalAlbum {
-  return { gid: gidToUuid(row.gid), title: row.title, artist: row.artist }
+function rowToAlbum(row: { gid: Uint8Array; title: string; artist: string | null }): LocalAlbum {
+  return { gid: gidToUuid(row.gid), title: row.title, artist: row.artist || '' }
 }
 
 /** 专辑名前缀联想（走索引，毫秒级） */
@@ -214,8 +214,10 @@ export function findLocalAlbum(title: string, artist: string): LocalAlbum | null
     .concat(db.prepare('SELECT gid,title,artist FROM albums WHERE title LIKE ? LIMIT 20').all(`%${title.trim()}%`)) as Array<{ gid: Uint8Array; title: string; artist: string }>
   for (const row of candidates) {
     const album = rowToAlbum(row)
-    const rowArtist = normalizeAlbumText(album.artist)
-    if (!a || !rowArtist || rowArtist.includes(a) || a.includes(rowArtist)) return album
+    const rowArtist = normalizeAlbumText(album.artist ?? '')
+    // 调用方未提供歌手：标题命中即用；提供了歌手：空歌手的候选行（多为噪声）不自动匹配
+    if (!a) return album
+    if (rowArtist && (rowArtist.includes(a) || a.includes(rowArtist))) return album
   }
   return null
 }
