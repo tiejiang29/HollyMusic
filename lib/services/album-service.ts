@@ -166,6 +166,52 @@ async function getAppleAlbumMeta(
   }
 }
 
+/** 封面图床白名单（服务端中转只抓这些域） */
+const COVER_IMAGE_DOMAINS = [
+  /^https:\/\/[a-z0-9-]+\.mzstatic\.com\//i,        // Apple 封面 CDN
+  /^https:\/\/y\.gtimg\.cn\//i,                     // QQ 专辑封面
+  /^https?:\/\/[a-z0-9]+\.music\.126\.net\//i,     // 网易封面
+  /^https:\/\/img[0-9]*\.kwcdn\.kuwo\.cn\//i,      // 酷我封面
+  /^https:\/\/d\.musicapp\.migu\.cn\//i,           // 咪咕封面
+]
+
+export interface CoverImageBytes {
+  bytes: ArrayBuffer
+  contentType: string
+}
+
+/** 服务端抓取封面字节（带 24h 缓存，转发给前端——前端不再直连图床）。 */
+export async function fetchCoverImageBytes(imageUrl: string): Promise<CoverImageBytes | null> {
+  if (!COVER_IMAGE_DOMAINS.some(re => re.test(imageUrl))) return null
+  const cacheKey = `album:imgbytes:${imageUrl}`
+  const cached = searchCache.get(cacheKey) as CoverImageBytes | null
+  if (cached) return cached
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8_000)
+    try {
+      const resp = await fetch(imageUrl, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        redirect: 'follow',
+      })
+      if (!resp.ok) return null
+      const contentType = resp.headers.get('content-type') || 'image/jpeg'
+      if (!contentType.startsWith('image/')) return null
+      const bytes = await resp.arrayBuffer()
+      if (bytes.byteLength === 0 || bytes.byteLength > 5 * 1024 * 1024) return null
+      const result: CoverImageBytes = { bytes, contentType }
+      searchCache.set(cacheKey, result, 24 * 60 * 60 * 1000)
+      return result
+    } finally {
+      clearTimeout(timer)
+    }
+  } catch (error) {
+    logger.debug('[album] 封面字节获取失败（静默）:', error instanceof Error ? error.message : error)
+    return null
+  }
+}
+
 /** 专辑封面探测（专辑卡片懒加载）：优先 Apple 高清封面，未收录回退 tx 首曲目搜曲推导 gtimg */
 export async function getAlbumCover(gid: string): Promise<string | null> {
   const cacheKey = `album:cover:${gid}`
