@@ -5,6 +5,7 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { AlbumCover } from '@@/components/shared/AlbumCover'
+import { KwAlbumCover } from '@@/components/shared/KwAlbumCover'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
@@ -150,17 +151,16 @@ export function AlbumDetailPage() {
           {isLocal ? (
             <AlbumCover gid={gid} alt={album.name} className="h-full w-full" />
           ) : source === 'kw' ? (
-            // 酷我专辑封面（卡片/详情自带 img1.kuwo.cn 直链）；渐变+图标垫底
+            // 酷我专辑封面两级降级：直链 → /api/album/kw/cover（kw→Apple 服务端解析）；渐变+图标垫底
             <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
               <Disc3 className="absolute h-12 w-12 text-primary-foreground/80" />
-              {album.img && (
-                <img
-                  src={album.img}
-                  alt={album.name}
-                  className="relative h-full w-full object-cover"
-                  onError={e => { e.currentTarget.style.display = 'none' }}
-                />
-              )}
+              <KwAlbumCover
+                albumId={albumId}
+                name={album.name}
+                singer={album.singer}
+                img={album.img}
+                className="relative h-full w-full object-cover"
+              />
             </div>
           ) : (
             // Apple 专辑封面（服务端中转）；渐变+图标垫底，加载失败时露出占位

@@ -5,6 +5,7 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
+import { KwAlbumCover } from '@@/components/shared/KwAlbumCover'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { getArtistDetail, getKwArtistDetail, type ArtistDetailData } from '@/lib/api/artist'
@@ -199,13 +200,13 @@ export function ArtistDetailPage() {
                 className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
               >
                 <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
-                  {a.source === 'kw' && a.img ? (
-                    <img
-                      src={a.img}
-                      alt={a.name}
-                      loading="lazy"
+                  {a.source === 'kw' ? (
+                    <KwAlbumCover
+                      albumId={a.albumId}
+                      name={a.name}
+                      singer={a.artist || artist.name}
+                      img={a.img}
                       className="h-full w-full object-cover transition group-hover:scale-105"
-                      onError={e => { e.currentTarget.style.display = 'none' }}
                     />
                   ) : (
                     <img

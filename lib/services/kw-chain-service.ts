@@ -553,6 +553,31 @@ export async function getKwAlbumDetailPlayable(albumId: string): Promise<{
   return result
 }
 
+/** 专辑封面解析（跨源降级链的酷我段）：专辑详情 pic（缓存 24h）→
+ *  按名搜专辑卡片 pic → null（路由层继续回落 Apple）。albumid 与 name 至少有其一。 */
+export async function resolveKwAlbumCoverUrl(
+  albumId: string | null,
+  name?: string,
+  singer?: string,
+): Promise<string | null> {
+  // 1. kw 专辑详情 pic
+  if (albumId && /^\d+$/.test(albumId)) {
+    const detail = await getKwAlbumDetail(albumId).catch(() => null)
+    if (detail?.album.pic) return detail.album.pic
+  }
+  // 2. kw 搜专辑卡片 pic（专辑详情未命中/无图时）
+  if (name?.trim()) {
+    const cards = await searchKwAlbums(`${name.trim()} ${singer?.trim() || ''}`.trim(), 5).catch(() => [])
+    const titleNorm = clean(name).toLowerCase().replace(/\s+/g, '')
+    const hit = cards.find(c => {
+      const t = c.name.toLowerCase().replace(/\s+/g, '')
+      return !!t && (t.includes(titleNorm) || titleNorm.includes(t))
+    })
+    if (hit?.pic) return hit.pic
+  }
+  return null
+}
+
 /** 按专辑名+歌手名找酷我 albumid（本地专辑进酷我链的门；带歌手校验防同名专辑错配） */
 export async function findKwAlbumId(title: string, artist: string): Promise<string | null> {
   const albums = await searchKwAlbums(`${title} ${artist}`.trim(), 10).catch(() => [])

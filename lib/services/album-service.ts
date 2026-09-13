@@ -120,7 +120,8 @@ const COVER_IMAGE_DOMAINS = [
   /^https:\/\/[a-z0-9-]+\.mzstatic\.com\//i,        // Apple 封面 CDN
   /^https:\/\/y\.gtimg\.cn\//i,                     // QQ 专辑封面
   /^https?:\/\/[a-z0-9]+\.music\.126\.net\//i,     // 网易封面
-  /^https:\/\/img[0-9]*\.kwcdn\.kuwo\.cn\//i,      // 酷我封面
+  /^https:\/\/img[0-9]*\.kwcdn\.kuwo\.cn\//i,      // 酷我封面（kwcdn 域）
+  /^https:\/\/(img[0-9]*|star)\.kuwo\.cn\//i,      // 酷我封面/歌手头像（img1/img4/star 直域，r.s 与 wapi 返回的实际域名）
   /^https:\/\/d\.musicapp\.migu\.cn\//i,           // 咪咕封面
 ]
 

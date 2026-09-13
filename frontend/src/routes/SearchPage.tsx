@@ -5,6 +5,7 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { AlbumGrid } from '@@/components/shared/AlbumGrid'
+import { KwAlbumCover } from '@@/components/shared/KwAlbumCover'
 import { Search, Music, X, CloudOff, ChevronDown, User, Disc3 } from 'lucide-react'
 import { toTrack } from '@/lib/types/player'
 import type { SourceType } from '@/lib/types/music'
@@ -376,13 +377,23 @@ export function SearchPage() {
                       className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
                     >
                       <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
-                        <img
-                          src={a.source === 'kw' && a.img ? a.img : `/api/album/apple/cover?collectionId=${a.albumId}`}
-                          alt={a.name}
-                          loading="lazy"
-                          className="h-full w-full object-cover transition group-hover:scale-105"
-                          onError={e => { e.currentTarget.style.display = 'none' }}
-                        />
+                        {a.source === 'kw' ? (
+                          <KwAlbumCover
+                            albumId={a.albumId}
+                            name={a.name}
+                            singer={a.singer}
+                            img={a.img}
+                            className="h-full w-full object-cover transition group-hover:scale-105"
+                          />
+                        ) : (
+                          <img
+                            src={`/api/album/apple/cover?collectionId=${a.albumId}`}
+                            alt={a.name}
+                            loading="lazy"
+                            className="h-full w-full object-cover transition group-hover:scale-105"
+                            onError={e => { e.currentTarget.style.display = 'none' }}
+                          />
+                        )}
                       </div>
                       <div className="truncate text-sm font-medium">{a.name}</div>
                       <div className="truncate text-xs text-muted-foreground">
