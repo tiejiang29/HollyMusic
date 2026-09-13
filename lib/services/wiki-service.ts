@@ -62,10 +62,15 @@ export interface WikiPageData {
  * @param query 搜索词（歌手名 / 专辑名）
  * @param kind artist=歌手条目；album=专辑条目（搜索词自动追加"專輯"消歧）
  */
+// 短 TTL 去重缓存：同词条一次详情里 bio/profile/头像会多次触达，10min 内只打一次上游
+const pageDataMemo = new Map<string, WikiPageData | null>()
+
 export async function getWikiPageData(query: string, kind: 'artist' | 'album'): Promise<WikiPageData | null> {
   const q = query.trim()
   if (!q || !PROXY_URL) return null
   const cacheKey = `wiki:v2:${kind}:${q}`
+  const memo = pageDataMemo.get(cacheKey)
+  if (memo !== undefined) return memo
   const cached = searchCache.get(cacheKey) as WikiPageData | null
   if (cached) return cached
 
@@ -105,14 +110,18 @@ export async function getWikiPageData(query: string, kind: 'artist' | 'album'): 
       }
       if (!result.extract && !result.thumbUrl) return null
       searchCache.set(cacheKey, result, CACHE_TTL)
+      pageDataMemo.set(cacheKey, result)
+      setTimeout(() => pageDataMemo.delete(cacheKey), 10 * 60 * 1000)
       return result
     } finally {
       clearTimeout(timer)
     }
   } catch (error) {
     logger.debug('[wiki] 条目获取失败（静默）:', error instanceof Error ? error.message : error)
-    return null
   }
+  pageDataMemo.set(cacheKey, null)
+  setTimeout(() => pageDataMemo.delete(cacheKey), 10 * 60 * 1000)
+  return null
 }
 
 /** 取维基简介（简体）——getWikiPageData 的简介薄封装 */
@@ -168,7 +177,7 @@ type WdClaims = Record<string, Array<{ mainsnak?: { datavalue?: { value?: unknow
 let wikiQueueTail: Promise<unknown> = Promise.resolve()
 function polite<T>(fn: () => Promise<T>): Promise<T> {
   const run = wikiQueueTail.then(async () => {
-    await new Promise(r => setTimeout(r, 250))
+    await new Promise(r => setTimeout(r, 100))
     return fn()
   })
   wikiQueueTail = run.catch(() => undefined)
@@ -284,10 +293,13 @@ export async function getArtistProfile(name: string): Promise<ArtistProfile | nu
   const claims = await getClaims(page.qid)
   if (!claims) return null
 
-  const occupations = await resolveQidLabels(claimQids(claims, 'P106'), 4)
-  const genres = await resolveQidLabels(claimQids(claims, 'P136'), 4)
-  const recordLabels = await resolveQidLabels(claimQids(claims, 'P264'), 3)
-  const nationality = (await resolveQidLabels(claimQids(claims, 'P27'), 1))[0]
+  const [occupations, genres, recordLabels, nationalities] = await Promise.all([
+    resolveQidLabels(claimQids(claims, 'P106'), 4),
+    resolveQidLabels(claimQids(claims, 'P136'), 4),
+    resolveQidLabels(claimQids(claims, 'P264'), 3),
+    resolveQidLabels(claimQids(claims, 'P27'), 1),
+  ])
+  const nationality = nationalities[0]
   const profile: ArtistProfile = {
     qid: page.qid,
     ...(claimTime(claims, 'P569') ? { birthDate: claimTime(claims, 'P569') } : {}),

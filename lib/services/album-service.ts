@@ -291,9 +291,14 @@ export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumD
   const cached = searchCache.get(cacheKey) as LocalAlbumDetail | null
   if (cached) return cached
 
+  // 落歌与维基 bio/profile 三路并行（wiki 内部 pageData 去重，只打一次上游）
   const album = findLocalAlbumByGid(gid)
   if (!album) return null
-  const detail = await buildLocalAlbumDetail(album.title, album.artist, album.gid)
+  const [detail, bio, profile] = await Promise.all([
+    buildLocalAlbumDetail(album.title, album.artist, album.gid),
+    getWikiExtract(album.title, 'album').catch(() => null),
+    getAlbumProfile(album.title, gid).catch(() => null),
+  ])
   if (!detail) return null
   const result: LocalAlbumDetail = {
     album: {
@@ -303,8 +308,8 @@ export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumD
       trackCount: album.trackCount ?? detail.list.length,
       img: detail.album.img ?? null,
       year: detail.album.publishTime,
-      bio: detail.album.bio ?? null,
-      profile: detail.album.profile ?? null,
+      bio: bio ?? null,
+      profile: profile ?? null,
     },
     list: detail.list,
   }
@@ -351,13 +356,17 @@ export async function getAppleArtistDetail(artistId: string): Promise<AppleArtis
   const info = await getItunesArtistSongs(artistId)
   if (!info) return null
 
-  // 热门歌：本地库 identity 优先 → 在线五源（与专辑详情同一落歌管道）
-  const resolved = await mapPool(info.songs, 4, song =>
-    resolveLocalTrack({ title: song.title, titleNorm: song.titleNorm, secs: song.secs, disc: 1, position: 0 }, info.name))
+  // 四路并行：热门歌落歌 / 专辑索引 / 维基简介 / Wikidata 档案
+  // （wiki 内部有 pageData 去重缓存，bio 与 profile 共享同一次条目请求）
+  const [resolved, index, bio, profile] = await Promise.all([
+    mapPool(info.songs, 4, song =>
+      resolveLocalTrack({ title: song.title, titleNorm: song.titleNorm, secs: song.secs, disc: 1, position: 0 }, info.name)),
+    getArtistAlbumIndex(info.name).catch(() => new Map()),
+    getWikiExtract(info.name, 'artist').catch(() => null),
+    getArtistProfile(info.name).catch(() => null),
+  ])
   const hotSongs = resolved.filter((x): x is Song => x !== null)
 
-  // 专辑列表（复用歌手专辑索引，缓存 24h）
-  const index = await getArtistAlbumIndex(info.name)
   const albums: ArtistAlbumCard[] = [...index.entries()].map(([title, meta]) => ({
     source: 'apple' as const,
     albumId: meta.collectionId,
@@ -370,8 +379,6 @@ export async function getAppleArtistDetail(artistId: string): Promise<AppleArtis
 
   // 头像 = 首张专辑封面（Apple 歌手实体无照片）
   const img = albums.find(a => a.img)?.img ?? null
-  const bio = await getWikiExtract(info.name, 'artist').catch(() => null)
-  const profile = await getArtistProfile(info.name).catch(() => null)
 
   const detail: AppleArtistDetail = {
     artist: { artistId: info.artistId, name: info.name, genre: info.genre, bio, profile, img },
