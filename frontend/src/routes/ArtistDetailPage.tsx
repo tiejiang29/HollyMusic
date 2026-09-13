@@ -222,7 +222,7 @@ export function ArtistDetailPage() {
                     <ChainAlbumCover
                       img={a.img}
                       alt={a.name}
-                      proxySrc={`/api/album/${a.source}/cover?albumid=${encodeURIComponent(a.albumId)}&name=${encodeURIComponent(a.name)}&singer=${encodeURIComponent(a.artist || artist.name)}`}
+                      proxySrc={`/api/album/cover?source=${a.source}&albumid=${encodeURIComponent(a.albumId)}&name=${encodeURIComponent(a.name)}&singer=${encodeURIComponent(a.artist || artist.name)}`}
                       className="h-full w-full object-cover transition group-hover:scale-105"
                     />
                   )}

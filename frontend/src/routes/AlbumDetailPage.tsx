@@ -171,7 +171,7 @@ export function AlbumDetailPage() {
               <ChainAlbumCover
                 img={album.img}
                 alt={album.name}
-                proxySrc={`/api/album/${source}/cover?albumid=${encodeURIComponent(albumId)}&name=${encodeURIComponent(album.name)}&singer=${encodeURIComponent(album.singer)}`}
+                proxySrc={`/api/album/cover?source=${source}&albumid=${encodeURIComponent(albumId)}&name=${encodeURIComponent(album.name)}&singer=${encodeURIComponent(album.singer)}`}
                 className="relative h-full w-full object-cover"
               />
             </div>
