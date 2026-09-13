@@ -386,10 +386,63 @@ export interface MgAlbumDetail {
   tracks: MusicInfo[]
 }
 
+/** 数字专辑（column）原生详情：resourceinfo.do（专辑元信息 + 曲目 contentId 列表，免登录）
+ *  → by-contentids/v2.0 一次补全标准 songItem（时长/音质）。两请求整张，曲序以专栏为准。 */
+async function getMgColumnAlbumDetail(columnId: string): Promise<MgAlbumDetail | null> {
+  interface ColRaw {
+    code?: string
+    resource?: Array<{
+      title?: string; singer?: string; publishDate?: string; summary?: string
+      imgItem?: Array<{ imgSizeType?: string; img?: string }>
+      songItems?: Array<{ contentId?: string | number; songId?: string | number; songName?: string }>
+    }>
+  }
+  const j = await mgGetJson<ColRaw>(`https://app.c.nf.migu.cn/v1.0/content/resourceinfo.do?needSimple=01&resourceType=5&resourceId=${encodeURIComponent(columnId)}`)
+  const meta = j?.resource?.[0]
+  if (!meta?.title || !meta.songItems?.length) return null
+
+  // by-contentids 补全（data 为索引对象；失败时用 resourceinfo 基础字段兜底，缺时长/音质）
+  const contentIds = meta.songItems.map(s => s.contentId).filter(Boolean).map(String)
+  interface BatchRaw { code?: string; data?: Record<string, MgSongItem> }
+  const batch = contentIds.length > 0
+    ? await mgGetJson<BatchRaw>(`https://app.c.nf.migu.cn/resource/song/by-contentids/v2.0?contentId=${encodeURIComponent(contentIds.join('|'))}`)
+    : null
+  const fullByContentId = new Map<string, MgSongItem>()
+  for (const item of Object.values(batch?.data || {})) {
+    if (item?.contentId != null) fullByContentId.set(String(item.contentId), item)
+  }
+
+  const pic = pickLargestImg(meta.imgItem)
+  const albumMeta = {
+    albumId: columnId,
+    name: clean(meta.title),
+    artist: clean(meta.singer),
+    pic,
+    summary: meta.summary ? clean(meta.summary).slice(0, 1000) || null : null,
+    ...(meta.publishDate ? { year: meta.publishDate.slice(0, 10) } : {}),
+  }
+  const tracks = meta.songItems
+    .map(item => {
+      const full = item.contentId != null ? fullByContentId.get(String(item.contentId)) : undefined
+      return full ?? ({ songId: item.songId, songName: item.songName } as MgSongItem)
+    })
+    .map(item => mgSongToMusicInfo(item, { name: albumMeta.name, pic }))
+    .filter((m): m is MusicInfo => m !== null)
+  if (tracks.length === 0) return null
+  return { album: albumMeta, tracks }
+}
+
 export async function getMgAlbumDetail(albumId: string): Promise<MgAlbumDetail | null> {
-  const cacheKey = `mg:albumDetail:${albumId}`
+  const cacheKey = `mg:albumDetail:v2:${albumId}`
   const cached = searchCache.get(cacheKey) as MgAlbumDetail | null
   if (cached) return cached
+
+  // 数字专辑（column id，6009 开头）走专栏原生链；老 albumId 走传统两接口
+  if (albumId.startsWith('6009')) {
+    const detail = await getMgColumnAlbumDetail(albumId)
+    if (detail) searchCache.set(cacheKey, detail, CACHE_TTL)
+    return detail
+  }
 
   interface AlbumInfoRaw {
     code?: string

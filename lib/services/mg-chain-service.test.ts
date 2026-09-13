@@ -134,3 +134,53 @@ describe('接口解析（fetch mock）', () => {
     expect(dbUpsert).toHaveBeenCalled()
   })
 })
+
+describe('数字专辑（column）原生链', () => {
+  beforeEach(() => {
+    get.mockReturnValue(undefined)
+    dbUpsert.mockResolvedValue([])
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  const json = (data: unknown, code = '000000') => ({
+    ok: true,
+    json: async () => ({ code, info: '操作成功', data }),
+  })
+
+  it('6009 前缀走 resourceinfo+by-contentids：曲序以专栏为准，时长/音质来自补全', async () => {
+    const colInfo = {
+      resource: [{
+        title: '太阳之子', singer: '周杰伦', publishDate: '2026-03-25', summary: '万众期盼！',
+        imgItem: [{ imgSizeType: '03', img: 'https://d/tzzz.webp' }],
+        songItems: [
+          { contentId: '600919000007823377', songId: '1142543109', songName: '太阳之子' },
+          { contentId: '600919000007823382', songId: '1142543100', songName: '西西里' },
+        ],
+      }],
+    }
+    const batch = {
+      0: { contentId: '600919000007823377', songId: '1142543109', songName: '太阳之子', duration: 297, singerList: [{ name: '周杰伦' }], audioFormats: [{ formatType: 'SQ' }] },
+      1: { contentId: '600919000007823382', songId: '1142543100', songName: '西西里', duration: 229, singerList: [{ name: '周杰伦' }] },
+    }
+    const calls = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
+      const u = String(url)
+      calls.push(u)
+      if (u.includes('resourceinfo.do')) return { ok: true, json: async () => colInfo }
+      if (u.includes('by-contentids')) return { ok: true, json: async () => ({ code: '000000', data: batch }) }
+      return json(null)
+    }))
+    const detail = await mgChain.getMgAlbumDetail('600927015009001083')
+    expect(detail?.album).toMatchObject({ albumId: '600927015009001083', name: '太阳之子', artist: '周杰伦', year: '2026-03-25', pic: 'https://d/tzzz.webp', summary: '万众期盼！' })
+    // 曲序=专栏 songItems 顺序；首曲拿到补全的时长与音质，次曲缺补全字段也能兜底
+    expect(detail?.tracks.map(t => `${t.name}:${t.interval}`)).toEqual(['太阳之子:04:57', '西西里:03:49'])
+    expect(detail?.tracks[0]?.types.map(t => t.type)).toEqual(['flac'])
+    expect(calls.some(u => u.includes('resourceinfo.do'))).toBe(true)
+    expect(calls.some(u => u.includes('by-contentids'))).toBe(true)
+  })
+
+  it('resourceinfo 空数据（假成功）返回 null → 上层走降级链', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ code: '000000', resource: [] }) })))
+    expect(await mgChain.getMgAlbumDetail('600900000000000009')).toBeNull()
+  })
+})
