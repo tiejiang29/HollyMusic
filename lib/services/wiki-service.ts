@@ -29,6 +29,20 @@ const PROXY_URL = process.env.WIKI_PROXY_URL || ''
 let dispatcher: ReturnType<typeof socksDispatcher> | null = null
 let dispatcherFailed = false
 
+/** 礼貌限速：同主机相邻请求间隔 ≥100ms（维基/Wikidata 限流按主机计，分开计时互不阻塞） */
+const POLITENESS_MS = 100
+const lastCallByHost = new Map<string, number>()
+
+function polite<T>(host: string, fn: () => Promise<T>): Promise<T> {
+  const run = (async () => {
+    const wait = Math.max(0, POLITENESS_MS - (Date.now() - (lastCallByHost.get(host) ?? 0)))
+    if (wait > 0) await new Promise(r => setTimeout(r, wait))
+    lastCallByHost.set(host, Date.now())
+    return fn()
+  })()
+  return run
+}
+
 function getDispatcher() {
   if (!PROXY_URL) return null
   if (dispatcher) return dispatcher
@@ -96,7 +110,7 @@ export async function getWikiPageData(query: string, kind: 'artist' | 'album'): 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), WIKI_TIMEOUT)
     try {
-      const resp = await polite(() => fetch(url, { dispatcher: d, signal: controller.signal } as RequestInit))
+      const resp = await polite('zh.wikipedia.org', () => fetch(url, { dispatcher: d, signal: controller.signal } as RequestInit))
       if (!resp.ok) return null
       const data = await resp.json() as {
         query?: { pages?: Record<string, { title?: string; extract?: string; thumbnail?: { source?: string }; pageprops?: { wikibase_item?: string } }> }
@@ -173,16 +187,6 @@ export async function fetchWikiImage(imageUrl: string): Promise<WikiImageBytes |
 /** Wikidata 声明（claims）的宽松形状 */
 type WdClaims = Record<string, Array<{ mainsnak?: { datavalue?: { value?: unknown } } }>>
 
-/** 礼貌队列：相邻维基/Wikidata 请求间隔 ≥250ms（模块级串行；维基限流会直接拒绝） */
-let wikiQueueTail: Promise<unknown> = Promise.resolve()
-function polite<T>(fn: () => Promise<T>): Promise<T> {
-  const run = wikiQueueTail.then(async () => {
-    await new Promise(r => setTimeout(r, 100))
-    return fn()
-  })
-  wikiQueueTail = run.catch(() => undefined)
-  return run
-}
 
 async function fetchWikidataJson(path: string): Promise<Record<string, unknown> | null> {
   const d = getDispatcher()
@@ -191,7 +195,7 @@ async function fetchWikidataJson(path: string): Promise<Record<string, unknown> 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), WIKI_TIMEOUT)
     try {
-      const resp = await polite(() => fetch(`https://www.wikidata.org${path}`, { dispatcher: d, signal: controller.signal } as RequestInit))
+      const resp = await polite('www.wikidata.org', () => fetch(`https://www.wikidata.org${path}`, { dispatcher: d, signal: controller.signal } as RequestInit))
       if (!resp.ok) return null
       return await resp.json() as Record<string, unknown>
     } finally {
