@@ -5,7 +5,7 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { AlbumGrid } from '@@/components/shared/AlbumGrid'
-import { KwAlbumCover } from '@@/components/shared/KwAlbumCover'
+import { ChainAlbumCover } from '@@/components/shared/ChainAlbumCover'
 import { Search, Music, X, CloudOff, ChevronDown, User, Disc3 } from 'lucide-react'
 import { toTrack } from '@/lib/types/player'
 import type { SourceType } from '@/lib/types/music'
@@ -324,7 +324,7 @@ export function SearchPage() {
           })()
         ) : artists.length > 0 ? (
           <>
-            <div className="mb-2 text-xs text-muted-foreground">歌手 · {artists[0].source === 'kw' ? '酷我' : 'Apple'} 数据源</div>
+            <div className="mb-2 text-xs text-muted-foreground">歌手 · {artists[0].source === 'kw' ? '酷我' : artists[0].source === 'mg' ? '咪咕' : 'Apple'} 数据源</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
               {artists.map(a => (
                 <Link
@@ -367,7 +367,7 @@ export function SearchPage() {
             {platformAlbums.length > 0 && (
               <>
                 <div className="mb-2 mt-6 text-xs text-muted-foreground">
-                  {albums.length > 0 ? '平台结果（本地库未收录）' : '平台专辑结果'} <span className="text-primary">{platformAlbums[0].source === 'kw' ? '酷我' : 'Apple'}</span>
+                  {albums.length > 0 ? '平台结果（本地库未收录）' : '平台专辑结果'} <span className="text-primary">{platformAlbums[0].source === 'kw' ? '酷我' : platformAlbums[0].source === 'mg' ? '咪咕' : 'Apple'}</span>
                 </div>
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                   {platformAlbums.map(a => (
@@ -377,12 +377,11 @@ export function SearchPage() {
                       className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
                     >
                       <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
-                        {a.source === 'kw' ? (
-                          <KwAlbumCover
-                            albumId={a.albumId}
-                            name={a.name}
-                            singer={a.singer}
+                        {a.source !== 'apple' ? (
+                          <ChainAlbumCover
                             img={a.img}
+                            alt={a.name}
+                            proxySrc={`/api/album/${a.source}/cover?albumid=${encodeURIComponent(a.albumId)}&name=${encodeURIComponent(a.name)}&singer=${encodeURIComponent(a.singer)}`}
                             className="h-full w-full object-cover transition group-hover:scale-105"
                           />
                         ) : (

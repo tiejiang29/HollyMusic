@@ -5,10 +5,10 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
-import { KwAlbumCover } from '@@/components/shared/KwAlbumCover'
+import { ChainAlbumCover } from '@@/components/shared/ChainAlbumCover'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
-import { getArtistDetail, getKwArtistDetail, type ArtistDetailData } from '@/lib/api/artist'
+import { getArtistDetail, getKwArtistDetail, getMgArtistDetail, type ArtistDetailData } from '@/lib/api/artist'
 
 /** 歌手详情页（双链）：kw=酷我全链（百科简介+官方头像+热门歌直可播+专辑）；
  *  apple=Apple 数据源（维基简介+热门歌落歌）。路由 /artist/:source/:artistId，
@@ -41,7 +41,7 @@ export function ArtistDetailPage() {
     }
     setLoading(true); setError(null); setUnsupported(false)
     try {
-      const r = source === 'kw' ? await getKwArtistDetail(artistId, nameKey) : await getArtistDetail(artistId)
+      const r = source === 'kw' ? await getKwArtistDetail(artistId, nameKey) : source === 'mg' ? await getMgArtistDetail(artistId, nameKey) : await getArtistDetail(artistId)
       if (stale()) return
       setDetail(r)
       setUnsupported(!!r.unsupported)
@@ -90,14 +90,14 @@ export function ArtistDetailPage() {
       {/* 歌手头部 */}
       <div className="mb-6 flex items-end gap-4">
         {avatarStage === 'primary' ? (
-          activeSource === 'kw' && artist.img ? (
+          (activeSource === 'kw' || activeSource === 'mg') && artist.img ? (
             <img
               src={artist.img}
               alt={artist.name}
               className="h-32 w-32 shrink-0 rounded-full object-cover shadow-lg"
               onError={() => setAvatarStage('wiki')}
             />
-          ) : activeSource === 'kw' ? (
+          ) : activeSource === 'kw' || activeSource === 'mg' ? (
             // kw 链无官方照：直接落维基档
             <img
               src={`/api/artist/avatar?name=${encodeURIComponent(artist.name)}`}
@@ -170,7 +170,7 @@ export function ArtistDetailPage() {
       )}
 
       {/* 热门歌曲 */}
-      <h2 className="mb-3 text-lg font-semibold">热门歌曲 <span className="text-sm font-normal text-muted-foreground">（{tracks.length} 首，{activeSource === 'kw' ? '酷我' : 'Apple'} 热门度）</span></h2>
+      <h2 className="mb-3 text-lg font-semibold">热门歌曲 <span className="text-sm font-normal text-muted-foreground">（{tracks.length} 首，{activeSource === 'kw' ? '酷我' : activeSource === 'mg' ? '咪咕' : 'Apple'} 热门度）</span></h2>
       {tracks.length > 0 ? (
         <>
           <SongList tracks={visibleTracks} />
@@ -210,21 +210,20 @@ export function ArtistDetailPage() {
                 className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
               >
                 <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
-                  {a.source === 'kw' ? (
-                    <KwAlbumCover
-                      albumId={a.albumId}
-                      name={a.name}
-                      singer={a.artist || artist.name}
-                      img={a.img}
-                      className="h-full w-full object-cover transition group-hover:scale-105"
-                    />
-                  ) : (
+                  {a.source === 'apple' ? (
                     <img
                       src={`/api/album/apple/cover?collectionId=${a.albumId}`}
                       alt={a.name}
                       loading="lazy"
                       className="h-full w-full object-cover transition group-hover:scale-105"
                       onError={e => { e.currentTarget.style.display = 'none' }}
+                    />
+                  ) : (
+                    <ChainAlbumCover
+                      img={a.img}
+                      alt={a.name}
+                      proxySrc={`/api/album/${a.source}/cover?albumid=${encodeURIComponent(a.albumId)}&name=${encodeURIComponent(a.name)}&singer=${encodeURIComponent(a.artist || artist.name)}`}
+                      className="h-full w-full object-cover transition group-hover:scale-105"
                     />
                   )}
                 </div>

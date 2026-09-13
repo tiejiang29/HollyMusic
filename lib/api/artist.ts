@@ -9,8 +9,8 @@ export interface ArtistSummary {
   artistId: string
   name: string
   genre?: string
-  /** 卡片来源（kw=酷我链详情 / apple=Apple 链详情），决定前端路由 */
-  source?: 'kw' | 'apple'
+  /** 卡片来源（kw=酷我 / mg=咪咕 / apple=Apple），决定前端路由 */
+  source?: 'kw' | 'mg' | 'apple'
   /** 酷我官方头像（star.kuwo.cn，卡片可直显） */
   pic?: string | null
   musicNum?: number
@@ -34,7 +34,7 @@ export interface AlbumProfile {
 }
 
 export type ArtistAlbumCard = {
-  source: 'kw' | 'apple'
+  source: 'kw' | 'mg' | 'apple'
   albumId: string
   name: string
   artist: string
@@ -72,6 +72,10 @@ export function getArtistDetail(artistId: string): Promise<ArtistDetailData> {
 }
 
 /** 酷我歌手详情（name=应急钥匙：kw 链不可用时服务端回落 Apple） */
+export function getMgArtistDetail(artistId: string, name?: string): Promise<ArtistDetailData> {
+  return apiGet('artist/mg/detail', name ? { artistId, name } : { artistId })
+}
+
 export function getKwArtistDetail(artistId: string, name?: string): Promise<ArtistDetailData> {
   return apiGet('artist/kw/detail', name ? { artistId, name } : { artistId })
 }

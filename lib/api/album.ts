@@ -38,9 +38,9 @@ export function getAppleAlbumTracks(collectionId: string): Promise<AppleAlbumDet
   return apiGet('album/apple/tracks', { collectionId })
 }
 
-/** 酷我专辑详情：r.s albuminfo 一次拿全曲目（全带 rid 直接可播） */
+/** 链专辑详情（kw/mg）：一次拿全曲目（全带可播 id）；apple 为降级形态 */
 export interface KwAlbumDetailData {
-  source: 'kw' | 'apple'
+  source: 'kw' | 'mg' | 'apple'
   album: {
     albumId?: string
     name: string
@@ -57,6 +57,13 @@ export interface KwAlbumDetailData {
 }
 
 /** 酷我专辑曲目（name/singer=应急钥匙：kw 链不可用时服务端回落 Apple） */
+export function getMgAlbumTracks(albumId: string, name?: string, singer?: string): Promise<KwAlbumDetailData> {
+  const params: Record<string, string> = { albumid: albumId }
+  if (name) params.name = name
+  if (singer) params.singer = singer
+  return apiGet('album/mg/tracks', params)
+}
+
 export function getKwAlbumTracks(albumId: string, name?: string, singer?: string): Promise<KwAlbumDetailData> {
   const params: Record<string, string> = { albumid: albumId }
   if (name) params.name = name
@@ -65,7 +72,7 @@ export function getKwAlbumTracks(albumId: string, name?: string, singer?: string
 }
 
 export interface PlatformAlbumSummary {
-  source: 'kw' | 'apple'
+  source: 'kw' | 'mg' | 'apple'
   /** kw albumid 或 Apple collectionId（按 source） */
   albumId: string
   name: string

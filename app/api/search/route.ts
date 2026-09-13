@@ -14,8 +14,7 @@ import { getMusicInfo, prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { searchOneSource } from '@/lib/services/song-search-service'
-import { searchItunesArtists } from '@/lib/services/itunes-service'
-import { searchKwArtists } from '@/lib/services/kw-chain-service'
+import { searchArtistCardsChain } from '@/lib/services/source-chain'
 import { searchAlbums } from '@/lib/services/album-service'
 import { dedupeByIdentity } from '@/lib/song-identity'
 import type { SearchResult, SourceType, Song } from '@/lib/types/music'
@@ -82,14 +81,9 @@ export async function GET(request: NextRequest) {
     // ---------- 类型分支：artist / album（type 缺省 = song，走原有五源逻辑，安卓零改动） ----------
     const type = searchParams.get('type') || 'song'
     if (type === 'artist') {
-      // 酷我链优先（卡片自带官方头像+歌曲数，详情全程 kw 命名空间）；
-      // 酷我失败/为空 → Apple 回退（卡片带 source 字段，前端按 source 路由）
-      const kwList = await searchKwArtists(keyword, 10).catch(() => [])
-      if (kwList.length > 0) {
-        return createSuccessResponse({ type, source: 'kw', list: kwList })
-      }
-      const list = (await searchItunesArtists(keyword, 10)).map(c => ({ ...c, source: 'apple' as const }))
-      return createSuccessResponse({ type, source: 'apple', list })
+      // 三源编排：酷我(完全匹配?) → 咪咕(完全匹配?) → Apple 兜底（卡片带 source 字段，前端按 source 路由）
+      const { source, list } = await searchArtistCardsChain(keyword, 10)
+      return createSuccessResponse({ type, source, list })
     }
     if (type === 'album') {
       const result = await searchAlbums(keyword, 30)

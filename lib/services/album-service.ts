@@ -23,6 +23,8 @@ import { searchOneSource } from '@/lib/services/song-search-service'
 import { batchResolveAndUpsert } from '@/lib/services/batch-resolve'
 import { getArtistAlbumIndex, getArtistAlbumsById, getItunesAlbumDetail, getItunesArtistSongs, searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
 import { searchKwAlbums, findKwAlbumId, getKwAlbumDetail } from '@/lib/services/kw-chain-service'
+import { findMgAlbumId, getMgAlbumDetail } from '@/lib/services/mg-chain-service'
+import { searchAlbumCardsChain } from '@/lib/services/source-chain'
 import { parseIntervalToSeconds } from '@/lib/services/source-toggle'
 import { getWikiExtract, getArtistProfile, getAlbumProfile, type ArtistProfile, type AlbumProfile } from '@/lib/services/wiki-service'
 
@@ -201,21 +203,14 @@ export async function getAlbumCover(gid: string): Promise<string | null> {
 
 /** 本地专辑倒查：曲目表逐首在线搜曲，返回可播放歌单与专辑元信息（年份/封面由 Apple 增强） */
 
-/** 酷我快路径：专辑名+歌手 → kw albumid → 整张曲目一次拿回（全带 rid，不写库）。
- *  本地曲目表为权威顺序：逐曲按「歌名归一双向包含 + 时长 ±8s」匹配 kw 曲目，
- *  返回 原始下标 → kw MusicInfo；kw 专辑不存在/匹配失败返回 null（走 batch 兜底）。 */
-async function resolveLocalTracksViaKw(
+/** 曲目匹配器（kw/mg 快路径共享）：本地曲目表为权威顺序，
+ *  逐曲按「歌名归一双向包含 + 时长 ±8s」匹配候选曲目，返回 原始下标 → MusicInfo */
+function matchTracksToCandidates(
   tracks: Array<{ title: string; secs: number | null }>,
-  artist: string,
-  albumTitle: string,
-): Promise<Map<number, MusicInfo> | null> {
-  const albumId = await findKwAlbumId(albumTitle, artist)
-  if (!albumId) return null
-  const kw = await getKwAlbumDetail(albumId)
-  if (!kw) return null
-
+  candidates: MusicInfo[],
+): Map<number, MusicInfo> {
   const normalize = (v: string | null | undefined) => normText(appleT2S(v || '').replace(/妳/g, '你'))
-  const kwTracks = kw.tracks.map(t => ({
+  const pool = candidates.map(t => ({
     mi: t,
     name: normalize(t.name),
     secs: parseIntervalToSeconds(t.interval),
@@ -225,7 +220,7 @@ async function resolveLocalTracksViaKw(
   tracks.forEach((track, i) => {
     const tNorm = normalize(track.title)
     if (!tNorm) return
-    const hit = kwTracks.find(k =>
+    const hit = pool.find(k =>
       !k.used && k.name
       && (k.name.includes(tNorm) || tNorm.includes(k.name))
       && (track.secs == null || k.secs == null || Math.abs(k.secs - track.secs) <= 8),
@@ -235,20 +230,40 @@ async function resolveLocalTracksViaKw(
       map.set(i, hit.mi)
     }
   })
+  return map
+}
+
+/** 链快路径（kw/mg 通用）：专辑名+歌手 → albumid → 整张曲目一次拿回（全带可播 id，不写库）。
+ *  匹配失败返回 null（走下一链/batch 兜底）。 */
+async function resolveLocalTracksViaChain(
+  source: 'kw' | 'mg',
+  tracks: Array<{ title: string; secs: number | null }>,
+  artist: string,
+  albumTitle: string,
+): Promise<Map<number, MusicInfo> | null> {
+  const albumId = source === 'kw'
+    ? await findKwAlbumId(albumTitle, artist)
+    : await findMgAlbumId(albumTitle, artist)
+  if (!albumId) return null
+  const detail = source === 'kw'
+    ? await getKwAlbumDetail(albumId)
+    : await getMgAlbumDetail(albumId)
+  if (!detail) return null
+  const map = matchTracksToCandidates(tracks, detail.tracks)
   return map.size > 0 ? map : null
 }
 
-/** kw 命中曲目单事务入库 + 附 uid（按本地曲目顺序）；失败返回 false 让全量走 batch 兜底 */
-async function upsertKwMatched(kwMap: Map<number, MusicInfo>): Promise<Song[] | null> {
-  if (kwMap.size === 0) return []
+/** 链命中曲目单事务入库 + 附 uid（按本地曲目顺序）；失败返回 null 让全量走 batch 兜底 */
+async function upsertChainMatched(chainMap: Map<number, MusicInfo>): Promise<Song[] | null> {
+  if (chainMap.size === 0) return []
   try {
-    await upsertMusicInfosInTransaction([...kwMap.values()])
+    await upsertMusicInfosInTransaction([...chainMap.values()])
   } catch (error) {
-    logger.warn('[album] 酷我快路径入库失败（该专辑走 batch 兜底）:', error instanceof Error ? error.message : error)
+    logger.warn('[album] 链快路径入库失败（该专辑走 batch 兜底）:', error instanceof Error ? error.message : error)
     return null
   }
   const songs: Song[] = []
-  kwMap.forEach(mi => songs.push({ ...mi, uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}` }))
+  chainMap.forEach(mi => songs.push({ ...mi, uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}` }))
   return songs
 }
 
@@ -256,25 +271,30 @@ async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gi
   const tracks = getLocalAlbumTracks(gid)
   if (tracks.length === 0) return null
 
-  // 曲目解析（酷我快路径优先 → batch 兜底）与 Apple/wiki 元数据增强全并行：
+  // 曲目解析（酷我快路径 → 咪咕快路径 → batch 兜底）与 Apple/wiki 元数据增强全并行：
   // 元数据只依赖专辑名+歌手，不依赖落歌结果
   const resolveTracks = async (): Promise<Song[]> => {
-    // 酷我快路径（优先）：整张专辑一次拿全 rid，本地表为权威顺序；
-    // 未命中的曲目回落 batchResolveAndUpsert（5 源逐首，三重校验）
-    let kwMap: Map<number, MusicInfo> | null = null
-    let kwSongs: Song[] | null = null
-    try {
-      kwMap = await resolveLocalTracksViaKw(tracks, localArtist, localTitle)
-      if (kwMap) kwSongs = await upsertKwMatched(kwMap)
-    } catch (error) {
-      logger.debug(`[album] 《${localTitle}》酷我快路径失败（走 batch 兜底）:`, error instanceof Error ? error.message : error)
+    let chainSongs: Song[] | null = null
+    let matched = new Set<number>()
+    for (const chain of ['kw', 'mg'] as const) {
+      try {
+        const chainMap = await resolveLocalTracksViaChain(chain, tracks, localArtist, localTitle)
+        if (!chainMap) continue
+        const songs = await upsertChainMatched(chainMap)
+        if (songs) {
+          chainSongs = songs
+          matched = new Set(chainMap.keys())
+          break
+        }
+      } catch (error) {
+        logger.debug(`[album] 《${localTitle}》${chain} 快路径失败（走下一条链）:`, error instanceof Error ? error.message : error)
+      }
     }
-    const matched = kwSongs ? new Set(kwMap?.keys() ?? []) : new Set<number>()
     const remaining = tracks.filter((_, i) => !matched.has(i))
     const fallbackList = remaining.length > 0
       ? await batchResolveAndUpsert(remaining, localArtist, localTitle)
       : []
-    return [...(kwSongs ?? []), ...fallbackList]
+    return [...(chainSongs ?? []), ...fallbackList]
   }
   const [list, apple, bio, profile] = await Promise.all([
     resolveTracks(),
@@ -437,46 +457,31 @@ export interface PlatformAlbumSummary {
  */
 export async function searchAlbums(keyword: string, limit = 30): Promise<{
   list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>
-  platformList: Array<{ source: 'kw' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
+  platformList: Array<{ source: 'kw' | 'mg' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
 }> {
   const k = keyword.trim()
   if (!k) return { list: [], platformList: [] }
-  const cacheKey = `album:v5:combined:${k}:${limit}`
-  type PlatformList = Array<{ source: 'kw' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
+  const cacheKey = `album:v7:combined:${k}:${limit}`
+  type PlatformList = Array<{ source: 'kw' | 'mg' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
   const cached = searchCache.get(cacheKey) as { list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>; platformList: PlatformList } | null
   if (cached) return cached
 
   const list = searchLocalAlbums(k, limit)
   let platformList: PlatformList = []
   if (list.length === 0) {
-    // 本地未命中 → 酷我链优先（卡片自带 albumid+封面，详情一步到位拿全 rid）；
-    // 酷我失败/为空 → Apple 兜底（均静默，返回空平台列表）
+    // 本地未命中 → 三源编排（kw 完全匹配? → mg 完全匹配? → apple → 模糊兜底）
     try {
-      platformList = (await searchKwAlbums(k, limit)).map(c => ({
-        source: 'kw' as const,
+      platformList = (await searchAlbumCardsChain(k, limit)).map(c => ({
+        source: c.source,
         albumId: c.albumId,
         name: c.name,
         singer: c.artist,
-        img: c.pic,
+        img: c.img ?? undefined,
         year: c.year,
+        ...('trackCount' in c && c.trackCount != null ? { trackCount: c.trackCount } : {}),
       }))
     } catch (error) {
-      logger.warn('[album] 酷我专辑搜索失败:', error instanceof Error ? error.message : error)
-    }
-    if (platformList.length === 0) {
-      try {
-        platformList = (await searchItunesAlbums(k, limit)).map(c => ({
-          source: 'apple' as const,
-          albumId: c.collectionId,
-          name: c.title,
-          singer: c.artist,
-          img: c.img,
-          year: c.year,
-          trackCount: c.trackCount,
-        }))
-      } catch (error) {
-        logger.warn('[album] Apple 专辑搜索兜底失败:', error instanceof Error ? error.message : error)
-      }
+      logger.warn('[album] 平台专辑搜索链失败:', error instanceof Error ? error.message : error)
     }
   }
   const result = { list, platformList }

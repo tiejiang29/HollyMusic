@@ -5,12 +5,12 @@ import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { AlbumCover } from '@@/components/shared/AlbumCover'
-import { KwAlbumCover } from '@@/components/shared/KwAlbumCover'
+import { ChainAlbumCover } from '@@/components/shared/ChainAlbumCover'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
-import { getLocalAlbumTracks, getAppleAlbumTracks, getKwAlbumTracks } from '@/lib/api/album'
+import { getLocalAlbumTracks, getAppleAlbumTracks, getKwAlbumTracks, getMgAlbumTracks } from '@/lib/api/album'
 import type { Song } from '@/lib/types/music'
 
 /** 专辑详情页（三模式）：gid = 本地专辑库倒查；kw = 酷我链（曲目全带 rid 直接可播）；
@@ -23,7 +23,7 @@ export function AlbumDetailPage() {
   const isLocal = !!gid
 
   const [detail, setDetail] = useState<{
-    album: { name: string; singer: string; trackCount?: number; img?: string | null; source?: string; albumId?: string; year?: string; company?: string }
+    album: { name: string; singer: string; trackCount?: number; img?: string | null; source?: string; albumId?: string; year?: string; company?: string; bio?: string | null }
     list: Song[]
   } | null>(null)
   const [unsupported, setUnsupported] = useState(false)
@@ -55,6 +55,20 @@ export function AlbumDetailPage() {
       setLoading(true); setError(null); setUnsupported(false)
       try {
         const r = await getKwAlbumTracks(albumId, name, singer)
+        if (stale()) return
+        setDetail(r.album ? { album: r.album, list: r.list } : null)
+        setUnsupported(!!r.unsupported || !r.album)
+      } catch (err) {
+        if (stale()) return
+        setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
+      } finally { if (!stale()) setLoading(false) }
+      return
+    }
+    // 咪咕链专辑：一次拿全 mg-{songId} 直接可播（含 summary 简介与唱片公司）
+    if (source === 'mg' && albumId) {
+      setLoading(true); setError(null); setUnsupported(false)
+      try {
+        const r = await getMgAlbumTracks(albumId, name, singer)
         if (stale()) return
         setDetail(r.album ? { album: r.album, list: r.list } : null)
         setUnsupported(!!r.unsupported || !r.album)
@@ -150,15 +164,14 @@ export function AlbumDetailPage() {
         <div className="h-32 w-32 shrink-0 overflow-hidden rounded-lg shadow-lg">
           {isLocal ? (
             <AlbumCover gid={gid} alt={album.name} className="h-full w-full" />
-          ) : source === 'kw' ? (
-            // 酷我专辑封面两级降级：直链 → /api/album/kw/cover（kw→Apple 服务端解析）；渐变+图标垫底
+          ) : source === 'kw' || source === 'mg' ? (
+            // 链专辑封面两级降级：直链 → /api/album/{source}/cover（服务端跨源解析）；渐变+图标垫底
             <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
               <Disc3 className="absolute h-12 w-12 text-primary-foreground/80" />
-              <KwAlbumCover
-                albumId={albumId}
-                name={album.name}
-                singer={album.singer}
+              <ChainAlbumCover
                 img={album.img}
+                alt={album.name}
+                proxySrc={`/api/album/${source}/cover?albumid=${encodeURIComponent(albumId)}&name=${encodeURIComponent(album.name)}&singer=${encodeURIComponent(album.singer)}`}
                 className="relative h-full w-full object-cover"
               />
             </div>
@@ -232,6 +245,13 @@ export function AlbumDetailPage() {
           {(profile.genres || []).slice(0, 3).map(g => <span key={g} className="rounded-md bg-primary/10 px-2 py-1 text-primary ring-1 ring-primary/30">{g}</span>)}
           {(profile.recordLabels || []).slice(0, 3).map(l => <span key={l} className="rounded-md bg-card px-2 py-1 text-muted-foreground ring-1 ring-border">{l}</span>)}
         </div>
+      )}
+
+      {(album as { bio?: string | null }).bio && (
+        <details className='mb-4 rounded-lg bg-card p-4 ring-1 ring-border'>
+          <summary className='cursor-pointer text-sm font-medium'>简介</summary>
+          <p className='mt-2 whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground'>{album.bio}</p>
+        </details>
       )}
 
       <SongList

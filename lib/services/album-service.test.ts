@@ -4,7 +4,8 @@ const {
   get, set, searchOneSource, findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks,
   searchLocalAlbums, getArtistAlbumIndex, getItunesAlbumDetail, searchItunesAlbums,
   dbFindFirst, dbGetStorageSongmid, batchResolveAndUpsert,
-  searchKwAlbums, findKwAlbumId, getKwAlbumDetail, upsertMusicInfosInTransaction,
+  searchKwArtists, searchKwAlbums, findKwAlbumId, getKwAlbumDetail, upsertMusicInfosInTransaction,
+  findMgAlbumId, getMgAlbumDetail, searchMgArtists, searchMgAlbums,
 } = vi.hoisted(() => ({
   get: vi.fn(),
   set: vi.fn(),
@@ -19,10 +20,15 @@ const {
   dbFindFirst: vi.fn(),
   dbGetStorageSongmid: vi.fn((mi: { songmid: string }) => mi.songmid),
   batchResolveAndUpsert: vi.fn(),
+  searchKwArtists: vi.fn(async () => []),
   searchKwAlbums: vi.fn(),
   findKwAlbumId: vi.fn(),
   getKwAlbumDetail: vi.fn(),
   upsertMusicInfosInTransaction: vi.fn(),
+  findMgAlbumId: vi.fn(async () => null),
+  getMgAlbumDetail: vi.fn(async () => null),
+  searchMgArtists: vi.fn(async () => []),
+  searchMgAlbums: vi.fn(async () => []),
 }))
 
 vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
@@ -41,9 +47,16 @@ vi.mock('@/lib/services/album-local-service', () => ({
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
 vi.mock('@/lib/services/batch-resolve', () => ({ batchResolveAndUpsert }))
 vi.mock('@/lib/services/kw-chain-service', () => ({
+  searchKwArtists,
   searchKwAlbums,
   findKwAlbumId,
   getKwAlbumDetail,
+}))
+vi.mock('@/lib/services/mg-chain-service', () => ({
+  findMgAlbumId,
+  getMgAlbumDetail,
+  searchMgArtists,
+  searchMgAlbums,
 }))
 vi.mock('@/lib/services/itunes-service', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/services/itunes-service')>()
@@ -230,7 +243,7 @@ describe('searchAlbums（本地优先 + 酷我兜底 + Apple 再兜底）', () =
   it('本地未命中：酷我优先兜底并映射 kw 卡片，不触发 Apple', async () => {
     searchLocalAlbums.mockReturnValue([])
     searchKwAlbums.mockResolvedValue([
-      { source: 'kw', albumId: '4533', name: '七里香', artist: '周杰伦', pic: 'https://img1.kuwo.cn/300/qlx.jpg', year: '2004-08-03' },
+      { source: 'kw', albumId: '4533', name: '七里香', artist: '周杰伦', pic: 'https://img1.kuwo.cn/300/qlx.jpg', img: 'https://img1.kuwo.cn/300/qlx.jpg', year: '2004-08-03' },
     ])
 
     const result = await searchAlbums('七里香', 30)
