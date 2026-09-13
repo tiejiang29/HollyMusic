@@ -92,11 +92,11 @@ export async function getWikiPageData(query: string, kind: 'artist' | 'album'): 
   if (!d) return null
 
   const search = kind === 'album' ? `${q} 專輯` : q
-  const url = 'https://zh.wikipedia.org/w/api.php?' + new URLSearchParams({
+  const buildUrl = (searchTerm: string) => 'https://zh.wikipedia.org/w/api.php?' + new URLSearchParams({
     action: 'query',
     format: 'json',
     generator: 'search',
-    gsrsearch: search,
+    gsrsearch: searchTerm,
     gsrlimit: '1',
     prop: 'extracts|pageimages|pageprops',
     explaintext: '1',
@@ -106,36 +106,56 @@ export async function getWikiPageData(query: string, kind: 'artist' | 'album'): 
     ppprop: 'wikibase_item',
   }).toString()
 
-  try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), WIKI_TIMEOUT)
+  /** 单次条目查询 */
+  const fetchPage = async (searchTerm: string): Promise<WikiPageData | null> => {
     try {
-      const resp = await polite('zh.wikipedia.org', () => fetch(url, { dispatcher: d, signal: controller.signal } as RequestInit))
-      if (!resp.ok) return null
-      const data = await resp.json() as {
-        query?: { pages?: Record<string, { title?: string; extract?: string; thumbnail?: { source?: string }; pageprops?: { wikibase_item?: string } }> }
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), WIKI_TIMEOUT)
+      try {
+        const resp = await polite('zh.wikipedia.org', () => fetch(buildUrl(searchTerm), { dispatcher: d, signal: controller.signal } as RequestInit))
+        if (!resp.ok) return null
+        const data = await resp.json() as {
+          query?: { pages?: Record<string, { title?: string; extract?: string; thumbnail?: { source?: string }; pageprops?: { wikibase_item?: string } }> }
+        }
+        const first = Object.values(data.query?.pages ?? {})[0]
+        const result: WikiPageData = {
+          extract: first?.extract?.trim() ? appleT2S(first.extract).slice(0, EXTRACT_LIMIT) : null,
+          thumbUrl: first?.thumbnail?.source || null,
+          qid: first?.pageprops?.wikibase_item || null,
+        }
+        if (!result.extract && !result.thumbUrl) return null
+        return result
+      } finally {
+        clearTimeout(timer)
       }
-      const pages = data.query?.pages ?? {}
-      const first = Object.values(pages)[0]
-      const result: WikiPageData = {
-        extract: first?.extract?.trim() ? appleT2S(first.extract).slice(0, EXTRACT_LIMIT) : null,
-        thumbUrl: first?.thumbnail?.source || null,
-        qid: first?.pageprops?.wikibase_item || null,
-      }
-      if (!result.extract && !result.thumbUrl) return null
-      searchCache.set(cacheKey, result, CACHE_TTL)
-      pageDataMemo.set(cacheKey, result)
-      setTimeout(() => pageDataMemo.delete(cacheKey), 10 * 60 * 1000)
-      return result
-    } finally {
-      clearTimeout(timer)
+    } catch (error) {
+      logger.debug('[wiki] 条目获取失败（静默）:', error instanceof Error ? error.message : error)
+      return null
     }
-  } catch (error) {
-    logger.debug('[wiki] 条目获取失败（静默）:', error instanceof Error ? error.message : error)
   }
-  pageDataMemo.set(cacheKey, null)
+
+  let result = await fetchPage(search)
+
+  // 消歧义检测：常见人名（如"张杰"）会命中维基消歧义页（"张杰可以指：…"），
+  // 简介是人物列表而非真正档案。追加"歌手"重搜可精确命中（实测"张杰 歌手"→
+  // "张杰 (中国大陆歌手)"；"周杰伦 歌手"仍命中"周杰倫"，不影响唯一条目）
+  if (kind === 'artist' && result?.extract && /可以指/.test(result.extract.slice(0, 30))) {
+    logger.debug(`[wiki] 命中消歧义页（${q}），追加"歌手"重搜`)
+    const retry = await fetchPage(`${q} 歌手`)
+    if (retry?.extract && !/可以指/.test(retry.extract.slice(0, 30))) {
+      result = retry
+    }
+  }
+
+  if (!result) {
+    pageDataMemo.set(cacheKey, null)
+    setTimeout(() => pageDataMemo.delete(cacheKey), 10 * 60 * 1000)
+    return null
+  }
+  searchCache.set(cacheKey, result, CACHE_TTL)
+  pageDataMemo.set(cacheKey, result)
   setTimeout(() => pageDataMemo.delete(cacheKey), 10 * 60 * 1000)
-  return null
+  return result
 }
 
 /** 取维基简介（简体）——getWikiPageData 的简介薄封装 */
