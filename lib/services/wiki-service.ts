@@ -303,7 +303,7 @@ export async function getArtistProfile(name: string): Promise<ArtistProfile | nu
     resolveQidLabels(claimQids(claims, 'P264'), 3),
     resolveQidLabels(claimQids(claims, 'P27'), 1),
   ])
-  const nationality = nationalities[0]
+  const nationality = nationalities[0]?.replace('中华民国', '中国台湾').replace('中華民國', '中国台湾')
   const profile: ArtistProfile = {
     qid: page.qid,
     ...(claimTime(claims, 'P569') ? { birthDate: claimTime(claims, 'P569') } : {}),
