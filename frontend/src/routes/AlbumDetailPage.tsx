@@ -9,10 +9,11 @@ import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
-import { getLocalAlbumTracks, getAppleAlbumTracks } from '@/lib/api/album'
+import { getLocalAlbumTracks, getAppleAlbumTracks, getKwAlbumTracks } from '@/lib/api/album'
 import type { Song } from '@/lib/types/music'
 
-/** 专辑详情页（双模式）：gid = 本地专辑库倒查；source+albumId = 平台专辑详情兜底。 */
+/** 专辑详情页（三模式）：gid = 本地专辑库倒查；kw = 酷我链（曲目全带 rid 直接可播）；
+ *  apple = Apple 曲目表逐首落歌。name/singer 兜底传递给 kw 链作降级应急钥匙。 */
 export function AlbumDetailPage() {
   const { gid = '', source = '', albumId = '' } = useParams<{ gid: string; source: string; albumId: string }>()
   const [searchParams] = useSearchParams()
@@ -21,7 +22,7 @@ export function AlbumDetailPage() {
   const isLocal = !!gid
 
   const [detail, setDetail] = useState<{
-    album: { name: string; singer: string; trackCount?: number; img?: string | null; source?: string; albumId?: string }
+    album: { name: string; singer: string; trackCount?: number; img?: string | null; source?: string; albumId?: string; year?: string; company?: string }
     list: Song[]
   } | null>(null)
   const [unsupported, setUnsupported] = useState(false)
@@ -48,7 +49,21 @@ export function AlbumDetailPage() {
       } finally { if (!stale()) setLoading(false) }
       return
     }
-    // Apple 平台专辑（搜索兜底卡片）：Apple 曲目表 → 逐首落歌
+    // 酷我链专辑（搜索平台卡片 / 歌手详情专辑网格）：一次拿全 rid 直接可播
+    if (source === 'kw' && albumId) {
+      setLoading(true); setError(null); setUnsupported(false)
+      try {
+        const r = await getKwAlbumTracks(albumId, name, singer)
+        if (stale()) return
+        setDetail(r.album ? { album: r.album, list: r.list } : null)
+        setUnsupported(!!r.unsupported || !r.album)
+      } catch (err) {
+        if (stale()) return
+        setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
+      } finally { if (!stale()) setLoading(false) }
+      return
+    }
+    // Apple 平台专辑（Apple 兜底卡片）：Apple 曲目表 → 逐首落歌
     if (source === 'apple' && albumId) {
       setLoading(true); setError(null); setUnsupported(false)
       try {
@@ -134,6 +149,19 @@ export function AlbumDetailPage() {
         <div className="h-32 w-32 shrink-0 overflow-hidden rounded-lg shadow-lg">
           {isLocal ? (
             <AlbumCover gid={gid} alt={album.name} className="h-full w-full" />
+          ) : source === 'kw' ? (
+            // 酷我专辑封面（卡片/详情自带 img1.kuwo.cn 直链）；渐变+图标垫底
+            <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
+              <Disc3 className="absolute h-12 w-12 text-primary-foreground/80" />
+              {album.img && (
+                <img
+                  src={album.img}
+                  alt={album.name}
+                  className="relative h-full w-full object-cover"
+                  onError={e => { e.currentTarget.style.display = 'none' }}
+                />
+              )}
+            </div>
           ) : (
             // Apple 专辑封面（服务端中转）；渐变+图标垫底，加载失败时露出占位
             <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">

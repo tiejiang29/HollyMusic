@@ -317,17 +317,31 @@ export function SearchPage() {
         !loading && artists.length === 1 && artistNavigateRef.current ? (
           // 单一歌手结果：自动跳进详情（完整包：简介+热门歌+专辑）
           (() => {
-            queueMicrotask(() => navigate(`/artist/apple/${artists[0].artistId}`))
+            const only = artists[0]
+            queueMicrotask(() => navigate(`/artist/${only.source || 'apple'}/${only.artistId}?name=${encodeURIComponent(only.name)}`))
             return <LoadingSkeleton />
           })()
         ) : artists.length > 0 ? (
           <>
-            <div className="mb-2 text-xs text-muted-foreground">歌手 · Apple 数据源</div>
+            <div className="mb-2 text-xs text-muted-foreground">歌手 · {artists[0].source === 'kw' ? '酷我' : 'Apple'} 数据源</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
               {artists.map(a => (
-                <Link key={a.artistId} to={`/artist/apple/${a.artistId}`} className="group flex flex-col items-center gap-2 rounded-lg p-3 hover:bg-accent/40">
-                  <div className="flex h-20 w-20 items-center justify-center rounded-full bg-gradient-to-br from-primary/40 to-primary/10 transition group-hover:scale-105">
+                <Link
+                  key={`${a.source || 'apple'}-${a.artistId}`}
+                  to={`/artist/${a.source || 'apple'}/${a.artistId}?name=${encodeURIComponent(a.name)}`}
+                  className="group flex flex-col items-center gap-2 rounded-lg p-3 hover:bg-accent/40"
+                >
+                  <div className="relative flex h-20 w-20 items-center justify-center rounded-full bg-gradient-to-br from-primary/40 to-primary/10 transition group-hover:scale-105">
                     <User className="h-9 w-9 text-primary/80" />
+                    {a.pic && (
+                      <img
+                        src={a.pic}
+                        alt={a.name}
+                        loading="lazy"
+                        className="absolute inset-0 h-full w-full rounded-full object-cover"
+                        onError={e => { e.currentTarget.style.display = 'none' }}
+                      />
+                    )}
                   </div>
                   <div className="max-w-full truncate text-sm font-medium">{a.name}</div>
                   {a.genre && <div className="max-w-full truncate text-xs text-muted-foreground">{a.genre}</div>}
@@ -352,18 +366,18 @@ export function SearchPage() {
             {platformAlbums.length > 0 && (
               <>
                 <div className="mb-2 mt-6 text-xs text-muted-foreground">
-                  {albums.length > 0 ? '平台结果（本地库未收录）' : '平台专辑结果'} <span className="text-primary">网易</span>
+                  {albums.length > 0 ? '平台结果（本地库未收录）' : '平台专辑结果'} <span className="text-primary">{platformAlbums[0].source === 'kw' ? '酷我' : 'Apple'}</span>
                 </div>
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                   {platformAlbums.map(a => (
                     <Link
-                      key={`wy-${a.albumId}`}
-                      to={`/album/wy/${a.albumId}?name=${encodeURIComponent(a.name)}&singer=${encodeURIComponent(a.singer)}`}
+                      key={`${a.source}-${a.albumId}`}
+                      to={`/album/${a.source}/${a.albumId}?name=${encodeURIComponent(a.name)}&singer=${encodeURIComponent(a.singer)}`}
                       className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
                     >
                       <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
                         <img
-                          src={`/api/album/apple/cover?collectionId=${a.albumId}`}
+                          src={a.source === 'kw' && a.img ? a.img : `/api/album/apple/cover?collectionId=${a.albumId}`}
                           alt={a.name}
                           loading="lazy"
                           className="h-full w-full object-cover transition group-hover:scale-105"
@@ -372,7 +386,7 @@ export function SearchPage() {
                       </div>
                       <div className="truncate text-sm font-medium">{a.name}</div>
                       <div className="truncate text-xs text-muted-foreground">
-                        {a.singer}{a.trackCount ? ` · ${a.trackCount} 首` : ''}
+                        {a.singer}{a.year ? ` · ${a.year.slice(0, 4)}` : a.trackCount ? ` · ${a.trackCount} 首` : ''}
                       </div>
                     </Link>
                   ))}

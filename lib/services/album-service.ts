@@ -15,13 +15,15 @@
 
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
-import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
+import { prisma, getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/lib/db'
 import { songIdentity } from '@/lib/song-identity'
 import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
 import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
 import { batchResolveAndUpsert } from '@/lib/services/batch-resolve'
-import { getArtistAlbumIndex, getArtistAlbumsById, getItunesAlbumDetail, getItunesArtistSongs, searchItunesArtists, searchItunesAlbums } from '@/lib/services/itunes-service'
+import { getArtistAlbumIndex, getArtistAlbumsById, getItunesAlbumDetail, getItunesArtistSongs, searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
+import { searchKwAlbums, findKwAlbumId, getKwAlbumDetail } from '@/lib/services/kw-chain-service'
+import { parseIntervalToSeconds } from '@/lib/services/source-toggle'
 import { getWikiExtract, getArtistProfile, getAlbumProfile, type ArtistProfile, type AlbumProfile } from '@/lib/services/wiki-service'
 
 /** 专辑详情（含已入库曲目）缓存 */
@@ -197,19 +199,92 @@ export async function getAlbumCover(gid: string): Promise<string | null> {
 }
 
 /** 本地专辑倒查：曲目表逐首在线搜曲，返回可播放歌单与专辑元信息（年份/封面由 Apple 增强） */
+
+/** 酷我快路径：专辑名+歌手 → kw albumid → 整张曲目一次拿回（全带 rid，不写库）。
+ *  本地曲目表为权威顺序：逐曲按「歌名归一双向包含 + 时长 ±8s」匹配 kw 曲目，
+ *  返回 原始下标 → kw MusicInfo；kw 专辑不存在/匹配失败返回 null（走 batch 兜底）。 */
+async function resolveLocalTracksViaKw(
+  tracks: Array<{ title: string; secs: number | null }>,
+  artist: string,
+  albumTitle: string,
+): Promise<Map<number, MusicInfo> | null> {
+  const albumId = await findKwAlbumId(albumTitle, artist)
+  if (!albumId) return null
+  const kw = await getKwAlbumDetail(albumId)
+  if (!kw) return null
+
+  const normalize = (v: string | null | undefined) => normText(appleT2S(v || '').replace(/妳/g, '你'))
+  const kwTracks = kw.tracks.map(t => ({
+    mi: t,
+    name: normalize(t.name),
+    secs: parseIntervalToSeconds(t.interval),
+    used: false,
+  }))
+  const map = new Map<number, MusicInfo>()
+  tracks.forEach((track, i) => {
+    const tNorm = normalize(track.title)
+    if (!tNorm) return
+    const hit = kwTracks.find(k =>
+      !k.used && k.name
+      && (k.name.includes(tNorm) || tNorm.includes(k.name))
+      && (track.secs == null || k.secs == null || Math.abs(k.secs - track.secs) <= 8),
+    )
+    if (hit) {
+      hit.used = true
+      map.set(i, hit.mi)
+    }
+  })
+  return map.size > 0 ? map : null
+}
+
+/** kw 命中曲目单事务入库 + 附 uid（按本地曲目顺序）；失败返回 false 让全量走 batch 兜底 */
+async function upsertKwMatched(kwMap: Map<number, MusicInfo>): Promise<Song[] | null> {
+  if (kwMap.size === 0) return []
+  try {
+    await upsertMusicInfosInTransaction([...kwMap.values()])
+  } catch (error) {
+    logger.warn('[album] 酷我快路径入库失败（该专辑走 batch 兜底）:', error instanceof Error ? error.message : error)
+    return null
+  }
+  const songs: Song[] = []
+  kwMap.forEach(mi => songs.push({ ...mi, uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}` }))
+  return songs
+}
+
 async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gid: string): Promise<AlbumDetail | null> {
   const tracks = getLocalAlbumTracks(gid)
   if (tracks.length === 0) return null
-  // 批量解析：全并发搜索（零 DB 写入）→ 一次入库 → 附 uid
-  const list = await batchResolveAndUpsert(tracks, localArtist, localTitle)
+
+  // 曲目解析（酷我快路径优先 → batch 兜底）与 Apple/wiki 元数据增强全并行：
+  // 元数据只依赖专辑名+歌手，不依赖落歌结果
+  const resolveTracks = async (): Promise<Song[]> => {
+    // 酷我快路径（优先）：整张专辑一次拿全 rid，本地表为权威顺序；
+    // 未命中的曲目回落 batchResolveAndUpsert（5 源逐首，三重校验）
+    let kwMap: Map<number, MusicInfo> | null = null
+    let kwSongs: Song[] | null = null
+    try {
+      kwMap = await resolveLocalTracksViaKw(tracks, localArtist, localTitle)
+      if (kwMap) kwSongs = await upsertKwMatched(kwMap)
+    } catch (error) {
+      logger.debug(`[album] 《${localTitle}》酷我快路径失败（走 batch 兜底）:`, error instanceof Error ? error.message : error)
+    }
+    const matched = kwSongs ? new Set(kwMap?.keys() ?? []) : new Set<number>()
+    const remaining = tracks.filter((_, i) => !matched.has(i))
+    const fallbackList = remaining.length > 0
+      ? await batchResolveAndUpsert(remaining, localArtist, localTitle)
+      : []
+    return [...(kwSongs ?? []), ...fallbackList]
+  }
+  const [list, apple, bio, profile] = await Promise.all([
+    resolveTracks(),
+    getAppleAlbumMeta(localTitle, localArtist).catch(() => ({ img: null as string | null, year: undefined as string | undefined })),
+    getWikiExtract(localTitle, 'album').catch(() => null),
+    getAlbumProfile(localTitle, gid).catch(() => null),
+  ])
   if (list.length === 0) {
     logger.warn(`[album] 本地专辑《${localTitle}》逐首匹配全部失败`)
     return null
   }
-  // Apple 增强（缓存命中时近零成本；失败静默）
-  const apple = await getAppleAlbumMeta(localTitle, localArtist).catch(() => ({ img: null as string | null, year: undefined as string | undefined }))
-  const bio = await getWikiExtract(localTitle, 'album').catch(() => null)
-  const profile = await getAlbumProfile(localTitle, gid).catch(() => null)
   return {
     album: {
       source: 'local',
@@ -234,7 +309,7 @@ export interface LocalAlbumDetail {
 /** 按 gid 解析本地专辑为可播放歌单（安卓专辑板块详情用） */
 export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumDetail | null> {
   // 详情缓存（落歌昂贵，二次打开秒回；封面探测接口也借这份缓存取 img）
-  const cacheKey = `album:v3:local:${gid}`
+  const cacheKey = `album:v6:local:${gid}`
   const cached = searchCache.get(cacheKey) as LocalAlbumDetail | null
   if (cached) return cached
 
@@ -361,30 +436,46 @@ export interface PlatformAlbumSummary {
  */
 export async function searchAlbums(keyword: string, limit = 30): Promise<{
   list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>
-  platformList: Array<{ source: 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
+  platformList: Array<{ source: 'kw' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
 }> {
   const k = keyword.trim()
   if (!k) return { list: [], platformList: [] }
-  const cacheKey = `album:v4:combined:${k}:${limit}`
-  const cached = searchCache.get(cacheKey) as { list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>; platformList: Array<{ source: 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }> } | null
+  const cacheKey = `album:v5:combined:${k}:${limit}`
+  type PlatformList = Array<{ source: 'kw' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
+  const cached = searchCache.get(cacheKey) as { list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>; platformList: PlatformList } | null
   if (cached) return cached
 
   const list = searchLocalAlbums(k, limit)
-  let platformList: Array<{ source: 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }> = []
+  let platformList: PlatformList = []
   if (list.length === 0) {
-    // 本地未命中 → Apple 兜底（失败静默，返回空平台列表）
+    // 本地未命中 → 酷我链优先（卡片自带 albumid+封面，详情一步到位拿全 rid）；
+    // 酷我失败/为空 → Apple 兜底（均静默，返回空平台列表）
     try {
-      platformList = (await searchItunesAlbums(k, limit)).map(c => ({
-        source: 'apple' as const,
-        albumId: c.collectionId,
-        name: c.title,
+      platformList = (await searchKwAlbums(k, limit)).map(c => ({
+        source: 'kw' as const,
+        albumId: c.albumId,
+        name: c.name,
         singer: c.artist,
-        img: c.img,
+        img: c.pic,
         year: c.year,
-        trackCount: c.trackCount,
       }))
     } catch (error) {
-      logger.warn('[album] Apple 专辑搜索兜底失败:', error instanceof Error ? error.message : error)
+      logger.warn('[album] 酷我专辑搜索失败:', error instanceof Error ? error.message : error)
+    }
+    if (platformList.length === 0) {
+      try {
+        platformList = (await searchItunesAlbums(k, limit)).map(c => ({
+          source: 'apple' as const,
+          albumId: c.collectionId,
+          name: c.title,
+          singer: c.artist,
+          img: c.img,
+          year: c.year,
+          trackCount: c.trackCount,
+        }))
+      } catch (error) {
+        logger.warn('[album] Apple 专辑搜索兜底失败:', error instanceof Error ? error.message : error)
+      }
     }
   }
   const result = { list, platformList }

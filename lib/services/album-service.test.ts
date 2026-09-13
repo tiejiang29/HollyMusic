@@ -4,6 +4,7 @@ const {
   get, set, searchOneSource, findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks,
   searchLocalAlbums, getArtistAlbumIndex, getItunesAlbumDetail, searchItunesAlbums,
   dbFindFirst, dbGetStorageSongmid, batchResolveAndUpsert,
+  searchKwAlbums, findKwAlbumId, getKwAlbumDetail, upsertMusicInfosInTransaction,
 } = vi.hoisted(() => ({
   get: vi.fn(),
   set: vi.fn(),
@@ -18,12 +19,17 @@ const {
   dbFindFirst: vi.fn(),
   dbGetStorageSongmid: vi.fn((mi: { songmid: string }) => mi.songmid),
   batchResolveAndUpsert: vi.fn(),
+  searchKwAlbums: vi.fn(),
+  findKwAlbumId: vi.fn(),
+  getKwAlbumDetail: vi.fn(),
+  upsertMusicInfosInTransaction: vi.fn(),
 }))
 
 vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
 vi.mock('@/lib/db', () => ({
   prisma: { musicInfo: { findFirst: dbFindFirst } },
   getStorageSongmidForMusicInfo: dbGetStorageSongmid,
+  upsertMusicInfosInTransaction,
 }))
 vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
 vi.mock('@/lib/services/album-local-service', () => ({
@@ -34,6 +40,11 @@ vi.mock('@/lib/services/album-local-service', () => ({
 }))
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
 vi.mock('@/lib/services/batch-resolve', () => ({ batchResolveAndUpsert }))
+vi.mock('@/lib/services/kw-chain-service', () => ({
+  searchKwAlbums,
+  findKwAlbumId,
+  getKwAlbumDetail,
+}))
 vi.mock('@/lib/services/itunes-service', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/services/itunes-service')>()
   return { ...actual, getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs: vi.fn(), searchItunesAlbums }
@@ -67,6 +78,10 @@ beforeEach(() => {
   getLocalAlbumTracks.mockReturnValue(LOCAL_TRACKS)
   findLocalAlbum.mockReturnValue(LOCAL_ALBUM)
   searchLocalAlbums.mockReturnValue([LOCAL_ALBUM])
+  searchKwAlbums.mockResolvedValue([])
+  findKwAlbumId.mockResolvedValue(null)
+  getKwAlbumDetail.mockResolvedValue(null)
+  upsertMusicInfosInTransaction.mockResolvedValue([])
 })
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -96,6 +111,33 @@ describe('getLocalAlbumDetailByGid（本地专辑倒查）', () => {
     batchResolveAndUpsert.mockResolvedValue([])
 
     expect(await getLocalAlbumDetailByGid(GID)).toBeNull()
+  })
+
+  it('酷我快路径：kw 专辑匹配曲目单事务入库，未命中曲目回落 batch 兜底', async () => {
+    // kw 专辑《叶惠美》有 2 曲，其中「以父之名」时长能对上，「懦夫」kw 缺失
+    findKwAlbumId.mockResolvedValue('1293')
+    getKwAlbumDetail.mockResolvedValue({
+      album: { albumId: '1293', name: '叶惠美', artist: '周杰伦', pic: 'https://img1.kuwo.cn/300/yhm.jpg', year: '2003-07-31' },
+      tracks: [
+        { name: '以父之名', singer: '周杰伦', source: 'kw', songmid: '97086', albumName: '叶惠美', interval: '05:42', img: null, types: [], _types: {}, typeUrl: {} },
+        { name: '东风破', singer: '周杰伦', source: 'kw', songmid: '97087', albumName: '叶惠美', interval: '05:15', img: null, types: [], _types: {}, typeUrl: {} },
+      ],
+    })
+    batchResolveAndUpsert.mockResolvedValue([resolvedSong('懦夫', 'tx')])
+
+    const detail = await getLocalAlbumDetailByGid(GID)
+
+    // kw 命中曲目单事务入库
+    expect(upsertMusicInfosInTransaction).toHaveBeenCalledWith([
+      expect.objectContaining({ songmid: '97086' }),
+    ])
+    // 兜底只收到未命中的「懦夫」
+    expect(batchResolveAndUpsert).toHaveBeenCalledWith(
+      [LOCAL_TRACKS[1]], '周杰伦', '叶惠美',
+    )
+    // 本地曲目顺序：kw 命中的以父之名在前，兜底的懦夫随后
+    expect(detail?.list.map(s => s.name)).toEqual(['以父之名', '懦夫'])
+    expect(detail?.list[0]).toMatchObject({ source: 'kw', songmid: '97086', uid: 'kw-97086' })
   })
 
   it('gid 不在本地库返回 null', async () => {
@@ -175,17 +217,35 @@ describe('getAppleAlbumDetail（Apple 曲目表批量落歌）', () => {
   })
 })
 
-describe('searchAlbums（本地优先 + Apple 兜底）', () => {
-  it('本地命中：platformList 为空，不触发 Apple 搜索', async () => {
+describe('searchAlbums（本地优先 + 酷我兜底 + Apple 再兜底）', () => {
+  it('本地命中：platformList 为空，不触发酷我/Apple 搜索', async () => {
     const result = await searchAlbums('叶惠美', 30)
 
     expect(result.list.map(a => a.title)).toEqual(['叶惠美'])
     expect(result.platformList).toEqual([])
+    expect(searchKwAlbums).not.toHaveBeenCalled()
     expect(searchItunesAlbums).not.toHaveBeenCalled()
   })
 
-  it('本地未命中：自动回退 Apple 专辑搜索并映射卡片', async () => {
+  it('本地未命中：酷我优先兜底并映射 kw 卡片，不触发 Apple', async () => {
     searchLocalAlbums.mockReturnValue([])
+    searchKwAlbums.mockResolvedValue([
+      { source: 'kw', albumId: '4533', name: '七里香', artist: '周杰伦', pic: 'https://img1.kuwo.cn/300/qlx.jpg', year: '2004-08-03' },
+    ])
+
+    const result = await searchAlbums('七里香', 30)
+
+    expect(searchKwAlbums).toHaveBeenCalledWith('七里香', 30)
+    expect(searchItunesAlbums).not.toHaveBeenCalled()
+    expect(result.platformList).toEqual([
+      { source: 'kw', albumId: '4533', name: '七里香', singer: '周杰伦', img: 'https://img1.kuwo.cn/300/qlx.jpg', year: '2004-08-03' },
+    ])
+    expect(result.list).toEqual([])
+  })
+
+  it('本地未命中且酷我为空：回落 Apple 专辑搜索并映射卡片', async () => {
+    searchLocalAlbums.mockReturnValue([])
+    searchKwAlbums.mockResolvedValue([])
     searchItunesAlbums.mockResolvedValue([
       { collectionId: '536114662', title: '七里香', artist: '周杰伦', trackCount: 10, year: '2004-08-03', img: 'https://mzstatic/qlx.jpg' },
     ])
