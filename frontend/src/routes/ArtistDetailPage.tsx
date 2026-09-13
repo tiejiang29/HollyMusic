@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
-import { Disc3, Music, Play, RefreshCw, User } from 'lucide-react'
+import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom'
+import { Disc3, ListPlus, Music, Play, RefreshCw, User } from 'lucide-react'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -8,7 +8,6 @@ import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { getArtistDetail, getKwArtistDetail, type ArtistDetailData } from '@/lib/api/artist'
-import { Link } from 'react-router-dom'
 
 /** 歌手详情页（双链）：kw=酷我全链（百科简介+官方头像+热门歌直可播+专辑）；
  *  apple=Apple 数据源（维基简介+热门歌落歌）。路由 /artist/:source/:artistId，
@@ -59,6 +58,13 @@ export function ArtistDetailPage() {
   }, [source, artistId, nameKey])
 
   const tracks: Track[] = (detail?.hotSongs ?? []).map(song => toTrack({ uid: song.uid, musicInfo: song }))
+
+  // 热门歌分页：首屏 30，逐次加载 30（kw 链一次有 100 首，避免长列表一铺到底）
+  const HOT_PAGE_SIZE = 30
+  const [visibleCount, setVisibleCount] = useState(HOT_PAGE_SIZE)
+  useEffect(() => { setVisibleCount(HOT_PAGE_SIZE) }, [source, artistId, nameKey])
+  const visibleTracks = tracks.slice(0, visibleCount)
+  const remainingCount = tracks.length - visibleTracks.length
 
   if (loading) return <div className="p-6"><LoadingSkeleton /></div>
 
@@ -164,7 +170,19 @@ export function ArtistDetailPage() {
       {/* 热门歌曲 */}
       <h2 className="mb-3 text-lg font-semibold">热门歌曲 <span className="text-sm font-normal text-muted-foreground">（{tracks.length} 首，{activeSource === 'kw' ? '酷我' : 'Apple'} 热门度）</span></h2>
       {tracks.length > 0 ? (
-        <SongList tracks={tracks} />
+        <>
+          <SongList tracks={visibleTracks} />
+          {remainingCount > 0 && (
+            <div className="mt-3 flex justify-center">
+              <button
+                onClick={() => setVisibleCount(c => c + HOT_PAGE_SIZE)}
+                className="flex items-center gap-1.5 rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-foreground"
+              >
+                <ListPlus className="h-4 w-4" /> 加载更多（还有 {remainingCount} 首）
+              </button>
+            </div>
+          )}
+        </>
       ) : (
         <EmptyState icon={Music} title="暂无可播热门歌曲" description="该歌手的歌曲未能匹配到可播放版本" />
       )}

@@ -131,7 +131,7 @@ describe('getKwArtistDetail 整包', () => {
     expect(detail?.hotSongs[0]).toMatchObject({ songmid: '228908', uid: 'kw-228908' })
     expect(dbUpsert).toHaveBeenCalled()
     expect(detail?.albums).toEqual([
-      { source: 'kw', albumId: '4533', name: '七里香', artist: '周杰伦', pic: 'https://img1/300.jpg', year: '2004-08-03' },
+      { source: 'kw', albumId: '4533', name: '七里香', artist: '周杰伦', pic: 'https://img1/300.jpg', img: 'https://img1/300.jpg', year: '2004-08-03' },
     ])
   })
 

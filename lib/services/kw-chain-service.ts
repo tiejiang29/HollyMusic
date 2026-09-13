@@ -212,8 +212,9 @@ export interface KwAlbumCard {
   albumId: string
   name: string
   artist: string
-  /** 300px 专辑封面（img1.kuwo.cn） */
-  pic?: string | null
+  /** 300px 专辑封面（img1.kuwo.cn），pic/img 同值双口径（前端统一消费 img） */
+  pic: string | null
+  img: string | null
   year?: string
 }
 
@@ -293,6 +294,7 @@ export async function searchKwAlbums(keyword: string, limit = 30): Promise<KwAlb
       name: clean(a.album),
       artist: clean(a.artist),
       pic: a.pic || null,
+      img: a.pic || null,
       ...(a.releaseDate ? { year: a.releaseDate.slice(0, 10) } : {}),
     }))
   if (list.length > 0) searchCache.set(cacheKey, list, CACHE_TTL)
@@ -305,7 +307,7 @@ export async function searchKwAlbums(keyword: string, limit = 30): Promise<KwAlb
 
 /** 歌手信息：artist/artist（百科级简介 + 官方头像 + 生日/国籍） */
 export async function getKwArtistInfo(artistId: string): Promise<KwArtistInfo | null> {
-  const cacheKey = `kw:artistInfo:${artistId}`
+  const cacheKey = `kw:artistInfo:v2:${artistId}`
   const cached = searchCache.get(cacheKey) as KwArtistInfo | null
   if (cached) return cached
 
@@ -380,7 +382,7 @@ export async function getKwArtistSongs(
 
 /** 歌手专辑全集：artistAlbum（wapi 免 Secret 已验证） */
 export async function getKwArtistAlbums(artistId: string, limit = 30): Promise<KwAlbumCard[]> {
-  const cacheKey = `kw:artistAlbums:${artistId}:${limit}`
+  const cacheKey = `kw:artistAlbums:v2:${artistId}:${limit}`
   const cached = searchCache.get(cacheKey) as KwAlbumCard[] | null
   if (cached) return cached
 
@@ -397,6 +399,7 @@ export async function getKwArtistAlbums(artistId: string, limit = 30): Promise<K
       name: clean(a.album),
       artist: clean(a.artist),
       pic: a.pic || null,
+      img: a.pic || null,
       ...(a.releaseDate ? { year: a.releaseDate.slice(0, 10) } : {}),
     }))
   if (list.length > 0) searchCache.set(cacheKey, list, CACHE_TTL)
@@ -463,7 +466,7 @@ export interface KwArtistDetail {
 /** 酷我歌手详情整包：信息/热门歌/专辑三路并行 → 热门歌一次入库附 uid。缓存 1h。
  *  返回 null = 酷我链整体不可用（调用方走名字应急钥匙回落 Apple）。 */
 export async function getKwArtistDetail(artistId: string): Promise<KwArtistDetail | null> {
-  const cacheKey = `kw:artistDetail:${artistId}`
+  const cacheKey = `kw:artistDetail:v3:${artistId}`
   const cached = searchCache.get(cacheKey) as KwArtistDetail | null
   if (cached) return cached
 
