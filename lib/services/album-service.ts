@@ -18,9 +18,10 @@ import { logger } from '@/lib/logger'
 import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import { songIdentity } from '@/lib/song-identity'
 import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
-import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums, type LocalAlbumTrack } from '@/lib/services/album-local-service'
+import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
-import { appleT2S, getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs, searchItunesAlbums } from '@/lib/services/itunes-service'
+import { batchResolveAndUpsert } from '@/lib/services/batch-resolve'
+import { getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs, searchItunesAlbums } from '@/lib/services/itunes-service'
 import { getWikiExtract, getArtistProfile, getAlbumProfile, type ArtistProfile, type AlbumProfile } from '@/lib/services/wiki-service'
 
 /** 专辑详情（含已入库曲目）缓存 */
@@ -76,60 +77,6 @@ async function resolveFromLocalLibrary(title: string, artist: string): Promise<S
     logger.debug('[album] 本地库 identity 查询失败（跳过）:', error instanceof Error ? error.message : error)
     return null
   }
-}
-
-/** 单首曲目跨源搜曲：本地库 identity 优先 → 在线按 RESOLVE_SOURCE_ORDER 依次尝试。
- *  候选校验（三重，歌名始终参与）：歌手归一化匹配 + 歌名简繁归一双向包含 + 时长 ±8s
- *  （无时长数据时歌名+歌手即通过）。带专辑上下文时优先取 albumName 一致的专辑版本，
- *  平台只收单曲版本时回退首个通过校验的候选（同一首歌、不同发行）。 */
-async function resolveLocalTrack(track: LocalAlbumTrack, artist: string, albumTitle?: string): Promise<Song | null> {
-  const localFit = await resolveFromLocalLibrary(track.title, artist)
-  if (localFit) return localFit
-
-  const keyword = `${track.title} ${artist}`
-  // 歌名归一化：OpenCC 简繁 + 妳→你（异体字 OpenCC 不转，"妳听得到/你听得到"会一字之差漏配）
-  const normalizeName = (v: string | null | undefined) => normText(appleT2S(v || '').replace(/妳/g, '你'))
-  const titleNorm = normalizeName(track.title)
-  const albumNorm = albumTitle ? normalizeName(albumTitle) : null
-  const passes = (s: Song) => {
-    if (!singerMatches(s.singer, artist)) return false
-    const candName = normalizeName(s.name)
-    if (!candName || (!candName.includes(titleNorm) && !titleNorm.includes(candName))) return false
-    if (track.secs != null) return durationMatches(s.interval, track.secs)
-    return true
-  }
-  for (const source of RESOLVE_SOURCE_ORDER) {
-    try {
-      const result = await searchOneSource(source, keyword, 1, 10)
-      const candidates = result.list.filter(passes)
-      if (candidates.length === 0) continue
-      if (albumNorm) {
-        const albumHit = candidates.find(s => {
-          const candAlbum = normalizeName(s.albumName)
-          return !!candAlbum && (candAlbum.includes(albumNorm) || albumNorm.includes(candAlbum))
-        })
-        if (albumHit) return albumHit
-      }
-      return candidates[0]
-    } catch (error) {
-      logger.debug(`[album] 逐首搜曲源 ${source} 失败:`, error instanceof Error ? error.message : error)
-    }
-  }
-  return null
-}
-
-/** 有界并发池：逐首搜曲并发 4，避免打爆上游 */
-async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length)
-  let index = 0
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (index < items.length) {
-      const current = index++
-      results[current] = await fn(items[current])
-    }
-  })
-  await Promise.all(workers)
-  return results
 }
 
 export interface AlbumDetail {
@@ -253,8 +200,8 @@ export async function getAlbumCover(gid: string): Promise<string | null> {
 async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gid: string): Promise<AlbumDetail | null> {
   const tracks = getLocalAlbumTracks(gid)
   if (tracks.length === 0) return null
-  const resolved = await mapPool(tracks, 4, track => resolveLocalTrack(track, localArtist, localTitle))
-  const list = resolved.filter((s): s is Song => s !== null)
+  // 批量解析：全并发搜索（零 DB 写入）→ 一次入库 → 附 uid
+  const list = await batchResolveAndUpsert(tracks, localArtist, localTitle)
   if (list.length === 0) {
     logger.warn(`[album] 本地专辑《${localTitle}》逐首匹配全部失败`)
     return null
@@ -358,14 +305,12 @@ export async function getAppleArtistDetail(artistId: string): Promise<AppleArtis
 
   // 四路并行：热门歌落歌 / 专辑索引 / 维基简介 / Wikidata 档案
   // （wiki 内部有 pageData 去重缓存，bio 与 profile 共享同一次条目请求）
-  const [resolved, index, bio, profile] = await Promise.all([
-    mapPool(info.songs, 4, song =>
-      resolveLocalTrack({ title: song.title, titleNorm: song.titleNorm, secs: song.secs, disc: 1, position: 0 }, info.name)),
+  const [hotSongs, index, bio, profile] = await Promise.all([
+    batchResolveAndUpsert(info.songs, info.name, undefined),
     getArtistAlbumIndex(info.name).catch(() => new Map()),
     getWikiExtract(info.name, 'artist').catch(() => null),
     getArtistProfile(info.name).catch(() => null),
   ])
-  const hotSongs = resolved.filter((x): x is Song => x !== null)
 
   const albums: ArtistAlbumCard[] = [...index.entries()].map(([title, meta]) => ({
     source: 'apple' as const,
@@ -456,9 +401,7 @@ export async function getAppleAlbumDetail(collectionId: string): Promise<AppleAl
   const itunes = await getItunesAlbumDetail(collectionId)
   if (!itunes || itunes.tracks.length === 0) return null
 
-  const resolved = await mapPool(itunes.tracks, 4, track =>
-    resolveLocalTrack({ title: track.title, titleNorm: track.titleNorm, secs: track.secs, disc: track.disc, position: track.position }, itunes.album.artist, itunes.album.title))
-  const list = resolved.filter((s): s is Song => s !== null)
+  const list = await batchResolveAndUpsert(itunes.tracks, itunes.album.artist, itunes.album.title)
   if (list.length === 0) {
     logger.warn(`[album] Apple 专辑《${itunes.album.title}》逐首匹配全部失败`)
     return null

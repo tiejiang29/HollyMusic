@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   get, set, searchOneSource, findLocalAlbum, findLocalAlbumByGid, getLocalAlbumTracks,
   searchLocalAlbums, getArtistAlbumIndex, getItunesAlbumDetail, searchItunesAlbums,
-  dbFindFirst, dbGetStorageSongmid,
+  dbFindFirst, dbGetStorageSongmid, batchResolveAndUpsert,
 } = vi.hoisted(() => ({
   get: vi.fn(),
   set: vi.fn(),
@@ -17,6 +17,7 @@ const {
   searchItunesAlbums: vi.fn(),
   dbFindFirst: vi.fn(),
   dbGetStorageSongmid: vi.fn((mi: { songmid: string }) => mi.songmid),
+  batchResolveAndUpsert: vi.fn(),
 }))
 
 vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
@@ -32,8 +33,8 @@ vi.mock('@/lib/services/album-local-service', () => ({
   searchLocalAlbums,
 }))
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
+vi.mock('@/lib/services/batch-resolve', () => ({ batchResolveAndUpsert }))
 vi.mock('@/lib/services/itunes-service', async (importOriginal) => {
-  // 保留真实 appleT2S（OpenCC 简繁转换，用例依赖真实转换行为），其余替换为受控 mock
   const actual = await importOriginal<typeof import('@/lib/services/itunes-service')>()
   return { ...actual, getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs: vi.fn(), searchItunesAlbums }
 })
@@ -52,15 +53,16 @@ const LOCAL_TRACKS = [
   { disc: 1, position: 2, title: '懦夫', titleNorm: '懦夫', secs: null },
 ]
 
-/** 构造能通过三重校验的候选歌 */
-function song(name: string, interval: string, source = 'tx') {
-  return { name, singer: '周杰伦', source, songmid: `${source}-1`, albumName: '叶惠美', interval, img: null, types: [], _types: {}, typeUrl: {} }
+/** 构造可播 Song */
+function resolvedSong(name: string, source = 'tx') {
+  return { name, singer: '周杰伦', source, songmid: `${source}-1`, albumName: '叶惠美', interval: '05:42', img: null, uid: `${source}-1`, types: [], _types: {}, typeUrl: {} }
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
   get.mockReturnValue(undefined)
   dbFindFirst.mockResolvedValue(null)
+  batchResolveAndUpsert.mockResolvedValue([])
   findLocalAlbumByGid.mockReturnValue(LOCAL_ALBUM)
   getLocalAlbumTracks.mockReturnValue(LOCAL_TRACKS)
   findLocalAlbum.mockReturnValue(LOCAL_ALBUM)
@@ -70,18 +72,19 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-describe('getAlbumDetailByGid（本地专辑倒查）', () => {
-  it('逐首搜曲 tx 命中，Apple 元数据增强年份与封面', async () => {
-    searchOneSource.mockImplementation(async (source: string, keyword: string) => {
-      const title = keyword.split(' ')[0]
-      return { list: [song(title, title === '以父之名' ? '05:42' : '03:38')], total: 1 }
-    })
+describe('getLocalAlbumDetailByGid（本地专辑倒查）', () => {
+  it('批量解析调用正确参数，Apple 元数据增强年份与封面', async () => {
+    batchResolveAndUpsert.mockResolvedValue([resolvedSong('以父之名'), resolvedSong('懦夫', 'kw')])
     getArtistAlbumIndex.mockResolvedValue(new Map([
       ['叶惠美', { collectionId: '536114662', img: 'https://mzstatic/a.jpg', year: '2003-07-31' }],
     ]))
 
     const detail = await getLocalAlbumDetailByGid(GID)
 
+    // 验证 batchResolveAndUpsert 收到正确参数（曲目表+歌手+专辑名）
+    expect(batchResolveAndUpsert).toHaveBeenCalledWith(
+      LOCAL_TRACKS, '周杰伦', '叶惠美',
+    )
     expect(detail?.album).toMatchObject({
       name: '叶惠美', singer: '周杰伦', trackCount: 2,
       img: 'https://mzstatic/a.jpg', year: '2003-07-31',
@@ -89,52 +92,17 @@ describe('getAlbumDetailByGid（本地专辑倒查）', () => {
     expect(detail?.list.map(s => s.name)).toEqual(['以父之名', '懦夫'])
   })
 
-  it('本地音乐库 identity 命中优先：零上游请求直接返回可播条目', async () => {
-    dbFindFirst.mockImplementation(async ({ where }: { where: { identity: string } }) => {
-      const name = where.identity.split('|')[0]
-      if (!name) return null
-      return { data: JSON.stringify({ name, singer: '周杰伦', source: 'kw', songmid: '999', interval: '342', types: [], _types: {}, typeUrl: {} }) }
-    })
-
-    const detail = await getLocalAlbumDetailByGid(GID)
-
-    expect(searchOneSource).not.toHaveBeenCalled() // 全部走库，零上游
-    expect(detail?.list[0]).toMatchObject({ name: '以父之名', uid: 'kw-999' })
-  })
-
-  it('全部未命中返回 null', async () => {
-    searchOneSource.mockResolvedValue({ list: [], total: 0 })
-    getArtistAlbumIndex.mockResolvedValue(new Map())
+  it('批量解析全部未命中返回 null', async () => {
+    batchResolveAndUpsert.mockResolvedValue([])
 
     expect(await getLocalAlbumDetailByGid(GID)).toBeNull()
-  })
-
-  it('同歌多版本时优先取 albumName 与目标专辑一致的候选', async () => {
-    // 以父之名：同歌手同时长两个版本——太阳之子专辑版 vs 圣诞星单曲版（错误发行）
-    searchOneSource.mockImplementation(async () => ({
-      list: [
-        { ...song('以父之名', '05:42', 'tx'), albumName: '圣诞星 (feat. 杨瑞代)' },
-        { ...song('以父之名', '05:42', 'tx'), albumName: '太阳之子' },
-      ],
-      total: 2,
-    }))
-    dbFindFirst.mockResolvedValue(null)
-    getArtistAlbumIndex.mockResolvedValue(new Map([
-      ['叶惠美', { collectionId: '1', img: 'https://mzstatic/a.jpg', year: '2003-07-31' }],
-    ]))
-
-    const detail = await getLocalAlbumDetailByGid(GID)
-
-    // 本地专辑《叶惠美》上下文：两候选 albumName 都不匹配"叶惠美"→ 取首个通过校验的
-    expect(detail?.list[0]).toMatchObject({ name: '以父之名' })
-    expect(detail?.list[0].albumName).toBe('圣诞星 (feat. 杨瑞代)')
   })
 
   it('gid 不在本地库返回 null', async () => {
     findLocalAlbumByGid.mockReturnValue(null)
 
     expect(await getLocalAlbumDetailByGid(GID)).toBeNull()
-    expect(searchOneSource).not.toHaveBeenCalled()
+    expect(batchResolveAndUpsert).not.toHaveBeenCalled()
   })
 })
 
@@ -154,7 +122,7 @@ describe('getAlbumCover（Apple 优先 + tx 推导兜底）', () => {
     getArtistAlbumIndex.mockResolvedValue(new Map())
     vi.stubGlobal('fetch', vi.fn())
     searchOneSource.mockResolvedValue({
-      list: [{ ...song('以父之名', '05:42', 'tx'), albumId: '000MkMni19ClKG' }],
+      list: [{ ...resolvedSong('以父之名'), source: 'tx', albumId: '000MkMni19ClKG' }],
       total: 1,
     })
 
@@ -165,23 +133,30 @@ describe('getAlbumCover（Apple 优先 + tx 推导兜底）', () => {
   })
 })
 
-describe('getAppleAlbumDetail（Apple 曲目表落歌）', () => {
-  it('Apple 曲目表逐首落歌，繁体自动转简体匹配', async () => {
+describe('getAppleAlbumDetail（Apple 曲目表批量落歌）', () => {
+  it('Apple 曲目表批量解析，正确传递参数', async () => {
     getItunesAlbumDetail.mockResolvedValue({
       album: { collectionId: '536114662', title: '七里香', artist: '周杰伦', year: '2004-08-03', img: 'https://mzstatic/qlx.jpg', trackCount: 2 },
       tracks: [
-        { title: '我的地盤', titleNorm: '我的地盤', secs: 242, disc: 1, position: 1 },
+        { title: '我的地盘', titleNorm: '我的地盘', secs: 242, disc: 1, position: 1 },
         { title: '七里香', titleNorm: '七里香', secs: 297, disc: 1, position: 2 },
       ],
     })
-    searchOneSource.mockImplementation(async (source: string, keyword: string) => {
-      const title = keyword.split(' ')[0]
-      const simple = title === '我的地盤' ? '我的地盘' : title
-      return { list: [song(simple, simple === '我的地盘' ? '04:02' : '04:57')], total: 1 }
-    })
+    batchResolveAndUpsert.mockResolvedValue([
+      { ...resolvedSong('我的地盘'), name: '我的地盘' },
+      { ...resolvedSong('七里香'), name: '七里香' },
+    ])
 
     const detail = await getAppleAlbumDetail('536114662')
 
+    expect(batchResolveAndUpsert).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ title: '我的地盘', secs: 242 }),
+        expect.objectContaining({ title: '七里香', secs: 297 }),
+      ]),
+      '周杰伦',
+      '七里香',
+    )
     expect(detail?.album).toMatchObject({ name: '七里香', singer: '周杰伦', year: '2004-08-03', trackCount: 2 })
     expect(detail?.list.map(s => s.name)).toEqual(['我的地盘', '七里香'])
   })
@@ -194,7 +169,7 @@ describe('getAppleAlbumDetail（Apple 曲目表落歌）', () => {
         { title: '曲二', titleNorm: '曲二', secs: 210, disc: 1, position: 2 },
       ],
     })
-    searchOneSource.mockResolvedValue({ list: [], total: 0 })
+    batchResolveAndUpsert.mockResolvedValue([])
 
     expect(await getAppleAlbumDetail('1')).toBeNull()
   })
