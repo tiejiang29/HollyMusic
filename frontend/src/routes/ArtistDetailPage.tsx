@@ -20,12 +20,12 @@ export function ArtistDetailPage() {
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
   const reqIdRef = useRef(0)
-  // 头像三级降级：维基头像（服务端代理转发）→ 首专辑封面 → 占位。
-  // 有简介=维基条目存在（基本都有头像）才尝试维基，否则直接从专辑封面起。
-  const [avatarStage, setAvatarStage] = useState<'wiki' | 'album'>('album')
+  // 头像四级降级：Apple 官方艺人照 → 维基头像 → 首专辑封面 → 占位。
+  // Apple 官方照直连国区可达（无需代理），质量最好；失败落维基（需代理）；再落专辑封面。
+  const [avatarStage, setAvatarStage] = useState<'apple' | 'wiki' | 'album'>('album')
   useEffect(() => {
-    setAvatarStage(detail?.artist.bio ? 'wiki' : 'album')
-  }, [detail?.artist.name, detail?.artist.bio])
+    setAvatarStage('apple')
+  }, [detail?.artist.name])
 
   const load = async () => {
     const reqId = ++reqIdRef.current
@@ -73,7 +73,14 @@ export function ArtistDetailPage() {
     <div className="p-6">
       {/* 歌手头部 */}
       <div className="mb-6 flex items-end gap-4">
-        {avatarStage === 'wiki' ? (
+        {avatarStage === 'apple' ? (
+          <img
+            src={`/api/artist/apple/avatar?artistId=${artist.artistId}`}
+            alt={artist.name}
+            className="h-32 w-32 shrink-0 rounded-full object-cover shadow-lg"
+            onError={() => setAvatarStage('wiki')}
+          />
+        ) : avatarStage === 'wiki' ? (
           <img
             src={`/api/artist/avatar?name=${encodeURIComponent(artist.name)}`}
             alt={artist.name}

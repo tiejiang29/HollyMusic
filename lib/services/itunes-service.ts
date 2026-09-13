@@ -234,6 +234,45 @@ export async function getItunesArtistSongs(artistId: string): Promise<ItunesArti
   return info
 }
 
+/** Apple Music 官方歌手头像：抓国区页面 og:image（URL 名字部分容错，只需 artistId）。
+ *  mzstatic.com 上的是 Apple 专职艺人照片（AMCArtistImages/Features），比专辑封面质量好。
+ *  国区直连可达（无需代理）；URL 缓存 24h。 */
+export async function getAppleArtistAvatarUrl(artistId: string): Promise<string | null> {
+  const cacheKey = `itunes:artistAvatarUrl:${artistId}`
+  const cached = searchCache.get(cacheKey) as string | null
+  if (cached) return cached
+
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), ITUNES_TIMEOUT)
+    try {
+      // URL 名字部分随便填（Apple 会 302 到正确路径），用 'a' 最短
+      const resp = await fetch(`https://music.apple.com/cn/artist/a/${encodeURIComponent(artistId)}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: controller.signal,
+        redirect: 'follow',
+      })
+      if (!resp.ok) return null
+      const html = await resp.text()
+      // og:image → 改 600x600 方形
+      const og = html.match(/<meta property="og:image" content="([^"]+)"/)
+      if (!og?.[1]) return null
+      const avatar600 = og[1].replace(/\/[^/]+$/, '/600x600bb.jpg')
+      // mzstatic 域名校验（防止抓到通配 logo）
+      if (!/^https:\/\/[a-z0-9-]+\.mzstatic\.com\//.test(avatar600)) return null
+      // Apple Music 通用 logo 跳过（不是歌手照片）
+      if (avatar600.includes('apple-music')) return null
+      searchCache.set(cacheKey, avatar600, CACHE_TTL)
+      return avatar600
+    } finally {
+      clearTimeout(timer)
+    }
+  } catch (error) {
+    logger.debug('[itunes] 歌手头像 URL 获取失败（静默）:', error instanceof Error ? error.message : error)
+    return null
+  }
+}
+
 /** 按 artistId 精确取该歌手全部专辑（lookup entity=album）——同名歌手（如多个"张杰"）
  *  各自拿到各自的专辑列表，替代按名字搜索（getArtistAlbumIndex 的名字搜索会让同名歌手共享结果）。缓存 24h。 */
 export async function getArtistAlbumsById(artistId: string): Promise<Array<{ collectionId: string; name: string; artist: string; year?: string; img: string | null; trackCount?: number }>> {
