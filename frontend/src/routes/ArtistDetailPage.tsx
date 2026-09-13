@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom'
-import { Disc3, ListPlus, Music, Play, RefreshCw, User } from 'lucide-react'
+import { Disc3, Music, Play, RefreshCw, User } from 'lucide-react'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -60,12 +60,13 @@ export function ArtistDetailPage() {
 
   const tracks: Track[] = (detail?.hotSongs ?? []).map(song => toTrack({ uid: song.uid, musicInfo: song }))
 
-  // 热门歌分页：首屏 30，逐次加载 30（kw 链一次有 100 首，避免长列表一铺到底）
+  // 热门歌分页：每页最多 30 首（kw 链单次 100 首，翻页浏览）
   const HOT_PAGE_SIZE = 30
-  const [visibleCount, setVisibleCount] = useState(HOT_PAGE_SIZE)
-  useEffect(() => { setVisibleCount(HOT_PAGE_SIZE) }, [source, artistId, nameKey])
-  const visibleTracks = tracks.slice(0, visibleCount)
-  const remainingCount = tracks.length - visibleTracks.length
+  const [page, setPage] = useState(1)
+  useEffect(() => { setPage(1) }, [source, artistId, nameKey])
+  const totalPages = Math.max(1, Math.ceil(tracks.length / HOT_PAGE_SIZE))
+  const currentPage = Math.min(page, totalPages)
+  const visibleTracks = tracks.slice((currentPage - 1) * HOT_PAGE_SIZE, currentPage * HOT_PAGE_SIZE)
 
   if (loading) return <div className="p-6"><LoadingSkeleton /></div>
 
@@ -173,13 +174,22 @@ export function ArtistDetailPage() {
       {tracks.length > 0 ? (
         <>
           <SongList tracks={visibleTracks} />
-          {remainingCount > 0 && (
-            <div className="mt-3 flex justify-center">
+          {totalPages > 1 && (
+            <div className="mt-3 flex items-center justify-center gap-3">
               <button
-                onClick={() => setVisibleCount(c => c + HOT_PAGE_SIZE)}
-                className="flex items-center gap-1.5 rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-foreground"
+                onClick={() => { setPage(p => Math.max(1, p - 1)); window.scrollTo({ top: 0, behavior: 'smooth' }) }}
+                disabled={currentPage <= 1}
+                className="rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
               >
-                <ListPlus className="h-4 w-4" /> 加载更多（还有 {remainingCount} 首）
+                上一页
+              </button>
+              <span className="text-sm text-muted-foreground">{currentPage} / {totalPages} 页</span>
+              <button
+                onClick={() => { setPage(p => Math.min(totalPages, p + 1)); window.scrollTo({ top: 0, behavior: 'smooth' }) }}
+                disabled={currentPage >= totalPages}
+                className="rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+              >
+                下一页
               </button>
             </div>
           )}
