@@ -234,6 +234,31 @@ export async function getItunesArtistSongs(artistId: string): Promise<ItunesArti
   return info
 }
 
+/** 按 artistId 精确取该歌手全部专辑（lookup entity=album）——同名歌手（如多个"张杰"）
+ *  各自拿到各自的专辑列表，替代按名字搜索（getArtistAlbumIndex 的名字搜索会让同名歌手共享结果）。缓存 24h。 */
+export async function getArtistAlbumsById(artistId: string): Promise<Array<{ collectionId: string; name: string; artist: string; year?: string; img: string | null; trackCount?: number }>> {
+  const cacheKey = `itunes:albumsById:${artistId}`
+  const cached = searchCache.get(cacheKey) as Array<{ collectionId: string; name: string; artist: string; year?: string; img: string | null; trackCount?: number }> | null
+  if (cached) return cached
+
+  const data = await polite(() => fetchItunesJson(
+    `https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=album&limit=200&country=tw`,
+  ))
+  const results = (data.results || []) as unknown as ItunesCollection[]
+  const albums = results
+    .filter(c => c.wrapperType === 'collection' && c.collectionId && c.collectionName)
+    .map(c => ({
+      collectionId: String(c.collectionId),
+      name: appleT2S(c.collectionName),
+      artist: appleT2S(c.artistName),
+      year: c.releaseDate?.slice(0, 10),
+      img: artworkHiRes(c.artworkUrl100),
+      trackCount: c.trackCount,
+    }))
+  searchCache.set(cacheKey, albums, CACHE_TTL)
+  return albums
+}
+
 export interface ItunesAlbumDetail {
   album: { collectionId: string; title: string; artist: string; year?: string; img: string | null; trackCount: number; copyright?: string }
   tracks: Array<{ title: string; titleNorm: string; secs: number | null; disc: number; position: number }>

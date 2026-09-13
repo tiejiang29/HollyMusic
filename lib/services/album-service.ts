@@ -21,7 +21,7 @@ import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
 import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
 import { batchResolveAndUpsert } from '@/lib/services/batch-resolve'
-import { getArtistAlbumIndex, getItunesAlbumDetail, getItunesArtistSongs, searchItunesAlbums } from '@/lib/services/itunes-service'
+import { getArtistAlbumIndex, getArtistAlbumsById, getItunesAlbumDetail, getItunesArtistSongs, searchItunesArtists, searchItunesAlbums } from '@/lib/services/itunes-service'
 import { getWikiExtract, getArtistProfile, getAlbumProfile, type ArtistProfile, type AlbumProfile } from '@/lib/services/wiki-service'
 
 /** 专辑详情（含已入库曲目）缓存 */
@@ -296,30 +296,37 @@ export interface AppleArtistDetail {
 
 /** Apple 歌手详情：热门歌（本地优先落歌）+ 专辑列表 + 维基简介。结果缓存 1h。 */
 export async function getAppleArtistDetail(artistId: string): Promise<AppleArtistDetail | null> {
-  const cacheKey = `album:v1:artist:${artistId}`
+  const cacheKey = `album:v2:artist:${artistId}`
   const cached = searchCache.get(cacheKey) as AppleArtistDetail | null
   if (cached) return cached
 
   const info = await getItunesArtistSongs(artistId)
   if (!info) return null
 
-  // 四路并行：热门歌落歌 / 专辑索引 / 维基简介 / Wikidata 档案
-  // （wiki 内部有 pageData 去重缓存，bio 与 profile 共享同一次条目请求）
-  const [hotSongs, index, bio, profile] = await Promise.all([
+  // 同名歌手检测：Apple 搜索该名字返回多个结果时，仅第一个（最热门）展示维基档案，
+  // 其余跳过避免张冠李戴（如四个"张杰"只有大陆张杰的简介是对的）
+  let isPrimaryArtist = true
+  try {
+    const artistSearch = await searchItunesArtists(info.name, 5)
+    isPrimaryArtist = artistSearch.length <= 1 || artistSearch[0]?.artistId === info.artistId
+  } catch { /* 检测失败时保守展示 */ }
+
+  // 四路并行：热门歌落歌 / 专辑（按 artistId 精确查）/ 维基简介 / Wikidata 档案
+  const [hotSongs, artistAlbums, bio, profile] = await Promise.all([
     batchResolveAndUpsert(info.songs, info.name, undefined),
-    getArtistAlbumIndex(info.name).catch(() => new Map()),
-    getWikiExtract(info.name, 'artist').catch(() => null),
-    getArtistProfile(info.name).catch(() => null),
+    getArtistAlbumsById(artistId).catch(() => []),
+    isPrimaryArtist ? getWikiExtract(info.name, 'artist').catch(() => null) : Promise.resolve(null),
+    isPrimaryArtist ? getArtistProfile(info.name).catch(() => null) : Promise.resolve(null),
   ])
 
-  const albums: ArtistAlbumCard[] = [...index.entries()].map(([title, meta]) => ({
+  const albums: ArtistAlbumCard[] = artistAlbums.map(a => ({
     source: 'apple' as const,
-    albumId: meta.collectionId,
-    name: title,
-    artist: info.name,
-    year: meta.year,
-    img: meta.img ?? null,
-    trackCount: undefined,
+    albumId: a.collectionId,
+    name: a.name,
+    artist: a.artist || info.name,
+    year: a.year,
+    img: a.img ?? null,
+    trackCount: a.trackCount,
   }))
 
   // 头像 = 首张专辑封面（Apple 歌手实体无照片）
