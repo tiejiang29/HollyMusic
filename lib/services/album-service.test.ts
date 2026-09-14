@@ -56,6 +56,10 @@ vi.mock('@/lib/services/kw-chain-service', () => ({
   findKwAlbumId,
   getKwAlbumDetail,
 }))
+vi.mock('@/lib/services/tx-chain-service', () => ({
+  findTxAlbumId: vi.fn(async () => null),
+  getTxAlbumDetail: vi.fn(async () => null),
+}))
 vi.mock('@/lib/services/mg-chain-service', () => ({
   findMgAlbumId,
   getMgAlbumDetail,

@@ -24,6 +24,7 @@ import { batchResolveAndUpsert } from '@/lib/services/batch-resolve'
 import { getArtistAlbumIndex, getArtistAlbumsById, getItunesAlbumDetail, getItunesArtistSongs, searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
 import { searchKwAlbums, findKwAlbumId, getKwAlbumDetail } from '@/lib/services/kw-chain-service'
 import { findMgAlbumId, getMgAlbumDetail } from '@/lib/services/mg-chain-service'
+import { findTxAlbumId, getTxAlbumDetail } from '@/lib/services/tx-chain-service'
 import { searchAlbumCardsChain } from '@/lib/services/source-chain'
 import { parseIntervalToSeconds } from '@/lib/services/source-toggle'
 import { getAmpArtistDetail, getAmpAlbumDetail } from '@/lib/services/apple-amp-service'
@@ -237,18 +238,22 @@ function matchTracksToCandidates(
 /** 链快路径（kw/mg 通用）：专辑名+歌手 → albumid → 整张曲目一次拿回（全带可播 id，不写库）。
  *  匹配失败返回 null（走下一链/batch 兜底）。 */
 async function resolveLocalTracksViaChain(
-  source: 'kw' | 'mg',
+  source: 'kw' | 'mg' | 'tx',
   tracks: Array<{ title: string; secs: number | null }>,
   artist: string,
   albumTitle: string,
 ): Promise<Map<number, MusicInfo> | null> {
   const albumId = source === 'kw'
     ? await findKwAlbumId(albumTitle, artist)
-    : await findMgAlbumId(albumTitle, artist)
+    : source === 'tx'
+      ? await findTxAlbumId(albumTitle, artist)
+      : await findMgAlbumId(albumTitle, artist)
   if (!albumId) return null
   const detail = source === 'kw'
     ? await getKwAlbumDetail(albumId)
-    : await getMgAlbumDetail(albumId)
+    : source === 'tx'
+      ? await getTxAlbumDetail(albumId)
+      : await getMgAlbumDetail(albumId)
   if (!detail) return null
   const map = matchTracksToCandidates(tracks, detail.tracks)
   return map.size > 0 ? map : null
@@ -272,12 +277,12 @@ async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gi
   const tracks = getLocalAlbumTracks(gid)
   if (tracks.length === 0) return null
 
-  // 曲目解析（酷我快路径 → 咪咕快路径 → batch 兜底）与 Apple/wiki 元数据增强全并行：
+  // 曲目解析（TX 主链 → 酷我 → 咪咕快路径 → batch 兜底）与 Apple/wiki 元数据增强全并行：
   // 元数据只依赖专辑名+歌手，不依赖落歌结果
   const resolveTracks = async (): Promise<Song[]> => {
     let chainSongs: Song[] | null = null
     let matched = new Set<number>()
-    for (const chain of ['kw', 'mg'] as const) {
+    for (const chain of ['tx', 'kw', 'mg'] as const) {
       try {
         const chainMap = await resolveLocalTracksViaChain(chain, tracks, localArtist, localTitle)
         if (!chainMap) continue

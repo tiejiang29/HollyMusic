@@ -10,7 +10,7 @@ import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
-import { getLocalAlbumTracks, getAppleAlbumTracks, getKwAlbumTracks, getMgAlbumTracks } from '@/lib/api/album'
+import { getLocalAlbumTracks, getAppleAlbumTracks, getKwAlbumTracks, getMgAlbumTracks, getTxAlbumTracks } from '@/lib/api/album'
 import type { Song } from '@/lib/types/music'
 
 /** 专辑详情页（三模式）：gid = 本地专辑库倒查；kw = 酷我链（曲目全带 rid 直接可播）；
@@ -55,6 +55,20 @@ export function AlbumDetailPage() {
       setLoading(true); setError(null); setUnsupported(false)
       try {
         const r = await getKwAlbumTracks(albumId, name, singer)
+        if (stale()) return
+        setDetail(r.album ? { album: r.album, list: r.list } : null)
+        setUnsupported(!!r.unsupported || !r.album)
+      } catch (err) {
+        if (stale()) return
+        setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
+      } finally { if (!stale()) setLoading(false) }
+      return
+    }
+    // TX 主链专辑：GetAlbumSongList 一次整张 tx-{songmid} 直接可播（T002 封面直链）
+    if (source === 'tx' && albumId) {
+      setLoading(true); setError(null); setUnsupported(false)
+      try {
+        const r = await getTxAlbumTracks(albumId, name, singer)
         if (stale()) return
         setDetail(r.album ? { album: r.album, list: r.list } : null)
         setUnsupported(!!r.unsupported || !r.album)
@@ -164,7 +178,7 @@ export function AlbumDetailPage() {
         <div className="h-32 w-32 shrink-0 overflow-hidden rounded-lg shadow-lg">
           {isLocal ? (
             <AlbumCover gid={gid} alt={album.name} className="h-full w-full" />
-          ) : source === 'kw' || source === 'mg' ? (
+          ) : source === 'kw' || source === 'mg' || source === 'tx' ? (
             // 链专辑封面两级降级：直链 → /api/album/{source}/cover（服务端跨源解析）；渐变+图标垫底
             <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
               <Disc3 className="absolute h-12 w-12 text-primary-foreground/80" />

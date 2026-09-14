@@ -10,7 +10,7 @@ export interface ArtistSummary {
   name: string
   genre?: string
   /** 卡片来源（kw=酷我 / mg=咪咕 / apple=Apple），决定前端路由 */
-  source?: 'kw' | 'mg' | 'apple'
+  source?: 'kw' | 'mg' | 'tx' | 'apple'
   /** 酷我官方头像（star.kuwo.cn，卡片可直显） */
   pic?: string | null
   musicNum?: number
@@ -34,7 +34,7 @@ export interface AlbumProfile {
 }
 
 export type ArtistAlbumCard = {
-  source: 'kw' | 'mg' | 'apple'
+  source: 'kw' | 'mg' | 'tx' | 'apple'
   albumId: string
   name: string
   artist: string
@@ -60,6 +60,8 @@ export interface ArtistDetailData {
   }
   hotSongs: Song[]
   albums: ArtistAlbumCard[]
+  /** TX 链自带 MV 列表（vid 展示型，不可播） */
+  mvs?: Array<{ vid: string; title: string; pic: string | null; durationSec?: number }>
   unsupported?: boolean
 }
 
@@ -88,6 +90,10 @@ export function getArtistDetail(artistId: string): Promise<ArtistDetailData> {
 }
 
 /** 酷我歌手详情（name=应急钥匙：kw 链不可用时服务端回落 Apple） */
+export function getTxArtistDetail(artistId: string, name?: string): Promise<ArtistDetailData> {
+  return apiGet('artist/tx/detail', name ? { artistId, name } : { artistId })
+}
+
 export function getMgArtistDetail(artistId: string, name?: string): Promise<ArtistDetailData> {
   return apiGet('artist/mg/detail', name ? { artistId, name } : { artistId })
 }

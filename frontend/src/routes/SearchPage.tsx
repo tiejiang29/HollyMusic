@@ -324,7 +324,7 @@ export function SearchPage() {
           })()
         ) : artists.length > 0 ? (
           <>
-            <div className="mb-2 text-xs text-muted-foreground">歌手 · {artists[0].source === 'kw' ? '酷我' : artists[0].source === 'mg' ? '咪咕' : 'Apple'} 数据源</div>
+            <div className="mb-2 text-xs text-muted-foreground">歌手 · {artists[0].source === 'kw' ? '酷我' : artists[0].source === 'mg' ? '咪咕' : artists[0].source === 'tx' ? 'QQ音乐' : 'Apple'} 数据源</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
               {artists.map(a => (
                 <Link

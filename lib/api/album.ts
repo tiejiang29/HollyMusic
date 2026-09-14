@@ -40,7 +40,7 @@ export function getAppleAlbumTracks(collectionId: string): Promise<AppleAlbumDet
 
 /** 链专辑详情（kw/mg）：一次拿全曲目（全带可播 id）；apple 为降级形态 */
 export interface KwAlbumDetailData {
-  source: 'kw' | 'mg' | 'apple'
+  source: 'kw' | 'mg' | 'tx' | 'apple'
   album: {
     albumId?: string
     name: string
@@ -57,6 +57,13 @@ export interface KwAlbumDetailData {
 }
 
 /** 酷我专辑曲目（name/singer=应急钥匙：kw 链不可用时服务端回落 Apple） */
+export function getTxAlbumTracks(albumId: string, name?: string, singer?: string): Promise<KwAlbumDetailData> {
+  const params: Record<string, string> = { albumid: albumId }
+  if (name) params.name = name
+  if (singer) params.singer = singer
+  return apiGet('album/tx/tracks', params)
+}
+
 export function getMgAlbumTracks(albumId: string, name?: string, singer?: string): Promise<KwAlbumDetailData> {
   const params: Record<string, string> = { albumid: albumId }
   if (name) params.name = name
@@ -72,7 +79,7 @@ export function getKwAlbumTracks(albumId: string, name?: string, singer?: string
 }
 
 export interface PlatformAlbumSummary {
-  source: 'kw' | 'mg' | 'apple'
+  source: 'kw' | 'mg' | 'tx' | 'apple'
   /** kw albumid 或 Apple collectionId（按 source） */
   albumId: string
   name: string

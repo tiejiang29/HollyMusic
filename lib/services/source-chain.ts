@@ -1,5 +1,5 @@
 /**
- * 三源编排器（搜索层链式降级）：酷我 → 咪咕 → Apple
+ * 多源编排器（搜索层链式降级）：TX 主链 → 酷我 → 咪咕 → Apple
  *
  * 链规则（用户定案）：
  * - 酷我结果中有「完全匹配」词条（归一化后名字相等）→ 用酷我
@@ -12,12 +12,13 @@
  */
 
 import { logger } from '@/lib/logger'
+import { searchTxArtists, type TxArtistCard } from '@/lib/services/tx-chain-service'
 import { searchKwArtists, searchKwAlbums, type KwArtistCard, type KwAlbumCard } from '@/lib/services/kw-chain-service'
 import { searchMgArtists, searchMgAlbums, type MgArtistCard, type MgAlbumCard } from '@/lib/services/mg-chain-service'
 import { searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
 import { searchAmpArtists } from '@/lib/services/apple-amp-service'
 
-export type ArtistCard = (KwArtistCard | MgArtistCard | { source: 'apple'; artistId: string; name: string; genre?: string })
+export type ArtistCard = (TxArtistCard | KwArtistCard | MgArtistCard | { source: 'apple'; artistId: string; name: string; genre?: string })
 export type AlbumCard = KwAlbumCard | MgAlbumCard | {
   source: 'apple'; albumId: string; name: string; artist: string; img: string | null; year?: string; trackCount?: number
 }
@@ -40,13 +41,17 @@ function hasExactMatch<T extends { name?: string }>(list: T[], keyword: string):
 export async function searchArtistCardsChain(
   keyword: string,
   limit = 10,
-): Promise<{ source: 'kw' | 'mg' | 'apple'; list: ArtistCard[] }> {
-  const [kwList, mgList] = await Promise.all([
+): Promise<{ source: 'tx' | 'kw' | 'mg' | 'apple'; list: ArtistCard[] }> {
+  // TX 主链（用户定案：TX 曲库最丰富）：tx/kw/mg 并行预取，完全匹配按 tx>kw>mg 判定
+  const [txList, kwList, mgList] = await Promise.all([
+    searchTxArtists(keyword, limit).catch(() => [] as TxArtistCard[]),
     searchKwArtists(keyword, limit).catch(() => [] as KwArtistCard[]),
-    // 咪咕并行预取（多数请求酷我有完全匹配，结果被丢弃也不亏——搜索有 24h 缓存）
     searchMgArtists(keyword, limit).catch(() => [] as MgArtistCard[]),
   ])
 
+  if (hasExactMatch(txList, keyword) && txList.length > 0) {
+    return { source: 'tx', list: txList }
+  }
   if (hasExactMatch(kwList, keyword) && kwList.length > 0) {
     return { source: 'kw', list: kwList }
   }
@@ -54,7 +59,7 @@ export async function searchArtistCardsChain(
     return { source: 'mg', list: mgList }
   }
 
-  // 两链均无完全匹配 → Apple 兜底（amp 版卡片自带官方头像；amp 失败回落老 iTunes Search API）
+  // 三链均无完全匹配 → Apple 兜底（amp 版卡片自带官方头像；失败回落老 iTunes API）
   try {
     const ampList = await searchAmpArtists(keyword, limit).catch(() => [])
     const appleList = ampList.length > 0 ? ampList : (await searchItunesArtists(keyword, limit)).map(c => ({ ...c, source: 'apple' as const }))
@@ -65,9 +70,9 @@ export async function searchArtistCardsChain(
     logger.warn('[source-chain] Apple 歌手搜索失败:', error instanceof Error ? error.message : error)
   }
 
-  // 全兜底：返回最好的模糊结果（酷我优先）
-  const best = kwList.length > 0 ? kwList : mgList
-  return { source: best.length > 0 ? (best[0].source as 'kw' | 'mg') : 'kw', list: best }
+  // 全兜底：返回最好的模糊结果（tx 主链优先）
+  const best = txList.length > 0 ? txList : kwList.length > 0 ? kwList : mgList
+  return { source: best.length > 0 ? (best[0].source as 'tx' | 'kw' | 'mg') : 'tx', list: best }
 }
 
 /**

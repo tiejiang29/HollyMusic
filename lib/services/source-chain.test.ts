@@ -13,6 +13,9 @@ const { searchItunesArtists, searchItunesAlbums } = vi.hoisted(() => ({
   searchItunesAlbums: vi.fn(),
 }))
 
+vi.mock('@/lib/services/tx-chain-service', () => ({
+  searchTxArtists: vi.fn(async () => []),
+}))
 vi.mock('@/lib/services/kw-chain-service', () => ({ searchKwArtists, searchKwAlbums }))
 vi.mock('@/lib/services/mg-chain-service', () => ({ searchMgArtists, searchMgAlbums }))
 vi.mock('@/lib/services/apple-amp-service', () => ({

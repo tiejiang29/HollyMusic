@@ -15,6 +15,7 @@ import { NextRequest } from 'next/server'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { getMgAlbumDetail, searchMgAlbums } from '@/lib/services/mg-chain-service'
+import { txPhotoUrl } from '@/lib/services/tx-chain-service'
 import { resolveKwAlbumCoverUrl } from '@/lib/services/kw-chain-service'
 import { searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
 import { fetchCoverImageBytes } from '@/lib/services/album-service'
@@ -49,7 +50,10 @@ export async function GET(request: NextRequest) {
 
     // 1. 本源直查
     let url: string | null = null
-    if (albumId && /^\d+$/.test(albumId)) {
+    if (source === 'tx' && albumId) {
+      // tx=T002 公式直出（500px，无需上游查询）
+      url = txPhotoUrl('T002', albumId)
+    } else if (albumId && /^\d+$/.test(albumId)) {
       if (source === 'mg') {
         const detail = await getMgAlbumDetail(albumId).catch(() => null)
         if (detail?.album.pic) url = detail.album.pic

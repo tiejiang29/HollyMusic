@@ -8,7 +8,7 @@ import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
 import { ChainAlbumCover } from '@@/components/shared/ChainAlbumCover'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
-import { getArtistDetail, getKwArtistDetail, getMgArtistDetail, getArtistMvs, type ArtistDetailData, type ArtistMv } from '@/lib/api/artist'
+import { getArtistDetail, getKwArtistDetail, getMgArtistDetail, getTxArtistDetail, getArtistMvs, type ArtistDetailData, type ArtistMv } from '@/lib/api/artist'
 
 /** 歌手详情页（三链）：kw/mg=全链（简介+官方头像+热门歌直可播+专辑）；
  *  apple=amp 升级（官方头像+生日+热门歌+专辑+维基简介）。
@@ -43,12 +43,14 @@ export function ArtistDetailPage() {
     }
     setLoading(true); setError(null); setUnsupported(false)
     try {
-      const r = source === 'kw' ? await getKwArtistDetail(artistId, nameKey) : source === 'mg' ? await getMgArtistDetail(artistId, nameKey) : await getArtistDetail(artistId)
+      const r = source === 'kw' ? await getKwArtistDetail(artistId, nameKey) : source === 'mg' ? await getMgArtistDetail(artistId, nameKey) : source === 'tx' ? await getTxArtistDetail(artistId, nameKey) : await getArtistDetail(artistId)
       if (stale()) return
       setDetail(r)
       setUnsupported(!!r.unsupported)
-      // MV 区（跨链增强，失败静默隐藏区块）
-      if (r?.artist?.name) {
+      // MV 区：tx 链自带 mvs；其余链走 Apple amp 增强（失败静默隐藏区块）
+      if (r?.mvs?.length) {
+        if (!stale()) setMvs(r.mvs.map(m => ({ id: m.vid, name: m.title, artist: r.artist.name, artwork: m.pic, durationSec: m.durationSec ?? 0, previewUrl: null })))
+      } else if (r?.artist?.name) {
         getArtistMvs(r.artist.name).then(mv => { if (!stale()) setMvs(mv.list || []) }).catch(() => {})
       }
     } catch (err) {
@@ -185,7 +187,7 @@ export function ArtistDetailPage() {
       )}
 
       {/* 热门歌曲 */}
-      <h2 className="mb-3 text-lg font-semibold">热门歌曲 <span className="text-sm font-normal text-muted-foreground">（{tracks.length} 首，{activeSource === 'kw' ? '酷我' : activeSource === 'mg' ? '咪咕' : 'Apple'} 热门度）</span></h2>
+      <h2 className="mb-3 text-lg font-semibold">热门歌曲 <span className="text-sm font-normal text-muted-foreground">（{tracks.length} 首，{activeSource === 'kw' ? '酷我' : activeSource === 'mg' ? '咪咕' : activeSource === 'tx' ? 'QQ音乐' : 'Apple'} 热门度）</span></h2>
       {tracks.length > 0 ? (
         <>
           <SongList tracks={visibleTracks} />
@@ -261,6 +263,7 @@ export function ArtistDetailPage() {
               <button
                 key={mv.id}
                 onClick={() => mv.previewUrl && setPlayingMv(mv)}
+                disabled={!mv.previewUrl}
                 className="group flex flex-col gap-2 rounded-lg p-2 text-left hover:bg-accent/40"
               >
                 <div className="relative flex aspect-video items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
