@@ -13,8 +13,8 @@
 
 import { logger } from '@/lib/logger'
 import { searchTxArtists, type TxArtistCard } from '@/lib/services/tx-chain-service'
-import { searchKwArtists, searchKwAlbums, type KwArtistCard, type KwAlbumCard } from '@/lib/services/kw-chain-service'
-import { searchMgArtists, searchMgAlbums, type MgArtistCard, type MgAlbumCard } from '@/lib/services/mg-chain-service'
+import { searchKwArtists, getKwArtistInfo, searchKwAlbums, type KwArtistCard, type KwAlbumCard } from '@/lib/services/kw-chain-service'
+import { searchMgArtists, getMgArtistBio, searchMgAlbums, type MgArtistCard, type MgAlbumCard } from '@/lib/services/mg-chain-service'
 import { searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
 import { searchAmpArtists } from '@/lib/services/apple-amp-service'
 
@@ -106,4 +106,32 @@ export async function searchAlbumCardsChain(
   }
 
   return kwList.length > 0 ? kwList : mgList
+}
+
+/**
+ * 快速歌手简介（免代理、300ms 级）：酷我百科 → 咪咕搜索 summary。
+ * 供 TX 主链等无原生简介的链使用——主链不依赖 WIKI_PROXY（延迟不可接受）。
+ */
+export async function getFastArtistBio(name: string): Promise<string | null> {
+  const q = name.trim()
+  if (!q) return null
+  // 酷我百科（歌手信息接口自带 bio，缓存 24h）
+  try {
+    const kwArtists = await searchKwArtists(q, 5)
+    const kwHit = kwArtists.find(a => a.name === q) ?? kwArtists[0]
+    if (kwHit) {
+      const info = await getKwArtistInfo(kwHit.artistId)
+      if (info?.bio) return info.bio
+    }
+  } catch { /* 落咪咕 */ }
+  // 咪咕搜索 summary（按 singerId 锚定）
+  try {
+    const mgArtists = await searchMgArtists(q, 3)
+    const mgHit = mgArtists.find(a => a.name === q) ?? mgArtists[0]
+    if (mgHit) {
+      const bio = await getMgArtistBio(mgHit.artistId, q)
+      if (bio) return bio
+    }
+  } catch { /* 静默 */ }
+  return null
 }

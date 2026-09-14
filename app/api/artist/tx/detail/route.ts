@@ -18,7 +18,7 @@ import { getKwArtistDetail, searchKwArtists } from '@/lib/services/kw-chain-serv
 import { getMgArtistDetail, searchMgArtists } from '@/lib/services/mg-chain-service'
 import { searchItunesArtists } from '@/lib/services/itunes-service'
 import { getAppleArtistDetail } from '@/lib/services/album-service'
-import { getWikiExtract } from '@/lib/services/wiki-service'
+import { getFastArtistBio } from '@/lib/services/source-chain'
 
 export async function GET(request: NextRequest) {
   try {
@@ -29,14 +29,13 @@ export async function GET(request: NextRequest) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '无效的 artistId', 400)
     }
 
-    // TX 主链
-    const detail = await getTxArtistDetail(artistId, name || undefined)
+    // TX 主链：详情/快速简介（kw百科→mg summary，免代理）/MV 三路并行
+    const [detail, bio, mvs] = await Promise.all([
+      getTxArtistDetail(artistId, name || undefined),
+      name.trim() ? getFastArtistBio(name.trim()).catch(() => null) : Promise.resolve(null),
+      getTxArtistMvs(artistId, 12).catch(() => []),
+    ])
     if (detail) {
-      // 简介维基兜底 + MV 列表并行（仅主结果，避免同名歌手错配由前端 name 锚定）
-      const [bio, mvs] = await Promise.all([
-        name.trim() ? getWikiExtract(name.trim(), 'artist').catch(() => null) : Promise.resolve(null),
-        getTxArtistMvs(artistId, 12).catch(() => []),
-      ])
       logger.info(`TX歌手详情: ${detail.artist.name}（热门歌 ${detail.hotSongs.length}，专辑 ${detail.albums.length}，MV ${mvs.length}）`)
       return createSuccessResponse({ ...detail, artist: { ...detail.artist, bio }, mvs })
     }
