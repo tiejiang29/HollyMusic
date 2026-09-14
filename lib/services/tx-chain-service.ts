@@ -251,37 +251,152 @@ export async function getTxArtistAlbums(songs: MusicInfo[], limit = 30): Promise
 }
 
 // ---------------------------------------------------------------------------
-// 专辑详情（GetAlbumSongList 一次整张，免登录实测）
+// 歌手简介（fcg_get_singer_desc.fcg 明文老接口，XML 格式，免登录）
+// 路径是 /splcloud/fcgi-bin/（/base/ 已 404）；format=xml 才有数据（json 返回 no supply）
 // ---------------------------------------------------------------------------
 
-export async function getTxAlbumDetail(albumMid: string): Promise<{ tracks: MusicInfo[] } | null> {
-  const cacheKey = `tx:albumDetail:${albumMid}`
-  const cached = searchCache.get(cacheKey) as { tracks: MusicInfo[] } | null
+export interface TxArtistDesc {
+  /** 百科简介全文 */
+  desc: string | null
+  /** basic 档案里的生日（如 1979年1月18日） */
+  birthDate?: string
+  /** basic 档案（外文名/国籍/出生地/职业等） */
+  basic: Array<{ key: string; value: string }>
+}
+
+export async function getTxArtistDesc(singerMid: string): Promise<TxArtistDesc | null> {
+  const cacheKey = `tx:artistDesc:${singerMid}`
+  const cached = searchCache.get(cacheKey) as TxArtistDesc | null
+  if (cached) return cached
+  try {
+    const xml = await polite('c.y.qq.com', async () => {
+      const resp = await fetch(`https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_singer_desc.fcg?singermid=${encodeURIComponent(singerMid)}&format=xml&outCharset=utf-8&utf8=1&r=${Date.now()}&loginUin=0&hostUin=0&inCharset=utf8&notice=0&platform=yqq.json&needNewCode=0`, {
+        headers: { 'User-Agent': WEB_UA, Referer: 'https://y.qq.com/' },
+        signal: AbortSignal.timeout(TX_TIMEOUT),
+      })
+      if (!resp.ok) throw new Error(`singer_desc HTTP ${resp.status}`)
+      return await resp.text()
+    })
+    const desc = xml.match(/<desc><!\[CDATA\[([\s\S]*?)\]\]><\/desc>/)?.[1]?.trim() || null
+    const basic = [...xml.matchAll(/<key><!\[CDATA\[([\s\S]*?)\]\]><\/key><value><!\[CDATA\[([\s\S]*?)\]\]><\/value>/g)]
+      .map(m => ({ key: m[1].trim(), value: m[2].trim() }))
+      .filter(x => x.key && x.value)
+    if (!desc && basic.length === 0) return null
+    const birth = basic.find(x => x.key === '生日')?.value
+    const result: TxArtistDesc = { desc, ...(birth ? { birthDate: birth } : {}), basic }
+    searchCache.set(cacheKey, result, CACHE_TTL)
+    return result
+  } catch (error) {
+    logger.warn('[tx-chain] 歌手简介获取失败:', error instanceof Error ? error.message : error)
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 专辑详情（v8 fcg_v8_album_info_cp.fcg 一次全：曲目 + desc 简介 + 公司 + 发行日）
+// ---------------------------------------------------------------------------
+
+interface V8Track {
+  songmid?: string; songname?: string; interval?: number
+  singer?: string[]; albummid?: string; albumname?: string
+  strMediaMid?: string
+  size128?: number; size320?: number; sizeflac?: number; sizehires?: number
+}
+
+function v8TrackToMusicInfo(item: V8Track, albumMid: string, albumName: string): MusicInfo | null {
+  if (!item.songmid || !item.songname || !item.strMediaMid) return null
+  const types: Array<{ type: QualityType; size: string }> = []
+  const _types: Partial<Record<QualityType, { size: string }>> = {}
+  const fmt = (v?: number) => v ? `${(v / 1024 / 1024).toFixed(2)}M` : '0B'
+  if (item.size128) { types.push({ type: '128k', size: fmt(item.size128) }); _types['128k'] = { size: fmt(item.size128) } }
+  if (item.size320) { types.push({ type: '320k', size: fmt(item.size320) }); _types['320k'] = { size: fmt(item.size320) } }
+  if (item.sizeflac) { types.push({ type: 'flac', size: fmt(item.sizeflac) }); _types.flac = { size: fmt(item.sizeflac) } }
+  const m = Math.floor((item.interval || 0) / 60), s = (item.interval || 0) % 60
+  return {
+    name: clean(item.songname),
+    singer: (Array.isArray(item.singer) ? item.singer : []).map(clean).filter(Boolean).join('、') || '未知歌手',
+    source: 'tx',
+    songmid: item.songmid,
+    strMediaMid: item.strMediaMid,
+    albumId: item.albummid || albumMid,
+    albumMid: item.albummid || albumMid,
+    albumName: clean(item.albumname || albumName) || '',
+    interval: `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`,
+    img: txPhotoUrl('T002', item.albummid || albumMid),
+    types,
+    _types: _types as MusicInfo['_types'],
+    typeUrl: {},
+  }
+}
+
+export async function getTxAlbumDetail(albumMid: string): Promise<{
+  album: { name: string; artist: string; desc: string | null; company?: string; year?: string }
+  tracks: MusicInfo[]
+} | null> {
+  const cacheKey = 'tx:albumDetail:v2:' + albumMid
+  const cached = searchCache.get(cacheKey) as { album: { name: string; artist: string; desc: string | null; company?: string; year?: string }; tracks: MusicInfo[] } | null
   if (cached) return cached
 
+  // 主：v8 专辑信息（一次全：曲目 + desc 简介 + 公司 + 发行日）
+  try {
+    const j = await polite('c.y.qq.com', async () => {
+      const resp = await fetch('https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg?albummid=' + encodeURIComponent(albumMid) + '&format=json&outCharset=utf-8&r=' + Date.now() + '&loginUin=0&hostUin=0&inCharset=utf8&notice=0&platform=yqq.json&needNewCode=0', {
+        headers: { 'User-Agent': WEB_UA, Referer: 'https://y.qq.com/' },
+        signal: AbortSignal.timeout(TX_TIMEOUT),
+      })
+      if (!resp.ok) throw new Error('v8_album HTTP ' + resp.status)
+      return await resp.json() as { code?: number; data?: { name?: string; singername?: string; desc?: string; company?: string; aDate?: string; list?: V8Track[] } }
+    })
+    const d = j?.data
+    if (d?.name && d.list?.length) {
+      const tracks = d.list.map(t => v8TrackToMusicInfo(t, albumMid, d.name || '')).filter((m): m is MusicInfo => m !== null)
+      if (tracks.length > 0) {
+        const result = {
+          album: {
+            name: clean(d.name),
+            artist: clean(d.singername),
+            desc: d.desc ? clean(d.desc).slice(0, 1000) || null : null,
+            ...(d.company ? { company: clean(d.company) } : {}),
+            ...(d.aDate ? { year: d.aDate } : {}),
+          },
+          tracks,
+        }
+        searchCache.set(cacheKey, result, CACHE_TTL)
+        return result
+      }
+    }
+  } catch (error) {
+    logger.warn('[tx-chain] v8 专辑信息失败，回落 GetAlbumSongList:', error instanceof Error ? error.message : error)
+  }
+
+  // 兜底：App 协议 GetAlbumSongList（无简介）
   interface RawSongInfo {
     songInfo?: {
-      mid?: string; name?: string; title?: string; interval?: number
+      mid?: string; name?: string; interval?: number
       singer?: Array<{ name?: string }>
       album?: { mid?: string; name?: string }
       file?: { media_mid?: string; size_128mp3?: number; size_320mp3?: number; size_flac?: number; size_hires?: number }
     }
   }
-  interface Raw { req_0?: { code?: number; data?: { songList?: RawSongInfo[]; totalNum?: number } } }
-  const j = await appPost<Raw>({
+  interface Raw { req_0?: { code?: number; data?: { songList?: RawSongInfo[] } } }
+  const j2 = await appPost<Raw>({
     req_0: {
       module: 'music.musichallAlbum.AlbumSongList',
       method: 'GetAlbumSongList',
       param: { albumMid, albumId: 0, begin: 0, num: 99 },
     },
   })
-  const rawList = j?.req_0?.data?.songList || []
+  const rawList = j2?.req_0?.data?.songList || []
   if (rawList.length === 0) return null
   const tracks = rawList
     .map(x => x.songInfo ? txSongToMusicInfo(x.songInfo as TxRawSong) : null)
     .filter((m): m is MusicInfo => m !== null)
   if (tracks.length === 0) return null
-  const result = { tracks }
+  const first = tracks[0]
+  const result = {
+    album: { name: first.albumName || '', artist: first.singer, desc: null as string | null },
+    tracks,
+  }
   searchCache.set(cacheKey, result, CACHE_TTL)
   return result
 }
@@ -342,10 +457,10 @@ export async function getTxArtistDetail(singerMid: string, nameHint?: string): P
 
 /** 专辑详情（可播版）：入库附 uid */
 export async function getTxAlbumDetailPlayable(albumMid: string): Promise<{
-  album: TxAlbumCard & { trackCount: number }
+  album: TxAlbumCard & { trackCount: number; bio?: string | null; company?: string; year?: string; profile?: { releaseDate?: string; recordLabels?: string[] } }
   list: Array<MusicInfo & { uid: string }>
 } | null> {
-  const cacheKey = `tx:albumPlayable:${albumMid}`
+  const cacheKey = 'tx:albumPlayable:v2:' + albumMid
   const cached = searchCache.get(cacheKey) as Awaited<ReturnType<typeof getTxAlbumDetailPlayable>> | null
   if (cached) return cached
 
@@ -353,16 +468,25 @@ export async function getTxAlbumDetailPlayable(albumMid: string): Promise<{
   if (!detail) return null
   const list = await upsertAndAttach(detail.tracks)
   if (!list) return null
-  const first = detail.tracks[0]
+  const pic = txPhotoUrl('T002', albumMid)
   const result = {
     album: {
       source: 'tx' as const,
       albumId: albumMid,
-      name: first?.albumName || '',
-      artist: first?.singer || '',
-      pic: txPhotoUrl('T002', albumMid),
-      img: txPhotoUrl('T002', albumMid),
+      name: detail.album.name,
+      artist: detail.album.artist,
+      pic,
+      img: pic,
       trackCount: list.length,
+      ...(detail.album.desc ? { bio: detail.album.desc } : {}),
+      ...(detail.album.company ? { company: detail.album.company } : {}),
+      ...(detail.album.year ? { year: detail.album.year } : {}),
+      ...((detail.album.year || detail.album.company) ? {
+        profile: {
+          ...(detail.album.year ? { releaseDate: detail.album.year } : {}),
+          ...(detail.album.company ? { recordLabels: [detail.album.company] } : {}),
+        },
+      } : {}),
     },
     list,
   }
@@ -407,7 +531,7 @@ export async function getTxArtistMvs(singerMid: string, limit = 12): Promise<TxM
   if (cached) return cached
   try {
     const j = await polite('c.y.qq.com', async () => {
-      const resp = await fetch(`https://c.y.qq.com/mv/fcgi-bin/fcg_singer_mv.fcg?cv=4747474&ct=24&format=json&inCharset=utf-8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=1&uin=0&singermid=${encodeURIComponent(singerMid)}&cid=205360581&order=time&begin=0&num=${Math.min(limit, 20)}&cmd=1`, {
+      const resp = await fetch(`https://c.y.qq.com/mv/fcgi-bin/fcg_singer_mv.fcg?cv=4747474&ct=24&format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=1&uin=0&singermid=${encodeURIComponent(singerMid)}&cid=205360581&order=time&begin=0&num=${Math.min(limit, 20)}&cmd=1`, {
         headers: { 'User-Agent': WEB_UA, Referer: 'https://y.qq.com/' },
         signal: AbortSignal.timeout(TX_TIMEOUT),
       })

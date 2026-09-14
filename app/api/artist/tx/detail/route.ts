@@ -13,7 +13,7 @@ import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
-import { getTxArtistDetail, getTxArtistMvs } from '@/lib/services/tx-chain-service'
+import { getTxArtistDetail, getTxArtistMvs, getTxArtistDesc } from '@/lib/services/tx-chain-service'
 import { getKwArtistDetail, searchKwArtists } from '@/lib/services/kw-chain-service'
 import { getMgArtistDetail, searchMgArtists } from '@/lib/services/mg-chain-service'
 import { searchItunesArtists } from '@/lib/services/itunes-service'
@@ -29,15 +29,21 @@ export async function GET(request: NextRequest) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '无效的 artistId', 400)
     }
 
-    // TX 主链：详情/快速简介（kw百科→mg summary，免代理）/MV 三路并行
-    const [detail, bio, mvs] = await Promise.all([
+    // TX 主链：详情/原生简介（fcg_get_singer_desc XML）/快速简介兜底（kw→mg）/MV 四路并行
+    const [detail, txDesc, fastBio, mvs] = await Promise.all([
       getTxArtistDetail(artistId, name || undefined),
+      getTxArtistDesc(artistId).catch(() => null),
       name.trim() ? getFastArtistBio(name.trim()).catch(() => null) : Promise.resolve(null),
       getTxArtistMvs(artistId, 12).catch(() => []),
     ])
     if (detail) {
+      const bio = txDesc?.desc || fastBio
       logger.info(`TX歌手详情: ${detail.artist.name}（热门歌 ${detail.hotSongs.length}，专辑 ${detail.albums.length}，MV ${mvs.length}）`)
-      return createSuccessResponse({ ...detail, artist: { ...detail.artist, bio }, mvs })
+      return createSuccessResponse({
+        ...detail,
+        artist: { ...detail.artist, bio, ...(txDesc?.birthDate && !detail.artist.pic ? {} : {}), ...(txDesc?.birthDate ? { birthDate: txDesc.birthDate } : {}) },
+        mvs,
+      })
     }
 
     // 降级①：名字 → 酷我

@@ -128,3 +128,36 @@ describe('txPhotoUrl 公式', () => {
     expect(tx.txPhotoUrl('T002', '000MkMni19ClKG')).toContain('T002R500x500M000000MkMni19ClKG.jpg')
   })
 })
+
+describe('原生简介 + v8 专辑信息', () => {
+  beforeEach(() => { get.mockReturnValue(undefined) })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('getTxArtistDesc：XML 解析 desc + basic 档案生日', async () => {
+    const xml = `<?xml version="1.0"?><result><code>0</code><data><info><id>4558</id><desc><![CDATA[周杰伦（Jay Chou），1979年生。]]></desc><basic><item><key><![CDATA[外文名]]></key><value><![CDATA[Jay Chou]]></value></item><item><key><![CDATA[生日]]></key><value><![CDATA[1979年1月18日]]></value></item></basic></info></data></result>`
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, text: async () => xml })))
+    const d = await tx.getTxArtistDesc('0025NhlN2yWrP4')
+    expect(d?.desc).toBe('周杰伦（Jay Chou），1979年生。')
+    expect(d?.birthDate).toBe('1979年1月18日')
+    expect(d?.basic).toContainEqual({ key: '外文名', value: 'Jay Chou' })
+  })
+
+  it('getTxAlbumDetail：v8 主路径（desc/company/aDate + 曲目）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        code: 0,
+        data: {
+          name: '叶惠美', singername: '周杰伦', desc: '专辑文案', company: '杰威尔音乐有限公司', aDate: '2003-07-31',
+          list: [
+            { songmid: '001n4C3p1yv0FU', songname: '以父之名', interval: 342, singer: ['周杰伦'], albummid: '000MkMni19ClKG', albumname: '叶惠美', strMediaMid: '002ExFMX2Jt6gv', size320: 13682683, sizeflac: 33950377 },
+          ],
+        },
+      }),
+    })))
+    const d = await tx.getTxAlbumDetail('000MkMni19ClKG')
+    expect(d?.album).toMatchObject({ name: '叶惠美', artist: '周杰伦', desc: '专辑文案', company: '杰威尔音乐有限公司', year: '2003-07-31' })
+    expect(d?.tracks[0]).toMatchObject({ songmid: '001n4C3p1yv0FU', strMediaMid: '002ExFMX2Jt6gv', interval: '05:42' })
+    expect(d?.tracks[0]?.types.map(t => t.type)).toEqual(['320k', 'flac'])
+  })
+})
