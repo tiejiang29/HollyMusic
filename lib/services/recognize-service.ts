@@ -113,7 +113,27 @@ async function findPlayable(name: string, singer: string): Promise<Song | null> 
  * 识曲主入口：PCM（Int16LE 48kHz 单声道，建议 6~12 秒）→ 前 3 候选（附可播 song）。
  * 从 PCM 的中部取段（避开前奏/空白）。
  */
-export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000): Promise<RecognizeCandidate[]> {
+export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000, channels = 1): Promise<RecognizeCandidate[]> {
+  // 预处理：声道归一（交错立体声→平均单声道）+ 重采样到 48k（指纹器硬性要求 48kHz）
+  if (channels === 2 && pcmInt16.length >= 4) {
+    const frames = Math.floor(pcmInt16.length / 4)
+    const mono = Buffer.alloc(frames * 2)
+    for (let i = 0; i < frames; i++) {
+      mono.writeInt16LE(Math.round((pcmInt16.readInt16LE(i * 4) + pcmInt16.readInt16LE(i * 4 + 2)) / 2), i * 2)
+    }
+    pcmInt16 = mono
+  }
+  if (sampleRate !== 48000 && sampleRate > 0 && pcmInt16.length >= 2) {
+    const srcFrames = Math.floor(pcmInt16.length / 2)
+    const dstFrames = Math.floor(srcFrames * 48000 / sampleRate)
+    const resampled = Buffer.alloc(dstFrames * 2)
+    for (let i = 0; i < dstFrames; i++) {
+      const src = Math.min(srcFrames - 1, Math.floor(i * sampleRate / 48000))
+      resampled.writeInt16LE(pcmInt16.readInt16LE(src * 2), i * 2)
+    }
+    pcmInt16 = resampled
+    sampleRate = 48000
+  }
   const totalSec = pcmInt16.length / 2 / sampleRate
   if (totalSec < 4) throw new Error('音频太短（至少 4 秒）')
   const lenSec = Math.min(6, Math.floor(totalSec))

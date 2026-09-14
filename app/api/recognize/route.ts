@@ -19,11 +19,13 @@ export async function POST(request: NextRequest) {
   try {
     await requireUser(request)
     const pcm = Buffer.from(await request.arrayBuffer())
-    if (pcm.length < 48000 * 2 * 4) {
-      return createErrorResponse(ErrorCodes.INVALID_PARAMS, '音频太短（至少 4 秒 48kHz PCM）', 400)
+    const sampleRate = parseInt(request.nextUrl.searchParams.get('sampleRate') || '48000') || 48000
+    const channels = parseInt(request.nextUrl.searchParams.get('channels') || '1') || 1
+    if (pcm.length < sampleRate * channels * 2 * 4) {
+      return createErrorResponse(ErrorCodes.INVALID_PARAMS, '音频太短（至少 4 秒）', 400)
     }
     const t = Date.now()
-    const list = await recognizeFromPcm(pcm)
+    const list = await recognizeFromPcm(pcm, sampleRate, channels)
     logger.info(`识曲: ${list.length} 个候选 ${Date.now() - t}ms ${list[0] ? '| 首选: ' + list[0].name + ' - ' + list[0].singer : ''}`)
     return createSuccessResponse({ list })
   } catch (error) {
