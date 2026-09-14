@@ -38,7 +38,8 @@ export function ArtistDetailPage() {
   const load = async () => {
     const reqId = ++reqIdRef.current
     const stale = () => reqId !== reqIdRef.current
-    if (!/^\d+$/.test(artistId)) {
+    // id 形态：apple/kw/mg 为纯数字，tx 为字母数字混合 mid（如 0025NhlN2yWrP4）
+    if (!/^[0-9A-Za-z]{1,64}$/.test(artistId)) {
       setDetail(null); setError('无效的歌手'); setLoading(false); return
     }
     setLoading(true); setError(null); setUnsupported(false)
