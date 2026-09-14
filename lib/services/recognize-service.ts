@@ -88,13 +88,30 @@ async function matchFingerprint(rawdata: string, durationSec: number): Promise<M
   return j.data?.result || []
 }
 
+/** 歌名清洗：去 DJ版/翻唱/AI/饭制/装饰括号等标记，恢复原始歌名用于搜原曲 */
+function cleanSongName(name: string): string {
+  let n = name
+  for (let i = 0; i < 3; i++) {
+    // 剥尾部版本括号：(DJ版) (Live) 【AI...】(翻自...) 等
+    n = n.replace(/\s*[(【\[](?:DJ|Live|Remix|翻唱|AI|饭制|feat\.|Cover|cover|翻自)[^)】\]]*[)】\]]\s*$/i, '')
+    // 剥尾部裸标记
+    n = n.replace(/\s*(DJ\s*版|Remix\s*版|翻唱版|饭制版|Live\s*版|AI\s*版)\s*$/i, '')
+    // 剥头部装饰【...】
+    n = n.replace(/^\s*【[^】]*】\s*/, '')
+  }
+  // 去前缀 emoji/装饰符
+  n = n.replace(/^[\p{So}\p{Sk}\s·]+/u, '').trim()
+  return n || name
+}
+
 /** 候选歌名+歌手 → TX 搜歌挑可播（歌名/歌手双重校验） */
 async function findPlayable(name: string, singer: string): Promise<Song | null> {
+  const cleanName = cleanSongName(name)
   try {
-    const keyword = `${name} ${singer}`.trim()
+    const keyword = `${cleanName} ${singer}`.trim()
     const result = await searchOneSource('tx', keyword, 1, 10)
     const norm = (v: string | null | undefined) => (v || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
-    const nameN = norm(name)
+    const nameN = norm(cleanName)
     const singerN = norm(singer)
     const hit = (result.list || []).find(s => {
       const sn = norm(s.name)
@@ -152,7 +169,7 @@ export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000, cha
 
   const top = results.slice(0, 3)
   const candidates = top.map(x => ({
-    name: x.song?.name || '',
+    name: cleanSongName(x.song?.name || ''),
     singer: (x.song?.artists || []).map(a => a.name).filter(Boolean).join('/') || '',
     ...(x.song?.album?.name ? { album: x.song.album.name } : {}),
   })).filter(c => c.name)
