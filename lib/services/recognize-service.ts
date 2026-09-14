@@ -136,11 +136,17 @@ export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000, cha
   }
   const totalSec = pcmInt16.length / 2 / sampleRate
   if (totalSec < 4) throw new Error('音频太短（至少 4 秒）')
+  // 静音检测：RMS 过低说明录到的是静音/无效音频
+  let sumSq = 0
+  const pcmFrames = Math.floor(pcmInt16.length / 2)
+  for (let i = 0; i < pcmFrames; i++) { const v = pcmInt16.readInt16LE(i * 2); sumSq += v * v }
+  const rms = Math.sqrt(sumSq / pcmFrames)
+  if (rms < 100) throw new Error('采集到的音频接近静音（请检查麦克风设备或外放音量）')
   const lenSec = Math.min(6, Math.floor(totalSec))
   const fromSec = Math.max(0, Math.floor(totalSec * 0.3))
 
   const rawdata = await encodeViaWorker(pcmInt16, sampleRate, fromSec, lenSec)
-  if (!rawdata) throw new Error('指纹编码失败')
+  if (!rawdata) throw new Error('未能提取音频特征（音频内容可能无法识别，试试录副歌段）')
   const results = await matchFingerprint(rawdata, lenSec)
   if (results.length === 0) return []
 

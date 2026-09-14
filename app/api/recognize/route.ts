@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
     }
     const t = Date.now()
     const list = await recognizeFromPcm(pcm, sampleRate, channels)
-    logger.info(`识曲: ${list.length} 个候选 ${Date.now() - t}ms ${list[0] ? '| 首选: ' + list[0].name + ' - ' + list[0].singer : ''}`)
+    logger.info(`识曲: ${list.length} 个候选 (pcm ${pcm.length}B, sr ${sampleRate}, ch ${channels}) ${Date.now() - t}ms ${list[0] ? '| 首选: ' + list[0].name + ' - ' + list[0].singer : ''}`)
     return createSuccessResponse({ list })
   } catch (error) {
     if (error instanceof AuthError) return createErrorResponse('UNAUTHORIZED', error.message, 401)
