@@ -174,10 +174,16 @@ export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000, cha
   const withSongs = await Promise.all(candidates.map(async c => {
     const song = await findPlayable(c.name)
     if (song) {
-      // 可播命中：用 TX 搜到的真实歌手/专辑覆盖网易候选的翻唱信息
       return { ...c, name: song.name, singer: song.singer, ...(song.albumName ? { album: song.albumName } : {}), song }
     }
     return { ...c, song: null }
   }))
-  return withSongs
+  // 去重：多候选清洗后搜到同一首歌（同 uid）只保留第一个
+  const seen = new Set<string>()
+  return withSongs.filter(c => {
+    if (!c.song) return true
+    if (seen.has(c.song.uid)) return false
+    seen.add(c.song.uid)
+    return true
+  })
 }
