@@ -1,16 +1,17 @@
 /**
- * 听音识曲服务（网易 shazam_v2 指纹方案，全部免鉴权实测）
+ * 听音识曲服务（双引擎：酷我 8k PCM 主引擎 + 网易 shazam_v2 兜底，全部免鉴权实测）
  *
- * 链路：前端采集 48kHz 单声道 PCM（Int16LE，麦克风或文件解码+重采样）
- *   → 本服务 lib/recognize 指纹器（网易官方 Chrome 扩展提取的 wasm 实现）
+ * 主引擎：酷我 discern/inner/info
+ *   PCM 8kHz s16le → base64 trait → POST wapi.kuwo.cn（免登录，明文 JSON）
+ *   → 直接返回 kw-{rid} 可播歌曲（与 kw 链完美对接）
+ *   归一化系数无关紧要（实测 3 种幅度全部命中）
+ *
+ * 兜底引擎：网易 shazam_v2
+ *   PCM 48kHz → sandbox.bundle.cjs 指纹（wasm，spawn 子进程）
  *   → POST interface.music.163.com/api/music/audio/match（form-urlencoded）
- *   → 候选（歌名/歌手/专辑，取前 3）
- *   → 每个候选走 TX 搜歌附可播 uid
+ *   → 候选走 TX 搜歌附可播 uid
  *
- * 注意：
- * - 指纹器要求 48kHz（44.1k 直接报错），前端负责重采样
- * - 识别取段建议从音频 30%~50% 处取 6 秒（前奏/空白段命中率低）
- * - 返回的候选可能是翻唱（网易库排序偏好），前端展示多候选由用户选择
+ * 前端统一采集 48kHz 单声道 Int16LE PCM，本服务负责降采样到 8k 给酷我主引擎。
  */
 
 import { logger } from '@/lib/logger'
@@ -21,16 +22,109 @@ export interface RecognizeCandidate {
   name: string
   singer: string
   album?: string
-  /** 匹配到的可播歌曲（TX 搜索附 uid；搜索失败为 null） */
+  /** 匹配到的可播歌曲（搜索附 uid；搜索失败为 null） */
   song: Song | null
 }
+
+// ---------------------------------------------------------------------------
+// 公共：音频预处理
+// ---------------------------------------------------------------------------
+
+/** 声道归一（交错立体声→平均单声道） */
+function deinterleave(pcm: Buffer): Buffer {
+  if (pcm.length < 4) return pcm
+  const frames = Math.floor(pcm.length / 4)
+  const mono = Buffer.alloc(frames * 2)
+  for (let i = 0; i < frames; i++) {
+    mono.writeInt16LE(Math.round((pcm.readInt16LE(i * 4) + pcm.readInt16LE(i * 4 + 2)) / 2), i * 2)
+  }
+  return mono
+}
+
+/** 线性重采样 */
+function resample(pcm: Buffer, fromRate: number, toRate: number): Buffer {
+  if (fromRate === toRate || fromRate <= 0) return pcm
+  const srcFrames = Math.floor(pcm.length / 2)
+  const dstFrames = Math.floor(srcFrames * toRate / fromRate)
+  const out = Buffer.alloc(dstFrames * 2)
+  for (let i = 0; i < dstFrames; i++) {
+    const src = Math.min(srcFrames - 1, Math.floor(i * fromRate / toRate))
+    out.writeInt16LE(pcm.readInt16LE(src * 2), i * 2)
+  }
+  return out
+}
+
+/** 静音检测（RMS < 100 判为静音） */
+function isSilence(pcm: Buffer): boolean {
+  let sumSq = 0
+  const frames = Math.floor(pcm.length / 2)
+  if (frames === 0) return true
+  for (let i = 0; i < frames; i++) { const v = pcm.readInt16LE(i * 2); sumSq += v * v }
+  return Math.sqrt(sumSq / frames) < 100
+}
+
+// ---------------------------------------------------------------------------
+// 主引擎：酷我识曲（8kHz PCM 免登录）
+// ---------------------------------------------------------------------------
+
+interface KwMusicResult {
+  name?: string; artist?: string; album?: string
+  rid?: string; mid?: string; duration?: string
+}
+
+/** PCM（任意采样率）→ 降采样 8k → base64 trait → 酷我识曲 → kw-{rid} 可播歌曲 */
+async function recognizeByKuwo(pcm48k: Buffer): Promise<Song | null> {
+  // 降采样到 8kHz
+  const pcm8k = resample(pcm48k, 48000, 8000)
+  const durationSec = Math.floor(pcm8k.length / 2 / 8000)
+  if (durationSec < 3) return null
+
+  // 取中段 3 秒（酷我接口按 recordDuration 分段识别）
+  const fromByte = Math.floor(durationSec * 0.3) * 8000 * 2
+  const segBytes = 3 * 8000 * 2
+  const segment = pcm8k.slice(fromByte, fromByte + segBytes)
+
+  const trait = segment.toString('base64')
+  const body = JSON.stringify({ format: 'pcm', libFlag: '1', os: '2', trait, type: '0' })
+
+  const url = `http://wapi.kuwo.cn/openapi/v1/music/discern/inner/info?appUid=0&coverSong=0&loginUid=0&recordDuration=3`
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US) AppleWebKit/534.10 (KHTML, like Gecko)',
+      Referer: 'https://kuwo.cn/',
+    },
+    body,
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (!resp.ok) throw new Error(`kuwo discern HTTP ${resp.status}`)
+  const j = await resp.json() as { code?: number; data?: { musics?: KwMusicResult[] } }
+  const music = j?.data?.musics?.[0]
+  if (!music?.name || !music.rid) return null
+
+  logger.info(`[recognize] 酷我命中: ${music.name} - ${music.artist} (rid=${music.rid})`)
+  // rid 就是 kw 链的 songmid → kw-{rid} 直接可播
+  const result = await searchOneSource('kw', `${music.name} ${music.artist}`, 1, 5)
+  const norm = (v: string | null | undefined) => (v || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+  const nameN = norm(music.name)
+  const hit = (result.list || []).find(s => {
+    const sn = norm(s.name)
+    return sn.includes(nameN) || nameN.includes(sn)
+  }) ?? (result.list || [])[0]
+  return hit ?? null
+}
+
+// ---------------------------------------------------------------------------
+// 兜底引擎：网易 shazam_v2（48kHz PCM + wasm 指纹子进程）
+// ---------------------------------------------------------------------------
 
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 
-/** 指纹子进程：lib/recognize/worker.js（绕开 Next 打包对 __dirname/wasm 路径的破坏） */
 async function encodeViaWorker(pcmInt16: Buffer, sampleRate: number, fromSec: number, lenSec: number): Promise<string | null> {
   const workerPath = path.join(process.cwd(), 'lib', 'recognize', 'worker.js')
   return new Promise((resolve) => {
@@ -39,7 +133,6 @@ async function encodeViaWorker(pcmInt16: Buffer, sampleRate: number, fromSec: nu
     child.stdout.on('data', d => { stdout += d })
     child.on('error', err => { logger.warn('[recognize] worker 启动失败:', err.message); resolve(null) })
     child.on('close', () => {
-      // wasm 噪声与结果混在 stdout，取最后一个可解析 JSON 行
       const lines = stdout.split('\n').filter(l => l.trim().startsWith('{'))
       for (let i = lines.length - 1; i >= 0; i--) {
         try {
@@ -50,7 +143,6 @@ async function encodeViaWorker(pcmInt16: Buffer, sampleRate: number, fromSec: nu
       }
       resolve(null)
     })
-    // PCM 写临时文件（Windows 管道传大 payload 会截断），worker 读后自删
     const pcmFile = path.join(os.tmpdir(), 'holly-rec-' + crypto.randomUUID() + '.pcm')
     fs.writeFileSync(pcmFile, pcmInt16)
     child.stdin.write(JSON.stringify({ pcmFile, sampleRate, fromSec, lenSec }))
@@ -62,7 +154,6 @@ interface MatchResult {
   song?: { name?: string; artists?: Array<{ name?: string }>; album?: { name?: string } }
 }
 
-/** 指纹 → 网易识曲接口 → 候选列表 */
 async function matchFingerprint(rawdata: string, durationSec: number): Promise<MatchResult[]> {
   const form = new URLSearchParams({
     sessionId: crypto.randomUUID(),
@@ -88,27 +179,24 @@ async function matchFingerprint(rawdata: string, durationSec: number): Promise<M
   return j.data?.result || []
 }
 
-/** 歌名清洗：去 DJ版/翻唱/AI/饭制/装饰括号等标记，恢复原始歌名用于搜原曲 */
+// ---------------------------------------------------------------------------
+// 公共：歌名清洗 + 可播搜索
+// ---------------------------------------------------------------------------
+
 function cleanSongName(name: string): string {
   let n = name
   for (let i = 0; i < 3; i++) {
-    // 剥尾部版本括号：(DJ版) (Live) 【AI...】(翻自...) 等
     n = n.replace(/\s*[(【\[](?:DJ|Live|Remix|翻唱|AI|饭制|feat\.|Cover|cover|翻自)[^)】\]]*[)】\]]\s*$/i, '')
-    // 剥尾部裸标记
     n = n.replace(/\s*(DJ\s*版|Remix\s*版|翻唱版|饭制版|Live\s*版|AI\s*版)\s*$/i, '')
-    // 剥头部装饰【...】
     n = n.replace(/^\s*【[^】]*】\s*/, '')
   }
-  // 去前缀 emoji/装饰符
   n = n.replace(/^[\p{So}\p{Sk}\s·]+/u, '').trim()
   return n || name
 }
 
-/** 候选歌名 → TX 搜歌挑可播。只搜歌名不搜翻唱歌手名——TX 按热门排序自然命中原曲 */
-async function findPlayable(name: string): Promise<Song | null> {
+async function findPlayableOnTx(name: string): Promise<Song | null> {
   const cleanName = cleanSongName(name)
   try {
-    // 只用歌名搜索（不带翻唱歌手名），TX 按热门排序命中原曲
     const result = await searchOneSource('tx', cleanName, 1, 10)
     const norm = (v: string | null | undefined) => (v || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
     const nameN = norm(cleanName)
@@ -123,43 +211,37 @@ async function findPlayable(name: string): Promise<Song | null> {
   }
 }
 
-/**
- * 识曲主入口：PCM（Int16LE 48kHz 单声道，建议 6~12 秒）→ 前 3 候选（附可播 song）。
- * 从 PCM 的中部取段（避开前奏/空白）。
- */
+// ---------------------------------------------------------------------------
+// 识曲主入口：双引擎（酷我主 → 网易兜底）
+// ---------------------------------------------------------------------------
+
 export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000, channels = 1): Promise<RecognizeCandidate[]> {
-  // 预处理：声道归一（交错立体声→平均单声道）+ 重采样到 48k（指纹器硬性要求 48kHz）
-  if (channels === 2 && pcmInt16.length >= 4) {
-    const frames = Math.floor(pcmInt16.length / 4)
-    const mono = Buffer.alloc(frames * 2)
-    for (let i = 0; i < frames; i++) {
-      mono.writeInt16LE(Math.round((pcmInt16.readInt16LE(i * 4) + pcmInt16.readInt16LE(i * 4 + 2)) / 2), i * 2)
-    }
-    pcmInt16 = mono
-  }
+  // 预处理：声道归一 + 重采样到 48k 统一口径
+  if (channels === 2 && pcmInt16.length >= 4) pcmInt16 = deinterleave(pcmInt16)
   if (sampleRate !== 48000 && sampleRate > 0 && pcmInt16.length >= 2) {
-    const srcFrames = Math.floor(pcmInt16.length / 2)
-    const dstFrames = Math.floor(srcFrames * 48000 / sampleRate)
-    const resampled = Buffer.alloc(dstFrames * 2)
-    for (let i = 0; i < dstFrames; i++) {
-      const src = Math.min(srcFrames - 1, Math.floor(i * sampleRate / 48000))
-      resampled.writeInt16LE(pcmInt16.readInt16LE(src * 2), i * 2)
-    }
-    pcmInt16 = resampled
+    pcmInt16 = resample(pcmInt16, sampleRate, 48000)
     sampleRate = 48000
   }
-  const totalSec = pcmInt16.length / 2 / sampleRate
+  const totalSec = pcmInt16.length / 2 / 48000
   if (totalSec < 4) throw new Error('音频太短（至少 4 秒）')
-  // 静音检测：RMS 过低说明录到的是静音/无效音频
-  let sumSq = 0
-  const pcmFrames = Math.floor(pcmInt16.length / 2)
-  for (let i = 0; i < pcmFrames; i++) { const v = pcmInt16.readInt16LE(i * 2); sumSq += v * v }
-  const rms = Math.sqrt(sumSq / pcmFrames)
-  if (rms < 100) throw new Error('采集到的音频接近静音（请检查麦克风设备或外放音量）')
+  if (isSilence(pcmInt16)) throw new Error('采集到的音频接近静音（请检查麦克风设备或外放音量）')
+
+  // 主引擎：酷我（8k PCM 直接识别）
+  try {
+    const song = await recognizeByKuwo(pcmInt16)
+    if (song) {
+      logger.info(`[recognize] 酷我主引擎命中: ${song.name} - ${song.singer}`)
+      return [{ name: song.name, singer: song.singer, ...(song.albumName ? { album: song.albumName } : {}), song }]
+    }
+    logger.info('[recognize] 酷我主引擎未命中，落网易兜底')
+  } catch (error) {
+    logger.warn('[recognize] 酷我主引擎失败，落网易兜底:', error instanceof Error ? error.message : error)
+  }
+
+  // 兜底引擎：网易 shazam_v2
   const lenSec = Math.min(6, Math.floor(totalSec))
   const fromSec = Math.max(0, Math.floor(totalSec * 0.3))
-
-  const rawdata = await encodeViaWorker(pcmInt16, sampleRate, fromSec, lenSec)
+  const rawdata = await encodeViaWorker(pcmInt16, 48000, fromSec, lenSec)
   if (!rawdata) throw new Error('未能提取音频特征（音频内容可能无法识别，试试录副歌段）')
   const results = await matchFingerprint(rawdata, lenSec)
   if (results.length === 0) return []
@@ -172,13 +254,12 @@ export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000, cha
   })).filter(c => c.name)
 
   const withSongs = await Promise.all(candidates.map(async c => {
-    const song = await findPlayable(c.name)
+    const song = await findPlayableOnTx(c.name)
     if (song) {
       return { ...c, name: song.name, singer: song.singer, ...(song.albumName ? { album: song.albumName } : {}), song }
     }
     return { ...c, song: null }
   }))
-  // 去重：多候选清洗后搜到同一首歌（同 uid）只保留第一个
   const seen = new Set<string>()
   return withSongs.filter(c => {
     if (!c.song) return true
