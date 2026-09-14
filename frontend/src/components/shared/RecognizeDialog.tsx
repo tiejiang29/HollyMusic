@@ -99,7 +99,7 @@ export function RecognizeDialog({ open, onClose }: { open: boolean; onClose: () 
               ref={fileInputRef} type="file" accept="audio/*,.mp3,.m4a,.wav,.webm,.ogg" className="hidden"
               onChange={e => { const f = e.target.files?.[0]; if (f) void handleFile(f); e.target.value = '' }}
             />
-            <p className="text-center text-xs text-muted-foreground">识曲由网易 shazam 引擎驱动，结果自动匹配 TX 可播源</p>
+            <p className="text-center text-xs text-muted-foreground">放一段音乐或哼唱，自动识别歌曲</p>
           </div>
         )}
 
