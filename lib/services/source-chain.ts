@@ -15,6 +15,7 @@ import { logger } from '@/lib/logger'
 import { searchKwArtists, searchKwAlbums, type KwArtistCard, type KwAlbumCard } from '@/lib/services/kw-chain-service'
 import { searchMgArtists, searchMgAlbums, type MgArtistCard, type MgAlbumCard } from '@/lib/services/mg-chain-service'
 import { searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
+import { searchAmpArtists } from '@/lib/services/apple-amp-service'
 
 export type ArtistCard = (KwArtistCard | MgArtistCard | { source: 'apple'; artistId: string; name: string; genre?: string })
 export type AlbumCard = KwAlbumCard | MgAlbumCard | {
@@ -53,9 +54,10 @@ export async function searchArtistCardsChain(
     return { source: 'mg', list: mgList }
   }
 
-  // 两链均无完全匹配 → Apple 兜底（Apple 搜索本身按相关度，接受模糊结果）
+  // 两链均无完全匹配 → Apple 兜底（amp 版卡片自带官方头像；amp 失败回落老 iTunes Search API）
   try {
-    const appleList = (await searchItunesArtists(keyword, limit)).map(c => ({ ...c, source: 'apple' as const }))
+    const ampList = await searchAmpArtists(keyword, limit).catch(() => [])
+    const appleList = ampList.length > 0 ? ampList : (await searchItunesArtists(keyword, limit)).map(c => ({ ...c, source: 'apple' as const }))
     if (appleList.length > 0) {
       return { source: 'apple', list: appleList }
     }

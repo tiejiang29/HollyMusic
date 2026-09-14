@@ -26,6 +26,7 @@ import { searchKwAlbums, findKwAlbumId, getKwAlbumDetail } from '@/lib/services/
 import { findMgAlbumId, getMgAlbumDetail } from '@/lib/services/mg-chain-service'
 import { searchAlbumCardsChain } from '@/lib/services/source-chain'
 import { parseIntervalToSeconds } from '@/lib/services/source-toggle'
+import { getAmpArtistDetail, getAmpAlbumDetail } from '@/lib/services/apple-amp-service'
 import { getWikiExtract, getArtistProfile, getAlbumProfile, type ArtistProfile, type AlbumProfile } from '@/lib/services/wiki-service'
 
 /** 专辑详情（含已入库曲目）缓存 */
@@ -381,8 +382,10 @@ export interface AppleArtistDetail {
     bio?: string | null
     /** Wikidata 结构化档案（出生/职业/流派/唱片公司，best-effort） */
     profile?: ArtistProfile | null
-    /** 头像（Apple 歌手实体无照片，取首张专辑封面） */
+    /** 头像（v2.5 amp 官方 artwork；老路径回落首张专辑封面） */
     img: string | null
+    /** amp bornOrFormed（Wikidata 档案缺失时兜底） */
+    birthDate?: string
   }
   /** 热门歌曲（Apple 热门度排序，本地库优先落歌，可播） */
   hotSongs: Song[]
@@ -392,44 +395,73 @@ export interface AppleArtistDetail {
 
 /** Apple 歌手详情：热门歌（本地优先落歌）+ 专辑列表 + 维基简介。结果缓存 1h。 */
 export async function getAppleArtistDetail(artistId: string): Promise<AppleArtistDetail | null> {
-  const cacheKey = `album:v2:artist:${artistId}`
+  const cacheKey = `album:v3:artist:${artistId}`
   const cached = searchCache.get(cacheKey) as AppleArtistDetail | null
   if (cached) return cached
 
-  const info = await getItunesArtistSongs(artistId)
-  if (!info) return null
+  // v2.5 amp 升级：一发全包（官方头像 artwork + 生日 + 24 热门歌 + 全部专辑），
+  // 失败回落老 iTunes Search API 路径；bio/档案仍走维基（cn 目录 amp artistBio 普遍为空）
+  const amp = await getAmpArtistDetail(artistId).catch(() => null)
+  const info = amp ? {
+    artistId,
+    name: amp.artist.name,
+    genre: amp.artist.genre,
+    img: amp.artist.img,
+    birthDate: amp.artist.birthDate,
+    songs: amp.topSongs.map(s => ({ title: s.title, titleNorm: '', secs: s.secs, artist: s.artist })),
+    ampAlbums: amp.albums,
+  } : null
+  const fallback = info ? null : await getItunesArtistSongs(artistId)
+  if (!info && !fallback) return null
+  const name = info?.name ?? fallback!.name
 
   // 同名歌手检测：Apple 搜索该名字返回多个结果时，仅第一个（最热门）展示维基档案，
   // 其余跳过避免张冠李戴（如四个"张杰"只有大陆张杰的简介是对的）
   let isPrimaryArtist = true
   try {
-    const artistSearch = await searchItunesArtists(info.name, 5)
-    isPrimaryArtist = artistSearch.length <= 1 || artistSearch[0]?.artistId === info.artistId
+    const artistSearch = await searchItunesArtists(name, 5)
+    isPrimaryArtist = artistSearch.length <= 1 || artistSearch[0]?.artistId === artistId
   } catch { /* 检测失败时保守展示 */ }
 
-  // 四路并行：热门歌落歌 / 专辑（按 artistId 精确查）/ 维基简介 / Wikidata 档案
+  // 四路并行：热门歌落歌 / 专辑（amp 优先）/ 维基简介 / Wikidata 档案
   const [hotSongs, artistAlbums, bio, profile] = await Promise.all([
-    batchResolveAndUpsert(info.songs, info.name, undefined),
-    getArtistAlbumsById(artistId).catch(() => []),
-    isPrimaryArtist ? getWikiExtract(info.name, 'artist').catch(() => null) : Promise.resolve(null),
-    isPrimaryArtist ? getArtistProfile(info.name).catch(() => null) : Promise.resolve(null),
+    batchResolveAndUpsert((info?.songs ?? fallback!.songs), name, undefined),
+    info ? Promise.resolve(info.ampAlbums.map(a => ({
+      source: 'apple' as const,
+      albumId: a.albumId,
+      name: a.name,
+      artist: a.artist || name,
+      year: a.year,
+      img: a.img ?? null,
+    }))) : getArtistAlbumsById(artistId).then(list => list.map(a => ({
+      source: 'apple' as const,
+      albumId: a.collectionId,
+      name: a.name,
+      artist: a.artist || name,
+      year: a.year,
+      img: a.img ?? null,
+      trackCount: a.trackCount,
+    }))).catch(() => []),
+    isPrimaryArtist ? getWikiExtract(name, 'artist').catch(() => null) : Promise.resolve(null),
+    isPrimaryArtist ? getArtistProfile(name, ).catch(() => null) : Promise.resolve(null),
   ])
 
-  const albums: ArtistAlbumCard[] = artistAlbums.map(a => ({
-    source: 'apple' as const,
-    albumId: a.collectionId,
-    name: a.name,
-    artist: a.artist || info.name,
-    year: a.year,
-    img: a.img ?? null,
-    trackCount: a.trackCount,
-  }))
+  const albums: ArtistAlbumCard[] = artistAlbums
 
-  // 头像 = 首张专辑封面（Apple 歌手实体无照片）
-  const img = albums.find(a => a.img)?.img ?? null
+  // 头像 = amp 官方 artwork（老路径无照片时回落首张专辑封面）
+  const img = info?.img ?? albums.find(a => a.img)?.img ?? null
 
   const detail: AppleArtistDetail = {
-    artist: { artistId: info.artistId, name: info.name, genre: info.genre, bio, profile, img },
+    artist: {
+      artistId,
+      name,
+      genre: info?.genre ?? fallback?.genre,
+      bio,
+      profile,
+      img,
+      // amp bornOrFormed（Wikidata 档案缺失时的兜底生日）
+      ...(info?.birthDate ? { birthDate: info.birthDate } : {}),
+    },
     hotSongs,
     albums,
   }
@@ -498,30 +530,37 @@ export interface AppleAlbumDetail {
 
 /** Apple 专辑卡片详情：Apple 曲目表（繁→简）→ 逐首在线搜曲落歌（与本地专辑同一管道） */
 export async function getAppleAlbumDetail(collectionId: string): Promise<AppleAlbumDetail | null> {
-  const cacheKey = `album:v1:apple:${collectionId}`
+  const cacheKey = `album:v2:apple:${collectionId}`
   const cached = searchCache.get(cacheKey) as AppleAlbumDetail | null
   if (cached) return cached
 
-  const itunes = await getItunesAlbumDetail(collectionId)
-  if (!itunes || itunes.tracks.length === 0) return null
+  // v2.5 amp 优先（editorialNotes 专业乐评），失败回落老 iTunes lookup
+  const amp = await getAmpAlbumDetail(collectionId).catch(() => null)
+  const meta = amp ?? await getItunesAlbumDetail(collectionId)
+  if (!meta || meta.tracks.length === 0) return null
+  const title = amp ? amp.album.title : meta.album.title
+  const artist = amp ? amp.album.artist : meta.album.artist
 
-  const list = await batchResolveAndUpsert(itunes.tracks, itunes.album.artist, itunes.album.title)
+  const list = await batchResolveAndUpsert(meta.tracks, artist, title)
   if (list.length === 0) {
-    logger.warn(`[album] Apple 专辑《${itunes.album.title}》逐首匹配全部失败`)
+    logger.warn(`[album] Apple 专辑《${title}》逐首匹配全部失败`)
     return null
   }
 
-  const bio = await getWikiExtract(itunes.album.title, 'album').catch(() => null)
-  const profile = await getAlbumProfile(itunes.album.title).catch(() => null)
+  const [bio, profile] = await Promise.all([
+    getWikiExtract(title, 'album').catch(() => null),
+    getAlbumProfile(title).catch(() => null),
+  ])
   const detail: AppleAlbumDetail = {
     album: {
       collectionId,
-      name: itunes.album.title,
-      singer: itunes.album.artist,
-      year: itunes.album.year,
-      img: itunes.album.img ?? albumCoverFromSongs(list),
-      trackCount: itunes.tracks.length,
-      bio,
+      name: title,
+      singer: artist,
+      year: amp ? amp.album.year : meta.album.year,
+      img: (amp ? amp.album.img : meta.album.img) ?? albumCoverFromSongs(list),
+      trackCount: meta.tracks.length,
+      // amp editorialNotes（专业乐评）优先于维基简介
+      bio: amp?.album.bio || bio,
       profile,
     },
     list,

@@ -63,6 +63,22 @@ export interface ArtistDetailData {
   unsupported?: boolean
 }
 
+export interface ArtistMv {
+  id: string
+  name: string
+  artist: string
+  artwork: string | null
+  durationSec: number
+  releaseDate?: string
+  /** 30 秒预告（m4v 直链，免鉴权） */
+  previewUrl: string | null
+}
+
+/** 歌手 MV 列表（Apple amp 数据，跨链通用增强；无结果返回空） */
+export function getArtistMvs(name: string): Promise<{ list: ArtistMv[] }> {
+  return apiGet('artist/apple/mvs', { name })
+}
+
 export function searchArtists(keyword: string): Promise<{ type: string; source?: string; list: ArtistSummary[] }> {
   return apiGet('search', { type: 'artist', keyword })
 }

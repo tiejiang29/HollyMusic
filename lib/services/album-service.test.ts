@@ -46,6 +46,10 @@ vi.mock('@/lib/services/album-local-service', () => ({
 }))
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource }))
 vi.mock('@/lib/services/batch-resolve', () => ({ batchResolveAndUpsert }))
+vi.mock('@/lib/services/apple-amp-service', () => ({
+  getAmpArtistDetail: vi.fn(async () => null),
+  getAmpAlbumDetail: vi.fn(async () => null),
+}))
 vi.mock('@/lib/services/kw-chain-service', () => ({
   searchKwArtists,
   searchKwAlbums,
