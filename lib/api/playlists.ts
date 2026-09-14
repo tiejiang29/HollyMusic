@@ -112,3 +112,8 @@ export function removeSongsFromPlaylist(
 ): Promise<{ removed: boolean }> {
   return apiDelete(`playlists/${id}/songs`, { positions: positions.join(',') })
 }
+
+/** 收藏歌单：复制一份到自己名下 */
+export function collectPlaylist(id: number): Promise<{ id: number; name: string }> {
+  return apiPost(`playlists/${id}/collect`, {})
+}

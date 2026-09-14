@@ -159,6 +159,60 @@ export async function getPlaylistDetail(
 }
 
 /**
+ * 收藏歌单：复制一份到自己名下（歌名+全部歌曲条目），标记来源。
+ * 原歌单删不删不影响副本；副本可自由改名/删歌。
+ */
+export async function collectPlaylist(
+  playlistId: number,
+  username: string
+): Promise<PlaylistSummary> {
+  const source = await prisma.playlist.findUnique({
+    where: { id: playlistId },
+    include: {
+      entries: { orderBy: { position: 'asc' } },
+    },
+  })
+  if (!source) throw new PlaylistError('找不到该歌单', 404)
+  if (!source.isPublic && source.username !== username) {
+    // 非公开且不是自己的（自己收藏自己的歌单没意义，但也不报错——直接返回）
+    throw new PlaylistError('该歌单未公开，无法收藏', 403)
+  }
+  if (source.username === username) throw new PlaylistError('不能收藏自己的歌单', 400)
+
+  // 创建副本
+  const copy = await prisma.playlist.create({
+    data: {
+      name: source.name,
+      username,
+      owner: username,
+      comment: source.comment ? `收藏自 ${source.owner ?? source.username}：${source.comment}` : `收藏自 ${source.owner ?? source.username}`,
+      isPublic: false,
+      songCount: source.entries.length,
+      coverArt: source.coverArt,
+      allowedUsers: { create: { username } },
+    },
+    include: { allowedUsers: true },
+  })
+
+  // 批量复制歌曲条目（保持顺序）
+  const entries = source.entries.map((entry, i) => ({
+    playlistId: copy.id,
+    musicInfoId: entry.musicInfoId,
+    songmid: entry.songmid,
+    position: i + 1,
+    addedBy: username,
+    snapshotJson: entry.snapshotJson,
+    playCount: 0,
+  }))
+  if (entries.length > 0) {
+    await prisma.playlistEntry.createMany({ data: entries })
+  }
+
+  logger.info(`[playlist] ${username} 收藏歌单 ${playlistId} → 副本 ${copy.id}（${entries.length} 首）`)
+  return toSummary(copy)
+}
+
+/**
  * 创建歌单。
  */
 export async function createPlaylist(username: string, name: string): Promise<PlaylistSummary> {

@@ -4,14 +4,15 @@ import { usePlaylistDetail } from '@/hooks/usePlaylistDetail'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Play, Trash2, Music, Share2, Sparkles, Download, CheckSquare, X } from 'lucide-react'
+import { Play, Trash2, Music, Share2, Sparkles, Download, CheckSquare, X, Bookmark } from 'lucide-react'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { shareContent, buildPlaylistShareUrl } from '@/lib/share'
 import { toTrack, type Track } from '@/lib/types/player'
-import { deletePlaylist } from '@/lib/api/playlists'
+import { deletePlaylist, collectPlaylist } from '@/lib/api/playlists'
 import { SourceSwitchDialog } from '@@/components/playlists/SourceSwitchDialog'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
+import { useAuthStore } from '@/hooks/useAuth'
 
 export function PlaylistDetailPage() {
   const { id: idStr } = useParams<{ id: string }>()
@@ -19,6 +20,18 @@ export function PlaylistDetailPage() {
   const { detail, loading, reload } = usePlaylistDetail(id)
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
+  const username = useAuthStore(s => s.username)
+  const isOwner = !!detail && detail.username === username
+  const [collecting, setCollecting] = useState(false)
+
+  const handleCollect = async () => {
+    if (collecting) return
+    setCollecting(true)
+    try {
+      const copy = await collectPlaylist(id)
+      navigate(`/playlists/${copy.id}`)
+    } catch { /* 后端已有错误处理 */ } finally { setCollecting(false) }
+  }
 
   // 保留每条 track 对应的 entry position（换源接口按 position 替换）
   const positions: number[] = []
@@ -109,12 +122,23 @@ export function PlaylistDetailPage() {
                 >
                   <Sparkles className="h-4 w-4" /> AI 加歌
                 </button>
-                <button
-                  onClick={handleDelete}
-                  className="flex items-center gap-1 rounded-full border border-border px-3 py-2 text-sm text-muted-foreground hover:text-destructive"
-                >
-                  <Trash2 className="h-4 w-4" /> 删除歌单
-                </button>
+                {!isOwner && (
+                  <button
+                    onClick={() => void handleCollect()}
+                    disabled={collecting}
+                    className="flex items-center gap-1 rounded-full bg-primary/15 px-3 py-2 text-sm font-medium text-primary hover:bg-primary/25 disabled:opacity-50"
+                  >
+                    <Bookmark className="h-4 w-4" /> {collecting ? '收藏中…' : '收藏歌单'}
+                  </button>
+                )}
+                {isOwner && (
+                  <button
+                    onClick={handleDelete}
+                    className="flex items-center gap-1 rounded-full border border-border px-3 py-2 text-sm text-muted-foreground hover:text-destructive"
+                  >
+                    <Trash2 className="h-4 w-4" /> 删除歌单
+                  </button>
+                )}
                 <button
                   onClick={() =>
                     shareContent({
