@@ -6,7 +6,8 @@ import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { AlbumGrid } from '@@/components/shared/AlbumGrid'
 import { ChainAlbumCover } from '@@/components/shared/ChainAlbumCover'
-import { Search, Music, X, CloudOff, ChevronDown, User, Disc3 } from 'lucide-react'
+import { RecognizeDialog } from '@@/components/shared/RecognizeDialog'
+import { Search, Music, X, CloudOff, ChevronDown, User, Disc3, AudioLines } from 'lucide-react'
 import { toTrack } from '@/lib/types/player'
 import type { SourceType } from '@/lib/types/music'
 import { apiGet } from '@/lib/api/client'
@@ -37,6 +38,7 @@ export function SearchPage() {
     setKeyword, setSource, setMode, run, runAlbum, runArtist,
   } = useSearch()
   const artistNavigateRef = useRef(false)
+  const [recognizeOpen, setRecognizeOpen] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
   /** 按当前结果类型分发：专辑=本地库+Apple兜底；歌手=Apple歌手卡；歌曲=五源 */
@@ -257,7 +259,18 @@ export function SearchPage() {
         >
           搜索
         </button>
+        <button
+          type="button"
+          onClick={() => setRecognizeOpen(true)}
+          aria-label="听音识曲"
+          title="听音识曲"
+          className="shrink-0 rounded-full border border-border p-2.5 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+        >
+          <AudioLines className="h-4 w-4" />
+        </button>
       </form>
+
+      <RecognizeDialog open={recognizeOpen} onClose={() => setRecognizeOpen(false)} />
 
       {/* 结果类型：歌曲 | 专辑 */}
       <div role="tablist" aria-label="结果类型" className="mb-3 flex gap-2">
