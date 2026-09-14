@@ -104,20 +104,17 @@ function cleanSongName(name: string): string {
   return n || name
 }
 
-/** 候选歌名+歌手 → TX 搜歌挑可播（歌名/歌手双重校验） */
-async function findPlayable(name: string, singer: string): Promise<Song | null> {
+/** 候选歌名 → TX 搜歌挑可播。只搜歌名不搜翻唱歌手名——TX 按热门排序自然命中原曲 */
+async function findPlayable(name: string): Promise<Song | null> {
   const cleanName = cleanSongName(name)
   try {
-    const keyword = `${cleanName} ${singer}`.trim()
-    const result = await searchOneSource('tx', keyword, 1, 10)
+    // 只用歌名搜索（不带翻唱歌手名），TX 按热门排序命中原曲
+    const result = await searchOneSource('tx', cleanName, 1, 10)
     const norm = (v: string | null | undefined) => (v || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
     const nameN = norm(cleanName)
-    const singerN = norm(singer)
     const hit = (result.list || []).find(s => {
       const sn = norm(s.name)
-      if (!sn.includes(nameN) && !nameN.includes(sn)) return false
-      if (!singerN) return true
-      return norm(s.singer).includes(singerN) || singerN.includes(norm(s.singer))
+      return sn.includes(nameN) || nameN.includes(sn)
     }) ?? (result.list || [])[0]
     return hit ?? null
   } catch (error) {
@@ -174,9 +171,13 @@ export async function recognizeFromPcm(pcmInt16: Buffer, sampleRate = 48000, cha
     ...(x.song?.album?.name ? { album: x.song.album.name } : {}),
   })).filter(c => c.name)
 
-  const withSongs = await Promise.all(candidates.map(async c => ({
-    ...c,
-    song: await findPlayable(c.name, c.singer),
-  })))
+  const withSongs = await Promise.all(candidates.map(async c => {
+    const song = await findPlayable(c.name)
+    if (song) {
+      // 可播命中：用 TX 搜到的真实歌手/专辑覆盖网易候选的翻唱信息
+      return { ...c, name: song.name, singer: song.singer, ...(song.albumName ? { album: song.albumName } : {}), song }
+    }
+    return { ...c, song: null }
+  }))
   return withSongs
 }
