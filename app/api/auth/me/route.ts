@@ -12,6 +12,7 @@ export async function GET(request: NextRequest) {
   return createSuccessResponse({
     authenticated: state.authenticated,
     username: state.user?.username ?? null,
+    avatar: state.user?.avatar ?? null,
     mustChangePassword: state.authenticated ? state.mustChangePassword : false,
   })
 }

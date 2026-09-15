@@ -18,6 +18,8 @@ export interface PlaylistSummary {
   owner: string | null
   username: string
   isPublic: boolean
+  /** 收藏歌单标记（从他人公开歌单复制而来） */
+  collected: boolean
   songCount: number
   duration: number | null
   coverArt: string | null
@@ -45,6 +47,7 @@ function toSummary(p: Prisma.PlaylistGetPayload<{ include: { allowedUsers: true 
     owner: p.owner,
     username: p.username,
     isPublic: p.isPublic,
+    collected: p.collected,
     songCount: p.songCount,
     duration: p.duration,
     coverArt: p.coverArt,
@@ -185,8 +188,9 @@ export async function collectPlaylist(
       name: source.name,
       username,
       owner: username,
-      comment: source.comment ? `收藏自 ${source.owner ?? source.username}：${source.comment}` : `收藏自 ${source.owner ?? source.username}`,
+      comment: source.comment,
       isPublic: false,
+      collected: true,
       songCount: source.entries.length,
       coverArt: source.coverArt,
       allowedUsers: { create: { username } },
