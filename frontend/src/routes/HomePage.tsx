@@ -9,6 +9,7 @@ import { useGuessStore } from '@/lib/store/guess-store'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import type { DiscoveryPlaylist, DiscoveryPlaylistSort, DiscoverySource, DiscoveryToplist } from '@/lib/services/discovery-service'
+import { RecentContexts } from '@@/components/shared/RecentContexts'
 
 const CHANNELS: Array<{ source: DiscoverySource; label: string }> = [
   { source: 'tx', label: 'QQ 音乐' },
@@ -130,6 +131,8 @@ export function HomePage() {
         <div className="hidden md:block"><h1 className="text-2xl font-bold">发现音乐</h1><p className="text-sm text-muted-foreground">各平台实时榜单与精选歌单</p></div>
         <button onClick={refresh} className="flex items-center gap-1 rounded-full border border-border px-3 py-2 text-sm hover:bg-accent" disabled={isLoading}><RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} /> 刷新</button>
       </div>
+
+      <RecentContexts />
 
       <div className="mb-6 flex flex-wrap gap-2" role="tablist" aria-label="音乐渠道">
         {CHANNELS.map(channel => (

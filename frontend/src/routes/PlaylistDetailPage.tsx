@@ -8,7 +8,8 @@ import { Play, Trash2, Music, Share2, Sparkles, Download, CheckSquare, X, Bookma
 import { usePlayerStore } from '@/lib/store/player-store'
 import { shareContent, buildPlaylistShareUrl } from '@/lib/share'
 import { toTrack, type Track } from '@/lib/types/player'
-import { deletePlaylist, collectPlaylist } from '@/lib/api/playlists'
+import { collectPlaylist, deletePlaylist } from '@/lib/api/playlists'
+import { recordRecentContext } from '@/lib/api/recent'
 import { SourceSwitchDialog } from '@@/components/playlists/SourceSwitchDialog'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
@@ -31,6 +32,14 @@ export function PlaylistDetailPage() {
       const copy = await collectPlaylist(id)
       navigate(`/playlists/${copy.id}`)
     } catch { /* 后端已有错误处理 */ } finally { setCollecting(false) }
+  }
+
+  // 播放时上报最近播放上下文（fire-and-forget）
+  const playWithContext = (track: Track, queue: Track[]) => {
+    playTrack(track, queue)
+    if (detail?.name) {
+      recordRecentContext({ itemType: 'playlist', itemId: String(id), name: detail.name, owner: detail.username }).catch(() => {})
+    }
   }
 
   // 保留每条 track 对应的 entry position（换源接口按 position 替换）
@@ -104,7 +113,7 @@ export function PlaylistDetailPage() {
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <button
-                  onClick={() => tracks.length > 0 && playTrack(tracks[0], tracks)}
+                  onClick={() => tracks.length > 0 && playWithContext(tracks[0], tracks)}
                   disabled={tracks.length === 0}
                   className="flex items-center gap-1 rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
                 >

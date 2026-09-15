@@ -12,6 +12,7 @@ import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
 import { getLocalAlbumTracks, getAppleAlbumTracks, getKwAlbumTracks, getMgAlbumTracks, getTxAlbumTracks } from '@/lib/api/album'
 import type { Song } from '@/lib/types/music'
+import { recordRecentContext } from '@/lib/api/recent'
 
 /** 专辑详情页（三模式）：gid = 本地专辑库倒查；kw = 酷我链（曲目全带 rid 直接可播）；
  *  apple = Apple 曲目表逐首落歌。name/singer 兜底传递给 kw 链作降级应急钥匙。 */
@@ -212,7 +213,22 @@ export function AlbumDetailPage() {
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <button
-              onClick={() => tracks[0] && playTrack(tracks[0], tracks)}
+              onClick={() => {
+                tracks[0] && playTrack(tracks[0], tracks)
+                // 上报最近播放的专辑（fire-and-forget）
+                if (detail?.album?.name) {
+                  const ctxId = gid || `${source}-${albumId}`
+                  if (ctxId) {
+                    recordRecentContext({
+                      itemType: 'album',
+                      itemId: ctxId,
+                      name: detail.album.name,
+                      img: detail.album.img,
+                      owner: detail.album.singer,
+                    }).catch(() => {})
+                  }
+                }
+              }}
               disabled={tracks.length === 0}
               className="flex items-center gap-1 rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
             >

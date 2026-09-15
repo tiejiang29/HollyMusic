@@ -253,3 +253,21 @@ model LibrarySong {
   @@index([uid])
   @@index([singer])
 }
+
+/// 最近播放的歌单/专辑（首页"最近播放"入口）
+model RecentContext {
+  id        Int      @id @default(autoincrement())
+  username  String
+  /// 'playlist'（自建+收藏歌单）| 'album'
+  itemType  String
+  /// 歌单 id 或专辑标识（source-albumId 如 kw-1293）
+  itemId    String
+  name      String
+  img       String?
+  /// 歌单原始所有者（收藏歌单标记来源）
+  owner     String?
+  playedAt  DateTime @default(now())
+
+  @@unique([username, itemType, itemId])
+  @@index([username, playedAt])
+}
