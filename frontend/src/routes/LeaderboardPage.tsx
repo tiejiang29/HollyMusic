@@ -126,7 +126,7 @@ export function LeaderboardPage() {
     if (tracks.length === 0) return
     setCollecting(true)
     try {
-      const playlist = await createPlaylist(name)
+      const playlist = await createPlaylist(name, { collected: true })
       await addSongsToPlaylist(playlist.id, tracks.map(t => t.uid))
       toast.success(`已收藏到歌单「${name}」（${tracks.length} 首）`)
       setCollectOpen(false)

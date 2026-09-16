@@ -184,3 +184,28 @@ describe('数字专辑（column）原生链', () => {
     expect(await mgChain.getMgAlbumDetail('600900000000000009')).toBeNull()
   })
 })
+
+describe('专辑详情（可播版）', () => {
+  beforeEach(() => {
+    get.mockReturnValue(undefined)
+    dbUpsert.mockResolvedValue([])
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('album.singer 与 kw/tx 详情同名字段（客户端只认 singer，不是咪咕原生的 artist）', async () => {
+    const json = (data: unknown) => ({ ok: true, json: async () => ({ code: '000000', info: '操作成功', data }) })
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('resource/album/v2.0')) {
+        return json({ title: '范特西', singer: '周杰伦', summary: '专辑简介', publishCorp: '阿尔发音乐', publishDate: '2001-09-14' })
+      }
+      return json({ songList: [{ songId: '6868', songName: '爱在西元前', duration: 234, singerList: [{ name: '周杰伦' }] }] })
+    }))
+    const d = await mgChain.getMgAlbumDetailPlayable('1000001899')
+    // 前端按 album.singer 读取（专辑页标题 / 封面兜底 / 收藏快照都走它）
+    expect(d?.album.singer).toBe('周杰伦')
+    expect(d?.album.artist).toBe('周杰伦')
+    expect(d?.album.name).toBe('范特西')
+    expect(d?.list.length).toBe(1)
+  })
+})

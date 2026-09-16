@@ -147,6 +147,50 @@ export async function searchTxArtists(keyword: string, limit = 10): Promise<TxAr
 }
 
 // ---------------------------------------------------------------------------
+// 接口：搜专辑（smartbox album 块，免鉴权）
+// ---------------------------------------------------------------------------
+
+/**
+ * 专辑搜索（smartbox album 块）：mid 即 albumMid，封面走 T002 500px 公式。
+ * 专辑搜索链的第一顺位（TX → 酷我 → 咪咕 → Apple）。
+ */
+export async function searchTxAlbums(keyword: string, limit = 30): Promise<TxAlbumCard[]> {
+  const q = keyword.trim()
+  if (!q) return []
+  const cacheKey = `tx:searchAlbum:${q}:${limit}`
+  const cached = searchCache.get(cacheKey) as TxAlbumCard[] | null
+  if (cached) return cached
+
+  interface Raw {
+    code?: number
+    data?: { album?: { itemlist?: Array<{ mid?: string; name?: string; singer?: string; pic?: string }> } }
+  }
+  try {
+    const j = await polite('c6.y.qq.com', async () => {
+      const resp = await fetch(`https://c6.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?_=${Date.now()}&cv=4747474&ct=24&format=json&inCharset=utf-8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=1&uin=0&hostUin=0&is_xml=0&key=${encodeURIComponent(q)}`, {
+        headers: { 'User-Agent': WEB_UA, accept: 'application/json', Referer: 'https://y.qq.com/' },
+        signal: AbortSignal.timeout(TX_TIMEOUT),
+      })
+      if (!resp.ok) throw new Error(`smartbox HTTP ${resp.status}`)
+      return await resp.json() as Raw
+    })
+    const list = (j?.data?.album?.itemlist || [])
+      .filter(a => a.mid && a.name)
+      .slice(0, limit)
+      .map(a => {
+        // pic 是 180px 直链，升 500px（与专辑链统一尺寸）
+        const pic = a.pic ? a.pic.replace(/T002R\d+x\d+/, 'T002R500x500') : txPhotoUrl('T002', a.mid!)
+        return { source: 'tx' as const, albumId: a.mid!, name: clean(a.name), artist: clean(a.singer), pic, img: pic }
+      })
+    if (list.length > 0) searchCache.set(cacheKey, list, CACHE_TTL)
+    return list
+  } catch (error) {
+    logger.warn('[tx-chain] smartbox 专辑搜索失败:', error instanceof Error ? error.message : error)
+    return []
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 接口：搜歌（App 协议 DoSearchForQQMusicLite，与 music-core tx 同形态）
 // ---------------------------------------------------------------------------
 
@@ -298,12 +342,22 @@ export async function getTxArtistDesc(singerMid: string): Promise<TxArtistDesc |
 
 interface V8Track {
   songmid?: string; songname?: string; interval?: number
-  singer?: string[]; albummid?: string; albumname?: string
+  /** v8 返回对象数组（{id,mid,name}），GetAlbumSongList 返回字符串数组，两种形态都要兼容 */
+  singer?: Array<string | { name?: string }>
+  albummid?: string; albumname?: string
   strMediaMid?: string
   size128?: number; size320?: number; sizeflac?: number; sizehires?: number
 }
 
-function v8TrackToMusicInfo(item: V8Track, albumMid: string, albumName: string): MusicInfo | null {
+/** v8/GetAlbumSongList 的 singer 字段 → 展示用歌手名（两种形态都兼容） */
+function v8TrackSinger(singer: V8Track['singer']): string {
+  return (Array.isArray(singer) ? singer : [])
+    .map(s => typeof s === 'string' ? clean(s) : clean(s?.name))
+    .filter(Boolean)
+    .join('、')
+}
+
+function v8TrackToMusicInfo(item: V8Track, albumMid: string, albumName: string, albumSinger = ''): MusicInfo | null {
   if (!item.songmid || !item.songname || !item.strMediaMid) return null
   const types: Array<{ type: QualityType; size: string }> = []
   const _types: Partial<Record<QualityType, { size: string }>> = {}
@@ -314,7 +368,8 @@ function v8TrackToMusicInfo(item: V8Track, albumMid: string, albumName: string):
   const m = Math.floor((item.interval || 0) / 60), s = (item.interval || 0) % 60
   return {
     name: clean(item.songname),
-    singer: (Array.isArray(item.singer) ? item.singer : []).map(clean).filter(Boolean).join('、') || '未知歌手',
+    // 曲目未带歌手时回落专辑歌手（缺失的'未知歌手'会让换源搜索词作废、identity 认不出同款歌）
+    singer: v8TrackSinger(item.singer) || clean(albumSinger) || '未知歌手',
     source: 'tx',
     songmid: item.songmid,
     strMediaMid: item.strMediaMid,
@@ -333,7 +388,7 @@ export async function getTxAlbumDetail(albumMid: string): Promise<{
   album: { name: string; artist: string; desc: string | null; company?: string; year?: string }
   tracks: MusicInfo[]
 } | null> {
-  const cacheKey = 'tx:albumDetail:v2:' + albumMid
+  const cacheKey = 'tx:albumDetail:v3:' + albumMid
   const cached = searchCache.get(cacheKey) as { album: { name: string; artist: string; desc: string | null; company?: string; year?: string }; tracks: MusicInfo[] } | null
   if (cached) return cached
 
@@ -349,7 +404,7 @@ export async function getTxAlbumDetail(albumMid: string): Promise<{
     })
     const d = j?.data
     if (d?.name && d.list?.length) {
-      const tracks = d.list.map(t => v8TrackToMusicInfo(t, albumMid, d.name || '')).filter((m): m is MusicInfo => m !== null)
+      const tracks = d.list.map(t => v8TrackToMusicInfo(t, albumMid, d.name || '', clean(d.singername))).filter((m): m is MusicInfo => m !== null)
       if (tracks.length > 0) {
         const result = {
           album: {
@@ -455,12 +510,13 @@ export async function getTxArtistDetail(singerMid: string, nameHint?: string): P
   return detail
 }
 
-/** 专辑详情（可播版）：入库附 uid */
+/** 专辑详情（可播版）：入库附 uid。album.singer 是 kw/mg 详情统一的歌手字段名
+ *  （TX 上游称 artist），客户端按 singer 读取，缺了会退化成「无名歌手」+空收藏快照。 */
 export async function getTxAlbumDetailPlayable(albumMid: string): Promise<{
-  album: TxAlbumCard & { trackCount: number; bio?: string | null; company?: string; year?: string; profile?: { releaseDate?: string; recordLabels?: string[] } }
+  album: TxAlbumCard & { singer: string; trackCount: number; bio?: string | null; company?: string; year?: string; profile?: { releaseDate?: string; recordLabels?: string[] } }
   list: Array<MusicInfo & { uid: string }>
 } | null> {
-  const cacheKey = 'tx:albumPlayable:v2:' + albumMid
+  const cacheKey = 'tx:albumPlayable:v4:' + albumMid
   const cached = searchCache.get(cacheKey) as Awaited<ReturnType<typeof getTxAlbumDetailPlayable>> | null
   if (cached) return cached
 
@@ -475,6 +531,7 @@ export async function getTxAlbumDetailPlayable(albumMid: string): Promise<{
       albumId: albumMid,
       name: detail.album.name,
       artist: detail.album.artist,
+      singer: detail.album.artist,
       pic,
       img: pic,
       trackCount: list.length,

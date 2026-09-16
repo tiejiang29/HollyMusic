@@ -204,4 +204,24 @@ describe('createScriptSandbox', () => {
     expect(onLog).toHaveBeenCalledWith('warn', 'w')
     expect(onLog).toHaveBeenCalledWith('error', 'e')
   })
+
+  it('console.group 等浏览器方法存在且不中断脚本（缺方法会让音源脚本初始化直接抛错）', () => {
+    const onLog = vi.fn()
+    const env = createScriptSandbox({ onLog })
+    // 聚合类音源常在初始化阶段用这些方法打日志；缺失会抛 "console.group is not a function"
+    expect(() =>
+      env.runScript(`
+        console.group('分组标题')
+        console.log('组内日志')
+        console.groupEnd()
+        console.groupCollapsed('折叠组')
+        console.table([{ a: 1 }])
+        console.assert(true, 'mute')
+        console.time('t'); console.timeEnd('t')
+        console.dir({ a: 1 }); console.count('c'); console.trace('tr'); console.clear()
+      `)
+    ).not.toThrow()
+    expect(onLog).toHaveBeenCalledWith('log', '分组标题')
+    expect(onLog).toHaveBeenCalledWith('log', expect.stringContaining('组内日志'))
+  })
 })

@@ -1,27 +1,30 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
-import { CheckSquare, Disc3, Download, Play, RefreshCw, X } from 'lucide-react'
+import { CheckSquare, Disc3, Download, Heart, Play, RefreshCw, X } from 'lucide-react'
+import { toast } from '@/lib/toast'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { AlbumCover } from '@@/components/shared/AlbumCover'
 import { ChainAlbumCover } from '@@/components/shared/ChainAlbumCover'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack, type Track } from '@/lib/types/player'
 import { useDownload } from '@/hooks/useDownload'
 import { QUALITY_LABEL } from '@/lib/quality-options'
-import { getLocalAlbumTracks, getAppleAlbumTracks, getKwAlbumTracks, getMgAlbumTracks, getTxAlbumTracks } from '@/lib/api/album'
+import { getAppleAlbumTracks, getKwAlbumTracks, getMgAlbumTracks, getTxAlbumTracks } from '@/lib/api/album'
+import { checkAlbumStarred, starAlbum, unstarAlbum } from '@/lib/api/favorites'
 import type { Song } from '@/lib/types/music'
 import { recordRecentContext } from '@/lib/api/recent'
 
-/** 专辑详情页（三模式）：gid = 本地专辑库倒查；kw = 酷我链（曲目全带 rid 直接可播）；
- *  apple = Apple 曲目表逐首落歌。name/singer 兜底传递给 kw 链作降级应急钥匙。 */
+/** 专辑详情页（平台链）：tx = QQ音乐链；kw = 酷我链（曲目全带 rid 直接可播）；
+ *  mg = 咪咕链；apple = Apple 曲目表逐首落歌。name/singer 兜底传递给各链作降级应急钥匙。
+ *  旧的单段路径 /album/:gid（本地 MusicBrainz 专辑库倒查）已下线，命中时给出失效提示。 */
 export function AlbumDetailPage() {
   const { gid = '', source = '', albumId = '' } = useParams<{ gid: string; source: string; albumId: string }>()
   const [searchParams] = useSearchParams()
   const name = searchParams.get('name') || undefined
   const singer = searchParams.get('singer') || undefined
-  const isLocal = !!gid
+  // 单段路径 /album/:gid 是旧本地专辑库的链接形态（该库已下线）
+  const isLegacyGid = !!gid && !source && !albumId
 
   const [detail, setDetail] = useState<{
     album: { name: string; singer: string; trackCount?: number; img?: string | null; source?: string; albumId?: string; year?: string; company?: string; bio?: string | null }
@@ -30,6 +33,9 @@ export function AlbumDetailPage() {
   const [unsupported, setUnsupported] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // 专辑收藏状态（与歌曲收藏同一套接口，靠 type=album 区分）
+  const [starred, setStarred] = useState(false)
+  const [starBusy, setStarBusy] = useState(false)
   // 请求序号：快速导航 X→Y 时丢弃 X 的晚到响应
   const reqIdRef = useRef(0)
   const playTrack = usePlayerStore(s => s.playTrack)
@@ -38,17 +44,11 @@ export function AlbumDetailPage() {
   const load = async () => {
     const reqId = ++reqIdRef.current
     const stale = () => reqId !== reqIdRef.current
-    if (isLocal) {
-      setLoading(true); setError(null); setUnsupported(false)
-      try {
-        const r = await getLocalAlbumTracks(gid)
-        if (stale()) return
-        setDetail(r.album ? { album: r.album, list: r.list } : null)
-        setUnsupported(!r.album)
-      } catch (err) {
-        if (stale()) return
-        setDetail(null); setError(err instanceof Error ? err.message : '专辑详情获取失败')
-      } finally { if (!stale()) setLoading(false) }
+    if (isLegacyGid) {
+      setDetail(null)
+      setUnsupported(false)
+      setError('该专辑链接来自已下线的本地专辑库，请重新搜索专辑')
+      setLoading(false)
       return
     }
     // 酷我链专辑（搜索平台卡片 / 歌手详情专辑网格）：一次拿全 rid 直接可播
@@ -116,6 +116,46 @@ export function AlbumDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gid, source, albumId, name, singer])
 
+  // 收藏状态按专辑查询；失败静默（当作未收藏，用户点一下就知道真实状态）
+  useEffect(() => {
+    if (isLegacyGid || !albumId || !source) {
+      setStarred(false)
+      return
+    }
+    let cancelled = false
+    checkAlbumStarred(albumId, source)
+      .then(r => { if (!cancelled) setStarred(!!r.starred) })
+      .catch(() => { if (!cancelled) setStarred(false) })
+    return () => { cancelled = true }
+  }, [albumId, source, isLegacyGid])
+
+  /** 收藏/取消收藏当前专辑：专辑信息随收藏一起提交，服务端存快照供收藏列表直接渲染 */
+  const toggleStar = async () => {
+    if (!detail?.album || starBusy) return
+    setStarBusy(true)
+    try {
+      if (starred) {
+        await unstarAlbum(albumId, source)
+        setStarred(false)
+        toast.success('已取消收藏')
+      } else {
+        await starAlbum({
+          albumId,
+          source,
+          name: detail.album.name,
+          singer: detail.album.singer,
+          img: detail.album.img,
+        })
+        setStarred(true)
+        toast.success(`已收藏专辑「${detail.album.name}」`)
+      }
+    } catch (err) {
+      toast.error(`操作失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setStarBusy(false)
+    }
+  }
+
   const tracks: Track[] = (detail?.list ?? []).map(song => toTrack({ uid: song.uid, musicInfo: song }))
 
   // ---------- 批量下载（勾选模式，与歌单详情一致） ----------
@@ -155,7 +195,7 @@ export function AlbumDetailPage() {
       <div className="p-6">
         <EmptyState
           icon={Disc3}
-          title={unsupported ? '本地专辑库未收录该专辑' : error ? '专辑详情获取失败' : '专辑暂无可播放曲目'}
+          title={unsupported ? '该专辑暂无可播放版本' : error ? '专辑详情获取失败' : '专辑暂无可播放曲目'}
           description={error || (unsupported ? '部分曲目未能匹配到可播放版本' : '稍后重试或换个专辑')}
         />
         <div className="text-center">
@@ -177,9 +217,7 @@ export function AlbumDetailPage() {
     <div className="p-6">
       <div className="mb-6 flex items-end gap-4">
         <div className="h-32 w-32 shrink-0 overflow-hidden rounded-lg shadow-lg">
-          {isLocal ? (
-            <AlbumCover gid={gid} alt={album.name} className="h-full w-full" />
-          ) : source === 'kw' || source === 'mg' || source === 'tx' ? (
+          {source === 'kw' || source === 'mg' || source === 'tx' ? (
             // 链专辑封面两级降级：直链 → /api/album/{source}/cover（服务端跨源解析）；渐变+图标垫底
             <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/50 to-primary/10">
               <Disc3 className="absolute h-12 w-12 text-primary-foreground/80" />
@@ -217,7 +255,7 @@ export function AlbumDetailPage() {
                 tracks[0] && playTrack(tracks[0], tracks)
                 // 上报最近播放的专辑（fire-and-forget）
                 if (detail?.album?.name) {
-                  const ctxId = gid || `${source}-${albumId}`
+                  const ctxId = `${source}-${albumId}`
                   if (ctxId) {
                     recordRecentContext({
                       itemType: 'album',
@@ -233,6 +271,19 @@ export function AlbumDetailPage() {
               className="flex items-center gap-1 rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
             >
               <Play className="h-4 w-4 fill-current" /> 播放全部
+            </button>
+            <button
+              onClick={() => void toggleStar()}
+              disabled={starBusy}
+              aria-label={starred ? '取消收藏专辑' : '收藏专辑'}
+              className={`flex items-center gap-1 rounded-full border px-3 py-2 text-sm transition disabled:opacity-50 ${
+                starred
+                  ? 'border-primary/40 text-primary'
+                  : 'border-border text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <Heart className={`h-4 w-4 ${starred ? 'fill-current' : ''}`} />
+              {starred ? '已收藏' : '收藏'}
             </button>
             <button
               onClick={() => { setSelecting(v => !v); setSelectedUids(new Set()) }}

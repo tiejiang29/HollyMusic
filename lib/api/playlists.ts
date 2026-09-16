@@ -12,6 +12,8 @@ export interface PlaylistSummary {
   owner: string | null
   username: string
   isPublic: boolean
+  /** 收藏歌单标记：由 collect（他人歌单副本）/ 平台导入生成，区别于自建 */
+  collected: boolean
   songCount: number
   duration: number | null
   coverArt: string | null
@@ -39,8 +41,9 @@ export function getPlaylist(id: number): Promise<PlaylistDetail> {
   return apiGet(`playlists/${id}`)
 }
 
-export function createPlaylist(name: string): Promise<PlaylistSummary> {
-  return apiPost('playlists', { name })
+/** collected=true 用于「收藏」类快照（如榜单收藏），后端据此归入「收藏歌单」分组 */
+export function createPlaylist(name: string, opts: { collected?: boolean } = {}): Promise<PlaylistSummary> {
+  return apiPost('playlists', { name, ...opts })
 }
 
 export interface ImportPlaylistResult {

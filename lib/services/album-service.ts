@@ -1,14 +1,10 @@
 /**
- * 专辑服务（本地中文专辑库为核心）
+ * 专辑服务（平台链为核心）
  *
- * 架构（2026-09 重构）：
- * - 专辑搜索 = 本地中文专辑库（album-local-service.ts，2.4 万张简体专辑）优先；
- *   本地未命中自动回退 Apple 专辑搜索（platformList，iTunes Search API country=tw，
- *   返回数据经 OpenCC 转简体），保证冷门/外语专辑也能搜到
- * - 专辑详情 = 本地曲目表 → 逐首落歌：
- *   逐首在线搜曲按 tx→kw→kg→mg→wy 顺序（网易搜索通道被翻唱污染放最后），
- *   歌名+歌手+时长三重校验（±8s），并发 4；命中的走搜索同款入库管道（uid 可播）。
- *   单源搜索管线复用 song-search-service 的 searchOneSource（入库/缓存行为与搜索一致）
+ * 架构（2026-09 调整）：
+ * - 专辑搜索 = 平台编排链 TX → 酷我 → 咪咕 → Apple（source-chain.searchAlbumCardsChain）；
+ *   原本地 MusicBrainz 专辑索引（album-db）已下线，不再参与专辑搜索与详情
+ * - 专辑详情 = 各平台原生链（/api/album/{tx,kw,mg,apple}/tracks），Apple 走 amp + iTunes
  * - 元数据增强：Apple 歌手级索引（一次调用拿该歌手全部专辑）补年份 + 600x600 高清封面
  *   （mzstatic CDN，218ms 实测），按歌手缓存 24h；失败静默不影响主流程
  */
@@ -18,7 +14,6 @@ import { logger } from '@/lib/logger'
 import { prisma, getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/lib/db'
 import { songIdentity } from '@/lib/song-identity'
 import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
-import { findLocalAlbumByGid, getLocalAlbumTracks, searchLocalAlbums } from '@/lib/services/album-local-service'
 import { searchOneSource } from '@/lib/services/song-search-service'
 import { batchResolveAndUpsert } from '@/lib/services/batch-resolve'
 import { getArtistAlbumIndex, getArtistAlbumsById, getItunesAlbumDetail, getItunesArtistSongs, searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
@@ -166,208 +161,6 @@ export async function fetchCoverImageBytes(imageUrl: string): Promise<CoverImage
   }
 }
 
-/** 专辑封面探测（专辑卡片懒加载）：优先 Apple 高清封面，未收录回退 tx 首曲目搜曲推导 gtimg */
-export async function getAlbumCover(gid: string): Promise<string | null> {
-  const cacheKey = `album:cover:${gid}`
-  // 注意 searchCache.get 未命中返回 null（与"已探测且无封面"不可区分），
-  // 因此无封面结果不写缓存——重复探测由 searchOneSource 的搜索缓存兜底，近乎零成本
-  const cached = searchCache.get(cacheKey) as string | null
-  if (cached) return cached
-
-  const album = findLocalAlbumByGid(gid)
-  let img: string | null = null
-  if (album) {
-    // ⓪ 详情缓存借用（零成本）：用户点开过详情（落歌完成）时封面已算好缓存
-    const detail = searchCache.get(`album:v3:local:${gid}`) as { album?: { img?: string | null } } | null
-    img = detail?.album?.img ?? null
-  }
-  if (!img && album) {
-    // ① Apple：歌手专辑索引按专辑名匹配 → 600x600 高清
-    const apple = await getAppleAlbumMeta(album.title, album.artist).catch(() => ({ img: null as string | null }))
-    img = apple.img ?? null
-  }
-  // ② 回退：首曲目在 tx 搜曲推导 gtimg 直链
-  if (!img && album) {
-    const tracks = getLocalAlbumTracks(gid)
-    const first = tracks[0]
-    if (first) {
-      try {
-        const result = await searchOneSource('tx', `${first.title} ${album.artist}`, 1, 5)
-        img = albumCoverFromSongs(result.list)
-      } catch (error) {
-        logger.debug('[album] 封面探测失败:', error instanceof Error ? error.message : error)
-      }
-    }
-  }
-  if (img) searchCache.set(cacheKey, img, 24 * 60 * 60 * 1000)
-  return img
-}
-
-/** 本地专辑倒查：曲目表逐首在线搜曲，返回可播放歌单与专辑元信息（年份/封面由 Apple 增强） */
-
-/** 曲目匹配器（kw/mg 快路径共享）：本地曲目表为权威顺序，
- *  逐曲按「歌名归一双向包含 + 时长 ±8s」匹配候选曲目，返回 原始下标 → MusicInfo */
-function matchTracksToCandidates(
-  tracks: Array<{ title: string; secs: number | null }>,
-  candidates: MusicInfo[],
-): Map<number, MusicInfo> {
-  const normalize = (v: string | null | undefined) => normText(appleT2S(v || '').replace(/妳/g, '你'))
-  const pool = candidates.map(t => ({
-    mi: t,
-    name: normalize(t.name),
-    secs: parseIntervalToSeconds(t.interval),
-    used: false,
-  }))
-  const map = new Map<number, MusicInfo>()
-  tracks.forEach((track, i) => {
-    const tNorm = normalize(track.title)
-    if (!tNorm) return
-    const hit = pool.find(k =>
-      !k.used && k.name
-      && (k.name.includes(tNorm) || tNorm.includes(k.name))
-      && (track.secs == null || k.secs == null || Math.abs(k.secs - track.secs) <= 8),
-    )
-    if (hit) {
-      hit.used = true
-      map.set(i, hit.mi)
-    }
-  })
-  return map
-}
-
-/** 链快路径（kw/mg 通用）：专辑名+歌手 → albumid → 整张曲目一次拿回（全带可播 id，不写库）。
- *  匹配失败返回 null（走下一链/batch 兜底）。 */
-async function resolveLocalTracksViaChain(
-  source: 'kw' | 'mg' | 'tx',
-  tracks: Array<{ title: string; secs: number | null }>,
-  artist: string,
-  albumTitle: string,
-): Promise<Map<number, MusicInfo> | null> {
-  const albumId = source === 'kw'
-    ? await findKwAlbumId(albumTitle, artist)
-    : source === 'tx'
-      ? await findTxAlbumId(albumTitle, artist)
-      : await findMgAlbumId(albumTitle, artist)
-  if (!albumId) return null
-  const detail = source === 'kw'
-    ? await getKwAlbumDetail(albumId)
-    : source === 'tx'
-      ? await getTxAlbumDetail(albumId)
-      : await getMgAlbumDetail(albumId)
-  if (!detail) return null
-  const map = matchTracksToCandidates(tracks, detail.tracks)
-  return map.size > 0 ? map : null
-}
-
-/** 链命中曲目单事务入库 + 附 uid（按本地曲目顺序）；失败返回 null 让全量走 batch 兜底 */
-async function upsertChainMatched(chainMap: Map<number, MusicInfo>): Promise<Song[] | null> {
-  if (chainMap.size === 0) return []
-  try {
-    await upsertMusicInfosInTransaction([...chainMap.values()])
-  } catch (error) {
-    logger.warn('[album] 链快路径入库失败（该专辑走 batch 兜底）:', error instanceof Error ? error.message : error)
-    return null
-  }
-  const songs: Song[] = []
-  chainMap.forEach(mi => songs.push({ ...mi, uid: `${mi.source}-${getStorageSongmidForMusicInfo(mi)}` }))
-  return songs
-}
-
-async function buildLocalAlbumDetail(localTitle: string, localArtist: string, gid: string): Promise<AlbumDetail | null> {
-  const tracks = getLocalAlbumTracks(gid)
-  if (tracks.length === 0) return null
-
-  // 曲目解析（TX 主链 → 酷我 → 咪咕快路径 → batch 兜底）与 Apple/wiki 元数据增强全并行：
-  // 元数据只依赖专辑名+歌手，不依赖落歌结果
-  const resolveTracks = async (): Promise<Song[]> => {
-    let chainSongs: Song[] | null = null
-    let matched = new Set<number>()
-    for (const chain of ['tx', 'kw', 'mg'] as const) {
-      try {
-        const chainMap = await resolveLocalTracksViaChain(chain, tracks, localArtist, localTitle)
-        if (!chainMap) continue
-        const songs = await upsertChainMatched(chainMap)
-        if (songs) {
-          chainSongs = songs
-          matched = new Set(chainMap.keys())
-          break
-        }
-      } catch (error) {
-        logger.debug(`[album] 《${localTitle}》${chain} 快路径失败（走下一条链）:`, error instanceof Error ? error.message : error)
-      }
-    }
-    const remaining = tracks.filter((_, i) => !matched.has(i))
-    const fallbackList = remaining.length > 0
-      ? await batchResolveAndUpsert(remaining, localArtist, localTitle)
-      : []
-    return [...(chainSongs ?? []), ...fallbackList]
-  }
-  const [list, apple, bio, profile] = await Promise.all([
-    resolveTracks(),
-    getAppleAlbumMeta(localTitle, localArtist).catch(() => ({ img: null as string | null, year: undefined as string | undefined })),
-    getWikiExtract(localTitle, 'album').catch(() => null),
-    getAlbumProfile(localTitle, gid).catch(() => null),
-  ])
-  if (list.length === 0) {
-    logger.warn(`[album] 本地专辑《${localTitle}》逐首匹配全部失败`)
-    return null
-  }
-  return {
-    album: {
-      source: 'local',
-      albumId: gid,
-      name: localTitle,
-      singer: localArtist,
-      img: apple.img ?? albumCoverFromSongs(list),
-      publishTime: apple.year,
-      trackCount: tracks.length,
-      bio,
-      profile,
-    },
-    list,
-  }
-}
-
-export interface LocalAlbumDetail {
-  album: { gid: string; name: string; singer: string; trackCount: number; img: string | null; year?: string; bio?: string | null; profile?: AlbumProfile | null }
-  list: Song[]
-}
-
-/** 按 gid 解析本地专辑为可播放歌单（安卓专辑板块详情用） */
-export async function getLocalAlbumDetailByGid(gid: string): Promise<LocalAlbumDetail | null> {
-  // 详情缓存（落歌昂贵，二次打开秒回；封面探测接口也借这份缓存取 img）
-  const cacheKey = `album:v6:local:${gid}`
-  const cached = searchCache.get(cacheKey) as LocalAlbumDetail | null
-  if (cached) return cached
-
-  // 落歌与维基 bio/profile 三路并行（wiki 内部 pageData 去重，只打一次上游）
-  const album = findLocalAlbumByGid(gid)
-  if (!album) return null
-  const [detail, bio, profile] = await Promise.all([
-    buildLocalAlbumDetail(album.title, album.artist, album.gid),
-    getWikiExtract(album.title, 'album').catch(() => null),
-    getAlbumProfile(album.title, gid).catch(() => null),
-  ])
-  if (!detail) return null
-  const result: LocalAlbumDetail = {
-    album: {
-      gid: album.gid,
-      name: album.title,
-      singer: album.artist,
-      trackCount: album.trackCount ?? detail.list.length,
-      img: detail.album.img ?? null,
-      year: detail.album.publishTime,
-      bio: bio ?? null,
-      profile: profile ?? null,
-    },
-    list: detail.list,
-  }
-  searchCache.set(cacheKey, result, ALBUM_TRACKS_CACHE_TTL)
-  return result
-}
-
-// ==================== 歌手详情（Apple） ====================
-
 export interface ArtistAlbumCard {
   source: 'apple'
   albumId: string
@@ -489,39 +282,35 @@ export interface PlatformAlbumSummary {
 }
 
 /**
- * 专辑搜索（组合）：本地中文专辑库优先；本地未命中自动回退 Apple 专辑搜索。
- * 返回 list（本地，gid 卡片）与 platformList（Apple 卡片，仅本地未命中时非空）。
+ * 专辑搜索：走平台编排链 TX → 酷我 → 咪咕 → Apple（本地 MusicBrainz 索引已下线）。
+ * 返回 list（恒为空，保留字段兼容旧前端）与 platformList（实际结果，卡片自带 source）。
  */
 export async function searchAlbums(keyword: string, limit = 30): Promise<{
   list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>
-  platformList: Array<{ source: 'kw' | 'mg' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
+  platformList: Array<{ source: 'tx' | 'kw' | 'mg' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
 }> {
   const k = keyword.trim()
   if (!k) return { list: [], platformList: [] }
-  const cacheKey = `album:v7:combined:${k}:${limit}`
-  type PlatformList = Array<{ source: 'kw' | 'mg' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
-  const cached = searchCache.get(cacheKey) as { list: Array<{ gid: string; title: string; artist: string; trackCount?: number }>; platformList: PlatformList } | null
+  const cacheKey = `album:v8:platform:${k}:${limit}`
+  type PlatformList = Array<{ source: 'tx' | 'kw' | 'mg' | 'apple'; albumId: string; name: string; singer: string; img?: string | null; year?: string; trackCount?: number }>
+  const cached = searchCache.get(cacheKey) as { list: Array<{ gid: string; title: string; artist: string }>; platformList: PlatformList } | null
   if (cached) return cached
 
-  const list = searchLocalAlbums(k, limit)
   let platformList: PlatformList = []
-  if (list.length === 0) {
-    // 本地未命中 → 三源编排（kw 完全匹配? → mg 完全匹配? → apple → 模糊兜底）
-    try {
-      platformList = (await searchAlbumCardsChain(k, limit)).map(c => ({
-        source: c.source,
-        albumId: c.albumId,
-        name: c.name,
-        singer: c.artist,
-        img: c.img ?? undefined,
-        year: c.year,
-        ...('trackCount' in c && c.trackCount != null ? { trackCount: c.trackCount } : {}),
-      }))
-    } catch (error) {
-      logger.warn('[album] 平台专辑搜索链失败:', error instanceof Error ? error.message : error)
-    }
+  try {
+    platformList = (await searchAlbumCardsChain(k, limit)).map(c => ({
+      source: c.source,
+      albumId: c.albumId,
+      name: c.name,
+      singer: c.artist,
+      img: c.img ?? undefined,
+      year: c.year,
+      ...('trackCount' in c && c.trackCount != null ? { trackCount: c.trackCount } : {}),
+    }))
+  } catch (error) {
+    logger.warn('[album] 平台专辑搜索链失败:', error instanceof Error ? error.message : error)
   }
-  const result = { list, platformList }
+  const result = { list: [] as Array<{ gid: string; title: string; artist: string }>, platformList }
   searchCache.set(cacheKey, result, ALBUM_TRACKS_CACHE_TTL)
   return result
 }

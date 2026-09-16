@@ -20,12 +20,33 @@ const TOGGLE_SOURCE_ORDER: SourceType[] = ['wy', 'tx', 'kw', 'kg', 'mg']
 /** 时长容差（秒）：同名翻唱/Live 常有 ±几秒差异，超太多视为不同版本 */
 const INTERVAL_TOLERANCE_SECONDS = 4
 
-/** 换源结果缓存：source-songmid → 匹配结果（null 表示已确认无替代，避免反复搜索） */
-const toggleCache = new Map<string, MusicInfo | null>()
+/**
+ * 换源结果缓存：source-songmid → 匹配结果（带过期时间）。
+ *
+ * 命中结果稳定，可以长缓存；未命中（null）只做短时去抖——旧实现把 null 也无限期缓存，
+ * 于是一次上游抖动或候选校验瞬时不过，就会把这首歌在本进程内判成「永远无替代」，
+ * 表现成反复点都播不出来（详见 lib/music-source-manager.ts 的换源调用方）。
+ */
+interface ToggleCacheEntry { value: MusicInfo | null; expiresAt: number }
+const toggleCache = new Map<string, ToggleCacheEntry>()
 const TOGGLE_CACHE_MAX = 300
+/** 命中缓存时长（10 分钟） */
+const TOGGLE_HIT_TTL_MS = 10 * 60 * 1000
+/** 未命中缓存时长（60 秒；仅用于抑制同一首歌的密集重复搜索） */
+const TOGGLE_MISS_TTL_MS = 60 * 1000
 
 function cacheKey(musicInfo: MusicInfo): string {
   return `${musicInfo.source}-${musicInfo.songmid}`
+}
+
+function cacheGet(key: string): MusicInfo | null | undefined {
+  const entry = toggleCache.get(key)
+  if (!entry) return undefined
+  if (entry.expiresAt <= Date.now()) {
+    toggleCache.delete(key)
+    return undefined
+  }
+  return entry.value
 }
 
 function cacheSet(key: string, value: MusicInfo | null): void {
@@ -33,7 +54,15 @@ function cacheSet(key: string, value: MusicInfo | null): void {
     // 简单清空策略：容量满时全清（换源命中本身有播放 URL 缓存兜底，损失可接受）
     toggleCache.clear()
   }
-  toggleCache.set(key, value)
+  toggleCache.set(key, {
+    value,
+    expiresAt: Date.now() + (value ? TOGGLE_HIT_TTL_MS : TOGGLE_MISS_TTL_MS),
+  })
+}
+
+/** 仅供单测：清空换源缓存 */
+export function clearToggleCache(): void {
+  toggleCache.clear()
 }
 
 /** "04:29" → 269 秒；解析失败返回 null */
@@ -209,7 +238,8 @@ export async function findAlternatives(
  */
 export async function findBestAlternative(musicInfo: MusicInfo): Promise<MusicInfo | null> {
   const key = cacheKey(musicInfo)
-  if (toggleCache.has(key)) return toggleCache.get(key) ?? null
+  const cached = cacheGet(key)
+  if (cached !== undefined) return cached
 
   const { candidates } = await findAlternatives(musicInfo)
   const best = candidates[0]?.musicInfo ?? null

@@ -211,7 +211,22 @@ export function PlaylistsPage() {
       {loading ? (
         <LoadingSkeleton count={4} />
       ) : playlists.length > 0 ? (
-        <PlaylistGrid playlists={playlists} />
+        <div className="space-y-6">
+          {/* 按后端 collected 字段分组：自建在前，收藏（副本/平台导入）在后 */}
+          {([
+            { key: 'created', title: '自建歌单', items: playlists.filter(p => !p.collected) },
+            { key: 'collected', title: '收藏歌单', items: playlists.filter(p => p.collected) },
+          ] as const).map(group =>
+            group.items.length > 0 ? (
+              <section key={group.key}>
+                <h2 className="mb-3 text-sm font-semibold text-muted-foreground">
+                  {group.title} <span className="font-normal">{group.items.length}</span>
+                </h2>
+                <PlaylistGrid playlists={group.items} />
+              </section>
+            ) : null,
+          )}
+        </div>
       ) : (
         <EmptyState icon={ListMusic} title="还没有歌单" description="新建、从洛雪导入，或粘贴平台歌单链接" />
       )}

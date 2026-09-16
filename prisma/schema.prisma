@@ -101,6 +101,11 @@ model Favorite {
   itemId    String   // the id value as passed by client (raw song id / album id / artist id)
   source    String?  // optional source/origin of the item (may be null)
   createdAt DateTime @default(now())
+  /// 专辑/艺术家收藏的展示快照（song 类型留空，展示时由 MusicInfo 富化）。
+  /// 专辑是平台数据、不在本站库内：不存快照就只能回查上游或退化成显示 id。
+  name      String?
+  singer    String?
+  img       String?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 

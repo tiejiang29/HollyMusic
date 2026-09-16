@@ -1,7 +1,7 @@
 /**
  * 歌单 API
- * GET   /api/playlists        歌单列表
- * POST  /api/playlists {name} 创建歌单
+ * GET   /api/playlists                     歌单列表
+ * POST  /api/playlists {name, collected?}  创建歌单（collected=true = 收藏类快照，如榜单收藏）
  */
 
 import { NextRequest } from 'next/server'
@@ -34,7 +34,9 @@ export async function POST(request: NextRequest) {
     const body = await request.json().catch(() => ({}))
     const name = typeof body?.name === 'string' ? body.name.trim() : ''
     if (!name) return createErrorResponse(ErrorCodes.INVALID_PARAMS, '缺少必填参数: name', 400)
-    const playlist = await createPlaylist(user.username, name)
+    // 只有显式 true 才归入「收藏歌单」分组，默认自建
+    const collected = body?.collected === true
+    const playlist = await createPlaylist(user.username, name, { collected })
     return createSuccessResponse(playlist, 201)
   } catch (err) {
     const guard = authGuard(err)

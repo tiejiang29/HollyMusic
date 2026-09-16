@@ -388,7 +388,7 @@ export async function POST(request: NextRequest) {
       }
 
       const gcidName = (typeof raw.name === 'string' && raw.name.trim()) || gcidResult.name || `酷狗歌单 ${id}`
-      const gcidPlaylist = await createPlaylist(user.username, gcidName.trim())
+      const gcidPlaylist = await createPlaylist(user.username, gcidName.trim(), { collected: true })
 
       // hash 直接作为 kg songmid（HollyMusic 的 kg 存储键 = FileHash）
       const gcidMusicInfos: MusicInfo[] = gcidResult.songs.map(s => {
@@ -454,7 +454,7 @@ export async function POST(request: NextRequest) {
       detail.name ||
       `${source} 歌单 ${id}`
 
-    const playlist = await createPlaylist(user.username, name.trim())
+    const playlist = await createPlaylist(user.username, name.trim(), { collected: true })
     await addSongsToPlaylist(playlist.id, user.username, detail.tracks.map(t => t.uid))
 
     logger.info(

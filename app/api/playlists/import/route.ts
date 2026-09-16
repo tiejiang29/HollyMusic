@@ -12,7 +12,7 @@
  *
  * 同时接受洛雪导出文件的原始包裹结构 { type: 'playList', data: [...] }。
  *
- * 流程：normalize → upsert MusicInfo（复用搜索入库链路）→ 建歌单 → 批量加入。
+ * 流程：normalize → upsert MusicInfo（复用搜索入库链路）→ 建歌单（collected=true，属「从外部拿来」）→ 批量加入。
  */
 
 import { NextRequest } from 'next/server'
@@ -116,7 +116,7 @@ export async function POST(request: NextRequest) {
     // 条目 uid 用存储键（kg 以 hash 为主键），保证与 MusicInfo 行精确关联
     const uids = songs.map(s => `${s.source}-${getStorageSongmidForMusicInfo(s)}`)
 
-    const playlist = await createPlaylist(user.username, name.trim())
+    const playlist = await createPlaylist(user.username, name.trim(), { collected: true })
     await addSongsToPlaylist(playlist.id, user.username, uids)
 
     logger.info(

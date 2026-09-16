@@ -218,21 +218,29 @@ export async function collectPlaylist(
 
 /**
  * 创建歌单。
+ *
+ * `collected` 显式区分「自己攒的」和「从外部拿来的」：站内收藏副本、平台歌单导入、
+ * 洛雪格式导入都应传 true（前端按该字段分组展示，见 PlaylistsPage）。默认 false = 自建。
  */
-export async function createPlaylist(username: string, name: string): Promise<PlaylistSummary> {
+export async function createPlaylist(
+  username: string,
+  name: string,
+  opts: { collected?: boolean } = {},
+): Promise<PlaylistSummary> {
   const created = await prisma.playlist.create({
     data: {
       name,
       username,
       owner: username,
       isPublic: false,
+      collected: opts.collected ?? false,
       songCount: 0,
       duration: 0,
       allowedUsers: { create: { username } },
     },
     include: { allowedUsers: true },
   })
-  logger.info(`[playlist] created ${created.id} - ${name}`)
+  logger.info(`[playlist] created ${created.id} - ${name}${opts.collected ? ' (collected)' : ''}`)
   return toSummary(created)
 }
 

@@ -2,24 +2,26 @@
  * 多源编排器（搜索层链式降级）：TX 主链 → 酷我 → 咪咕 → Apple
  *
  * 链规则（用户定案）：
- * - 酷我结果中有「完全匹配」词条（归一化后名字相等）→ 用酷我
- * - 酷我无完全匹配 → 咪咕再搜，咪咕有完全匹配 → 用咪咕
- * - 两链都无完全匹配 → Apple 兜底
- * - Apple 也失败/为空 → 回落最好的模糊结果（酷我优先，其次咪咕），比空列表好
+ * - 先看 TX 结果里有没有「命中」词条（归一化后名字相等，或关键词分词后与卡片名相等）→ 用 TX
+ * - TX 未命中 → 酷我再搜，命中 → 用酷我
+ * - 酷我也未命中 → 咪咕，命中 → 用咪咕
+ * - 三家都未命中 → Apple 兜底
+ * - Apple 也失败/为空 → 回落最好的模糊结果（TX 优先，其次酷我、咪咕），比空列表好
  *
+ * 专辑搜索同样走本编排器（本地 MusicBrainz 索引已下线，不再参与专辑搜索）。
  * 归一化口径：繁→简 + 小写 + 去非字母数字（"Taylor&nbsp;Swift"/"taylor swift" 等价）。
  * 详情层降级（kw/mg 失败按名字回落）在各 API 路由内，不经本编排器。
  */
 
 import { logger } from '@/lib/logger'
-import { searchTxArtists, type TxArtistCard } from '@/lib/services/tx-chain-service'
+import { searchTxArtists, searchTxAlbums, type TxArtistCard, type TxAlbumCard } from '@/lib/services/tx-chain-service'
 import { searchKwArtists, getKwArtistInfo, searchKwAlbums, type KwArtistCard, type KwAlbumCard } from '@/lib/services/kw-chain-service'
 import { searchMgArtists, getMgArtistBio, searchMgAlbums, type MgArtistCard, type MgAlbumCard } from '@/lib/services/mg-chain-service'
 import { searchItunesArtists, searchItunesAlbums, appleT2S } from '@/lib/services/itunes-service'
 import { searchAmpArtists } from '@/lib/services/apple-amp-service'
 
 export type ArtistCard = (TxArtistCard | KwArtistCard | MgArtistCard | { source: 'apple'; artistId: string; name: string; genre?: string })
-export type AlbumCard = KwAlbumCard | MgAlbumCard | {
+export type AlbumCard = TxAlbumCard | KwAlbumCard | MgAlbumCard | {
   source: 'apple'; albumId: string; name: string; artist: string; img: string | null; year?: string; trackCount?: number
 }
 
@@ -32,6 +34,19 @@ function hasExactMatch<T extends { name?: string }>(list: T[], keyword: string):
   const k = normKey(keyword)
   if (!k) return false
   return list.some(item => normKey(item.name) === k)
+}
+
+/**
+ * 专辑命中判定：整串完全匹配，或关键词任一空格分词与卡片名完全匹配。
+ * 分词这条是刚需——用户常把「专辑名 歌手」一起输入（如"叶惠美 周杰伦"），
+ * 只比整串会让所有平台都判为不命中、一路落到链尾的 Apple。
+ */
+function hasAlbumKeywordHit<T extends { name?: string }>(list: T[], keyword: string): boolean {
+  if (list.length === 0) return false
+  const names = new Set(list.map(i => normKey(i.name)).filter(Boolean))
+  if (names.size === 0) return false
+  if (names.has(normKey(keyword))) return true
+  return keyword.trim().split(/\s+/).some(token => token.length > 0 && names.has(normKey(token)))
 }
 
 /**
@@ -76,19 +91,23 @@ export async function searchArtistCardsChain(
 }
 
 /**
- * 专辑平台搜索链（本地库未命中时调用）：kw(完全匹配?) → mg(完全匹配?) → apple → 模糊兜底
+ * 专辑搜索链：TX(命中?) → kw(命中?) → mg(命中?) → apple → 模糊兜底
+ * 返回卡片（每张带 source 字段，前端据此路由到对应专辑详情链）。
  */
 export async function searchAlbumCardsChain(
   keyword: string,
   limit = 30,
 ): Promise<AlbumCard[]> {
-  const [kwList, mgList] = await Promise.all([
+  // TX 主链：tx/kw/mg 并行预取，命中判定按 tx > kw > mg
+  const [txList, kwList, mgList] = await Promise.all([
+    searchTxAlbums(keyword, limit).catch(() => [] as TxAlbumCard[]),
     searchKwAlbums(keyword, limit).catch(() => [] as KwAlbumCard[]),
     searchMgAlbums(keyword, limit).catch(() => [] as MgAlbumCard[]),
   ])
 
-  if (hasExactMatch(kwList, keyword) && kwList.length > 0) return kwList
-  if (hasExactMatch(mgList, keyword) && mgList.length > 0) return mgList
+  if (hasAlbumKeywordHit(txList, keyword)) return txList
+  if (hasAlbumKeywordHit(kwList, keyword)) return kwList
+  if (hasAlbumKeywordHit(mgList, keyword)) return mgList
 
   try {
     const appleList = (await searchItunesAlbums(keyword, limit)).map(c => ({
@@ -105,7 +124,8 @@ export async function searchAlbumCardsChain(
     logger.warn('[source-chain] Apple 专辑搜索失败:', error instanceof Error ? error.message : error)
   }
 
-  return kwList.length > 0 ? kwList : mgList
+  // 全兜底：返回最好的模糊结果（TX 主链优先）
+  return txList.length > 0 ? txList : kwList.length > 0 ? kwList : mgList
 }
 
 /**

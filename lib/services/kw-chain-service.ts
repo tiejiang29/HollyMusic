@@ -17,7 +17,7 @@ import { searchCache } from '@/lib/cache-manager'
 import { upsertMusicInfosInTransaction, getStorageSongmidForMusicInfo } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { appleT2S } from '@/lib/services/itunes-service'
-import type { MusicInfo } from '@/lib/types/music'
+import type { MusicInfo, QualityType } from '@/lib/types/music'
 
 const KW_TIMEOUT = 8_000
 const POLITENESS_INTERVAL = 100
@@ -334,12 +334,71 @@ export async function getKwArtistInfo(artistId: string): Promise<KwArtistInfo | 
   return info
 }
 
+/** 音质档位展示顺序（与 tx/music-core 一致：低→高） */
+const KW_QUALITY_ORDER: QualityType[] = ['128k', '320k', 'flac', 'flac24bit']
+
+/** MINFO 单段（`level:ff,bitrate:2000,format:flac,size:32.38Mb`）→ 音质档位 */
+function qualityOfMinfoSegment(seg: string): { quality: QualityType; size: string } | null {
+  const format = /format:([a-z0-9]+)/i.exec(seg)?.[1]?.toLowerCase()
+  const bitrate = Number(/bitrate:(\d+)/i.exec(seg)?.[1] || 0)
+  const sizeMatch = /size:([\d.]+)\s*([MG])b?/i.exec(seg)
+  // 与 tx 链的尺寸文案对齐（"32.38M"），缺失时留空串（历史库里已有空串约定）
+  const size = sizeMatch ? `${sizeMatch[1]}${sizeMatch[2].toUpperCase()}` : ''
+  if (format === 'flac') return { quality: 'flac', size }
+  if (format === 'mp3') return { quality: bitrate >= 256 ? '320k' : '128k', size }
+  // ogg/aac/ZP 等非本项目音质档位忽略（音源脚本也送不出这些格式）
+  return null
+}
+
+/**
+ * 酷我可用音质 → types/_types。
+ *
+ * 必须给出档位：音源管理器按 `_types[quality]` 逐档筛选，空 _types 会让该曲在
+ * 酷我平台被整段跳过、同平台取址必然失败，只能依赖跨平台换源兜底（见 kwSongToMusicInfo 调用方）。
+ * 数据来源优先级：MINFO 明细（r.s 专辑接口，含各档大小）→ formats 集合 → 基线档位。
+ * 酷我 mp3 128k/320k 是平台基线，任何歌曲都有，故始终补上；flac 仅在明确标记时给。
+ */
+export function parseKwQualities(input: {
+  minfo?: string | null
+  formats?: string | null
+  hasLossless?: boolean | string | null
+}): Pick<MusicInfo, 'types' | '_types'> {
+  const sizes = new Map<QualityType, string>()
+  const put = (quality: QualityType, size: string) => {
+    if (!sizes.has(quality)) sizes.set(quality, size)
+  }
+
+  for (const seg of (input.minfo || '').split(';')) {
+    if (!seg) continue
+    const hit = qualityOfMinfoSegment(seg)
+    if (hit) put(hit.quality, hit.size)
+  }
+
+  if (sizes.size === 0 && input.formats) {
+    const tokens = new Set(input.formats.split('|').map(t => t.trim().toUpperCase()))
+    if (tokens.has('MP3128')) put('128k', '')
+    if (tokens.has('MP3H')) put('320k', '')
+    if (tokens.has('ALFLAC')) put('flac', '')
+  }
+
+  put('128k', '')
+  put('320k', '')
+  if (input.hasLossless === true || input.hasLossless === 'true') put('flac', '')
+
+  const types = KW_QUALITY_ORDER.filter(q => sizes.has(q)).map(q => ({ type: q, size: sizes.get(q) as string }))
+  const _types = Object.fromEntries(types.map(t => [t.type, { size: t.size }]))
+  return { types, _types: _types as MusicInfo['_types'] }
+}
+
 /** 酷我歌曲 → kw MusicInfo（interval 格式与 music-core 对齐，uid 由入库方附加） */
 export function kwSongToMusicInfo(s: {
   rid?: number | string; name?: string; artist?: string
   album?: string; duration?: number | string; albumpic?: string
+  /** 音质线索：MINFO（r.s 专辑接口）/ formats 集合（同上）/ hasLossless（wapi 歌手接口） */
+  minfo?: string; formats?: string; hasLossless?: boolean
 }): MusicInfo | null {
   if (s.rid == null || !s.name) return null
+  const { types, _types } = parseKwQualities(s)
   return {
     name: clean(s.name),
     singer: clean(s.artist) || '未知歌手',
@@ -348,8 +407,8 @@ export function kwSongToMusicInfo(s: {
     ...(s.album ? { albumName: clean(s.album) } : {}),
     interval: secsToInterval(s.duration),
     img: s.albumpic || null,
-    types: [],
-    _types: {} as MusicInfo['_types'],
+    types,
+    _types,
     typeUrl: {},
   }
 }
@@ -359,13 +418,14 @@ export async function getKwArtistSongs(
   artistId: string,
   limit = 100,
 ): Promise<{ total: number; list: MusicInfo[] } | null> {
-  const cacheKey = `kw:artistSongs:${artistId}:${limit}`
+  const cacheKey = `kw:artistSongs:v2:${artistId}:${limit}`
   const cached = searchCache.get(cacheKey) as { total: number; list: MusicInfo[] } | null
   if (cached) return cached
 
   interface RawSong {
     rid?: number | string; name?: string; artist?: string
     album?: string; duration?: number | string; albumpic?: string
+    hasLossless?: boolean
   }
   interface Raw { total?: number; list?: RawSong[] }
   const data = await kwWwwGet<Raw>('artist/artistMusic', {
@@ -373,7 +433,8 @@ export async function getKwArtistSongs(
   })
   const rawList = data?.list || []
   if (rawList.length === 0) return null
-  const list = rawList.map(kwSongToMusicInfo).filter((m): m is MusicInfo => m !== null)
+  const list = rawList.map(s => kwSongToMusicInfo({ ...s, hasLossless: s.hasLossless === true }))
+    .filter((m): m is MusicInfo => m !== null)
   if (list.length === 0) return null
   const result = { total: data?.total ?? list.length, list }
   searchCache.set(cacheKey, result, CACHE_TTL)
@@ -412,14 +473,18 @@ export async function getKwArtistAlbums(artistId: string, limit = 30): Promise<K
 
 /** 专辑详情：stype=albuminfo → name/artist/musiclist(rid)/pic/company */
 export async function getKwAlbumDetail(albumId: string): Promise<KwAlbumDetail | null> {
-  const cacheKey = `kw:albumDetail:${albumId}`
+  const cacheKey = `kw:albumDetail:v2:${albumId}`
   const cached = searchCache.get(cacheKey) as KwAlbumDetail | null
   if (cached) return cached
 
   interface Raw {
     albumid?: number | string; name?: string; artist?: string; artistid?: number | string
     pic?: string; company?: string; releaseDate?: string; publishtime?: string
-    musiclist?: Array<{ id?: number | string; name?: string; artist?: string; duration?: number | string; album?: string }>
+    musiclist?: Array<{
+      id?: number | string; name?: string; artist?: string; duration?: number | string; album?: string
+      /** 音质明细（`level:ff,bitrate:2000,format:flac,size:32.38Mb;…`）与可用格式集合，用于补齐 types */
+      MINFO?: string; formats?: string
+    }>
   }
   const d = await kwRsGet<Raw>({
     stype: 'albuminfo', albumid: albumId,
@@ -444,6 +509,7 @@ export async function getKwAlbumDetail(albumId: string): Promise<KwAlbumDetail |
     tracks: d.musiclist.map(t => kwSongToMusicInfo({
       rid: t.id, name: t.name, artist: t.artist, duration: t.duration,
       albumpic: pic || undefined, album: d.name,
+      minfo: t.MINFO, formats: t.formats,
     })).filter((m): m is MusicInfo => m !== null),
   }
   if (detail.tracks.length === 0) return null
@@ -466,7 +532,7 @@ export interface KwArtistDetail {
 /** 酷我歌手详情整包：信息/热门歌/专辑三路并行 → 热门歌一次入库附 uid。缓存 1h。
  *  返回 null = 酷我链整体不可用（调用方走名字应急钥匙回落 Apple）。 */
 export async function getKwArtistDetail(artistId: string): Promise<KwArtistDetail | null> {
-  const cacheKey = `kw:artistDetail:v3:${artistId}`
+  const cacheKey = `kw:artistDetail:v4:${artistId}`
   const cached = searchCache.get(cacheKey) as KwArtistDetail | null
   if (cached) return cached
 
@@ -511,7 +577,7 @@ export async function getKwAlbumDetailPlayable(albumId: string): Promise<{
   }
   list: Array<MusicInfo & { uid: string }>
 } | null> {
-  const cacheKey = `kw:albumPlayable:${albumId}`
+  const cacheKey = `kw:albumPlayable:v2:${albumId}`
   const cached = searchCache.get(cacheKey) as Awaited<ReturnType<typeof getKwAlbumDetailPlayable>> | null
   if (cached) return cached
 

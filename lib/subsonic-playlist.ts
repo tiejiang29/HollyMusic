@@ -247,6 +247,9 @@ export async function handleCreatePlaylist(request: NextRequest, authRes: AuthRe
                 username,
                 owner: username,
                 isPublic: false,
+                // Subsonic 协议没有「来源」概念，从这里建的歌单都来自第三方客户端（App 内自建走
+                // POST /api/playlists），按站内导入的口径归入「收藏歌单」分组
+                collected: true,
                 songCount: 0,
                 duration: 0,
                 // 创建时自动将创建者添加到 allowedUsers

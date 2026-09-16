@@ -3,7 +3,7 @@
  *
  * 状态放在组件外部 store：离开搜索页再回来时不会丢失数据，输入框/源/结果都保留。
  * - run(keyword, source)：歌曲搜索，过期请求会被丢弃（reqId 自增）
- * - runAlbum(keyword)：专辑搜索（mode=album，本地优先 + 平台兜底）
+ * - runAlbum(keyword)：专辑搜索（mode=album，平台链 TX→酷我→咪咕→Apple）
  * - setKeyword / setSource / setMode：仅更新输入态，不触发请求
  * - reset：清空（注销或切换用户时调用）
  *
@@ -12,7 +12,7 @@
 
 import { create } from 'zustand'
 import { search } from '@/lib/api/search'
-import { searchAlbums, type LocalAlbumSummary, type PlatformAlbumSummary } from '@/lib/api/album'
+import { searchAlbums, type PlatformAlbumSummary } from '@/lib/api/album'
 import { searchArtists, type ArtistSummary } from '@/lib/api/artist'
 import type { Song, SourceType } from '@/lib/types/music'
 
@@ -35,7 +35,6 @@ interface SearchStore {
   /** 平台搜索附带的本地音乐库匹配（顶部"本地匹配"区；source=local 时为空） */
   localList: Song[]
   /** 专辑搜索结果（mode=album，本地专辑库命中） */
-  albums: LocalAlbumSummary[]
   /** 平台兜底结果（本地未命中时自动搜索，Apple 专辑卡片） */
   platformAlbums: PlatformAlbumSummary[]
   /** 歌手搜索结果（mode=artist，Apple 歌手卡片） */
@@ -70,7 +69,6 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   lastSource: 'all',
   results: [],
   localList: [],
-  albums: [],
   platformAlbums: [],
   artists: [],
   loading: false,
@@ -122,7 +120,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
   runAlbum: async (kw) => {
     const trimmed = kw.trim()
     if (!trimmed) {
-      set({ albums: [], platformAlbums: [], loading: false, error: null, lastKeyword: '' })
+      set({ platformAlbums: [], loading: false, error: null, lastKeyword: '' })
       return
     }
     const reqId = get().reqId + 1
@@ -132,7 +130,6 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       const r = await searchAlbums(trimmed, 30)
       if (reqId !== get().reqId) return
       set({
-        albums: r.list,
         platformAlbums: r.platformList || [],
         loading: false,
         error: null,
@@ -141,8 +138,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
     } catch (e) {
       if (reqId !== get().reqId) return
       set({
-        albums: [],
-        platformAlbums: [],
+              platformAlbums: [],
         loading: false,
         error: toFriendlyError(e),
         lastKeyword: trimmed,
@@ -177,8 +173,7 @@ export const useSearchStore = create<SearchStore>((set, get) => ({
       lastSource: 'all',
       results: [],
       localList: [],
-      albums: [],
-      platformAlbums: [],
+          platformAlbums: [],
       artists: [],
       loading: false,
       error: null,

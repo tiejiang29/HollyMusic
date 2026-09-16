@@ -109,7 +109,8 @@ export function PlaylistDetailPage() {
             <div className="flex-1">
               <h1 className="text-3xl font-bold">{detail.name}</h1>
               <p className="mt-1 text-sm text-muted-foreground">
-                {detail.songCount} 首 · {detail.username}
+                {detail.songCount} 首 ·{' '}
+                {detail.collected ? (detail.comment || '收藏的歌单') : detail.username}
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <button

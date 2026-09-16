@@ -4,7 +4,20 @@ import { PrismaClient } from './generated/prisma'
 const prisma = new PrismaClient()
 
 export type ItemType = 'song' | 'album' | 'artist'
-export type FavoriteItem = { itemType: ItemType; itemId: string; source?: string | null }
+/**
+ * 收藏条目。
+ * name/singer/img 是**展示快照**，只有专辑收藏需要：专辑是平台数据，不在本站曲库里，
+ * 无法像歌曲那样靠 itemId 回查富化（详见 prisma/schema.prisma 的 Favorite 注释）。
+ * 歌曲收藏不传这三个字段，行为与从前完全一致。
+ */
+export type FavoriteItem = {
+  itemType: ItemType
+  itemId: string
+  source?: string | null
+  name?: string | null
+  singer?: string | null
+  img?: string | null
+}
 
 export async function getOrCreateUserByName(username: string) {
   const name = (username || '').trim()
@@ -51,9 +64,23 @@ export async function starItems(userId: number, items: FavoriteItem[]) {
       })
       if (!existing) {
         await prisma.favorite.create({
-          data: { userId, itemType: item.itemType, itemId: item.itemId, source },
+          data: {
+            userId,
+            itemType: item.itemType,
+            itemId: item.itemId,
+            source,
+            name: item.name ?? null,
+            singer: item.singer ?? null,
+            img: item.img ?? null,
+          },
         })
         created++
+      } else if (item.name || item.singer || item.img) {
+        // 已收藏过：刷新展示快照（专辑名/封面可能在上游变过），不改变收藏时间
+        await prisma.favorite.update({
+          where: { id: existing.id },
+          data: { name: item.name ?? null, singer: item.singer ?? null, img: item.img ?? null },
+        })
       }
     } catch (err) {
       // ignore constraint/uniqueness errors
@@ -70,24 +97,29 @@ export async function unstarItems(userId: number, items: FavoriteItem[]) {
   }
 
   let totalDeleted = 0
-  
+
   for (const item of items) {
     if (!item.itemId) {
       console.warn('[unstarItems] Warning: item without itemId', item)
       continue
     }
 
-    // Delete all records matching userId + itemId (ignore itemType and source)
+    // 删除匹配 userId + itemType + itemId 的记录；显式传了 source 时再按平台收窄。
+    // 必须带上 itemType：本站 song id 与 Subsonic 专辑 id 同为 `source-{key}` 形态，
+    // 可能是同一个字符串，只按 itemId 删会把另一种类型的收藏一起删掉。
+    const source = item.source ?? null
     const res = await prisma.favorite.deleteMany({
       where: {
         userId,
+        itemType: item.itemType,
         itemId: item.itemId,
+        ...(source ? { source } : {}),
       },
     })
     console.log('[unstarItems] Deleted', res.count, 'records for userId', userId, 'itemId', item.itemId)
     totalDeleted += res.count
   }
-  
+
   console.log('[unstarItems] Total deleted:', totalDeleted)
   return { deleted: totalDeleted }
 }

@@ -50,12 +50,51 @@ describe('kwSongToMusicInfo（歌曲映射与清洗）', () => {
       source: 'kw', songmid: '228908', name: '晴天', singer: '周杰伦',
       albumName: '叶惠美', interval: '04:29', img: 'https://img4.kuwo.cn/120/a.jpg',
     })
-    expect(mi?.types).toEqual([])
   })
 
   it('缺 rid 或歌名返回 null', () => {
     expect(kwChain.kwSongToMusicInfo({ name: '无id' })).toBeNull()
     expect(kwChain.kwSongToMusicInfo({ rid: 1 })).toBeNull()
+  })
+})
+
+describe('parseKwQualities（音质档位，_types 空会让同平台取址被整段跳过）', () => {
+  it('MINFO 明细解析出 flac/320k/128k 及各档大小', () => {
+    const r = kwChain.parseKwQualities({
+      minfo: 'level:ff,bitrate:2000,format:flac,size:32.38Mb;level:p,bitrate:192,format:ogg,size:7.15Mb;level:p,bitrate:320,format:mp3,size:13.05Mb;level:s,bitrate:48,format:aac,size:1.97Mb;level:h,bitrate:128,format:mp3,size:5.22Mb',
+    })
+    expect(r.types).toEqual([
+      { type: '128k', size: '5.22M' },
+      { type: '320k', size: '13.05M' },
+      { type: 'flac', size: '32.38M' },
+    ])
+    expect(r._types).toMatchObject({ '128k': { size: '5.22M' }, '320k': { size: '13.05M' }, flac: { size: '32.38M' } })
+  })
+
+  it('无 MINFO 时按 formats 集合给档位（大小未知留空串）', () => {
+    const r = kwChain.parseKwQualities({ formats: 'AAC48|ALFLAC|MP3128|MP3H|OGG192' })
+    expect(r.types.map(t => t.type)).toEqual(['128k', '320k', 'flac'])
+    expect(r._types['320k']).toEqual({ size: '' })
+  })
+
+  it('wapi 歌手接口只有 hasLossless：基线 mp3 档位恒在，额外补 flac', () => {
+    expect(kwChain.parseKwQualities({ hasLossless: true }).types.map(t => t.type)).toEqual(['128k', '320k', 'flac'])
+    expect(kwChain.parseKwQualities({}).types.map(t => t.type)).toEqual(['128k', '320k'])
+  })
+
+  it('任何输入都至少给出 128k/320k（回归守卫：空 _types 会让管理器的音质筛选全部跳过）', () => {
+    for (const input of [{}, { minfo: '' }, { formats: '' }, { minfo: 'level:zz,format:zp,size:zpMb' }]) {
+      const r = kwChain.parseKwQualities(input)
+      expect(r.types.length).toBeGreaterThanOrEqual(2)
+      expect(r._types['128k']).toBeDefined()
+      expect(r._types['320k']).toBeDefined()
+    }
+  })
+
+  it('kwSongToMusicInfo 输出的 _types 非空（音源管理器按 _types 逐档筛选）', () => {
+    const mi = kwChain.kwSongToMusicInfo({ rid: 238210, name: '以父之名', artist: '周杰伦', duration: 342 })
+    expect(Object.keys(mi?._types || {}).sort()).toEqual(['128k', '320k'])
+    expect(mi?.types.map(t => t.type)).toEqual(['128k', '320k'])
   })
 })
 

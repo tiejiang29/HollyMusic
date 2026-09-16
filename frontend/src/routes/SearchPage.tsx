@@ -4,7 +4,6 @@ import { useSearch } from '@/hooks/useSearch'
 import { SongList } from '@/components/shared/SongList'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { AlbumGrid } from '@@/components/shared/AlbumGrid'
 import { ChainAlbumCover } from '@@/components/shared/ChainAlbumCover'
 import { RecognizeDialog } from '@@/components/shared/RecognizeDialog'
 import { Search, Music, X, CloudOff, ChevronDown, User, Disc3, AudioLines } from 'lucide-react'
@@ -16,6 +15,11 @@ import { type SearchMode } from '@/lib/store/search-store'
 interface SuggestItem {
   text: string
   type: 'song' | 'singer' | 'album'
+}
+
+/** 专辑卡片的来源标签（编排链：TX → 酷我 → 咪咕 → Apple） */
+const ALBUM_SOURCE_LABEL: Record<'tx' | 'kw' | 'mg' | 'apple', string> = {
+  tx: 'QQ音乐', kw: '酷我', mg: '咪咕', apple: 'Apple',
 }
 
 const SOURCES: { value: SourceType | 'all' | 'local'; label: string }[] = [
@@ -33,7 +37,7 @@ export function SearchPage() {
   // keyword/source/mode/results/loading 全部来自 search-store（外部状态）：
   // 离开搜索页再回来时输入框与结果都保留。
   const {
-    results, localList, albums, platformAlbums, artists, mode,
+    results, localList, platformAlbums, artists, mode,
     loading, error, keyword, lastKeyword, source,
     setKeyword, setSource, setMode, run, runAlbum, runArtist,
   } = useSearch()
@@ -118,11 +122,9 @@ export function SearchPage() {
     if (appliedSuggest.current !== null) appliedSuggest.current = null
     const timer = setTimeout(() => {
       const reqId = ++suggestReqId.current
-      // 联想按结果类型取对应语料：专辑=本地专辑库前缀（与专辑搜索同一语料），
-      // 歌手=五源歌手联想，歌曲=原有网易+本地库联想
+      // 联想按结果类型取对应语料：专辑/歌手=通用联想接口按 type 过滤，歌曲=不过滤
       const fetcher: Promise<SuggestItem[]> = mode === 'album'
-        ? apiGet<{ list: Array<{ gid: string; title: string; artist: string }> }>('album/local/suggest', { keyword: kw, limit: 8 })
-            .then(r => (r.list || []).map(a => ({ text: a.title, type: 'album' as const })))
+        ? apiGet<SuggestItem[]>('search/suggest', { keyword: kw, type: 'album' })
         : mode === 'artist'
           ? apiGet<SuggestItem[]>('search/suggest', { keyword: kw, type: 'artist' })
           : apiGet<SuggestItem[]>('search/suggest', { keyword: kw })
@@ -369,18 +371,12 @@ export function SearchPage() {
           <EmptyState icon={User} title="搜索歌手" description="输入歌手名，查看简介、热门歌曲与专辑" />
         )
       ) : mode === 'album' ? (
-        albums.length > 0 || platformAlbums.length > 0 ? (
+        platformAlbums.length > 0 ? (
           <>
-            {albums.length > 0 && (
-              <>
-                <div className="mb-2 text-xs text-muted-foreground">本地专辑库 · 搜索专辑名或歌手名</div>
-                <AlbumGrid albums={albums} />
-              </>
-            )}
             {platformAlbums.length > 0 && (
               <>
                 <div className="mb-2 mt-6 text-xs text-muted-foreground">
-                  {albums.length > 0 ? '平台结果（本地库未收录）' : '平台专辑结果'} <span className="text-primary">{platformAlbums[0].source === 'kw' ? '酷我' : platformAlbums[0].source === 'mg' ? '咪咕' : 'Apple'}</span>
+                  专辑结果 <span className="text-primary">{ALBUM_SOURCE_LABEL[platformAlbums[0].source]}</span>
                 </div>
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                   {platformAlbums.map(a => (
@@ -420,7 +416,7 @@ export function SearchPage() {
         ) : lastKeyword ? (
           <EmptyState icon={Search} title="未找到专辑" description={`没有找到与“${lastKeyword}”相关的专辑`} />
         ) : (
-          <EmptyState icon={Disc3} title="开始搜索" description="输入专辑名或歌手名，探索本地专辑库" />
+          <EmptyState icon={Disc3} title="开始搜索" description="输入专辑名或歌手名，从各平台检索专辑" />
         )
       ) : visibleTracks.length > 0 ? (
         <>

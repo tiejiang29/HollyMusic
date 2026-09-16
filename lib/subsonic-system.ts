@@ -235,7 +235,22 @@ export async function handleGetAlbumList2(request: NextRequest, authRes: AuthRes
         }
         const favs = await prisma.favorite.findMany({ where: { userId: u.id, itemType: 'album' } })
         const favSet = new Set(favs.map(f => f.itemId))
+        // 本站曲库内的专辑（id = 代表曲存储键）按原路过滤；App 收藏的站外专辑不在曲库里，
+        // 拿不到节点 —— 用收藏时落下的展示快照补成专辑节点（songCount/duration 记 0）。
         albums = albums.filter(a => favSet.has(a.id))
+        const listedIds = new Set(albums.map(a => a.id))
+        for (const fav of favs) {
+          if (!fav.name || listedIds.has(fav.itemId)) continue
+          albums.push({
+            id: fav.itemId,
+            name: fav.name,
+            songCount: 0,
+            duration: 0,
+            created: fav.createdAt,
+            coverArt: fav.itemId,
+            artist: fav.singer || '',
+          })
+        }
         break
       }
       default:

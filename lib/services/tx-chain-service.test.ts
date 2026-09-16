@@ -150,7 +150,8 @@ describe('原生简介 + v8 专辑信息', () => {
         data: {
           name: '叶惠美', singername: '周杰伦', desc: '专辑文案', company: '杰威尔音乐有限公司', aDate: '2003-07-31',
           list: [
-            { songmid: '001n4C3p1yv0FU', songname: '以父之名', interval: 342, singer: ['周杰伦'], albummid: '000MkMni19ClKG', albumname: '叶惠美', strMediaMid: '002ExFMX2Jt6gv', size320: 13682683, sizeflac: 33950377 },
+            // v8 真实形态：singer 是对象数组（{id,mid,name}），不是字符串数组
+            { songmid: '001n4C3p1yv0FU', songname: '以父之名', interval: 342, singer: [{ id: 4558, mid: '0025NhlN2yWrP4', name: '周杰伦' }], albummid: '000MkMni19ClKG', albumname: '叶惠美', strMediaMid: '002ExFMX2Jt6gv', size320: 13682683, sizeflac: 33950377 },
           ],
         },
       }),
@@ -158,6 +159,47 @@ describe('原生简介 + v8 专辑信息', () => {
     const d = await tx.getTxAlbumDetail('000MkMni19ClKG')
     expect(d?.album).toMatchObject({ name: '叶惠美', artist: '周杰伦', desc: '专辑文案', company: '杰威尔音乐有限公司', year: '2003-07-31' })
     expect(d?.tracks[0]).toMatchObject({ songmid: '001n4C3p1yv0FU', strMediaMid: '002ExFMX2Jt6gv', interval: '05:42' })
+    // 歌手必须解析成真名：'未知歌手' 会让换源搜索词作废（identity 也认不出同款歌）
+    expect(d?.tracks[0]?.singer).toBe('周杰伦')
     expect(d?.tracks[0]?.types.map(t => t.type)).toEqual(['320k', 'flac'])
+  })
+
+  it('getTxAlbumDetail：v8 曲目缺歌手时回落专辑歌手（兼容字符串数组形态）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        code: 0,
+        data: {
+          name: '叶惠美', singername: '周杰伦',
+          list: [
+            { songmid: 'a1', songname: '晴天', interval: 269, singer: ['周杰伦'], albummid: 'm1', albumname: '叶惠美', strMediaMid: 'mm1', size320: 1 },
+            { songmid: 'a2', songname: '懦夫', interval: 218, singer: [], albummid: 'm1', albumname: '叶惠美', strMediaMid: 'mm2', size320: 1 },
+            { songmid: 'a3', songname: '双刀', interval: 291, albummid: 'm1', albumname: '叶惠美', strMediaMid: 'mm3', size320: 1 },
+          ],
+        },
+      }),
+    })))
+    const d = await tx.getTxAlbumDetail('m1')
+    expect(d?.tracks.map(t => t.singer)).toEqual(['周杰伦', '周杰伦', '周杰伦'])
+  })
+
+  it('getTxAlbumDetailPlayable：album.singer 与 kw/mg 详情同名字段（客户端只认 singer）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        code: 0,
+        data: {
+          name: '范特西', singername: '周杰伦',
+          list: [
+            { songmid: 'a1', songname: '爱在西元前', interval: 234, singer: [{ name: '周杰伦' }], albummid: 'm1', albumname: '范特西', strMediaMid: 'mm1', size320: 1 },
+          ],
+        },
+      }),
+    })))
+    const d = await tx.getTxAlbumDetailPlayable('m1')
+    // 前端按 album.singer 读取（专辑页标题 / 封面兜底 / 收藏快照都走它），
+    // 只给上游原名 artist 会让标题掉歌手名、收藏快照 singer 落 null。
+    expect(d?.album.singer).toBe('周杰伦')
+    expect(d?.album.artist).toBe('周杰伦')
   })
 })

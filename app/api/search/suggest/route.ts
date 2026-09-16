@@ -4,14 +4,16 @@ import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { prisma } from '@/lib/db'
 import { searchCache } from '@/lib/cache-manager'
+import { searchTxAlbums } from '@/lib/services/tx-chain-service'
 
 /**
  * 搜索联想 API（登录用户）
  * GET /api/search/suggest?keyword=xxx
  *
  * 数据源（并行，整体 1.2s 截断——联想宁快勿全）：
- * 1. 网易云 legacy suggest 接口（GET，无需加密；返回歌曲/歌手/专辑联想）
+ * 1. 网易云 legacy suggest 接口（GET，无需加密；返回歌曲/歌手联想）
  * 2. 本地音乐库（name/singer 包含匹配；零网络，对用户自己的库最相关）
+ * 3. TX 专辑搜索（smartbox）：专辑语料（网易联想几乎不给专辑）
  *
  * 合并去重后最多 10 条；结果短缓存（10 分钟）。
  */
@@ -24,6 +26,20 @@ const MAX_ITEMS = 10
 export interface SuggestItem {
   text: string
   type: 'song' | 'singer' | 'album'
+}
+
+/**
+ * 专辑联想（TX smartbox）：网易 legacy 联想对专辑几乎不给结果
+ * （实测「叶惠美」「七里香」的 result.albums 均为空），故专辑语料改用 TX 专辑搜索，
+ * 与专辑搜索链首（TX → 酷我 → 咪咕 → Apple）保持一致。
+ */
+async function fetchTxAlbumSuggest(keyword: string): Promise<SuggestItem[]> {
+  try {
+    const cards = await searchTxAlbums(keyword, 8)
+    return cards.filter(c => c.name).map(c => ({ text: c.name, type: 'album' as const }))
+  } catch {
+    return []
+  }
 }
 
 /** 网易云联想（legacy 接口，GET 明文，返回 result.{songs,artists,albums}） */
@@ -126,22 +142,22 @@ export async function GET(request: NextRequest) {
     // artist 复用五源歌手联想（网易 suggest 的 singer 项），album 复用本地专辑前缀联想。
     const type = params.get('type') || ''
 
-    const cacheKey = `suggest:v3:${keyword}`
+    const cacheKey = `suggest:v4:${type}:${keyword}`
     const cached = searchCache.get(cacheKey) as SuggestItem[] | null
     if (cached) return createSuccessResponse(cached)
 
-    // 三源并行，整体预算 1.2s（超时源静默丢弃）
-    const [wySuggest, libraryItems, artistItems] = await Promise.race([
-      Promise.all([fetchNeteaseSuggest(keyword), fetchLibrarySuggest(keyword), fetchNeteaseArtists(keyword)]),
-      new Promise<[SuggestItem[], SuggestItem[], SuggestItem[]]>(r =>
-        setTimeout(() => [[], [], []] as [SuggestItem[], SuggestItem[], SuggestItem[]], OVERALL_BUDGET_MS)
+    // 四源并行，整体预算 1.2s（超时源静默丢弃）
+    const [wySuggest, libraryItems, artistItems, txAlbums] = await Promise.race([
+      Promise.all([fetchNeteaseSuggest(keyword), fetchLibrarySuggest(keyword), fetchNeteaseArtists(keyword), fetchTxAlbumSuggest(keyword)]),
+      new Promise<[SuggestItem[], SuggestItem[], SuggestItem[], SuggestItem[]]>(r =>
+        setTimeout(() => [[], [], [], []] as [SuggestItem[], SuggestItem[], SuggestItem[], SuggestItem[]], OVERALL_BUDGET_MS)
       ),
     ])
 
-    // 去重（文本归一：去空格小写）。排序：歌手置顶（人名搜索意图最强，
-    // 也避免被大量歌曲挤出上限）→ 本地音乐库 → 歌曲 → 专辑
-    const seen = new Set<string>()
+    // 按结果类型取对应语料集（各自独立占满 10 条上限）：
+    // 给某类型单独成集，避免专辑项排在歌手/歌曲之后被上限挤出（旧实现先合并再过滤，专辑常被挤空）。
     const items: SuggestItem[] = []
+    const seen = new Set<string>()
     const push = (item: SuggestItem) => {
       if (items.length >= MAX_ITEMS) return
       const key = item.text.replace(/\s+/g, '').toLowerCase()
@@ -149,21 +165,32 @@ export async function GET(request: NextRequest) {
       seen.add(key)
       items.push(item)
     }
-    let singerSlots = 4
-    for (const item of [...wySuggest, ...artistItems].filter(i => i.type === 'singer')) {
-      if (singerSlots <= 0) break
-      const before = items.length
-      push(item)
-      if (items.length > before) singerSlots--
+    if (type === 'album') {
+      // 专辑语料：TX 专辑搜索优先，其次网易联想里的专辑项
+      for (const item of txAlbums) push(item)
+      for (const item of wySuggest.filter(i => i.type === 'album')) push(item)
+    } else if (type === 'artist') {
+      for (const item of [...wySuggest, ...artistItems].filter(i => i.type === 'singer')) push(item)
+    } else if (type === 'song') {
+      for (const item of libraryItems) push(item)
+      for (const item of wySuggest.filter(i => i.type === 'song')) push(item)
+    } else {
+      // 缺省（不按类型）：歌手置顶（人名搜索意图最强，也避免被大量歌曲挤出上限）
+      // → 本地音乐库 → 歌曲 → TX 专辑 → 网易专辑
+      let singerSlots = 4
+      for (const item of [...wySuggest, ...artistItems].filter(i => i.type === 'singer')) {
+        if (singerSlots <= 0) break
+        const before = items.length
+        push(item)
+        if (items.length > before) singerSlots--
+      }
+      for (const item of libraryItems) push(item)
+      for (const item of wySuggest.filter(i => i.type === 'song')) push(item)
+      for (const item of txAlbums) push(item)
+      for (const item of wySuggest.filter(i => i.type === 'album')) push(item)
     }
-    for (const item of libraryItems) push(item)
-    for (const item of wySuggest.filter(i => i.type === 'song')) push(item)
-    for (const item of wySuggest.filter(i => i.type === 'album')) push(item)
 
     searchCache.set(cacheKey, items, CACHE_TTL)
-    if (type === 'artist') return createSuccessResponse(items.filter(i => i.type === 'singer'))
-    if (type === 'album') return createSuccessResponse(items.filter(i => i.type === 'album'))
-    if (type === 'song') return createSuccessResponse(items.filter(i => i.type === 'song'))
     return createSuccessResponse(items)
   } catch (error) {
     if (error instanceof AuthError) {

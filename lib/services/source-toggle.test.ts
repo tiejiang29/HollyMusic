@@ -7,7 +7,7 @@
  * - forceUpstream → 跳过库内查询，强制上游搜索
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const findManyMock = vi.fn()
 const searchMock = vi.fn(async () => ({ list: [] }))
@@ -26,7 +26,7 @@ vi.mock('@/lib/search-config', () => ({
   getSearchSources: vi.fn(async () => []),
 }))
 
-const { findAlternatives } = await import('./source-toggle')
+const { findAlternatives, findBestAlternative, clearToggleCache } = await import('./source-toggle')
 
 function mi(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -117,5 +117,50 @@ describe('findAlternatives 本地优先', () => {
     expect(candidates).toEqual([])
     expect(findManyMock).not.toHaveBeenCalled()
     expect(searchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('findBestAlternative 换源结果缓存', () => {
+  beforeEach(() => {
+    findManyMock.mockReset()
+    searchMock.mockReset()
+    searchMock.mockResolvedValue({ list: [] })
+    clearToggleCache()
+  })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('命中结果被缓存，重复播放同一首不再搜上游', async () => {
+    findManyMock.mockResolvedValue([])
+    searchMock.mockResolvedValue({ list: [mi({ source: 'wy', songmid: 'wy-9' })] })
+
+    const first = await findBestAlternative(mi())
+    expect(first?.source).toBe('wy')
+    const callsAfterFirst = searchMock.mock.calls.length
+
+    const second = await findBestAlternative(mi())
+    expect(second?.source).toBe('wy')
+    expect(searchMock.mock.calls.length).toBe(callsAfterFirst)
+  })
+
+  it('未命中只短暂缓存：过期后重新搜上游（回归守卫：旧实现把 null 永久缓存，一首歌会被钉死到进程结束）', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-16T00:00:00Z'))
+    findManyMock.mockResolvedValue([])
+    searchMock.mockResolvedValue({ list: [] })
+
+    // 第一次：上游抖动/无候选 → 未命中
+    expect(await findBestAlternative(mi())).toBeNull()
+    const callsAfterMiss = searchMock.mock.calls.length
+
+    // 未过期：仍在去抖窗口内，直接用缓存
+    searchMock.mockResolvedValue({ list: [mi({ source: 'wy', songmid: 'wy-9' })] })
+    expect(await findBestAlternative(mi())).toBeNull()
+    expect(searchMock.mock.calls.length).toBe(callsAfterMiss)
+
+    // 过期后：重新搜索并命中
+    vi.setSystemTime(new Date('2026-09-16T00:02:00Z'))
+    const recovered = await findBestAlternative(mi())
+    expect(recovered?.source).toBe('wy')
+    expect(searchMock.mock.calls.length).toBeGreaterThan(callsAfterMiss)
   })
 })

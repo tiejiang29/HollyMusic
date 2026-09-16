@@ -73,18 +73,22 @@ export async function handleGetStarred(
       const starredAttr = formatDate(fav.createdAt)
 
       if (fav.itemType === 'artist') {
+        // 收藏时落了名字就用名字，老数据只有 id 时退化为 id
         artists.push({
-          name: fav.itemId, // 由于只存了 ID，name 用 ID 代替（理想情况下需要查询艺术家名称）
+          name: fav.name || fav.itemId,
           id: fav.itemId,
           starred: starredAttr,
         })
       } else if (fav.itemType === 'album') {
+        // 专辑收藏带展示快照（name/singer/img）；老数据没有快照则用 id / source 兜底
+        const albumName = fav.name || fav.itemId
         albums.push({
           id: fav.itemId,
           parent: fav.source || '', // 使用 source 作为 parent
-          title: fav.itemId,
-          album: fav.itemId,
-          artist: fav.source || 'Unknown',
+          name: albumName,
+          title: albumName,
+          album: albumName,
+          artist: fav.singer || fav.source || 'Unknown',
           isDir: true,
           coverArt: fav.itemId,
           created: formatDate(fav.createdAt),

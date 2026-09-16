@@ -531,12 +531,13 @@ export async function getMgArtistDetail(singerId: string, nameHint?: string): Pr
   return detail
 }
 
-/** 咪咕专辑详情（可播版）：两接口并行 → 批量入库附 uid。缓存 1h */
+/** 咪咕专辑详情（可播版）：两接口并行 → 批量入库附 uid。缓存 1h。
+ *  album.singer 是 kw/mg/tx 详情统一的歌手字段名（咪咕上游称 artist）。 */
 export async function getMgAlbumDetailPlayable(albumId: string): Promise<{
-  album: MgAlbumDetail['album'] & { trackCount: number; profile?: { releaseDate?: string; recordLabels?: string[] } }
+  album: MgAlbumDetail['album'] & { singer: string; trackCount: number; profile?: { releaseDate?: string; recordLabels?: string[] } }
   list: Array<MusicInfo & { uid: string }>
 } | null> {
-  const cacheKey = `mg:albumPlayable:${albumId}`
+  const cacheKey = `mg:albumPlayable:v2:${albumId}`
   const cached = searchCache.get(cacheKey) as Awaited<ReturnType<typeof getMgAlbumDetailPlayable>> | null
   if (cached) return cached
 
@@ -548,6 +549,7 @@ export async function getMgAlbumDetailPlayable(albumId: string): Promise<{
   const result = {
     album: {
       ...detail.album,
+      singer: detail.album.artist,
       trackCount: list.length,
       ...((detail.album.year || detail.album.company) ? {
         profile: {

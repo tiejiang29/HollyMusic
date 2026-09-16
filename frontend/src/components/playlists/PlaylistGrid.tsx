@@ -12,7 +12,12 @@ export function PlaylistGrid({ playlists }: { playlists: PlaylistSummary[] }) {
           to={`/playlists/${p.id}`}
           className="group flex flex-col gap-2 rounded-lg p-2 hover:bg-accent/40"
         >
-          <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
+          <div className="relative flex aspect-square items-center justify-center overflow-hidden rounded bg-gradient-to-br from-primary/30 to-primary/10">
+            {p.collected && (
+              <span className="absolute right-1.5 top-1.5 z-10 rounded-full bg-black/55 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                收藏
+              </span>
+            )}
             {p.coverArt ? (
               <img
                 src={p.coverArt}
@@ -26,7 +31,10 @@ export function PlaylistGrid({ playlists }: { playlists: PlaylistSummary[] }) {
             )}
           </div>
           <div className="truncate text-sm font-medium">{p.name}</div>
-          <div className="text-xs text-muted-foreground">{p.songCount} 首</div>
+          <div className="truncate text-xs text-muted-foreground">
+            {p.songCount} 首{/* 老收藏副本的 comment 存有「收藏自 xxx」，新副本 comment 继承源歌单 */}
+            {p.comment ? ` · ${p.comment}` : ''}
+          </div>
         </Link>
       ))}
     </div>
