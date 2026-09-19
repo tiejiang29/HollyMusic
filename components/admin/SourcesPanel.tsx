@@ -43,7 +43,8 @@ const HEALTH_BAND_CLASS: Record<SourceHealthView['band'], string> = {
   'no-data': 'bg-muted text-muted-foreground',
 }
 
-function HealthCell({ health }: { health?: SourceHealthView[] }) {
+/** 健康列单元格：导出以便单测直接渲染（整页面板要 mock 异步接口，反而不如这个准） */
+export function HealthCell({ health }: { health?: SourceHealthView[] }) {
   // 无实测 ≠ 这个源坏了：瀑布通常第一个源就出货，排在后面的源天然没有样本
   if (!health || health.length === 0) {
     return <span className="text-xs text-muted-foreground">无实测</span>
