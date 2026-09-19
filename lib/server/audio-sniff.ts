@@ -260,15 +260,9 @@ export function judgeUpstreamPayload(input: {
   const ctKind = classifyContentType(input.contentType)
   const base = { container: null, contentType: ctMain } as const
 
-  // ① 字节层面
+  // ① 字节层面。容器魔数必须先查：isTextLike 里的"整段可打印"判据只看前 32 字节，
+  //    而某些合法容器的头部恰好全可打印（如 'fLaC' + ASCII 填充），先查文本会把真音频判成假地址。
   if (head) {
-    const rejectName = detectRejectBinary(head)
-    if (rejectName) {
-      return { ...base, verdict: 'reject', reason: `响应是 ${rejectName} 内容，不是音频` }
-    }
-    if (isTextLike(head)) {
-      return { ...base, verdict: 'reject', reason: '响应是文本/HTML/JSON，不是音频' }
-    }
     const container = detectContainer(head)
     if (container) {
       return {
@@ -277,6 +271,13 @@ export function judgeUpstreamPayload(input: {
         container,
         contentType: ctMain,
       }
+    }
+    const rejectName = detectRejectBinary(head)
+    if (rejectName) {
+      return { ...base, verdict: 'reject', reason: `响应是 ${rejectName} 内容，不是音频` }
+    }
+    if (isTextLike(head)) {
+      return { ...base, verdict: 'reject', reason: '响应是文本/HTML/JSON，不是音频' }
     }
   }
 

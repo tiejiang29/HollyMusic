@@ -145,6 +145,19 @@ describe('judgeUpstreamPayload：三档判定', () => {
     }
   })
 
+  /**
+   * 容器魔数必须先于"整段可打印"的文本判据。写周测时被这条咬到：isPrintableRun 的
+   * 注释声称"已知容器在调用前已排除"，但代码里 isTextLike 排在 detectContainer 前面，
+   * 于是 'fLaC' + ASCII 填充的头 32 字节（全可打印）会被判成"文本假地址"。
+   * 真实文件头部通常带 0x00 侥幸不触发，但证据强度上魔数明确高于"看起来像文本"。
+   */
+  it('头部全可打印的合法容器仍是 audio（魔数优先于文本判据）', () => {
+    const v = judgeUpstreamPayload({ contentType: 'audio/flac', head: head('fLaC0000000000000000000000000000') })
+    expect(v.verdict).toBe('audio')
+    expect(v.container).toBe('flac')
+    expect(judgeUpstreamPayload({ contentType: null, head: head('MAC 0000000000000000000000000000') }).container).toBe('ape')
+  })
+
   it('HTML 错误页 → reject（即使 Content-Type 谎称 audio/mpeg）', () => {
     const v = judgeUpstreamPayload({
       contentType: 'audio/mpeg',
