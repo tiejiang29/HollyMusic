@@ -45,6 +45,21 @@ function computeChecksum(mi: MusicInfo) {
   return crypto.createHash('md5').update(s).digest('hex')
 }
 
+/**
+ * 读库边界归一化。
+ *
+ * `MusicInfo.types` 在接口里是必填数组，但 `data` 列存的是上游原样 JSON——重建索引、
+ * 批量导入（scripts/push-music-info）、老版本写入的行都可能整个缺掉这个键，于是下游
+ * 任何 `mi.types.map(...)` 都会抛 TypeError（实测：/api/share 落地页 500、Subsonic
+ * stream 同形）。只补这一个字段：它是唯一被无条件解引用的，其余字段各有下游按各自的
+ * 可选性处理，在这里统一改写反而会把「声明必填但实际可缺」的既有形态悄悄改掉。
+ */
+function normalizeMusicInfo(parsed: MusicInfo): MusicInfo {
+  return Array.isArray(parsed.types)
+    ? parsed
+    : { ...parsed, types: [] }
+}
+
 export async function getMusicInfo(source: string, songmid: string): Promise<MusicInfo | null> {
   try {
     const row = await prisma.musicInfo.findUnique({
@@ -56,7 +71,7 @@ export async function getMusicInfo(source: string, songmid: string): Promise<Mus
       },
     })
     if (!row || !row.data) return null
-    return JSON.parse(row.data) as MusicInfo
+    return normalizeMusicInfo(JSON.parse(row.data))
   } catch (e) {
     console.warn('getMusicInfo error', e)
     return null
@@ -94,7 +109,7 @@ export async function getFirstMusicInfoByAlbumId(albumId: string): Promise<Music
       orderBy: { id: 'asc' },
     })
     if (!row || !row.data) return null
-    return JSON.parse(row.data) as MusicInfo
+    return normalizeMusicInfo(JSON.parse(row.data))
   } catch (e) {
     console.warn('getFirstMusicInfoByAlbumId error', e)
     return null
@@ -112,7 +127,7 @@ export async function getFirstMusicInfoByArtistAndTitle(artist: string, title: s
       orderBy: { id: 'asc' },
     })
     if (!row?.data) return null
-    return JSON.parse(row.data) as MusicInfo
+    return normalizeMusicInfo(JSON.parse(row.data))
   } catch (error) {
     logger.warn('getFirstMusicInfoByArtistAndTitle error', error)
     return null
@@ -133,7 +148,7 @@ export async function getMusicInfoListByAlbumId(albumId: string): Promise<MusicI
     for (const row of rows) {
       if (!row.data) continue
       try {
-        list.push(JSON.parse(row.data) as MusicInfo)
+        list.push(normalizeMusicInfo(JSON.parse(row.data)))
       } catch {
         // 跳过解析失败的行
       }
@@ -178,7 +193,7 @@ export async function getRandomMusicInfoList(size: number, allowedSources?: stri
     for (const row of rows) {
       if (!row.data) continue
       try {
-        list.push(JSON.parse(row.data) as MusicInfo)
+        list.push(normalizeMusicInfo(JSON.parse(row.data)))
       } catch {
         // 跳过解析失败的行
       }

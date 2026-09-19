@@ -34,11 +34,12 @@ const SOURCE_LABEL: Record<string, string> = {
  * 不主动选 flac/flac24bit——落地页是试听场景，无损流量过大且首播慢。
  * 若歌曲只有无损（罕见），回退到 types 里的第一个；无 types 信息时兜底 320k 交上游决定。
  */
-function pickShareQuality(types: { type: QualityType }[]): string {
-  const available = new Set(types.map((t) => t.type))
+function pickShareQuality(types?: { type: QualityType }[]): string {
+  const list = types ?? []
+  const available = new Set(list.map((t) => t.type))
   if (available.has('320k')) return '320k'
   if (available.has('128k')) return '128k'
-  if (types.length > 0) return types[0].type
+  if (list.length > 0) return list[0].type
   return '320k'
 }
 

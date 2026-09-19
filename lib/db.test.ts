@@ -14,7 +14,7 @@ vi.mock('./generated/prisma', () => ({
 }))
 vi.mock('./logger', () => ({ logger: { error: vi.fn(), warn: vi.fn() } }))
 
-const { upsertMusicInfo } = await import('./db')
+const { upsertMusicInfo, getMusicInfo } = await import('./db')
 
 const musicInfo = {
   source: 'kw' as const,
@@ -43,5 +43,32 @@ describe('upsertMusicInfo', () => {
 
     expect(findUnique).toHaveBeenCalledTimes(2)
     expect(update).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('getMusicInfo 读库边界归一化', () => {
+  it('data 里缺 types 的历史行补成空数组（下游 .map 不再抛），其余字段原样透出', async () => {
+    // 重建索引 / push-music-info 批量导入 / 老版本写入都可能留下这种行
+    findUnique.mockResolvedValueOnce({
+      data: JSON.stringify({ source: 'tx', songmid: '002NmjQb', name: '曹操', singer: '林俊杰' }),
+    })
+
+    const mi = await getMusicInfo('tx', '002NmjQb')
+
+    expect(mi?.types).toEqual([])
+    expect(mi?.name).toBe('曹操')
+    expect(mi?.songmid).toBe('002NmjQb')
+  })
+
+  it('types 形态异常（非数组）同样归零，合法数组原样保留', async () => {
+    findUnique.mockResolvedValueOnce({
+      data: JSON.stringify({ source: 'kw', songmid: 'a', types: null }),
+    })
+    expect((await getMusicInfo('kw', 'a'))?.types).toEqual([])
+
+    findUnique.mockResolvedValueOnce({
+      data: JSON.stringify({ source: 'kw', songmid: 'b', types: [{ type: '320k', size: '7MB' }] }),
+    })
+    expect((await getMusicInfo('kw', 'b'))?.types).toEqual([{ type: '320k', size: '7MB' }])
   })
 })
