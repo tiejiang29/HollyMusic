@@ -7,6 +7,7 @@
  */
 export async function register() {
   if (process.env.NEXT_RUNTIME !== 'nodejs') return
+  const { logger } = await import('@/lib/logger')
   const configSync = (await import('@/lib/config-sync')).default
   configSync
     .syncUsersFromConfig()
@@ -16,4 +17,20 @@ export async function register() {
   // 封面自动回填：启动首轮 + 每 6 小时自愈轮（kw/kg/tx 库内空 img 自动补齐）
   const { startCoverBackfillScheduler } = await import('@/lib/services/cover-backfill')
   startCoverBackfillScheduler()
+
+  // 首页「大家都在听」预热：trending 虽有 10 分钟内存缓存，但重启即空，冷启动首开
+  // 要现场拉五平台热歌榜（秒级）。启动 5 秒后后台拉一次填掉第一跳——topPerSource=20
+  // 与 Web/App 默认请求参数一致（缓存键含该值）；失败静默，getTrending 对空结果不缓存，
+  // 用户首开时自然会重试。delay 让路给启动期的迁移/config-sync。
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const { getTrending } = await import('@/lib/services/discovery-service')
+        const r = await getTrending(20)
+        logger.info('[startup] trending 预热完成:', r.list.length, '首')
+      } catch (err) {
+        logger.warn('[startup] trending 预热失败（不影响启动，首开时会重试）:', err)
+      }
+    })()
+  }, 5_000)
 }
