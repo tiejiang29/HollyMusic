@@ -34,7 +34,13 @@ export function RecentContexts() {
   const activeItems = activeTab === 'playlist' ? playlists : albums
 
   const to = (item: RecentContextItem) => {
-    if (item.itemType === 'playlist') return `/playlists/${item.itemId}`
+    if (item.itemType === 'playlist') {
+      // 站内歌单是纯数字 id；平台歌单（歌单广场）按约定带 "source-id" 前缀，跳广场歌单详情
+      if (/^\d+$/.test(item.itemId)) return `/playlists/${item.itemId}`
+      const idx = item.itemId.indexOf('-')
+      if (idx > 0) return `/discover/playlists/${item.itemId.slice(idx + 1)}?source=${item.itemId.slice(0, idx)}`
+      return `/playlists/${item.itemId}`
+    }
     // 专辑：itemId 可能是 gid 或 source-albumId
     if (item.itemId.includes('-')) {
       const idx = item.itemId.indexOf('-')

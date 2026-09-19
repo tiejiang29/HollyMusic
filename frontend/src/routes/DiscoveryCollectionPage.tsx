@@ -6,6 +6,7 @@ import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
 import { SongList } from '@/components/shared/SongList'
 import { getRecommendedPlaylistDetail, getToplistDetail } from '@/lib/api/discovery'
+import { recordRecentContext } from '@/lib/api/recent'
 import { usePlayerStore } from '@/lib/store/player-store'
 import { toTrack } from '@/lib/types/player'
 import type { DiscoveryCollectionDetail, DiscoverySource } from '@/lib/services/discovery-service'
@@ -48,6 +49,20 @@ export function DiscoveryCollectionPage({ kind }: { kind: 'toplists' | 'playlist
   }, [id, kind, source])
 
   const tracks = useMemo(() => (detail?.tracks ?? []).map(song => toTrack({ uid: song.uid, musicInfo: song })), [detail])
+
+  // 最近歌单上报：平台歌单（歌单广场）itemId 按 "source-id" 前缀约定，与站内纯数字 id 区分；
+  // 榜单（toplists）不报——打开路由不同，历史里会变成点不开的卡。与站内歌单页同款：进入详情即记录
+  useEffect(() => {
+    if (kind === 'playlists' && detail) {
+      recordRecentContext({
+        itemType: 'playlist',
+        itemId: `${source}-${id}`,
+        name: detail.name,
+        img: detail.cover,
+        owner: detail.author,
+      }).catch(() => {})
+    }
+  }, [kind, source, id, detail])
 
   if (loading) return <div className="p-6"><LoadingSkeleton /></div>
   if (!detail) return <div className="p-6"><EmptyState icon={Music} title="加载失败" description={error || '内容不存在'} /></div>
