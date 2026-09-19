@@ -46,7 +46,7 @@ interface SourceSlot {
   dispose?(): Promise<void> | void
 }
 
-interface SimulatorInstance {
+export interface SimulatorInstance {
   simulator: SourceSlot
   config: {
     name: string
@@ -96,7 +96,52 @@ function extractLyric(result: unknown): { lyric: string; tlyric: string | null }
   return null
 }
 
-class MusicSourceManager {
+/**
+ * 取址瀑布的三级预算。必须满足两条关系：
+ *
+ *   perSourceMs < totalMs < audio-serve 的外层解析预算（AUDIO_CACHE_READINESS_TIMEOUT_MS，默认 20s）
+ *
+ * 第二条最要命：总预算一旦超过外层，外层先 reject，客户端拿到的是 502 READINESS_TIMEOUT，
+ * 而不是"瀑布真的试完了"的结论。实测（HANDOFF 2026-09-19 摸底）旧值"单次 15s / 总 45s"
+ * 对外层 20s —— 一个挂起的头源能在多个音质档上各烧满 15s 吃满全程，只要它挂了这首歌必然
+ * 播不出来，排在后面的可用源一次都轮不到。perSourceMs 就是堵这一格的：一个源在这首歌上
+ * 累计花完它就换下一个源。
+ *
+ * urlMs 只是单次调用的上限，实际取值会被夹到"本源/全程剩余预算"以内，允许大于 perSourceMs。
+ */
+export interface UrlBudgets {
+  /** 单次 getMusicUrl 调用的上限 */
+  urlMs: number
+  /** 同一个源在一首歌上的累计上限（跨音质档位累加） */
+  perSourceMs: number
+  /** 整条瀑布（所有源×所有音质）的总上限 */
+  totalMs: number
+}
+
+function readBudget(envVar: string, fallback: number): number {
+  const raw = process.env[envVar]
+  if (raw === undefined || raw === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && Number.isInteger(n) && n > 0 ? n : fallback
+}
+
+export function readUrlBudgets(): UrlBudgets {
+  const budgets: UrlBudgets = {
+    urlMs: readBudget('SOURCE_URL_TIMEOUT_MS', 15_000),
+    perSourceMs: readBudget('SOURCE_URL_PER_SOURCE_TIMEOUT_MS', 8_000),
+    totalMs: readBudget('SOURCE_URL_TOTAL_TIMEOUT_MS', 18_000),
+  }
+  // 预算配歪了不会报错、只会悄悄让后面的源轮不到，所以这里显式提醒一次
+  if (budgets.perSourceMs >= budgets.totalMs) {
+    logger.warn(
+      `[source-budget] 单源预算 ${budgets.perSourceMs}ms ≥ 总预算 ${budgets.totalMs}ms，` +
+      '一条瀑布只够试一个音源，降级链会失效（SOURCE_URL_PER_SOURCE_TIMEOUT_MS / SOURCE_URL_TOTAL_TIMEOUT_MS）'
+    )
+  }
+  return budgets
+}
+
+export class MusicSourceManager {
   private instances: SimulatorInstance[] = []
   private initialized: boolean = false
   private configPath: string = ''
@@ -105,10 +150,8 @@ class MusicSourceManager {
   private lyricCache: Map<string, { value: { lyric: string; tlyric: string | null }; expires: number }> = new Map()
   private picCache: Map<string, { value: Buffer | string; expires: number }> = new Map()
   private defaultCacheTtl = 60 * 60 * 1000 // 1 hour
-  /** 单次 getMusicUrl 调用超时（仿照 getLyric 已有的 Promise.race 超时模式） */
-  private readonly musicUrlTimeoutMs = 15_000
-  /** 全音源×音质尝试总预算，超时直接放弃（避免上游全挂时客户端等待数分钟） */
-  private readonly musicUrlTotalTimeoutMs = 45_000
+  /** 取址瀑布预算（见 UrlBudgets 的三级关系） */
+  private budgets: UrlBudgets = readUrlBudgets()
 
   /** 给 Promise 加超时的通用辅助（超时后 reject，定时器清理） */
   private async withTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -385,7 +428,7 @@ class MusicSourceManager {
     logger.debug(`音源: ${musicInfo.source}, 请求音质: ${requestedQuality}`)
 
     // 总预算：全音源×音质尝试不无限串行（上游全挂时限制客户端等待时间）
-    const deadline = Date.now() + this.musicUrlTotalTimeoutMs
+    const deadline = Date.now() + this.budgets.totalMs
 
     // 尝试所有音源和音质组合
     outer: for (const instance of availableInstances) {
@@ -413,10 +456,25 @@ class MusicSourceManager {
         continue
       }
 
+      // 单源累计预算：这个源在一首歌上最多花这么多时间（跨音质档累加），到点就换
+      // 下一个源。没有它，一个挂起的源能在多个音质档上各烧满单次超时，把整条瀑布
+      // 的预算吃光——外层解析超时先到，结果是这首歌必然失败。
+      const sourceDeadline = Date.now() + this.budgets.perSourceMs
+
       // 尝试不同音质
       for (const quality of qualitiesToTry) {
-        // 总超时：超出预算立即放弃整个尝试
-        if (Date.now() > deadline) break outer
+        const now = Date.now()
+        // 总预算用尽：整条瀑布到此为止
+        if (now > deadline) break outer
+        // 本源预算用尽：换下一个源，而不是终止瀑布
+        if (now > sourceDeadline) {
+          logger.debug(
+            `音源 ${instance.config.name} 取址累计超过 ${this.budgets.perSourceMs}ms，跳过余下音质换下一个源`
+          )
+          continue outer
+        }
+        // 单次调用的实际上限：不超过本源剩余预算，也不超过整条瀑布的剩余预算
+        const callTimeoutMs = Math.min(this.budgets.urlMs, sourceDeadline - now, deadline - now)
 
         // 检查音源是否支持该音质
         if (!sourceConfig.qualitys.includes(quality)) {
@@ -433,10 +491,10 @@ class MusicSourceManager {
             `尝试: ${instance.config.name} - ${musicInfo.source} - ${quality}`
           )
 
-          // 单次调用加超时（洛雪脚本挂起时不阻塞整个请求）
+          // 单次调用加超时（洛雪脚本挂起时不阻塞整个请求），并被单源/总预算夹住
           const url = await this.withTimeout(
             instance.simulator.getMusicUrl(musicInfo.source, musicInfo, quality),
-            this.musicUrlTimeoutMs,
+            callTimeoutMs,
             `获取音乐URL超时: ${instance.config.name} - ${quality}`,
           )
 
@@ -653,6 +711,22 @@ class MusicSourceManager {
    */
   isInitialized(): boolean {
     return this.initialized
+  }
+
+  /**
+   * 仅供单测：注入实例清单与预算，绕开真实配置文件与 runner 子进程
+   * （命名前缀沿用 audio-serve 的 _resetAudioServeConfigForTest 约定）。
+   * 顺带把 configHash 冻结成当前文件 hash，免得 checkConfigChanged 触发 reload 把注入的实例冲掉。
+   */
+  _setInstancesForTest(instances: SimulatorInstance[]): void {
+    this.instances = instances
+    this.initialized = true
+    this.configHash = getFileHash(path.resolve(process.cwd(), 'config/music-sources.json'))
+  }
+
+  /** 仅供单测：改取址预算 */
+  _setBudgetsForTest(budgets: Partial<UrlBudgets>): void {
+    this.budgets = { ...this.budgets, ...budgets }
   }
 
   /**
