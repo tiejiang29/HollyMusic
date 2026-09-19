@@ -2,6 +2,10 @@
  * 音乐播放器类型定义
  */
 
+// 只引类型：source-health 是零依赖的纯内存账本，且这里是 import type，
+// 前端经 @/lib/types/music 引用本文件时不会被拖进服务端实现
+import type { SourceHealthView } from '../server/source-health'
+
 // 音质类型
 export type QualityType = '128k' | '320k' | 'flac' | 'flac24bit'
 
@@ -97,6 +101,11 @@ export interface HealthStatus {
   supportedActions: Record<string, string[]>
   supportedQualities: Record<string, string[]>
   error?: string
+  /**
+   * 运行实测健康度（按平台分别，来自内存账本 lib/server/source-health.ts）。
+   * 与上面 supported* 的区别：那些是脚本自报的声明，这个是真实取址与字节校验的结果。
+   */
+  health?: SourceHealthView[]
 }
 
 // API 响应

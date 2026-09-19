@@ -10,7 +10,7 @@
  * 在外层炸掉之前给出结论。这里用注入的假实例（不碰配置文件与 runner 子进程）验四件事。
  */
 
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // 跨平台换源会打 DB 与搜索，这里全部屏蔽：本测试只关心同平台瀑布的预算行为
 vi.mock('./services/source-toggle', () => ({
@@ -21,7 +21,12 @@ vi.mock('./logger', () => ({
 }))
 
 const { MusicSourceManager, readUrlBudgets } = await import('./music-source-manager')
+const { sourceHealth } = await import('./server/source-health')
 import type { SimulatorInstance } from './music-source-manager'
+
+beforeEach(() => {
+  sourceHealth.reset()
+})
 
 const QUALITIES = ['128k', '320k', 'flac', 'flac24bit']
 
@@ -93,6 +98,35 @@ describe('取址瀑布的单源累计预算', () => {
     expect(hangCalls).toBe(1)
     // 远小于外层 20s：瀑布自己先出结论
     expect(Date.now() - t).toBeLessThan(1500)
+
+    // 埋点确实落账了，且坏/好各自归位
+    const bad = sourceHealth.view('挂起的头源', 'kw')
+    expect(bad?.bad).toBe(1)
+    expect(bad?.badKinds).toEqual({ timeout: 1 })
+    // 单次调用确实被夹到剩余预算附近（允许超时回调与计时器粒度的少量超出，
+    // 关键是它没有按 urlMs=1000 等满，更没有把整条瀑布的预算吃光）
+    expect(bad?.latencyP50Ms).toBeLessThan(500)
+    const good = sourceHealth.view('后面的好源', 'kw')
+    expect(good?.resolveOk).toBe(1)
+    expect(good?.bad).toBe(0)
+  })
+
+  it('能力/平台不符而跳过尝试的源，一条样本都不记（否则版权面窄的好源会被误判成坏源）', async () => {
+    const m = managerWith(
+      [
+        {
+          ...fakeSource('不支持本平台的好源', async () => 'https://x/a.flac', 'tx'),
+        },
+        fakeSource('出货源', async () => 'https://ok/b.flac'),
+      ],
+      { urlMs: 1000, perSourceMs: 800, totalMs: 5000 }
+    )
+
+    await m.getMusicUrlWithProvider(musicInfo, 'flac')
+
+    // 第一个源连 kw 平台都没声明，被 continue 掉：不应出现在账本里
+    expect(sourceHealth.view('不支持本平台的好源', 'kw')).toBeNull()
+    expect(sourceHealth.view('出货源', 'kw')?.resolveOk).toBe(1)
   })
 
   it('普通失败（返回空/抛错）不受单源预算影响，同一源仍会继续试下一档音质', async () => {

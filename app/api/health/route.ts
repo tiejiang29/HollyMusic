@@ -22,6 +22,9 @@ export async function GET() {
         total: healthStatus.length,
         initialized: healthStatus.filter(s => s.initialized).length,
         failed: healthStatus.filter(s => s.error).length,
+        // 运行实测的健康分档计数（band 来自内存账本，重启即清零）
+        degraded: healthStatus.filter(s => s.health?.some(h => h.band === 'degraded')).length,
+        cooling: healthStatus.filter(s => s.health?.some(h => h.band === 'cooling')).length,
       },
     }
 

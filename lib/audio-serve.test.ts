@@ -45,6 +45,7 @@ vi.mock('@/lib/logger', () => ({
 
 const { audioServe, _resetAudioServeConfigForTest } = await import('@/lib/audio-serve')
 const { prisma } = await import('@/lib/db')
+const { sourceHealth } = await import('@/lib/server/source-health')
 type UpstreamUrlResolver = import('@/lib/audio-serve').UpstreamUrlResolver
 
 // --- 辅助 --------------------------------------------------------------------
@@ -109,6 +110,7 @@ beforeEach(async () => {
   cacheDir = path.join(os.tmpdir(), `audio-serve-test-${Date.now()}-${dirSeq++}`)
   process.env.AUDIO_CACHE_DIR = cacheDir
   _resetAudioServeConfigForTest()
+  sourceHealth.reset()
   await fsp.mkdir(cacheDir, { recursive: true })
   vi.mocked(prisma.audioCache.findUnique).mockImplementation(async () => null)
   vi.mocked(prisma.audioCache.aggregate).mockImplementation(async () => ({ _sum: { size: 0 } }))
@@ -313,6 +315,10 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     expect(Buffer.from(await resp.arrayBuffer()).equals(AUDIO)).toBe(true)
     expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1)
     expect(onCached).toHaveBeenCalledTimes(1)
+
+    // 字节段结论按 `音源×平台` 落账（provider 由 resolver 回传，平台退回 cacheKey 首段）
+    expect(sourceHealth.view('坏源A', 'kw')?.badKinds['byte:fake']).toBe(1)
+    expect(sourceHealth.view('好源B', 'kw')?.byteOk).toBe(1)
   })
 
   it('上游 404 → 同样换源重试（坏链路不再挡路）', async () => {

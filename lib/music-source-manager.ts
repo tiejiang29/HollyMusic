@@ -13,6 +13,7 @@ import { logger } from './logger'
 import { decodeLyricEntities } from './server/lyric-decode'
 import { normalizeStructuredLyricText } from './server/lyric-normalize'
 import { findBestAlternative } from './services/source-toggle'
+import { sourceHealth, type ResolveOutcome } from './server/source-health'
 
 /** 换源元信息：本次取址发生跨平台自动换源时填充，供 API 层透出给前端展示 */
 export interface SourceToggleInfo {
@@ -350,7 +351,7 @@ export class MusicSourceManager {
     musicInfo: MusicInfo,
     requestedQuality: QualityType = '320k',
     ctx?: { toggle?: SourceToggleInfo | null; excludeProviders?: ReadonlySet<string> }
-  ): Promise<{ url: string; provider: string | null }> {
+  ): Promise<{ url: string; provider: string | null; platform: string | null }> {
     try {
       return await this._getMusicUrlSamePlatform(
         musicInfo,
@@ -392,7 +393,7 @@ export class MusicSourceManager {
     musicInfo: MusicInfo,
     requestedQuality: QualityType = '320k',
     excludeProviders?: ReadonlySet<string>
-  ): Promise<{ url: string; provider: string | null }> {
+  ): Promise<{ url: string; provider: string | null; platform: string | null }> {
     // 在获取 URL 时检查配置是否变更
     if (this.initialized && this.checkConfigChanged()) {
       logger.info('配置文件已变更，重新加载音源...')
@@ -461,6 +462,15 @@ export class MusicSourceManager {
       // 的预算吃光——外层解析超时先到，结果是这首歌必然失败。
       const sourceDeadline = Date.now() + this.budgets.perSourceMs
 
+      // 一次播放里同一个源最多记一个坏样本：一首歌会在多个音质档上重试同一个源，
+      // 全记进去会把 consecutiveBad 灌水成"一首歌=三次坏"，让分档虚高。
+      let badRecorded = false
+      const recordBad = (outcome: ResolveOutcome, ms: number | null, reason: string) => {
+        if (badRecorded) return
+        badRecorded = true
+        sourceHealth.recordResolve(instance.config.name, musicInfo.source, outcome, ms, reason)
+      }
+
       // 尝试不同音质
       for (const quality of qualitiesToTry) {
         const now = Date.now()
@@ -471,6 +481,8 @@ export class MusicSourceManager {
           logger.debug(
             `音源 ${instance.config.name} 取址累计超过 ${this.budgets.perSourceMs}ms，跳过余下音质换下一个源`
           )
+          // 慢到用尽单源预算，本身就是一次"这个源这档太慢"的坏证据
+          recordBad('timeout', Date.now() - now, `超过单源预算 ${this.budgets.perSourceMs}ms`)
           continue outer
         }
         // 单次调用的实际上限：不超过本源剩余预算，也不超过整条瀑布的剩余预算
@@ -486,6 +498,7 @@ export class MusicSourceManager {
           continue
         }
 
+        const attemptAt = Date.now()
         try {
           logger.debug(
             `尝试: ${instance.config.name} - ${musicInfo.source} - ${quality}`
@@ -497,6 +510,7 @@ export class MusicSourceManager {
             callTimeoutMs,
             `获取音乐URL超时: ${instance.config.name} - ${quality}`,
           )
+          const tookMs = Date.now() - attemptAt
 
           if (url && typeof url === 'string' && url.trim()) {
             // 回源 SSRF 防护：拒绝私网/非 http(s) 地址
@@ -504,18 +518,24 @@ export class MusicSourceManager {
               logger.warn(
                 `音源 ${instance.config.name} 返回了不可信播放地址，已拒绝并尝试下一源`
               )
+              recordBad('ssrf', tookMs, '返回私网/非 http(s) 地址')
               continue
             }
             logger.info(
               `获取成功: ${instance.config.name} - ${quality} - ${musicInfo.name}`
             )
-            return { url, provider: instance.config.name }
+            // 注意这只说明「拿到了地址」；到底能不能播由 audio-serve 的字节段判定入账
+            sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'ok', tookMs)
+            return { url, provider: instance.config.name, platform: musicInfo.source }
           }
+          // 返回空地址：多半是该源没有这首歌的版权，属正常事件，不计坏
+          sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'no-address', tookMs)
         } catch (error) {
-          logger.debug(
-            `获取失败: ${instance.config.name} - ${quality}`,
-            error instanceof Error ? error.message : error
-          )
+          const tookMs = Date.now() - attemptAt
+          const message = error instanceof Error ? error.message : String(error)
+          // 耗时顶到本次上限即视为挂起，否则是脚本内部报错——两者都算坏，分开记便于归因
+          recordBad(tookMs >= callTimeoutMs ? 'timeout' : 'error', tookMs, message.slice(0, 120))
+          logger.debug(`获取失败: ${instance.config.name} - ${quality}`, message)
         }
       }
     }
@@ -701,6 +721,10 @@ export class MusicSourceManager {
           status.supportedQualities[source] = config.qualitys
         }
       }
+
+      // 声明之外再挂一份运行实测：supported* 是脚本自报的，health 是真跑出来的
+      const health = sourceHealth.ofSource(instance.config.name)
+      if (health.length > 0) status.health = health
 
       return status
     })

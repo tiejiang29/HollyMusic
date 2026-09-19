@@ -28,6 +28,7 @@ import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { checkTrialAudio } from '@/lib/server/audio-integrity'
 import { judgeUpstreamPayload, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
+import { sourceHealth, isLikelyLocalNetworkFault, type ByteOutcome } from '@/lib/server/source-health'
 import {
   getLyricSidecarPath,
   getTranslationLyricSidecarPath,
@@ -38,11 +39,16 @@ import {
 // 上游 URL 解析契约
 // ============================================================================
 
-/** 一次解析的产物：地址 + 命中的音源名（用于假地址时排除重试） */
+/** 一次解析的产物：地址 + 命中的音源名与平台（用于假地址时排除重试与健康度归因） */
 export interface ResolvedUpstream {
   url: string
   /** 提供该地址的音源名（provider）；未知传 null */
   provider: string | null
+  /**
+   * 该地址实际对应的平台（歌曲 source）。跨平台换源后它与 cacheKey 里的 source 不同，
+   * 健康度按 `音源×平台` 记账，所以必须由解析方回传，不能从 cacheKey 反推。
+   */
+  platform?: string | null
 }
 
 /**
@@ -184,6 +190,12 @@ interface InflightEntry {
    * `unverified` 的文件可正常播放但不应进永久音乐库。
    */
   payloadVerdict: 'audio' | 'unverified' | null
+  /**
+   * 这批字节实际由哪个音源、在哪个平台上提供（openUpstream 写入，含换源重试后的最终值）。
+   * 健康度按 `音源×平台` 记账用；provider 未知（resolver 只回传裸字符串）时为 null。
+   */
+  provider: string | null
+  platform: string | null
 }
 
 class AudioServe {
@@ -448,6 +460,8 @@ class AudioServe {
       error: null,
       emitter: new EventEmitter(),
       payloadVerdict: null,
+      provider: null,
+      platform: null,
     }
     this.inflight.set(cacheKey, entry)
 
@@ -526,6 +540,13 @@ class AudioServe {
       } catch (downloadError) {
         writeStream.destroy()
         await fsp.unlink(entry.paths.filePath).catch(() => {})
+        // 地址与首块都是好的，中途断掉：这个源"给得出内容但传不完"，也是坏证据
+        if (entry.provider && entry.platform) {
+          sourceHealth.recordByte(
+            entry.provider, entry.platform, 'truncated',
+            `下载中断：${downloadError instanceof Error ? downloadError.message : String(downloadError)}`.slice(0, 120)
+          )
+        }
         throw downloadError
       }
 
@@ -534,6 +555,12 @@ class AudioServe {
         logger.warn(
           `[AudioServe] size mismatch: expected ${entry.size}, got ${entry.downloadedBytes}`
         )
+        if (entry.provider && entry.platform) {
+          sourceHealth.recordByte(
+            entry.provider, entry.platform, 'truncated',
+            `字节不完整 ${entry.downloadedBytes}/${entry.size}`
+          )
+        }
         // 删除半成品文件
         await fsp.unlink(entry.paths.filePath).catch(() => {})
         throw new Error(`下载不完整：${entry.downloadedBytes}/${entry.size}`)
@@ -640,6 +667,16 @@ class AudioServe {
       )
       const url = typeof resolved === 'string' ? resolved : resolved.url
       const provider = typeof resolved === 'string' ? null : resolved.provider
+      // 平台以解析方回传为准（跨平台换源后与 cacheKey 里的 source 不同）；
+      // 老式只回传裸字符串的调用方没有这个信息，退回用 cacheKey 首段猜，且没有 provider
+      // 时下面根本不记账，所以这个退回值只可能在"换源但没回传平台"的边角场景被用到。
+      const platform = (typeof resolved === 'string' ? null : resolved.platform) ?? cacheKey.split(':')[0] ?? null
+      /** 字节段唯一能识破"有地址但播不了"的一段；provider 未知时无法归因，直接不记 */
+      const recordByte = (outcome: ByteOutcome, reason?: string) => {
+        if (provider && platform) sourceHealth.recordByte(provider, platform, outcome, reason)
+      }
+      entry.provider = provider
+      entry.platform = platform
 
       const controller = new AbortController()
       const stallTimer = setTimeout(() => controller.abort(), this.fetchTimeoutMs)
@@ -653,6 +690,14 @@ class AudioServe {
         })
       } catch (e) {
         clearTimeout(stallTimer)
+        // DNS/连不上这类是本机或出口的故障，不是这个源的错：开豁免窗，期间不记坏，
+        // 否则一次断网会把全部音源一起冤枉成坏源（护栏见 source-health 的头注释）
+        if (isLikelyLocalNetworkFault(e)) {
+          sourceHealth.markNetworkOutage()
+          logger.warn('[AudioServe] 本机网络疑似故障，本次不计音源坏样本：', e instanceof Error ? e.message : e)
+        } else {
+          recordByte('http-error', e instanceof Error ? e.message : String(e))
+        }
         throw e
       }
 
@@ -660,6 +705,7 @@ class AudioServe {
       if (!resp.ok) {
         await resp.body?.cancel().catch(() => {})
         clearTimeout(stallTimer)
+        recordByte('http-error', `上游返回 ${resp.status}`)
         if (provider && attempt < this.maxFakeRetries) {
           attempt++
           excluded.add(provider)
@@ -698,6 +744,8 @@ class AudioServe {
       if (judgment.verdict === 'reject') {
         await reader.cancel().catch(() => {})
         clearTimeout(stallTimer)
+        // 最高置信度的坏证据：HTTP 200 但字节是 HTML/JSON/图片等
+        recordByte('fake', judgment.reason)
         if (provider && attempt < this.maxFakeRetries) {
           attempt++
           excluded.add(provider)
@@ -714,6 +762,7 @@ class AudioServe {
 
       if (judgment.verdict === 'unverified') {
         // 可交付但不可信：可能是罕见容器，也可能是伪装成音频的垃圾数据
+        recordByte('unverified', judgment.reason)
         logger.warn(
           `[AudioServe] 上游载荷无法识别（按可交付处理，不落永久库）: ${cacheKey} — ${judgment.reason}`
         )
@@ -730,6 +779,7 @@ class AudioServe {
       }
       entry.contentType = byteMime ?? contentType
       entry.payloadVerdict = judgment.verdict === 'audio' ? 'audio' : 'unverified'
+      if (judgment.verdict === 'audio') recordByte('audio', judgment.reason)
       return { reader, firstChunk, size, stallTimer }
     }
   }
