@@ -4,9 +4,12 @@
 
 import { apiGet, apiPost, apiPut, apiDelete } from './client'
 import type { SourceConfig } from '@/lib/types/music'
+import type { SourceHealthView } from '@/lib/server/source-health'
 
 export interface AdminSource extends SourceConfig {
   scriptExists: boolean
+  /** 运行实测健康度（内存账本，按平台分别；重启清零） */
+  health?: SourceHealthView[]
 }
 
 export function listSources(): Promise<{ list: AdminSource[] }> {

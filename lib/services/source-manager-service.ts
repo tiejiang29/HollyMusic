@@ -16,6 +16,7 @@ import dns from 'dns/promises'
 import net from 'net'
 import { logger } from '@/lib/logger'
 import { isPublicIp } from '@/lib/server/url-guard'
+import { sourceHealth, type SourceHealthView } from '@/lib/server/source-health'
 import { sanitizeFilename } from '@/lib/server/download-utils'
 import type { MusicSourcesConfig, SourceConfig } from '@/lib/types/music'
 import { musicSourceManager } from '@/lib/music-source-manager'
@@ -329,6 +330,11 @@ export interface SourceWithStatus extends SourceConfig {
   scriptExists: boolean
   /** 从 sourceInfo 提取的平台列表（可能未加载过，为空） */
   supportedPlatforms?: string[]
+  /**
+   * 运行实测健康度（按平台分别）。与上面声明式字段的区别：supported* 是脚本自报的，
+   * health 是真实取址与字节校验跑出来的。来自内存账本，重启即清零。
+   */
+  health?: SourceHealthView[]
 }
 
 export async function listSourcesWithStatus(): Promise<SourceWithStatus[]> {
@@ -336,7 +342,10 @@ export async function listSourcesWithStatus(): Promise<SourceWithStatus[]> {
   const result: SourceWithStatus[] = []
   for (const s of config.sources) {
     const exists = await scriptExists(s.path)
-    result.push({ ...s, scriptExists: exists })
+    // 账本的键是音源名，且沿用 manager 的同一个回退（name 缺省时用 path），
+    // 两边不一致的话面板会对所有源都显示"无实测"
+    const health = sourceHealth.ofSource(s.name || s.path)
+    result.push({ ...s, scriptExists: exists, ...(health.length ? { health } : {}) })
   }
   return result
 }

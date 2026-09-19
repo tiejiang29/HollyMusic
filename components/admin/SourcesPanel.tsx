@@ -17,6 +17,7 @@ import {
 } from '@/lib/api/admin-sources'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
+import type { SourceHealthView } from '@/lib/server/source-health'
 import { Plus, Pencil, Trash2, Music, X, Loader2, Upload, AlertCircle, CheckCircle2, FileWarning, RefreshCw, Rss } from 'lucide-react'
 
 const PLATFORMS = ['tx', 'wy', 'kw', 'kg', 'mg'] as const
@@ -26,6 +27,44 @@ const PLATFORM_LABELS: Record<string, string> = {
   kw: '酷我',
   kg: '酷狗',
   mg: '咪咕',
+}
+
+/** 运行实测健康分档（band 来自内存账本，进程重启即清零） */
+const HEALTH_BAND_LABEL: Record<SourceHealthView['band'], string> = {
+  healthy: '正常',
+  degraded: '波动',
+  cooling: '冷却中',
+  'no-data': '样本少',
+}
+const HEALTH_BAND_CLASS: Record<SourceHealthView['band'], string> = {
+  healthy: 'bg-green-500/15 text-green-600',
+  degraded: 'bg-amber-500/15 text-amber-600',
+  cooling: 'bg-red-500/15 text-red-600',
+  'no-data': 'bg-muted text-muted-foreground',
+}
+
+function HealthCell({ health }: { health?: SourceHealthView[] }) {
+  // 无实测 ≠ 这个源坏了：瀑布通常第一个源就出货，排在后面的源天然没有样本
+  if (!health || health.length === 0) {
+    return <span className="text-xs text-muted-foreground">无实测</span>
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {health.map(v => (
+        <span
+          key={v.platform}
+          title={
+            `${PLATFORM_LABELS[v.platform] || v.platform}｜窗口 ${v.samples} 次：出货 ${v.resolveOk}、坏 ${v.bad}、无地址 ${v.noMatch}` +
+            `｜延迟 p50 ${v.latencyP50Ms ?? '-'}ms / p90 ${v.latencyP90Ms ?? '-'}ms` +
+            (v.lastBadReason ? `｜最近一次坏：${v.lastBadReason}` : '')
+          }
+          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${HEALTH_BAND_CLASS[v.band]}`}
+        >
+          {PLATFORM_LABELS[v.platform] || v.platform} {HEALTH_BAND_LABEL[v.band]}
+        </span>
+      ))}
+    </div>
+  )
 }
 
 type DialogMode =
@@ -225,6 +264,12 @@ export function SourcesPanel() {
               <tr>
                 <th className="px-4 py-3 font-medium">名称</th>
                 <th className="px-4 py-3 font-medium">状态</th>
+                <th
+                  className="px-4 py-3 font-medium"
+                  title="运行实测健康度（按平台分别）：来自真实取址与字节校验，存在内存里、重启清零。显示「无实测」只说明它没被轮到，不代表这个源坏了"
+                >
+                  健康
+                </th>
                 <th className="px-4 py-3 font-medium">优先级</th>
                 <th className="px-4 py-3 font-medium">平台</th>
                 <th className="px-4 py-3 font-medium">脚本路径</th>
@@ -256,6 +301,9 @@ export function SourcesPanel() {
                     >
                       {s.enabled ? '启用' : '停用'}
                     </button>
+                  </td>
+                  <td className="px-4 py-3">
+                    <HealthCell health={s.health} />
                   </td>
                   <td className="px-4 py-3 text-muted-foreground">{s.priority}</td>
                   <td className="px-4 py-3">
