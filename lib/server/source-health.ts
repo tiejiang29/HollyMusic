@@ -1,5 +1,5 @@
 /**
- * 音源健康账本（3b：只做观测，不影响任何取址行为）。
+ * 音源健康账本（3b 观测 → 3c 起会动作：瀑布按本账本临时跳过冷却中的源）。
  *
  * 为什么需要它：运行时此前对"源可用性"是零记录——瀑布里每个源的成败只进日志（而且
  * 大半是 debug 级，生产根本看不到），成功路径连耗时都不记。于是"哪个源在拖后腿"
@@ -21,8 +21,13 @@
  *    markNetworkOutage()，此后一小段时间内"坏"信号直接丢弃（"好"信号仍记，因为好的
  *    时候一定可信）。
  *
- * 内存为主、不落库：这是分钟级信号，重启清零是可接受的（也正是最干净的紧急回滚）。
- * 持久校准由周测负责，那边才需要落库。
+ * 冷却参数（连续 2 次坏 / 快速失败 60s / 挂起 5min / 半开失败翻倍上限 30min）不是拍的，
+ * 来自全矩阵摸底实测 62 格（两轮）：0 次取址超时，坏样 p50 1031ms / max 2224ms，健康源
+ * 取址 p50 0-1860ms、单次成功最大 4558ms。所以「坏」的主流形态是快速报错与死链，不是挂起；
+ * 也因此不按延迟分位数熔断——那会砍掉唯一支持 mg 的两个源里较慢的那个。
+ *
+ * 内存为主、不落库：这是分钟级信号，重启清零是可接受的（也正是最干净的紧急回滚，
+ * 以及 3c 的冷却态在冷启动时一律不成立）。持久校准由周测负责，那边才需要落库。
  */
 
 /** 解析段结局。bad 列为准：ok/no-address 不计坏 */
@@ -37,12 +42,25 @@ const BYTE_BAD: ReadonlySet<ByteOutcome> = new Set(['fake', 'http-error', 'trunc
 const WINDOW = 50
 /** 最多多少个 `源×平台` 键；超出按最久未更新淘汰 */
 const MAX_KEYS = 256
-/** 样本少于此数不下结论（band=no-data），避免一次抖动就定生死 */
+/** 样本少于此数时「波动/正常」不作结论（band=no-data），避免一次抖动就定性 */
 const MIN_SAMPLES = 5
 /** 网络中断豁免窗口的默认长度 */
 const OUTAGE_MS = 60_000
-/** 坏样本超过这个时长就过期，不再把源一直挂在 degraded 上 */
+/** 坏样本超过这个时长就过期，不再把源一直挂在 degraded 上；同时是冷却翻倍的上限 */
 const BAD_TTL_MS = 30 * 60 * 1000
+/** 连续坏达到这个数就进冷却窗（3c 在此档跳过该源）。不设 MIN_SAMPLES 门槛：跨歌
+ *  连续两次全坏本身就是强证据，等满 5 个样本意味着死源在头几首歌上每首都烧掉 8s 预算 */
+const COOLING_TRIP = 2
+/** 快速失败类坏（脚本报错 / 假地址 / ssrf）的冷却基时长 */
+const COOL_BASE_FAST_MS = 60_000
+/** 挂起类坏的冷却基时长：取址超时，以及字节段 stall 中断（同一种"上游不给数据"） */
+const COOL_BASE_HANG_MS = 5 * 60_000
+const HANG_KINDS: ReadonlySet<string> = new Set(['timeout', 'byte:truncated'])
+/**
+ * 半开探测的租约时长。探测请求若在记账之前就异常退出（总预算到点、进程被掐），
+ * 槽位靠这个时限自动释放，否则该源会被永久锁在"有人在测"的状态。
+ */
+const PROBE_LEASE_MS = 60_000
 
 interface Sample {
   t: number
@@ -64,6 +82,12 @@ interface KeyState {
   byteOk: number
   byteUnverified: number
   lastTouchedAt: number
+  /** 冷却截止时刻；0 = 未在冷却。到期后放一次半开探测，不直接恢复 */
+  coolUntil: number
+  /** 半开探测在途的起始时刻；null = 无探测占用槽位 */
+  probeStartedAt: number | null
+  /** 已翻倍次数（半开失败一次 +1），决定冷却时长 = 基时长 × 2^n，上限 BAD_TTL_MS */
+  backoffs: number
 }
 
 export interface SourceHealthView {
@@ -88,10 +112,18 @@ export interface SourceHealthView {
   lastBadReason: string | null
   lastBadAt: number | null
   lastOkAt: number | null
+  /** 冷却截止时刻（0 = 未冷却）。3c 的跳过依据就是这个字段 */
+  coolingUntil: number
+  /** 仍在冷却时距离半开还有多少毫秒 */
+  retryAfterMs: number
+  /** 半开探测槽位被占用中（其它请求据此继续跳过） */
+  probing: boolean
+  /** 冷却时长已翻倍几次 */
+  backoffs: number
   /**
-   * 分档而非连续打分：可解释、抗抖动，且方便下一步（3c）直接按档动作。
+   * 分档而非连续打分：可解释、抗抖动，且方便下一步直接按档动作。
    * no-data: 样本不足；healthy: 无近期坏；degraded: 窗口内有零星坏；
-   * cooling: 连续坏达到阈值（3c 会在此档跳过该源，本档目前只展示）
+   * cooling: 连续坏达到阈值 —— 3c 在此档跳过该源（排序不变，冷却到期放一次半开）
    */
   band: 'no-data' | 'healthy' | 'degraded' | 'cooling'
 }
@@ -99,6 +131,18 @@ export interface SourceHealthView {
 /** 我们自己 abort 的 stall 超时不算本机故障，故不含 ABORT_ERR */
 const NETWORK_FAULT_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOENT_NETWORK'])
 const NETWORK_FAULT_MESSAGES = ['getaddrinfo', 'Unable to resolve', 'network unreachable', 'No such host is known']
+
+/**
+ * 冷却基时长看"这一串连续坏"里最恶劣的那种：掺了挂起（取址超时 / 字节段 stall 中断）
+ * 就按 5min，全是快速失败按 60s。理由是两者对用户的影响不同——快速失败只浪费 1-2s，
+ * 挂起会把单源预算 8s 整个烧掉。
+ */
+function coolBaseMs(samples: Sample[]): number {
+  for (let i = samples.length - 1; i >= 0 && samples[i].bad; i--) {
+    if (HANG_KINDS.has(samples[i].kind)) return COOL_BASE_HANG_MS
+  }
+  return COOL_BASE_FAST_MS
+}
 
 class SourceHealthLedger {
   private states = new Map<string, KeyState>()
@@ -113,7 +157,10 @@ class SourceHealthLedger {
     const k = this.key(source, platform)
     let st = this.states.get(k)
     if (!st) {
-      st = { samples: [], noMatch: 0, byteOk: 0, byteUnverified: 0, lastTouchedAt: 0 }
+      st = {
+        samples: [], noMatch: 0, byteOk: 0, byteUnverified: 0, lastTouchedAt: 0,
+        coolUntil: 0, probeStartedAt: null, backoffs: 0,
+      }
       this.states.set(k, st)
       this.evictIfNeeded()
     }
@@ -135,7 +182,10 @@ class SourceHealthLedger {
     if (!source) return
     // 能力/版权不符：单独计数，不进样本窗，否则好源会被误判
     if (outcome === 'no-address') {
-      this.touch(source, platform).noMatch++
+      const st = this.touch(source, platform)
+      st.noMatch++
+      // 半开探测即使「没搜到」也算走完了，槽位必须释放，否则要空等一个租约期
+      st.probeStartedAt = null
       return
     }
     const bad = RESOLVE_BAD.has(outcome)
@@ -158,6 +208,7 @@ class SourceHealthLedger {
     } else if (outcome === 'unverified') {
       // 既不肯定也不否定：只计数，不进窗口，免得污染分档
       st.byteUnverified++
+      st.probeStartedAt = null
       return
     }
     this.push(st, { t: Date.now(), bad, ms: null, kind: `byte:${outcome}`, reason })
@@ -166,6 +217,54 @@ class SourceHealthLedger {
   private push(st: KeyState, s: Sample): void {
     st.samples.push(s)
     if (st.samples.length > WINDOW) st.samples.shift()
+    const now = s.t
+    // 只有租约仍在期内的探测才算「半开失败」；过期租约是探测请求自己中途死了，
+    // 不能拿它去翻倍冷却，否则一次异常退出会让源多罚一整轮
+    const wasProbing = st.probeStartedAt !== null && now - st.probeStartedAt < PROBE_LEASE_MS
+    st.probeStartedAt = null
+
+    if (!s.bad) {
+      // 一次成功就把冷却与翻倍全部清零：3c 要的是"现在能用"，不是"历史清白"
+      st.coolUntil = 0
+      st.backoffs = 0
+      return
+    }
+    let consecutiveBad = 0
+    for (let i = st.samples.length - 1; i >= 0 && st.samples[i].bad; i--) consecutiveBad++
+
+    if (wasProbing || consecutiveBad >= COOLING_TRIP) {
+      // 半开失败（wasProbing）不要求攒满连续次数：刚试过就不行，直接进下一轮冷却
+      const mult = wasProbing ? st.backoffs + 1 : 0
+      st.backoffs = mult
+      st.coolUntil = now + Math.min(coolBaseMs(st.samples) * 2 ** mult, BAD_TTL_MS)
+    }
+  }
+
+  /**
+   * 只读：这个 `源×平台` 现在该不该被跳过。3c 的瀑布据此换下一个源，
+   * 不放行时也不产生任何副作用——占用半开槽位要另外调 claimProbe。
+   */
+  coolStatus(source: string, platform: string): { skip: boolean; retryAfterMs: number; cooling: boolean } {
+    const st = this.states.get(this.key(source, platform))
+    if (!st || !st.coolUntil) return { skip: false, retryAfterMs: 0, cooling: false }
+    const now = Date.now()
+    if (now < st.coolUntil) return { skip: true, retryAfterMs: st.coolUntil - now, cooling: true }
+    if (st.probeStartedAt !== null && now - st.probeStartedAt < PROBE_LEASE_MS) {
+      return { skip: true, retryAfterMs: PROBE_LEASE_MS - (now - st.probeStartedAt), cooling: true }
+    }
+    // 冷却到期且无人占槽 → 允许放行一次，由调用方 claimProbe 占位
+    return { skip: false, retryAfterMs: 0, cooling: true }
+  }
+
+  /** 占用半开探测槽位（冷却已到期且无人占用才成功） */
+  claimProbe(source: string, platform: string): boolean {
+    const st = this.states.get(this.key(source, platform))
+    if (!st || !st.coolUntil) return false
+    const now = Date.now()
+    if (now < st.coolUntil) return false
+    if (st.probeStartedAt !== null && now - st.probeStartedAt < PROBE_LEASE_MS) return false
+    st.probeStartedAt = now
+    return true
   }
 
   /** 本机网络疑似故障：此后 OUTAGE_MS 内不记坏。返回是否真的进入了豁免窗 */
@@ -181,13 +280,12 @@ class SourceHealthLedger {
   }
 
   /**
-   * 分档（3b 只用于展示；3c 才按档动作）。
-   * cooling 只看"窗口末尾连续坏"，不看比例：实测一次挂起就毁掉一整首歌，
-   * 连续三次坏再跳过去已经太晚，但样本不足时又绝不能下结论。
+   * 分档。cooling 直接由状态机给出（与 3c 的跳过判据同源，避免两处判断漂移）；
+   * 其余档位在样本不足时不下结论。
    */
-  private bandOf(sampleCount: number, consecutiveBad: number, lastBadAt: number | null, now: number): SourceHealthView['band'] {
+  private bandOf(st: KeyState, sampleCount: number, lastBadAt: number | null, now: number): SourceHealthView['band'] {
+    if (st.coolUntil > now) return 'cooling'
     if (sampleCount < MIN_SAMPLES) return 'no-data'
-    if (consecutiveBad >= 3) return 'cooling'
     if (lastBadAt !== null && now - lastBadAt < BAD_TTL_MS) return 'degraded'
     return 'healthy'
   }
@@ -247,6 +345,7 @@ class SourceHealthLedger {
     for (let i = st.samples.length - 1; i >= 0 && st.samples[i].bad; i--) consecutiveBad++
 
     const ms = st.samples.map(s => s.ms).filter((v): v is number => typeof v === 'number')
+    const probing = st.probeStartedAt !== null && now - st.probeStartedAt < PROBE_LEASE_MS
     return {
       source,
       platform,
@@ -263,7 +362,11 @@ class SourceHealthLedger {
       lastBadReason,
       lastBadAt,
       lastOkAt,
-      band: this.bandOf(st.samples.length, consecutiveBad, lastBadAt, now),
+      coolingUntil: st.coolUntil,
+      retryAfterMs: st.coolUntil > now ? st.coolUntil - now : 0,
+      probing,
+      backoffs: st.backoffs,
+      band: this.bandOf(st, st.samples.length, lastBadAt, now),
     }
   }
 

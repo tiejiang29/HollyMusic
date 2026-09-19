@@ -170,3 +170,105 @@ describe('取址瀑布的单源累计预算', () => {
     expect(b.totalMs).toBeLessThan(20_000)
   })
 })
+
+/**
+ * 3c：瀑布开始消费健康账本。参数依据见 source-health.test.ts 顶部的摸底实测说明。
+ * 要点是"排序不动、临时跳过、同平台保底留一个"，不是自动改 priority。
+ */
+describe('3c：按账本跳过冷却中的源', () => {
+  /** 连记两次坏，把一个 `源×平台` 推进冷却（快速失败档 = 60s） */
+  function tripCooldown(name: string, platform = 'kw') {
+    sourceHealth.recordResolve(name, platform, 'error', 20, '脚本内部报错')
+    sourceHealth.recordResolve(name, platform, 'error', 20, '脚本内部报错')
+    expect(sourceHealth.coolStatus(name, platform).skip).toBe(true)
+  }
+
+  it('头源冷却中 → 一次都不调用，第二个源直接上场（旧行为是每首歌都白等一轮预算）', async () => {
+    tripCooldown('冷却中的头源')
+    let hangCalls = 0
+    const m = managerWith(
+      [
+        fakeSource('冷却中的头源', () => {
+          hangCalls++
+          return new Promise<string>(() => {})
+        }),
+        fakeSource('后面的好源', async () => 'https://ok/recovered.flac'),
+      ],
+      { urlMs: 1000, perSourceMs: 300, totalMs: 5000 }
+    )
+
+    const r = await m.getMusicUrlWithProvider(musicInfo, 'flac')
+    expect(hangCalls).toBe(0)
+    expect(r.provider).toBe('后面的好源')
+  })
+
+  it('跳过的源不参与本轮记账：冷却期间的坏样本不该把翻倍次数继续往上叠', async () => {
+    tripCooldown('冷却中的头源')
+    const before = sourceHealth.view('冷却中的头源', 'kw')!
+    const m = managerWith(
+      [
+        fakeSource('冷却中的头源', () => new Promise<string>(() => {})),
+        fakeSource('出货源', async () => 'https://ok/x.flac'),
+      ],
+      { urlMs: 1000, perSourceMs: 300, totalMs: 5000 }
+    )
+    await m.getMusicUrlWithProvider(musicInfo, 'flac')
+    const after = sourceHealth.view('冷却中的头源', 'kw')!
+    expect(after.samples).toBe(before.samples)
+    expect(after.consecutiveBad).toBe(before.consecutiveBad)
+  })
+
+  it('该平台只剩一个候选源时，即使冷却中也要上场（mg 只有两个源，全跳等于无源可用）', async () => {
+    tripCooldown('唯一的冷却源')
+    let calls = 0
+    const m = managerWith(
+      [fakeSource('唯一的冷却源', async () => { calls++; return 'https://ok/only.flac' })],
+      { urlMs: 1000, perSourceMs: 800, totalMs: 5000 }
+    )
+
+    const r = await m.getMusicUrlWithProvider(musicInfo, 'flac')
+    expect(calls).toBe(1)
+    expect(r.url).toBe('https://ok/only.flac')
+    // 保底上场且成功 → 冷却立即解除，不会把唯一源永久锁死
+    expect(sourceHealth.coolStatus('唯一的冷却源', 'kw').skip).toBe(false)
+  })
+
+  it('保底只保一个：前两个源冷却时第三个仍上场，第四个不被无谓消耗', async () => {
+    tripCooldown('坏源0')
+    tripCooldown('坏源1')
+    let n2 = 0, n3 = 0
+    const m = managerWith(
+      [
+        fakeSource('坏源0', () => new Promise<string>(() => {})),
+        fakeSource('坏源1', () => new Promise<string>(() => {})),
+        fakeSource('第三个源', async () => { n2++; return 'https://ok/third.flac' }),
+        fakeSource('第四个源', async () => { n3++; return 'https://ok/fourth.flac' }),
+      ],
+      { urlMs: 1000, perSourceMs: 300, totalMs: 5000 }
+    )
+    const r = await m.getMusicUrlWithProvider(musicInfo, 'flac')
+    expect(n2).toBe(1)
+    expect(n3).toBe(0) // 前面的源出货后瀑布照常短路，跳过不会让顺序倒退
+    expect(r.provider).toBe('第三个源')
+  })
+
+  it('冷却到期后放一次半开：成功即恢复，之后的请求照常优先用它', async () => {
+    vi.useFakeTimers({ now: Date.now() })
+    try {
+      tripCooldown('待复活源')
+      vi.advanceTimersByTime(60_001)
+      let calls = 0
+      const m = managerWith(
+        [fakeSource('待复活源', async () => { calls++; return 'https://ok/reborn.flac' })],
+        { urlMs: 1000, perSourceMs: 800, totalMs: 5000 }
+      )
+      const r = await m.getMusicUrlWithProvider(musicInfo, 'flac')
+      expect(calls).toBe(1)
+      expect(r.url).toBe('https://ok/reborn.flac')
+      expect(sourceHealth.view('待复活源', 'kw')?.coolingUntil).toBe(0)
+      expect(sourceHealth.view('待复活源', 'kw')?.backoffs).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

@@ -32,13 +32,17 @@ function view(over: Partial<SourceHealthView>): SourceHealthView {
     lastBadReason: null,
     lastBadAt: null,
     lastOkAt: 1,
+    coolingUntil: 0,
+    retryAfterMs: 0,
+    probing: false,
+    backoffs: 0,
     band: 'healthy',
     ...over,
   }
 }
 
-const render = (health?: SourceHealthView[]) =>
-  renderToStaticMarkup(createElement(HealthCell, { health }))
+const render = (health?: SourceHealthView[], pt?: string[]) =>
+  renderToStaticMarkup(createElement(HealthCell, { health, pt }))
 
 describe('HealthCell', () => {
   it('无实测数据 → 显示「无实测」，不给任何坏暗示', () => {
@@ -89,5 +93,43 @@ describe('HealthCell', () => {
     ])
     expect(html).toContain('酷我 正常')
     expect(html).toContain('咪咕 冷却中')
+  })
+
+  // 3c 起「健康」列会说话，管理员要能从标签里读出现在到底在发生什么
+  it('冷却中给出剩余秒数，并把"跳过"这件事说清楚', () => {
+    const html = render([
+      view({
+        band: 'cooling',
+        bad: 2,
+        consecutiveBad: 2,
+        coolingUntil: 1,
+        retryAfterMs: 48_000,
+        lastBadReason: '脚本内部报错',
+      }),
+    ])
+    expect(html).toContain('酷我 冷却中 48s')
+    expect(html).toContain('3c 已跳过该源')
+    expect(html).toContain('48s 后放一次探测')
+  })
+
+  it('半开试探中与冷却倒计时是两种状态，不能混标', () => {
+    const html = render([view({ band: 'cooling', coolingUntil: 1, retryAfterMs: 0, probing: true })])
+    expect(html).toContain('酷我 冷却中·试探')
+    expect(html).toContain('正在半开试探')
+  })
+
+  it('pt 不含的平台标「不测」，与「无实测」分开——前者不是坏', () => {
+    const html = render([view({ platform: 'kw', band: 'healthy' })], ['kw', 'tx'])
+    expect(html).toContain('酷我 正常')
+    expect(html).toContain('腾讯 无实测') // pt 内但没样本
+    expect(html).toContain('酷狗 不测')   // pt 外
+    expect(html).toContain('咪咕 不测')
+    expect(html).toContain('pt 未包含该平台')
+  })
+
+  it('完全没数据时仍然说明哪些平台压根不参与取址', () => {
+    const html = render([], ['wy'])
+    expect(html).toContain('无实测')
+    expect(html).toContain('pt 不含：腾讯、酷我、酷狗、咪咕')
   })
 })

@@ -119,6 +119,13 @@ export interface UrlBudgets {
   totalMs: number
 }
 
+/**
+ * 一次尝试值得花的最小剩余预算。低于它就直接换源：给 0-2ms 的"尘埃调用"既不可能出货，
+ * 又会把一次真实脚本调用丢进 runner —— 我们放弃了它的 promise，slot 却还占着。
+ * 也顺带消除了"定时器在预算边界前一瞬触发导致同一个源被多调一次"的抖动。
+ */
+const MIN_USEFUL_ATTEMPT_MS = 250
+
 function readBudget(envVar: string, fallback: number): number {
   const raw = process.env[envVar]
   if (raw === undefined || raw === '') return fallback
@@ -431,31 +438,32 @@ export class MusicSourceManager {
     // 总预算：全音源×音质尝试不无限串行（上游全挂时限制客户端等待时间）
     const deadline = Date.now() + this.budgets.totalMs
 
-    // 尝试所有音源和音质组合
-    outer: for (const instance of availableInstances) {
-      // 上层已证实该音源返回假地址（HTML/JSON/垃圾字节）→ 本次解析跳过，
-      // 避免「换源后又被同一个坏源挡住」（见 audio-serve 的重试逻辑）
-      if (excludeProviders?.has(instance.config.name)) {
-        logger.debug(`跳过已排除音源: ${instance.config.name}`)
-        continue
-      }
-      // pt 优先：用户配置的 pt 未包含该平台则跳过（即使脚本声明支持）
-      if (!this.isAllowedByPt(instance, musicInfo.source)) {
-        continue
-      }
-      // 检查该音源是否支持当前歌曲的音源平台
-      if (!instance.sourceInfo?.sources[musicInfo.source]) {
-        logger.debug(`${instance.config.name} 不支持音源: ${musicInfo.source}`)
-        continue
-      }
+    // 候选源：pt 白名单 + 脚本声明 + musicUrl 能力 + 上层排除，四道门槛一次过完。
+    // 必须先拿到完整候选集，3c 才知道"跳掉冷却中的源之后还剩不剩人"。
+    const candidates = this.eligibleFor(availableInstances, musicInfo.source, excludeProviders)
 
-      const sourceConfig = instance.sourceInfo.sources[musicInfo.source]
-      
-      // 检查是否支持 musicUrl 操作
-      if (!sourceConfig.actions.includes('musicUrl')) {
-        logger.debug(`${instance.config.name} 不支持 musicUrl 操作`)
+    // 3c：跳过处于冷却的 `源×平台`。排序（priority）一律不动，跳过只是临时行为，
+    // 冷却到期放一次半开探测，成功即恢复。
+    // 保底护栏：同平台至少留一个源上场——摸底实测 mg 只有两个源支持，且其中之一
+    // （gdstudio）本身就是全场最慢的，一次抖动就能让 mg 全灭，宁可慢不可全灭。
+    const cooled = new Set<string>()
+    for (const instance of candidates) {
+      if (candidates.length - cooled.size <= 1) break
+      if (sourceHealth.coolStatus(instance.config.name, musicInfo.source).skip) {
+        cooled.add(instance.config.name)
+      }
+    }
+
+    // 尝试所有音源和音质组合
+    outer: for (const instance of candidates) {
+      if (cooled.has(instance.config.name)) {
+        logger.debug(`[source-health] 跳过冷却中的音源: ${instance.config.name} (${musicInfo.source})`)
         continue
       }
+      // 冷却刚到期时占下半开槽位（并发请求据此继续跳过）；不在该状态时是无副作用的 no-op
+      sourceHealth.claimProbe(instance.config.name, musicInfo.source)
+
+      const sourceConfig = instance.sourceInfo!.sources[musicInfo.source]
 
       // 单源累计预算：这个源在一首歌上最多花这么多时间（跨音质档累加），到点就换
       // 下一个源。没有它，一个挂起的源能在多个音质档上各烧满单次超时，把整条瀑布
@@ -475,9 +483,9 @@ export class MusicSourceManager {
       for (const quality of qualitiesToTry) {
         const now = Date.now()
         // 总预算用尽：整条瀑布到此为止
-        if (now > deadline) break outer
+        if (deadline - now < MIN_USEFUL_ATTEMPT_MS) break outer
         // 本源预算用尽：换下一个源，而不是终止瀑布
-        if (now > sourceDeadline) {
+        if (sourceDeadline - now < MIN_USEFUL_ATTEMPT_MS) {
           logger.debug(
             `音源 ${instance.config.name} 取址累计超过 ${this.budgets.perSourceMs}ms，跳过余下音质换下一个源`
           )
@@ -766,6 +774,38 @@ export class MusicSourceManager {
       return false
     }
     return true
+  }
+
+  /**
+   * 某个平台上可用的音源（保持 priority 顺序）。四道门槛：上层排除、pt 白名单、
+   * 脚本声明了该平台、该平台有 musicUrl 操作。
+   *
+   * 从瀑布主循环里抽出来，是因为 3c 需要"这个平台一共有几个候选"才能判断跳过之后
+   * 是否还留有人上场（见 _getMusicUrlSamePlatform 的保底护栏）。
+   */
+  private eligibleFor(
+    instances: SimulatorInstance[],
+    platform: string,
+    excludeProviders?: ReadonlySet<string>
+  ): SimulatorInstance[] {
+    return instances.filter(instance => {
+      // 上层已证实该音源返回假地址（HTML/JSON/垃圾字节）→ 本次解析跳过，
+      // 避免「换源后又被同一个坏源挡住」（见 audio-serve 的重试逻辑）
+      if (excludeProviders?.has(instance.config.name)) {
+        logger.debug(`跳过已排除音源: ${instance.config.name}`)
+        return false
+      }
+      if (!this.isAllowedByPt(instance, platform)) return false
+      if (!instance.sourceInfo?.sources[platform]) {
+        logger.debug(`${instance.config.name} 不支持音源: ${platform}`)
+        return false
+      }
+      if (!instance.sourceInfo.sources[platform].actions.includes('musicUrl')) {
+        logger.debug(`${instance.config.name} 不支持 musicUrl 操作`)
+        return false
+      }
+      return true
+    })
   }
 }
 

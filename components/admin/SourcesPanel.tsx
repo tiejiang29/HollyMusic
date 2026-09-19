@@ -43,25 +43,76 @@ const HEALTH_BAND_CLASS: Record<SourceHealthView['band'], string> = {
   'no-data': 'bg-muted text-muted-foreground',
 }
 
-/** 健康列单元格：导出以便单测直接渲染（整页面板要 mock 异步接口，反而不如这个准） */
-export function HealthCell({ health }: { health?: SourceHealthView[] }) {
-  // 无实测 ≠ 这个源坏了：瀑布通常第一个源就出货，排在后面的源天然没有样本
-  if (!health || health.length === 0) {
-    return <span className="text-xs text-muted-foreground">无实测</span>
+/**
+ * 「健康」列单元格。导出以便单测直接渲染（整页面板要 mock 异步接口，反而不如这个准）。
+ * 三个容易误读的点，都在这里分开：
+ * - 无实测：这个平台上还没走过取址（瀑布通常第一个源就出货，排在后面的天然没样本）
+ * - 不测：pt 白名单不含该平台，压根不会向它取址——不是坏
+ * - 冷却中：3c 正在跳过它，附剩余秒数；到期后放一次半开探测（标「试探」）
+ */
+export function healthLabel(v: SourceHealthView): string {
+  if (v.band === 'cooling') {
+    if (v.probing) return `${HEALTH_BAND_LABEL.cooling}·试探`
+    const sec = Math.max(1, Math.ceil(v.retryAfterMs / 1000))
+    return `${HEALTH_BAND_LABEL.cooling} ${sec}s`
+  }
+  return HEALTH_BAND_LABEL[v.band]
+}
+
+function healthTitle(v: SourceHealthView): string {
+  return (
+    `${PLATFORM_LABELS[v.platform] || v.platform}｜窗口 ${v.samples} 次：出货 ${v.resolveOk}、坏 ${v.bad}、无地址 ${v.noMatch}` +
+    `｜延迟 p50 ${v.latencyP50Ms ?? '-'}ms / p90 ${v.latencyP90Ms ?? '-'}ms` +
+    (v.lastBadReason ? `｜最近一次坏：${v.lastBadReason}` : '') +
+    (v.band === 'cooling' ? `｜3c 已跳过该源${v.probing ? '，正在半开试探' : `，${Math.ceil(v.retryAfterMs / 1000)}s 后放一次探测`}（已连续翻倍 ${v.backoffs} 次）` : '')
+  )
+}
+
+export function HealthCell({ health, pt }: { health?: SourceHealthView[]; pt?: string[] }) {
+  const list = health || []
+  const scoped = pt && pt.length ? PLATFORMS.filter(p => pt.includes(p)) : [...PLATFORMS]
+  const outOfScope = PLATFORMS.filter(p => !scoped.includes(p))
+  const byPlatform = new Map(list.map(v => [v.platform, v]))
+
+  // 无实测 ≠ 这个源坏了
+  if (list.length === 0) {
+    return (
+      <span
+        className="text-xs text-muted-foreground"
+        title={outOfScope.length ? `pt 不含：${outOfScope.map(p => PLATFORM_LABELS[p] || p).join('、')}` : undefined}
+      >
+        无实测
+      </span>
+    )
   }
   return (
     <div className="flex flex-wrap gap-1">
-      {health.map(v => (
+      {scoped.map(p => {
+        const v = byPlatform.get(p)
+        if (!v) {
+          return (
+            <span
+              key={p}
+              title="这个平台上还没有实测样本"
+              className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${HEALTH_BAND_CLASS['no-data']}`}
+            >
+              {PLATFORM_LABELS[p] || p} 无实测
+            </span>
+          )
+        }
+        return (
+          <span key={p} title={healthTitle(v)} className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${HEALTH_BAND_CLASS[v.band]}`}>
+            {PLATFORM_LABELS[p] || p} {healthLabel(v)}
+          </span>
+        )
+      })}
+      {outOfScope.map(p => (
         <span
-          key={v.platform}
-          title={
-            `${PLATFORM_LABELS[v.platform] || v.platform}｜窗口 ${v.samples} 次：出货 ${v.resolveOk}、坏 ${v.bad}、无地址 ${v.noMatch}` +
-            `｜延迟 p50 ${v.latencyP50Ms ?? '-'}ms / p90 ${v.latencyP90Ms ?? '-'}ms` +
-            (v.lastBadReason ? `｜最近一次坏：${v.lastBadReason}` : '')
-          }
-          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${HEALTH_BAND_CLASS[v.band]}`}
+          key={p}
+          title="pt 未包含该平台，不会向它取址（不是坏）"
+          className="rounded px-1.5 py-0.5 text-[10px] text-muted-foreground/60 line-through"
         >
-          {PLATFORM_LABELS[v.platform] || v.platform} {HEALTH_BAND_LABEL[v.band]}
+          {PLATFORM_LABELS[p] || p} 不测
         </span>
       ))}
     </div>
@@ -304,7 +355,7 @@ export function SourcesPanel() {
                     </button>
                   </td>
                   <td className="px-4 py-3">
-                    <HealthCell health={s.health} />
+                    <HealthCell health={s.health} pt={s.pt} />
                   </td>
                   <td className="px-4 py-3 text-muted-foreground">{s.priority}</td>
                   <td className="px-4 py-3">
