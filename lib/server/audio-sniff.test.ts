@@ -19,6 +19,10 @@ import {
   isTextLike,
   classifyContentType,
   readHeadBytes,
+  extFromContainer,
+  mimeFromContainer,
+  extFromAudioMime,
+  mimeFromAudioExt,
 } from '@/lib/server/audio-sniff'
 import fsp from 'fs/promises'
 import os from 'os'
@@ -239,5 +243,39 @@ describe('readHeadBytes', () => {
     await fsp.writeFile(p, Buffer.alloc(0))
     expect(await readHeadBytes(p)).toBeNull()
     await fsp.rm(dir, { recursive: true, force: true })
+  })
+})
+
+describe('容器 → MIME / 扩展名（字节证据纠正谎报的 Content-Type）', () => {
+  it('常见音频容器各自给出 MIME 与扩展名', () => {
+    expect(mimeFromContainer('flac')).toBe('audio/flac')
+    expect(extFromContainer('flac')).toBe('.flac')
+    expect(mimeFromContainer('mp3')).toBe('audio/mpeg')
+    expect(mimeFromContainer('mpeg-frame')).toBe('audio/mpeg')
+    expect(extFromContainer('wavpack')).toBe('.wv')
+  })
+
+  it('视频可承载的容器不参与覆盖（源会把 MV 当音频链路返回）', () => {
+    for (const c of ['mp4', 'asf', 'avi', 'realmedia', 'midi']) {
+      expect(mimeFromContainer(c)).toBeNull()
+      expect(extFromContainer(c)).toBeNull()
+    }
+  })
+
+  it('未知容器 / null / 空串 → 一律 null，由调用方回落上游声明', () => {
+    expect(mimeFromContainer('nope')).toBeNull()
+    expect(extFromContainer(null)).toBeNull()
+    expect(extFromContainer(undefined)).toBeNull()
+    expect(mimeFromContainer('')).toBeNull()
+  })
+
+  it('MIME ↔ 扩展名与容器表同源（audio-serve 与 music-library 各自的一跳不再各说各话）', () => {
+    expect(extFromAudioMime('audio/x-dsf')).toBe('.dsf')
+    expect(extFromAudioMime('audio/ape')).toBe('.ape')
+    expect(mimeFromAudioExt('.tta')).toBe('audio/x-tta')
+    expect(mimeFromAudioExt('.FLAC')).toBe('audio/flac') // 大小写归一
+    expect(extFromAudioMime('audio/mpeg')).toBe('.mp3') // 与 mp3 的表内值一致
+    expect(extFromAudioMime(null)).toBeNull()
+    expect(mimeFromAudioExt('.exe')).toBeNull()
   })
 })

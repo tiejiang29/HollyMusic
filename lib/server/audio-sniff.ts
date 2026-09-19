@@ -88,6 +88,57 @@ const CONTAINER_TESTS: Array<{ name: string; test: (h: Uint8Array) => boolean }>
   { name: 'mpeg-frame', test: isMpegFrameSync },
 ]
 
+/**
+ * 嗅探出的容器 → 权威 MIME 与扩展名。
+ *
+ * 存在的理由：音源的上游 Content-Type 会撒谎（全库实测有 115/228 个 `.mp3` 命名的
+ * 文件真实容器是 FLAC），而下游三处都按 contentType 定名定头——缓存文件名、
+ * AudioCache.contentType、响应头与库文件名。既然魔数已经认出了容器，就以字节为准。
+ *
+ * mp4 / asf / avi / realmedia 可能装视频（源偶尔把 MV 当音频链路返回），
+ * midi 不是录制音频——这些一律不覆盖上游声明，交回原逻辑处理。
+ */
+const CONTAINER_TYPES: Record<string, { mime: string; ext: string }> = {
+  mp3: { mime: 'audio/mpeg', ext: '.mp3' },
+  'mpeg-frame': { mime: 'audio/mpeg', ext: '.mp3' },
+  flac: { mime: 'audio/flac', ext: '.flac' },
+  ogg: { mime: 'audio/ogg', ext: '.ogg' },
+  wav: { mime: 'audio/wav', ext: '.wav' },
+  aiff: { mime: 'audio/aiff', ext: '.aiff' },
+  ape: { mime: 'audio/ape', ext: '.ape' },
+  wavpack: { mime: 'audio/wavpack', ext: '.wv' },
+  tta: { mime: 'audio/x-tta', ext: '.tta' },
+  dsf: { mime: 'audio/x-dsf', ext: '.dsf' },
+  amr: { mime: 'audio/amr', ext: '.amr' },
+  au: { mime: 'audio/basic', ext: '.au' },
+  caf: { mime: 'audio/x-caf', ext: '.caf' },
+}
+
+/** 容器 → 扩展名；视频可承载或未知容器返回 null */
+export function extFromContainer(container: string | null | undefined): string | null {
+  return (container && CONTAINER_TYPES[container]?.ext) || null
+}
+
+/** 容器 → MIME；视频可承载或未知容器返回 null */
+export function mimeFromContainer(container: string | null | undefined): string | null {
+  return (container && CONTAINER_TYPES[container]?.mime) || null
+}
+
+/** MIME → 扩展名（供 audio-serve 的 extFromContentType 复用，避免两份表漂移） */
+export function extFromAudioMime(mime: string | null | undefined): string | null {
+  if (!mime) return null
+  const hit = Object.values(CONTAINER_TYPES).find(t => t.mime === mime)
+  return hit?.ext ?? null
+}
+
+/** 扩展名 → MIME（供按扩展名发响应头的下游复用同一张表） */
+export function mimeFromAudioExt(ext: string | null | undefined): string | null {
+  if (!ext) return null
+  const normalized = ext.toLowerCase()
+  const hit = Object.values(CONTAINER_TYPES).find(t => t.ext === normalized)
+  return hit?.mime ?? null
+}
+
 /** 明确「不是音频」的二进制格式（图片/压缩包/文档）：源返回这些必定是坏链路 */
 const REJECT_BINARY_TESTS: Array<{ name: string; test: (h: Uint8Array) => boolean }> = [
   {

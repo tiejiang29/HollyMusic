@@ -27,7 +27,7 @@ import { EventEmitter } from 'events'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { checkTrialAudio } from '@/lib/server/audio-integrity'
-import { judgeUpstreamPayload } from '@/lib/server/audio-sniff'
+import { judgeUpstreamPayload, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
 import {
   getLyricSidecarPath,
   getTranslationLyricSidecarPath,
@@ -126,7 +126,9 @@ export function extFromContentType(contentType: string | null | undefined): stri
     'audio/ogg': '.ogg',
     'audio/webm': '.webm',
   }
-  return map[ct] ?? '.mp3'
+  // 表里没有的先问嗅探容器表（下载侧已把字节认定的 MIME 写进 contentType，
+  // 如 audio/x-dsf / audio/ape 这些本表不认识的），都没有才退到 .mp3
+  return map[ct] ?? extFromAudioMime(ct) ?? '.mp3'
 }
 
 export interface ResolvedPaths {
@@ -717,7 +719,16 @@ class AudioServe {
         )
       }
 
-      entry.contentType = contentType
+      // 字节证据优先：认出容器就用它的 MIME，认不出（unverified）才沿用上游声明。
+      // 上游 Content-Type 会撒谎（全库实测把 FLAC 标成 audio/mpeg 是常态），而缓存
+      // 文件名、AudioCache.contentType、响应头三处都由这个值派生——在此纠正一次即可。
+      const byteMime = mimeFromContainer(judgment.container)
+      if (byteMime && byteMime !== judgment.contentType) {
+        logger.info(
+          `[AudioServe] 上游 Content-Type 与容器不符，按字节认定 ${byteMime}（原声明 ${judgment.contentType}）: ${cacheKey}`
+        )
+      }
+      entry.contentType = byteMime ?? contentType
       entry.payloadVerdict = judgment.verdict === 'audio' ? 'audio' : 'unverified'
       return { reader, firstChunk, size, stallTimer }
     }

@@ -167,4 +167,24 @@ describe('ingestFromCache 容器嗅探入库门槛', () => {
     expect(result.status).toBe('skip-error')
     expect(prisma.librarySong.create).not.toHaveBeenCalled()
   })
+
+  it('FLAC 字节 + 记录里谎报的 audio/mpeg → 入库扩展名按容器走 .flac', async () => {
+    // 复现全库实测缺陷：源把 FLAC 字节配 audio/mpeg 头返回，缓存文件名与 AudioCache
+    // 行都被定成 .mp3，入库若照抄记录就得到一个名叫 .mp3 的 FLAC 正本（115/228 例）
+    const content = Buffer.concat([
+      Buffer.from('fLaC\x00\x00\x00"'),
+      Buffer.alloc(128 * 1024, 0x11),
+    ])
+    await stageCacheFile('cd/flac0001.mp3', content, 'audio/mpeg')
+
+    const result = await ingestFromCache('kw:sm-test:320k', musicInfo, '320k')
+
+    expect(result.status).toBe('ingested')
+    const arg = vi.mocked(prisma.librarySong.create).mock.calls[0][0] as unknown as {
+      data: { filePath: string; quality: string }
+    }
+    expect(arg.data.filePath).toMatch(/\.flac$/)
+    // 音质档位仍是请求值（去重/替换判定用，与容器无关）
+    expect(arg.data.quality).toBe('320k')
+  })
 })

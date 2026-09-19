@@ -23,7 +23,7 @@ import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import type { LibrarySong } from '@/lib/generated/prisma'
 import { logger } from '@/lib/logger'
 import { isIncompleteTrial, parseDurationFromFile } from '@/lib/server/audio-integrity'
-import { judgeUpstreamPayload, readHeadBytes } from '@/lib/server/audio-sniff'
+import { judgeUpstreamPayload, readHeadBytes, extFromContainer, mimeFromAudioExt } from '@/lib/server/audio-sniff'
 import { getAudioServeConfig, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, removeAudioCacheFiles, extFromContentType } from '@/lib/audio-serve'
 import { sanitizeFilename, extForQuality } from '@/lib/server/download-utils'
 import { QUALITY_ORDER, getAvailableQualities } from '@/lib/quality-options'
@@ -113,7 +113,8 @@ function contentTypeForFile(filePath: string): string {
     '.ogg': 'audio/ogg',
     '.wav': 'audio/wav',
   }
-  return map[ext] || 'audio/mpeg'
+  // 本表没覆盖的扩展名（.ape / .wv / .dsf 等）回落到嗅探容器表，两边共用一份定义
+  return map[ext] ?? mimeFromAudioExt(ext) ?? 'audio/mpeg'
 }
 
 /** 目录名 sanitize：复用文件名规则（保留中文，去非法字符，限长） */
@@ -200,9 +201,13 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     const destDir = path.join(cfg.libraryDir, singerDir, albumDir)
     await fsp.mkdir(destDir, { recursive: true })
 
-    // 扩展名按上游实际 contentType（缓存记录里有）：源偶尔把 MV/MP4 当音频链路
-    // 返回，按请求音质定名会得到假的 .flac（内容是 mp4，播放 Content-Type 也错）
-    const ext = extFromContentType(record.contentType) || extForQuality(quality)
+    // 扩展名以字节认定的容器为准：上游 Content-Type 会撒谎（全库实测大量 FLAC 被标成
+    // audio/mpeg），照它定名就得到一批名叫 .mp3 的 FLAC 文件，serve 时再按扩展名发头
+    // 就一路错。存量 AudioCache 记录里仍是假的 contentType，所以这里直接取上面嗅探到的
+    // 容器。视频可承载的容器（mp4/asf 等）不在容器表里，仍按记录 contentType 定名——
+    // 源偶尔把 MV/MP4 当音频链路返回，按请求音质定名会得到假的 .flac。
+    const ext =
+      extFromContainer(sniff.container) || extFromContentType(record.contentType) || extForQuality(quality)
     let destName = sanitizeFilename(`${normalizeText(musicInfo.singer)} - ${normalizeText(musicInfo.name)}${ext}`)
     // 同名冲突：同录音（将替换）外，追加序号
     const replacingIds = sameRecording.map(r => r.id)

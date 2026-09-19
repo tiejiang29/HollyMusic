@@ -403,6 +403,74 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
 })
 
 // ===========================================================================
+// contentType 以字节为准（上游把 FLAC 标成 audio/mpeg 是常态）
+// ===========================================================================
+
+describe('AudioServe.serve() 容器与上游声明不符', () => {
+  function payloadResponse(data: Buffer, ct: string): Response {
+    return new Response(new Uint8Array(data), {
+      status: 200,
+      headers: { 'content-type': ct, 'content-length': String(data.length) },
+    })
+  }
+
+  function upsertCreate() {
+    const arg = vi.mocked(prisma.audioCache.upsert).mock.calls[0][0] as unknown as {
+      create: { contentType: string | null; filePath: string }
+    }
+    return arg.create
+  }
+
+  it('FLAC 字节 + audio/mpeg 头 → 响应头、AudioCache 行、缓存文件名三处都按字节走', async () => {
+    const flac = Buffer.concat([Buffer.from('fLaC\x00\x00\x00"'), Buffer.alloc(4096, 0x11)])
+    globalThis.fetch = vi.fn(
+      async () => payloadResponse(flac, 'audio/mpeg')
+    ) as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:liar1:flac',
+      upstreamUrlResolver: async () => ({
+        url: 'https://example.com/liar.mp3',
+        provider: '说谎源',
+      }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(resp.headers.get('content-type')).toContain('audio/flac')
+    const created = upsertCreate()
+    expect(created.contentType).toBe('audio/flac')
+    // 缓存文件名同源于 contentType（extFromContentType），不再落成 .mp3
+    expect(created.filePath).toMatch(/\.flac$/)
+  })
+
+  it('mp4 容器可能装视频 → 不覆盖上游声明，交回原逻辑定名', async () => {
+    const mp4 = Buffer.alloc(4096, 0x00)
+    mp4.write('ftyp', 4, 'ascii')
+    globalThis.fetch = vi.fn(
+      async () => payloadResponse(mp4, 'application/octet-stream')
+    ) as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:mp4a:320k',
+      upstreamUrlResolver: async () => ({
+        url: 'https://example.com/maybe-mv',
+        provider: '混发 MV 的源',
+      }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(resp.status).toBe(200)
+    const created = upsertCreate()
+    expect(created.contentType).toBe('application/octet-stream')
+    expect(created.filePath).toMatch(/\.mp3$/)
+  })
+})
+
+// ===========================================================================
 // 命中磁盘缓存（现状回归）
 // ===========================================================================
 
