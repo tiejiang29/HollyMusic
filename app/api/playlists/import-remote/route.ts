@@ -88,7 +88,7 @@ async function resolveShareUrl(url: string): Promise<string | null> {
 }
 
 import { createHash } from 'crypto'
-import { assertPublicHttpUrl } from '@/lib/services/source-manager-service'
+import { assertPublicHttpUrl } from '@/lib/server/url-guard'
 
 /**
  * 酷狗移动端 API 签名（从洛雪 musicSdk/kg/util.js 逆向）

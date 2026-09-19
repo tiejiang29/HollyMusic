@@ -2,10 +2,9 @@ import { NextRequest } from 'next/server'
 import { respond, subsonicError, type SubsonicPlaylistNode } from './subsonic'
 import { resolveSubsonicMediaMeta, toDurationSeconds } from './subsonic-media'
 import { type AuthResult } from './auth'
-import { PrismaClient, Prisma } from './generated/prisma'
+import { Prisma } from './generated/prisma'
+import { prisma } from './db'
 import { logger } from './logger'
-
-const prisma = new PrismaClient()
 
 /**
  * 处理 getPlaylists 请求 - 返回用户的所有播放列表

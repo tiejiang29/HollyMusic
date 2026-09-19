@@ -229,6 +229,8 @@ ENABLE_FILE_CACHE=true
 AUDIO_CACHE_QUOTA_GB=10
 AUDIO_CACHE_MAX_CONCURRENT=5
 # AUDIO_CACHE_DIR=/app/.cache/audio-cache   # Docker 建议
+# 假地址换源重试次数上限（音源返回 HTML/JSON 等非音频内容时排除该源重试；默认 2）
+# AUDIO_FAKE_URL_RETRIES=2
 # 完整变量见 .env.example
 
 # 可选：搜索/URL 内存缓存 TTL（默认 210 分钟）
@@ -479,7 +481,7 @@ admin 登录后，侧边栏头像下拉 →「音源管理」：
 - `getPlaylists`、`getPlaylist`、`createPlaylist`、`updatePlaylist`、`deletePlaylist`：歌单及歌单曲目管理
 - `getAlbumList2`、`getAlbum`、`getLyricsBySongId`、`getOpenSubsonicExtensions`：专辑、结构化歌词与 OpenSubsonic 客户端兼容
 
-接口支持 XML 与 `f=json` JSON 响应。写操作要求有效的 Subsonic token 认证；具体认证开关见 `REQUIRE_AUTH` 配置与 `app/rest/[method]/route.ts`。
+接口支持 XML 与 `f=json` JSON 响应。写操作要求有效的 Subsonic token 认证；具体认证开关见 `REQUIRE_AUTH` 配置与 `app/rest/[method]/route.ts`。客户端填的用户名是本机用户名、密码填该用户的 **Subsonic 令牌**（与 Web 登录密码不同，由管理员通过 `POST /api/admin/users/[id]/subsonic-token` 发放，仅显示一次）。
 
 ---
 
@@ -507,7 +509,9 @@ admin 登录后，侧边栏头像下拉 →「音源管理」：
 
 2. **音频磁盘缓存**（服务端落盘，`ENABLE_FILE_CACHE=true` 时启用）：LRU 自动清理，admin 可通过 `/api/admin/cache` 查询/清理。
 
-3. **歌词边车缓存**：音源精确歌词会以 `.lrc` 保存在某一份已缓存音频的同级目录，翻译歌词为 `.tlyric.lrc`。同一首歌只缓存一份；读取时会遍历该歌曲各音质的缓存记录查找，找到即直接使用。音频缓存被 LRU 清理时，关联边车文件会一同清理。
+3. **假地址拦截与换源重试**：部分音源对无版权/VIP 歌曲会返回 HTTP 200 的 HTML/JSON 错误页或垃圾数据（"有地址但播不了"的根源）。服务端在下载首块时按「容器魔数 + Content-Type」判定载荷真伪（`lib/server/audio-sniff.ts`）：确认非音频 → 自动排除该音源换源重试（默认最多 2 次，`AUDIO_FAKE_URL_RETRIES` 可调）；无法识别容器的载荷可正常播放但**不进永久音乐库**（库优先于在线源且不可自愈，只留在缓存里随 LRU 淘汰）。
+
+4. **歌词边车缓存**：音源精确歌词会以 `.lrc` 保存在某一份已缓存音频的同级目录，翻译歌词为 `.tlyric.lrc`。同一首歌只缓存一份；读取时会遍历该歌曲各音质的缓存记录查找，找到即直接使用。音频缓存被 LRU 清理时，关联边车文件会一同清理。
 
 ---
 
@@ -530,7 +534,7 @@ admin 登录后，侧边栏头像下拉 →「音源管理」：
 
 ## 🛡 安全说明
 
-- **密码存储**：当前为明文（`User.subsonicSecret`），与 Subsonic 协议的 `md5(secret+s)` 校验兼容。DB 文件务必做好权限控制。
+- **密码存储**：Web/App 登录密码以 **scrypt 哈希**（`User.passwordHash`）落库，不存明文；老库中的明文密码会在该用户下次登录成功时就地迁移为哈希。Subsonic 客户端用独立凭据——`User.subsonicSecret` 改为每用户随机令牌（`t=md5(令牌+s)`），由管理员经 `POST /api/admin/users/[id]/subsonic-token` 发放/轮换（令牌只在响应里显示一次），改密或重置密码会一并轮换。DB 文件仍应做好权限控制。
 - **初始管理员**：首次启动自动创建 `admin` 账户并生成**随机初始密码**（打印在服务端启动日志，仅显示一次），登录后强制要求修改密码。历史仍使用 `admin/admin` 弱口令的账户会在启动时被重置为随机密码并标记待改密。
 - **登录限速**：按客户端 IP 维度，5 分钟内失败 10 次将锁定该 IP 15 分钟。管理员可在后台「登录锁定」Tab 查看锁定列表并手动解锁。
 - **强制改密**：首次登录或管理员重置密码后，`mustChangePassword` 标记为 true，前端会拦截到改密页直到完成修改。

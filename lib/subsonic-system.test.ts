@@ -9,7 +9,9 @@ const { resolveMusicInfoById, reportPlay } = vi.hoisted(() => ({
 vi.mock('./generated/prisma', () => ({
   PrismaClient: class {},
 }))
-vi.mock('./db', () => ({ resolveMusicInfoById }))
+// prisma 现由 lib/db 统一提供（本模块不再自建客户端）；本用例覆盖的
+// getLicense/scrobble 分支不触库，空对象即可
+vi.mock('./db', () => ({ prisma: {}, resolveMusicInfoById }))
 vi.mock('./services/history-service', () => ({ reportPlay }))
 
 const { handleGetLicense, handleScrobble } = await import('./subsonic-system')

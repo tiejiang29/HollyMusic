@@ -30,6 +30,8 @@ const { starItems, unstarItems, listFavorites } = vi.hoisted(() => ({
 
 vi.mock('../favorites', () => ({ starItems, unstarItems, listFavorites }))
 vi.mock('../db', () => ({
+  // prisma 现由 lib/db 统一提供（本 service 不再自建客户端）
+  prisma: { favorite: { findFirst, count } },
   resolveMusicInfoById: vi.fn(),
   getStorageSongmidForMusicInfo: vi.fn(),
 }))

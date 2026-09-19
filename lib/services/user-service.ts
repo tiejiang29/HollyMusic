@@ -6,14 +6,15 @@
  * - 禁止当前登录用户删除自己
  * - 用户名唯一约束
  *
- * 密码仍以明文存于 User.subsonicSecret（与 Subsonic t 校验兼容），不在此处做哈希。
+ * 密码以 scrypt 哈希存于 User.passwordHash（见 lib/server/credentials.ts），
+ * 管理员重置密码时同时轮换 Subsonic 令牌（User.subsonicSecret），
+ * 并强制该用户下次登录改密 + 使其所有旧会话失效。
  */
 
-import { PrismaClient } from '../generated/prisma'
+import { prisma } from '../db'
 import { logger } from '../logger'
 import { ONLINE_TTL_MS } from '../user'
-
-const prisma = new PrismaClient()
+import { buildCredentials, generateSubsonicToken } from '../server/credentials'
 
 export interface AdminUserView {
   id: number
@@ -37,10 +38,11 @@ export interface AdminUserView {
   updatedAt: Date
 }
 
-/** 安全用户视图：脱敏，不含密码字段 */
+/** 安全用户视图：脱敏，不含密码哈希与 Subsonic 令牌 */
 function toView(u: {
   id: number
   username: string
+  passwordHash?: string | null
   subsonicSecret: string | null
   mustChangePassword: boolean
   lastLogin: Date | null
@@ -54,7 +56,8 @@ function toView(u: {
     id: u.id,
     username: u.username,
     isAdmin: u.username === 'admin',
-    hasPassword: !!u.subsonicSecret,
+    // 存量未迁移用户的凭据仍在 subsonicSecret（明文），一并算作已设密码
+    hasPassword: !!(u.passwordHash || u.subsonicSecret),
     mustChangePassword: !!u.mustChangePassword,
     lastLogin: u.lastLogin,
     lastSeen: u.lastSeen,
@@ -89,7 +92,7 @@ export async function createUser(username: string, password: string): Promise<Ad
 
   try {
     const u = await prisma.user.create({
-      data: { username: name, subsonicSecret: password },
+      data: { username: name, ...(await buildCredentials(password)) },
     })
     logger.info(`[user-service] 新建用户: ${name}`)
     return toView(u)
@@ -121,6 +124,7 @@ export async function updateUser(
 
   const data: {
     username?: string
+    passwordHash?: string | null
     subsonicSecret?: string | null
     mustChangePassword?: boolean
     sessionVersion?: { increment: number }
@@ -141,7 +145,8 @@ export async function updateUser(
 
   // password === null / '' 表示不改；显式传非空字符串才更新
   if (typeof opts.password === 'string' && opts.password !== '') {
-    data.subsonicSecret = opts.password
+    // 密码落 scrypt 哈希，并轮换 Subsonic 令牌（旧令牌同时失效）
+    Object.assign(data, await buildCredentials(opts.password))
     // 管理员重置某用户密码后，强制该用户下次登录改密
     data.mustChangePassword = true
     // 会话版本 +1：该用户所有已登录设备的旧会话立即失效
@@ -193,6 +198,24 @@ export async function deleteUser(id: number, currentUsername: string): Promise<v
   logger.info(`[user-service] 删除用户: ${existing.username} (by ${currentUsername})`)
 }
 
+/**
+ * 轮换并返回用户的 Subsonic 令牌（管理员操作）。
+ *
+ * 令牌只在本次响应中返回一次，库内不再有明文本可读；旧令牌立即失效，
+ * 该用户名下已连接的 Subsonic 客户端需重新配置。
+ *
+ * @throws NotFoundError 用户不存在
+ */
+export async function issueSubsonicToken(id: number): Promise<string> {
+  const existing = await prisma.user.findUnique({ where: { id } })
+  if (!existing) throw new NotFoundError('用户不存在')
+
+  const token = generateSubsonicToken()
+  await prisma.user.update({ where: { id }, data: { subsonicSecret: token } })
+  logger.info(`[user-service] 已轮换 Subsonic 令牌: ${existing.username} (id=${id})`)
+  return token
+}
+
 /** 业务层输入错误（4xx） */
 export class UserInputError extends Error {
   statusCode = 400
@@ -211,5 +234,5 @@ export class NotFoundError extends Error {
   }
 }
 
-const userService = { listUsers, getUserById, createUser, updateUser, deleteUser }
+const userService = { listUsers, getUserById, createUser, updateUser, deleteUser, issueSubsonicToken }
 export default userService

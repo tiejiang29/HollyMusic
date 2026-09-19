@@ -31,6 +31,7 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if (error instanceof AuthError) return createErrorResponse('UNAUTHORIZED', error.message, 401)
     logger.error('识曲失败:', error)
-    return createErrorResponse(ErrorCodes.INTERNAL_ERROR, error instanceof Error ? error.message : '识曲失败', 500)
+    // 对外统一文案：原始 message 会带上指纹器/子进程/文件路径等内部细节，只留在日志
+    return createErrorResponse(ErrorCodes.INTERNAL_ERROR, '识曲失败，请重试', 500)
   }
 }

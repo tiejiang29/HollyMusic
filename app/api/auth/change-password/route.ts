@@ -3,36 +3,23 @@
  * POST /api/auth/change-password  body { currentPassword, newPassword }
  *
  * - 需已登录
- * - 校验当前密码（恒定时间比较）
+ * - 校验当前密码（passwordHash 哈希比对；存量明文用户按老字段比较，见下）
  * - 新密码长度 ≥ 6，且与当前密码不同
  * - 改密成功后清除 mustChangePassword 标记
  * - 改密成功后 sessionVersion +1：其它设备的旧会话立即失效；
  *   当前设备重发新版本 cookie 保持登录态
  *
- * 注：本项目密码仍以明文存于 User.subsonicSecret（与 Subsonic t 校验兼容），
- * 此处仅做"改密"语义，不引入哈希以避免破坏 Subsonic 协议鉴权。
+ * 密码以 scrypt 哈希存于 User.passwordHash；Subsonic 令牌（User.subsonicSecret，
+ * t=md5(token+s) 用）与登录密码解耦，改密时一并轮换，令旧令牌同时失效。
  */
 
 import { NextRequest } from 'next/server'
-import crypto from 'crypto'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { requireUser } from '@/lib/services/user-context'
 import { createSessionCookies } from '@/lib/services/auth'
 import { logger } from '@/lib/logger'
-import { PrismaClient } from '@/lib/generated/prisma'
-
-const prisma = new PrismaClient()
-
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a)
-  const bb = Buffer.from(b)
-  if (ab.length !== bb.length) return false
-  try {
-    return crypto.timingSafeEqual(ab, bb)
-  } catch {
-    return false
-  }
-}
+import { prisma } from '@/lib/db'
+import { verifyUserPassword, buildCredentials } from '@/lib/server/credentials'
 
 export async function POST(request: NextRequest) {
   try {
@@ -50,16 +37,20 @@ export async function POST(request: NextRequest) {
     }
 
     const user = await prisma.user.findUnique({ where: { id: me.id } })
-    if (!user || !user.subsonicSecret || !safeEqual(user.subsonicSecret, currentPassword)) {
+    if (!user || !(await verifyUserPassword(user, currentPassword))) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '当前密码错误', 401)
     }
-    if (safeEqual(user.subsonicSecret, newPassword)) {
+    if (await verifyUserPassword(user, newPassword)) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '新密码不能与当前密码相同', 400)
     }
 
     const updated = await prisma.user.update({
       where: { id: me.id },
-      data: { subsonicSecret: newPassword, mustChangePassword: false, sessionVersion: { increment: 1 } },
+      data: {
+        ...(await buildCredentials(newPassword)),
+        mustChangePassword: false,
+        sessionVersion: { increment: 1 },
+      },
     })
 
     logger.info(`[auth/change-password] 用户修改密码成功: ${me.username} (sessionVersion → ${updated.sessionVersion})`)

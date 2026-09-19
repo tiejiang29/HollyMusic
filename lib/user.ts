@@ -1,7 +1,5 @@
-import { PrismaClient } from './generated/prisma'
+import { prisma } from './db'
 import type { NextRequest } from 'next/server'
-
-const prisma = new PrismaClient()
 
 /** 在线判定阈值：最近一次活跃在此时间内视为在线 */
 export const ONLINE_TTL_MS = 5 * 60 * 1000

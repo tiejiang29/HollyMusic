@@ -11,6 +11,7 @@
 import { NextRequest } from 'next/server'
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
+import { safePublicFetch, SafeFetchError } from '@/lib/server/url-guard'
 
 const ALLOWED_HOST_SUFFIXES = [
   'gtimg.cn', // QQ 图片 CDN（y.gtimg.cn / imgcache.gtimg.cn 等）
@@ -51,7 +52,9 @@ export async function GET(request: NextRequest) {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT)
   try {
-    const upstream = await fetch(parsed, {
+    // 首跳已过平台域名白名单，但白名单域名仍可能 302 到其它主机，
+    // 故逐跳校验目标为公网地址（重定向目标不再要求白名单：CDN 换主是常态）
+    const upstream = await safePublicFetch(parsed.toString(), {
       headers: { 'User-Agent': 'Mozilla/5.0', Referer: `${parsed.protocol}//${parsed.hostname}/` },
       signal: controller.signal,
     })
@@ -71,6 +74,10 @@ export async function GET(request: NextRequest) {
     searchCache.set(cacheKey, image, CACHE_TTL)
     return toImageResponse(image)
   } catch (error) {
+    if (error instanceof SafeFetchError && error.code === 'BLOCKED_URL') {
+      logger.warn('[api/image-proxy] 重定向目标被私网拦截:', rawUrl.slice(0, 100), error.message)
+      return new Response('host not allowed', { status: 403 })
+    }
     logger.warn('[api/image-proxy] fetch failed:', rawUrl.slice(0, 100), error)
     return new Response('fetch failed', { status: 502 })
   } finally {

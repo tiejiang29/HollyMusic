@@ -6,11 +6,9 @@
  */
 
 import { NextRequest } from 'next/server'
-import { PrismaClient } from '../generated/prisma'
+import { prisma } from '../db'
 import { verifySession } from './auth'
 import { logger } from '../logger'
-
-const prisma = new PrismaClient()
 
 export interface RequestUser {
   id: number

@@ -6,6 +6,7 @@ import { resolveSubsonicMediaMeta } from './subsonic-media'
 import { type AuthResult } from './auth'
 import * as dbAPI from './db'
 import { logger } from './logger'
+import { safePublicFetch } from './server/url-guard'
 import { fetchLyricForMusic } from './services/lyrics'
 import type { MusicInfo } from './types/music'
 
@@ -94,13 +95,13 @@ async function fetchImageFromUrl(imageUrl: string): Promise<Response | null> {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 5000)
 
-    const response = await fetch(imageUrl, {
+    // picUrl 来自上游音源，属不可信地址：逐跳校验公网地址，防 302 跳内网
+    const response = await safePublicFetch(imageUrl, {
       method: 'GET',
       signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      redirect: 'follow'
+      }
     })
     
     clearTimeout(timeoutId)

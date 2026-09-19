@@ -5,11 +5,10 @@
  * 权限模型与 subsonic 一致：自己创建的 + 公开的 + 被授权的可访问；写操作仅 owner。
  */
 
-import { PrismaClient, Prisma } from '../generated/prisma'
+import { Prisma } from '../generated/prisma'
+import { prisma } from '../db'
 import { logger } from '../logger'
 import type { MusicInfo } from '../types/music'
-
-const prisma = new PrismaClient()
 
 export interface PlaylistSummary {
   id: number

@@ -1,7 +1,5 @@
 import crypto from 'crypto'
-import { PrismaClient } from './generated/prisma'
-
-const prisma = new PrismaClient()
+import { prisma } from './db'
 
 export type ItemType = 'song' | 'album' | 'artist'
 /**
@@ -30,6 +28,11 @@ export async function getOrCreateUserByName(username: string) {
   return user
 }
 
+/**
+ * Subsonic t 校验：t = md5(subsonicSecret + s)。
+ * subsonicSecret 现为每用户随机令牌（与登录密码解耦，见 lib/server/credentials.ts），
+ * 由管理员通过 POST /api/admin/users/[id]/subsonic-token 发放/轮换。
+ */
 export async function verifyTForUser(username: string, t: string | null | undefined, s: string | null | undefined): Promise<boolean> {
   if (!t || !s) return false
   const name = (username || '').trim()

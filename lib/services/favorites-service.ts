@@ -11,14 +11,11 @@
  * （name/singer/img），列表直接读快照，不触上游。
  */
 
-import { PrismaClient } from '../generated/prisma'
 import { starItems, unstarItems, listFavorites } from '../favorites'
 import * as dbAPI from '../db'
-import { getStorageSongmidForMusicInfo } from '../db'
+import { prisma, getStorageSongmidForMusicInfo } from '../db'
 import { logger } from '../logger'
 import type { MusicInfo } from '../types/music'
-
-const prisma = new PrismaClient()
 
 export interface FavoriteSong {
   songId: string

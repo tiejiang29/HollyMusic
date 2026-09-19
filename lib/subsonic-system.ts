@@ -1,12 +1,9 @@
 import { NextRequest } from 'next/server'
 import { respond, subsonicError, TEXT_KEY, type SubsonicPayload } from './subsonic'
 import { type AuthResult } from './auth'
-import { PrismaClient } from './generated/prisma'
-import { resolveMusicInfoById } from './db'
+import { prisma, resolveMusicInfoById } from './db'
 import { reportPlay } from './services/history-service'
 import { logger } from './logger'
-
-const prisma = new PrismaClient()
 
 /**
  * 返回许可证状态。

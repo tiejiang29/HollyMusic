@@ -1,9 +1,8 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
 import { resolve } from 'path'
 import crypto from 'crypto'
-import { PrismaClient } from './generated/prisma'
-
-const prisma = new PrismaClient()
+import { prisma } from './db'
+import { buildCredentials, verifyPassword } from './server/credentials'
 
 export type UserConfigEntry = { username: string; password: string }
 
@@ -86,8 +85,11 @@ export async function syncUsersFromConfig(configPath?: string) {
           console.warn('========================================================')
         }
         const mustChange = username === 'admin'
+        // 配置里给的是明文初始密码（部署者需要能读到它去登录），入库即转为
+        // scrypt 哈希 + 随机 Subsonic 令牌；配置为空则不设密码（该账号无法登录）
+        const credentials = effectivePassword ? await buildCredentials(effectivePassword) : {}
         await prisma.user.create({
-          data: { username, subsonicSecret: effectivePassword, mustChangePassword: mustChange },
+          data: { username, ...credentials, mustChangePassword: mustChange },
         })
         created.push(username)
       }
@@ -96,17 +98,26 @@ export async function syncUsersFromConfig(configPath?: string) {
       // 也就不会反复触发下方的弱口令迁移导致 mustChangePassword 被反复置 true。
     }
 
-    // 迁移历史弱口令：仍使用 admin/admin 的账户，重置为随机密码并强制改密
+    // 迁移历史弱口令：仍是 admin/admin 的账户，重置为随机密码并强制改密。
+    // 判据覆盖两种存储形态：存量未迁移用户（明文在 subsonicSecret）与已迁移用户
+    // （scrypt 哈希在 passwordHash）——后者需要真比对一次，账户数很少故开销可忽略。
     try {
-      const weakUsers = await prisma.user.findMany({ where: { subsonicSecret: 'admin' } })
-      for (const wu of weakUsers) {
+      const allUsers = await prisma.user.findMany({
+        select: { id: true, username: true, passwordHash: true, subsonicSecret: true },
+      })
+      for (const u of allUsers) {
+        const isWeak = u.passwordHash
+          ? await verifyPassword('admin', u.passwordHash)
+          : u.subsonicSecret === 'admin'
+        if (!isWeak) continue
+
         const newPwd = generateRandomPassword()
         await prisma.user.update({
-          where: { id: wu.id },
-          data: { subsonicSecret: newPwd, mustChangePassword: true, sessionVersion: { increment: 1 } },
+          where: { id: u.id },
+          data: { ...(await buildCredentials(newPwd)), mustChangePassword: true, sessionVersion: { increment: 1 } },
         })
         console.warn('========================================================')
-        console.warn(`[config-sync] 检测到弱口令账户 "${wu.username}"（原密码为 admin），已重置为随机密码`)
+        console.warn(`[config-sync] 检测到弱口令账户 "${u.username}"（原密码为 admin），已重置为随机密码`)
         console.warn(`[config-sync] 新密码: ${newPwd}`)
         console.warn('[config-sync] 请立即登录并修改密码！此密码仅显示一次。')
         console.warn('========================================================')

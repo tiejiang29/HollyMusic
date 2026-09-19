@@ -15,6 +15,7 @@ import path from 'path'
 import dns from 'dns/promises'
 import net from 'net'
 import { logger } from '@/lib/logger'
+import { isPublicIp } from '@/lib/server/url-guard'
 import { sanitizeFilename } from '@/lib/server/download-utils'
 import type { MusicSourcesConfig, SourceConfig } from '@/lib/types/music'
 import { musicSourceManager } from '@/lib/music-source-manager'
@@ -231,65 +232,6 @@ async function replaceScript(relativePath: string, content: string): Promise<voi
     await fsp.unlink(tempPath).catch(() => {})
     throw err
   }
-}
-
-function isPublicIp(address: string): boolean {
-  const version = net.isIP(address)
-  if (version === 4) {
-    const [first, second] = address.split('.').map(Number)
-    return !(
-      first === 0 ||
-      first === 10 ||
-      first === 127 ||
-      first >= 224 ||
-      (first === 100 && second >= 64 && second <= 127) ||
-      (first === 169 && second === 254) ||
-      (first === 172 && second >= 16 && second <= 31) ||
-      (first === 192 && second === 168) ||
-      (first === 198 && (second === 18 || second === 19))
-    )
-  }
-  if (version === 6) {
-    const normalized = address.toLowerCase()
-    if (normalized.startsWith('::ffff:')) return isPublicIp(normalized.slice('::ffff:'.length))
-    return !(
-      normalized === '::1' ||
-      normalized === '::' ||
-      normalized.startsWith('fc') ||
-      normalized.startsWith('fd') ||
-      normalized.startsWith('fe8') ||
-      normalized.startsWith('fe9') ||
-      normalized.startsWith('fea') ||
-      normalized.startsWith('feb')
-    )
-  }
-  return false
-}
-
-/** 校验 http(s) URL 拒绝本机/私网/无法解析地址（防 SSRF），供下载回源与分享短链解析复用。 */
-export async function assertPublicHttpUrl(value: string): Promise<URL> {
-  let url: URL
-  try {
-    url = new URL(value)
-  } catch {
-    throw new Error('无效的 URL')
-  }
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    throw new Error('仅支持 HTTP 或 HTTPS')
-  }
-  if (url.username || url.password) {
-    throw new Error('URL 不能包含账号信息')
-  }
-  if (url.hostname.toLowerCase() === 'localhost') {
-    throw new Error('不允许访问本机或内网地址')
-  }
-  const addresses = net.isIP(url.hostname)
-    ? [{ address: url.hostname }]
-    : await dns.lookup(url.hostname, { all: true, verbatim: true }).catch(() => [])
-  if (addresses.length === 0 || addresses.some(({ address }) => !isPublicIp(address))) {
-    throw new Error('不允许访问本机、内网或无法解析的地址')
-  }
-  return url
 }
 
 /** 校验远程订阅地址，拒绝本机及私网地址，避免管理员接口成为 SSRF 入口。 */

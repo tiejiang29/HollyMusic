@@ -14,13 +14,10 @@
  *   保证数据库行数可控、查询性能稳定。
  */
 
-import { PrismaClient } from '../generated/prisma'
 import * as dbAPI from '../db'
-import { getStorageSongmidForMusicInfo } from '../db'
+import { prisma, getStorageSongmidForMusicInfo } from '../db'
 import { logger } from '../logger'
 import type { MusicInfo } from '../types/music'
-
-const prisma = new PrismaClient()
 
 /** 每用户历史记录上限，超出则 FIFO 淘汰最旧记录。可通过环境变量覆盖。 */
 const MAX_HISTORY_PER_USER = Number(process.env.MAX_HISTORY_PER_USER) || 500

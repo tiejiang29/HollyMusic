@@ -18,6 +18,7 @@
  */
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
+import { safePublicFetch } from '@/lib/server/url-guard'
 import type { MusicInfo } from '@/lib/types/music'
 
 // 原生封面获取模块（参考 lx-music 各源 pic 实现），与 cover.ts 同款接法
@@ -83,7 +84,7 @@ async function isReachableImageUrl(url: string): Promise<boolean> {
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 5000)
-    const resp = await fetch(url, {
+    const resp = await safePublicFetch(url, {
       method: 'GET',
       signal: controller.signal,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },

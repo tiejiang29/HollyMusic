@@ -11,6 +11,7 @@
 
 import { searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
+import { safePublicFetch } from '@/lib/server/url-guard'
 import { prisma, getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/lib/db'
 import { songIdentity } from '@/lib/song-identity'
 import type { MusicInfo, Song, SourceType } from '@/lib/types/music'
@@ -139,10 +140,10 @@ export async function fetchCoverImageBytes(imageUrl: string): Promise<CoverImage
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 8_000)
     try {
-      const resp = await fetch(imageUrl, {
+      // 域名白名单只约束首跳，白名单主机仍可能 302 到内网 → 逐跳校验目标为公网地址
+      const resp = await safePublicFetch(imageUrl, {
         signal: controller.signal,
         headers: { 'User-Agent': 'Mozilla/5.0' },
-        redirect: 'follow',
       })
       if (!resp.ok) return null
       const contentType = resp.headers.get('content-type') || 'image/jpeg'

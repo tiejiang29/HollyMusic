@@ -2,37 +2,26 @@
  * 登录 API
  * POST /api/auth/login  body { username, password }
  *
- * 校验 DB User.subsonicSecret（= config/users.json 的 password），
+ * 校验 DB User.passwordHash（scrypt，见 lib/server/credentials.ts），
  * 成功则签发 holly_user + holly_sig 签名 cookie，并记录登录活动（lastLogin + 最近活跃 IP/UA）。
  *
+ * 存量兼容：passwordHash 为空的老用户按明文 subsonicSecret 校验，通过后就地落哈希
+ * 并把 subsonicSecret 轮换为随机 Subsonic 令牌（惰性迁移，DB 内不再留明文密码）。
+ *
  * 安全策略：
- * - 按 IP 维度登录限速：5 分钟内失败 10 次锁定该 IP 15 分钟
- * - 密码校验用恒定时间比较，防时序攻击
+ * - 按 IP / 用户名双维度登录限速：5 分钟内失败 10 次锁定 15 分钟
+ * - 密码校验用 scrypt 哈希比对；用户不存在时也烧一次同耗时校验，防用户名枚举
  * - 返回 mustChangePassword 标记，前端据此强制引导改密
  */
 
 import { NextRequest } from 'next/server'
-import crypto from 'crypto'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { createSessionCookies } from '@/lib/services/auth'
 import { logger } from '@/lib/logger'
-import { PrismaClient } from '@/lib/generated/prisma'
+import { prisma } from '@/lib/db'
+import { verifyUserPassword, buildCredentials } from '@/lib/server/credentials'
 import { updateLastLoginByUsername, updateLastSeenByUsername, getClientIp, getUa } from '@/lib/user'
 import { checkLoginRate, recordLoginFailure, resetLoginRate, buildRateLimitKeys } from '@/lib/server/login-rate-limit'
-
-const prisma = new PrismaClient()
-
-/** 恒定时间字符串比较，防时序攻击 */
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a)
-  const bb = Buffer.from(b)
-  if (ab.length !== bb.length) return false
-  try {
-    return crypto.timingSafeEqual(ab, bb)
-  } catch {
-    return false
-  }
-}
 
 export async function POST(request: NextRequest) {
   try {
@@ -64,14 +53,13 @@ export async function POST(request: NextRequest) {
 
     const user = await prisma.user.findUnique({ where: { username } })
 
-    // 无论用户是否存在，都返回相同的错误信息，避免用户名枚举；
-    // 用户不存在时也执行一次 dummy 比较，统一耗时
-    const storedSecret = user?.subsonicSecret ?? ''
-    const ok = user && storedSecret
-      ? safeEqual(storedSecret, password)
-      : safeEqual('x'.repeat(32), 'y'.repeat(32))
+    // 无论用户是否存在都返回相同的错误信息，避免用户名枚举；
+    // 用户不存在时也走一次等价耗时的校验（内部烧 dummy scrypt）
+    const ok = user
+      ? await verifyUserPassword(user, password)
+      : await verifyUserPassword({}, password)
 
-    if (!user || !storedSecret || !ok) {
+    if (!user || !ok) {
       // 记录失败，达阈值则锁定对应维度
       let locked = false
       for (const key of keys) {
@@ -89,6 +77,17 @@ export async function POST(request: NextRequest) {
 
     // 2. 登录成功：清空所有维度的失败计数
     for (const key of keys) resetLoginRate(key)
+
+    // 2.1 存量凭据惰性迁移：明文密码 → scrypt 哈希，Subsonic 令牌换随机值。
+    //     失败不影响本次登录（下次登录会重试），故只记日志。
+    if (!user.passwordHash) {
+      try {
+        await prisma.user.update({ where: { id: user.id }, data: await buildCredentials(password) })
+        logger.info(`[auth/login] 存量密码已迁移为哈希存储，Subsonic 令牌已轮换: ${username}`)
+      } catch (e) {
+        logger.warn('[auth/login] 凭据惰性迁移失败（下次登录重试）:', e)
+      }
+    }
 
     // 3. 签发签名 cookie（版本取 DB 当前 sessionVersion；若该用户曾被改密/重置，
     //    其旧 cookie 已因版本不匹配失效，此处新签的即为唯一有效版本）

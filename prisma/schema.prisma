@@ -73,7 +73,12 @@ model MusicInfo {
 model User {
   id             Int      @id @default(autoincrement())
   username       String   @unique
-  subsonicSecret String?  // optional plain secret for t verification (md5(secret+s))
+  // Web/App 登录密码哈希（scrypt$N$r$p$salt$hash，见 lib/server/credentials.ts）。
+  // 为空 = 存量未迁移用户，此时 subsonicSecret 存的仍是明文密码，登录成功后惰性迁移
+  passwordHash   String?
+  // Subsonic 客户端专用令牌（每用户随机生成），t 校验用 md5(token+s)。
+  // 与登录密码解耦：不再存明文密码；改密/管理员重置时一并轮换
+  subsonicSecret String?
   lastLogin      DateTime?
   lastSeen       DateTime?  // 最近一次活跃（登录/心跳）时间，用于在线状态推断
   lastSeenIp     String?    // 最近一次活跃的客户端 IP

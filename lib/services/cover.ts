@@ -9,6 +9,7 @@ import { resolve } from 'path'
 import { readFileSync } from 'fs'
 import * as dbAPI from '../db'
 import { logger } from '../logger'
+import { safePublicFetch } from '@/lib/server/url-guard'
 
 // 原生封面获取模块（参考 lx-music 各源 pic 实现）
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -90,11 +91,12 @@ async function fetchImageFromUrl(imageUrl: string): Promise<Response | null> {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 5000)
 
-    const response = await fetch(imageUrl, {
+    // img / picUrl 都是上游音源返回值，属于不可信地址：逐跳校验公网地址，
+    // 避免公网 URL 302 跳内网（原 redirect:'follow' 会静默跟到私网）
+    const response = await safePublicFetch(imageUrl, {
       method: 'GET',
       signal: controller.signal,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      redirect: 'follow',
     })
     clearTimeout(timeoutId)
 

@@ -5,7 +5,11 @@ import { logger } from './logger'
 import type { MusicInfo } from './types/music'
 import { dedupeByIdentity, songIdentity } from './song-identity'
 
-export const prisma = new PrismaClient()
+// 全进程唯一连接池：dev 热重载会重复执行模块顶层，挂到 globalThis 上复用；
+// 生产/测试环境模块本身即单例。其它模块一律 import 本实例，勿再 new PrismaClient()
+const globalForPrisma = globalThis as unknown as { __hollyPrisma?: PrismaClient }
+export const prisma = globalForPrisma.__hollyPrisma ?? new PrismaClient()
+if (process.env.NODE_ENV !== 'production') globalForPrisma.__hollyPrisma = prisma
 
 function stableStringify(obj: any): string {
   if (obj === null || typeof obj !== 'object') return JSON.stringify(obj)
@@ -286,12 +290,33 @@ export async function setRecommendedStatus(uid: string, value: boolean): Promise
 }
 
 /**
- * 批量设置推荐状态（并行）。返回成功更新的数量。
+ * 批量设置推荐状态。返回成功更新的数量。
+ *
+ * 原实现 Promise.all 逐条 update：全选上百首时会同时发起上百条写事务，
+ * 在 SQLite 上表现为写锁竞争（P2034 / timeout），成功条数还会随机掉。
+ * 现改为分块 updateMany，并发度固定为 1；未命中的 uid 天然不计入 count，
+ * 与单条版 P2025 记 0 的口径一致。
  */
+const RECOMMENDED_BATCH_CHUNK = 200
+
 export async function setRecommendedBatch(uids: string[], value: boolean): Promise<{ updated: number }> {
   if (!Array.isArray(uids) || uids.length === 0) return { updated: 0 }
-  const results = await Promise.all(uids.map(uid => setRecommendedStatus(uid, value)))
-  return { updated: results.reduce((sum, r) => sum + r.updated, 0) }
+  const pairs = uids.map(u => parseUid(u)).filter((p): p is { source: string; songmid: string } => p !== null)
+  if (pairs.length === 0) return { updated: 0 }
+  let updated = 0
+  try {
+    for (let i = 0; i < pairs.length; i += RECOMMENDED_BATCH_CHUNK) {
+      const res = await prisma.musicInfo.updateMany({
+        where: { OR: pairs.slice(i, i + RECOMMENDED_BATCH_CHUNK).map(p => ({ source: p.source, songmid: p.songmid })) },
+        data: { isRecommended: value },
+      })
+      updated += res.count
+    }
+  } catch (e) {
+    // 部分批次已生效时保留已计数结果，仅告警不抛给调用方
+    console.warn('setRecommendedBatch error', e)
+  }
+  return { updated }
 }
 
 /**

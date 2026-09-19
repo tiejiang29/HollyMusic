@@ -6,11 +6,12 @@ import { logger } from '@/lib/logger'
 import { resolveMusicInfoById } from '@/lib/db'
 import { musicSourceManager } from '@/lib/music-source-manager'
 import { audioServe } from '@/lib/audio-serve'
+import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { findLibrarySong, shouldServeLibraryFile } from '@/lib/services/music-library'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import type { QualityType } from '@/lib/types/music'
-import { assertPublicHttpUrl } from '@/lib/services/source-manager-service'
+import { assertPublicHttpUrl } from '@/lib/server/url-guard'
 import {
   isValidUrl,
   extractDomain,
@@ -99,11 +100,12 @@ async function handleDownloadByUid(
   const cacheKey = `${musicInfo.source}:${musicInfo.songmid}:${quality}`
 
   // 3. upstreamUrlResolver：只在 cache miss 时调用一次（audioServe 内部去重）
-  const upstreamUrlResolver = async (): Promise<string> => {
+  //    回传 provider：audioServe 发现假地址时可排除该音源重新解析
+  const upstreamUrlResolver: UpstreamUrlResolver = async (excludeProviders) => {
     if (!musicSourceManager.isInitialized()) {
       await musicSourceManager.initialize()
     }
-    return musicSourceManager.getMusicUrl(musicInfo, quality)
+    return musicSourceManager.getMusicUrlWithProvider(musicInfo, quality, { excludeProviders })
   }
 
   // 3.5 本地优先：音乐库命中（uid 精确 → 跨平台模糊，音质 ≥ 请求档）直接发文件
