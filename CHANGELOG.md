@@ -16,6 +16,173 @@
 
 > v0.17.0 之前的完整提交历史可执行 `git log v0.17.0` 查看。
 
+## v2.1.1（2026-09-19）
+
+**完整对比**：[v2.1.0 → v2.1.1](https://github.com/redcatH/HollyMusic/compare/v2.1.0...v2.1.1)
+
+### 🔧 工程与依赖
+
+- **release**：同步 v2.1.0 更新日志与版本号
+- **release**：v2.1.1
+
+
+### 🧩 其他变更
+
+- 修掉分享页 500：读库边界的 MusicInfo 不再交出 undefined types
+
+现象（NAS 生产日志）：GET /api/share?uid=tx-002NmjQb4DhZr6 → HTTP 500，
+`TypeError: Cannot read properties of undefined (reading 'map')`，堆栈落在
+app/api/share/route.js 的 pickShareQuality。
+
+根因不在分享页一处：MusicInfo.types 在接口里声明为必填数组，但 data 列存的是上游原样
+JSON，lib/db.ts 有 5 处 `JSON.parse(row.data) as MusicInfo` 盲转——重建索引、
+scripts/push-music-info 批量导入、老版本写入的行都可能整个缺掉 types 键。于是任何
+`mi.types.map(...)` 都会抛：/api/share 是其中一条，Subsonic stream（lib/subsonic-stream.ts
+的 supportedQualities）同形。所以修在读库边界，而不是逐个调用点补 ?? []。
+
+- lib/db.ts：新增 normalizeMusicInfo，仅在 types 不是数组时补 []（只动这一个字段——它是
+  唯一被无条件解引用的；_types 声明是必填四项的 Record，补 {} 反而不合法也不诚实）
+- app/api/share/route.ts：pickShareQuality 的参数改为可选并落 `types ?? []`，把函数自己
+  注释里承诺的「无 types 信息时兜底 320k 交上游决定」真正兑现，不依赖调用方是否归一化
+- 测试：lib/db.test.ts +2（缺 types 的行补空数组且其余字段原样透出；非数组同样归零、
+  合法数组不动）；新增 app/api/share/route.test.ts（types 缺失/为空 → 200 且 quality=320k
+  带 st；有 types 时 320k→128k→首个 的挑选顺序；查不到歌与无 uid 的降级页）
+- 验证：typecheck 通过、60 文件 / 603 测试全绿、lint 0 error；dev server 实跑本地同类行
+  tx-000cFsFl1o17jp / tx-003J6p942xp6ho → 分享页 200 + quality=320k，再按页内 st 拉流
+  得 206 audio/flac（首块魔数 fLaC）
+- 取址瀑布加单源累计预算，头源挂起不再让整首歌必败
+
+实测出来的缺陷（HANDOFF「源可用性摸底实测」一节有全过程）：往 priority 0 插一个永不
+返回的假音源，/api/audio 首字节 20030ms 后 502，两首样本全失败——排在后面的可用源
+一次都没轮到。不是"多等一会才跳"，是这首歌必然播不出来。
+
+根因是三处预算对不上：单次 getMusicUrl 15s、整条瀑布 45s（music-source-manager），
+而外层 audio-serve 等解析结果只有 20s（AUDIO_CACHE_READINESS_TIMEOUT_MS）。挂起的源
+能在 flac/320k/128k 三档上各烧 15s 吃满 45s，外层 20s 先炸。45s > 20s 意味着总预算
+这个值一直形同不存在。
+
+- 新增一级 perSourceMs（默认 8s，跨音质档累加）：一个源在一首歌上花完它就 continue outer
+  换下一个源，而不是终止整条瀑布；单次调用的上限改为 min(urlMs, 本源剩余, 全程剩余)，
+  所以"放弃"发生在预算点上，不会让在途调用再拖 15s
+- 总预算 45s → 18s，让不变式成立且可读：单源 < 总预算 < 外层 20s。瀑布现在一定在外层
+  判死之前自己给出结论
+- 三个值改为 env 可读（SOURCE_URL_TIMEOUT_MS / _PER_SOURCE_TIMEOUT_MS / _TOTAL_TIMEOUT_MS），
+  15s/45s 此前是硬编码常量——不可注入也就不可测，这正是预算错配能长期潜伏没人发现的原因。
+  readUrlBudgets() 在 perSourceMs ≥ totalMs 时 warn：这种配法不会报错，只会悄悄让后面的
+  源永远轮不到
+- 测试：新增 lib/music-source-manager.test.ts（注入假实例与预算，不碰配置文件与 runner）。
+  核心用例是头源挂起时断言「挂起源只被调用一次 + 第二源出货 + 远低于 20s」；另有一条钉住
+  三级预算不变式。61 文件 / 607 测试、typecheck、lint 0 error 全过
+- 真实 dev 复跑同一实验：挂起头源 20030ms/502/0-2 → 8833ms/206/2-2，日志「获取音乐URL超时:
+  探针挂起源 - flac（8s）」
+
+剩下的 8s 用户仍然感知得到，那是下一刀"早对冲"（同平台约 2s 无结果就并发下一源）要解决的。
+- 源健康账本 3b-1：按 源×平台 记账 + /api/health 出口（纯观测，零行为变化）
+
+运行时此前对"哪个源能用"是零记录：瀑布里每个源的成败只进日志（大半还是 debug 级，
+生产看不到），成功路径连耗时都不记。于是"源可用性分析"没有地基——本提交只补地基，
+不动任何取址决策（按档跳过属于 3c）。
+
+- lib/server/source-health.ts：纯内存零依赖账本，键是 音源×平台（一个源对 kw 强对 tx 弱
+  是常态，pt 白名单就是这个经验的粗粒度手工版；音质只记不排，样本太稀）。每键 50 样本
+  滑动窗 + band 分档（no-data/healthy/degraded/cooling），延迟取窗口分位数。不落库：分钟级
+  信号，重启清零本身就是最干净的紧急回滚，持久校准归周测
+- 三条护栏（都是 2026-09-19 摸底换来的，任何一条失效 3c 就会误杀好源）：
+  ① 版权/能力不符（pt 不含、脚本未声明平台或音质、返回空地址）不计坏，只累计 noMatch；
+     且这类跳过连样本都不建，避免"版权面窄但音质好的源"被算成坏源
+  ② 缓存与音乐库命中不入账——结构性保证：埋点只在瀑布和 openUpstream 里，两者都只在
+     miss 路径执行；否则热门歌会被刷成 100% 并稀释真实信号
+  ③ 本机网络故障（ENOTFOUND/EAI_AGAIN/ECONNREFUSED…，含 fetch 的 cause 包装）开 60s 豁免
+     窗，期间"坏"直接丢弃、"好"照记；否则断一次网就把 10 个源一起冤枉熔断
+- 一次播放里同一个源最多记一个坏样本：同一首歌会在多个音质档上重试同一个源，全记会把
+  consecutiveBad 灌水成"一首歌 = 三次坏"
+- 字节段是账本里唯一能识破"有地址但播不了"的一段，也是最高置信的坏证据。为此把 provider
+  抬到 inflight entry 上，并给解析契约补 platform（跨平台换源后平台 ≠ cacheKey 里的 source，
+  不回传就会把 tx 的失败记到 kw 头上）；四个入口经 manager 透传，无 provider 时不记账
+- 出口复用现成的 getHealthStatus → /api/health 的 sources[].health（声明与实际并排），
+  summary 加 degraded/cooling 两个计数；不新增端点、不动 schema、不动配置写路径
+- 测试 +12（账本 11：维度隔离/滑窗出清/三条护栏/分档/空 provider 不建键/排序与分位数；
+  埋点 1 + 既有断言加固：瀑布与假地址换源确实落账）。全量 62 文件 / 619 测试、typecheck、
+  lint 0 error
+- dev 实测：5 次真实取址后 /api/health 显示 长青SVIP×kw band=healthy 样本=5 p50=321ms
+  p90=474ms；同时暴露出马太效应——10 个源里只有 1 个有数据，正是周测不可省略的证据
+- 音源面板加"健康"列：把内存账本的运行实测显示出来（3b-2，仍零行为变化）
+
+数据接口复用现成的 GET /api/admin/sources：listSourcesWithStatus 顺手挂上
+sourceHealth.ofSource(...)，不新增端点、不加轮询接口。面板按 `源×平台` 显示分档色签
+（正常/波动/冷却中/样本少），悬浮 title 给完整数字：窗口内出货/坏/无地址计数、
+p50 与 p90 延迟、最近一次坏的原因。
+
+两个坑都钉进测试与注释：
+- 账本的键沿用 manager 的同一个回退 `name || path`。直接用可能为 undefined 的 name 会
+  让面板对所有源都显示"无实测"——数据在账本里但界面上看不见（第一版就踩了这个，
+  typecheck 抓到）
+- "无实测"不等于"坏了"：健康路径下瀑布通常第一个源就出货，排在后面的源天然没有样本。
+  列头 title 与组件注释都写明了，避免管理员把"没数据"读成"这源不行"顺手停用它
+
+新增 lib/services/source-manager-service.test.ts：用真实 config + 造样本的方式验证键匹配
+（含 name 缺省回退 path 的分支）。全量 63 文件 / 620 测试、typecheck、lint 0 error；
+面板模块经 Vite 编译通过。注：数据通路已验证，界面像素级效果未经人眼确认（本地没有
+管理员会话），下一个 admin 会话里扫一眼即可。
+- 健康列补渲染测试：无管理员会话也能验证这一列显示对不对
+
+上一笔只验到"数据通路 + Vite 能编译"，界面效果没确认（本地 admin 口令不是默认值，
+没有管理员会话，也没去向你要密码）。这里用 react-dom/server 直接渲染 HealthCell，
+把管理员最容易误读的三点钉成测试：
+- 没数据 → 「无实测」，且不得出现任何坏暗示的文案/配色
+- 四个分档各自的中文标签与配色类（正常/波动/冷却中/样本少）
+- 悬浮 title 必须带上判定依据：窗口次数、出货/坏/无地址、p50 与 p90、最近一次坏的原因
+再加一个多平台用例（kw 正常 + mg 冷却中 + tx 样本少 各自成签，互不覆盖）
+
+为此把 HealthCell 导出（整页面板要 mock 异步加载，测渲染反而不如直接测这个单元格准）。
+前端测试新增 4 条：11 passed。同时确认 frontend/vitest.config.ts 的 components/**/*.test.tsx
+这条 include 一直是空跑的——现在有了第一个用例，路径约定也就落地了。
+- 摸底工具：全矩阵探测「源×平台」的取址与首块真伪
+
+实时账本是被动记账，瀑布止于首次成功，实测面板只有 1/31 格有数据——3c 要定的
+阈值（连续坏几次跳、冷却多久、半开放几个）没有数据可依据。这个脚本把 62 格填出来。
+
+判据口径与生产一致：取到地址后还要发一次 Range 首块请求，用 audio-sniff 的
+CONTAINER_TESTS（不是管扩展生命名的 CONTAINER_TYPES）判真伪——只取址会漏掉「地址给了、
+Content-Type 谎称 audio/mpeg、真取是 404 文本页」这一类最坑的故障。
+- 3c：瀑布按健康账本跳过冷却中的源，排序不动、同平台保底留一个
+
+账本从只观测变成会动作。参数来自全矩阵摸底 62 格：0 次取址超时，坏样 p50 1031ms/
+max 2224ms，健康源取址 p50 0-1860ms、单次成功最大 4558ms——所以熔断只看跨歌连续坏次数
+（2 次），不按延迟分位数（那会砍掉最慢但真出货的 gdstudio，而它是 mg 唯二来源之一）；
+快速失败冷却 60s，挂起类 5min，半开失败 2^n 翻倍封顶 30min。
+
+半开槽位是租约式的，且 no-address / unverified 也归还槽位：版权没命中不等于探测失败，
+否则一次异常退出能把源永久锁死。
+
+顺带修掉摸底暴露的一个真缺陷：单源预算耗尽后仍剩 0-1ms「尘埃预算」时照样又调了一次源，
+生产上那是一次真实脚本调用，promise 被放弃而 runner slot 还占着。
+- 修判序：容器魔数先于「整段可打印」的文本判据
+
+isPrintableRun 的注释写着"已知容器在调用前已排除"，代码里却是 isTextLike 排在
+detectContainer 前面。'fLaC' + ASCII 填充这种头 32 字节全可打印的载荷会被判成文本假地址
+→ 真音频被误 reject，还连带触发一次无谓换源。真实文件头部一般带 0x00 才侥幸没炸。
+
+写周测的首块验证时被这条咬到（测试夹具用 ASCII 填充），顺带确认生产路径同样会误判。
+- 周测：主动探测「源×平台」全矩阵并落库，给 3c 提供跨重启的先验
+
+3b 的账本是内存态、且只看得到被瀑布轮到的源（实测面板 1/31 格有数据），所以每次
+重启 3c 都全盲。周测把这 62 格主动跑一遍写进 SourceProbeResult，启动时把 TTL 内
+判坏的格子用 seedCooldown 注回账本——只设冷却、不伪造成功样本，到期照常半开，
+一次真实成功即彻底解除，所以先验判错最多浪费一首歌。
+
+探测走 manager 新增的 probeSourceUrl（单源、不写账本）：复用 excludeProviders 那条路
+会把探测抖动记成用户遇到的坏，而且瀑布在头源出货后短路，被测源根本轮不到。每格都补一次
+Range 首块验证——只取址漏掉「地址给了、CT 谎称 audio/mpeg、真取 404」这一类。
+
+启动接线必须由取址侧模块实例做：Next 给 instrumentation 单独一套 lib 副本，从那边写
+内存账本路由读不到（实测日志说注入 3 格而 /api/health 恒为 cooling:0），且它那份 manager
+会再拉一个 runner 子进程。现挂在 MusicSourceManager.initialize() 末尾，每进程一次。
+
+实测：一批 58 秒 / 62 格 / 56 出货 6 坏（6 坏全在聚合API，与摸底一致）；重启后
+「聚合API × kw,tx,wy」以 cooling 出现在路由侧账本，剩 57.6s，出处写明来自周测。
+
+
 ## v2.1.0（2026-09-19）
 
 **完整对比**：[v1.0.7 → v2.1.0](https://github.com/redcatH/HollyMusic/compare/v1.0.7...v2.1.0)
