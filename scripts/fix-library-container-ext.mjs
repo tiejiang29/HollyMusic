@@ -6,12 +6,13 @@
  * 代码侧已修好（嗅探容器优先，见 lib/server/audio-sniff.ts 的 CONTAINER_TYPES），本脚本
  * 只处理修好之前已经入库的存量文件。
  *
- * 动作：逐条读文件头魔数 → 认出容器且与现扩展名不符 → 连同歌词边车（.lrc /
+ * 动作一：逐条读文件头魔数 → 认出容器且与现扩展名不符 → 连同歌词边车（.lrc /
  * .tlyric.lrc，与音频同目录同名）一起改名 + 更新 LibrarySong.filePath。目标名已被占用
  * 时跳过并报告，不自动加序号——重复正本是要人看一眼的数据问题，不是命名问题。
  *
- * 顺带审计（只报告不改动）：AudioCache 行里同样谎报的 contentType，它只影响缓存命中时
- * 的响应头，重下即自然收敛。
+ * 动作二：把 AudioCache 里谎报的 contentType 按字节纠正（只改这一列，不动缓存文件名——
+ * 那名字是按 cacheKey 哈希出来的，扩展名没有任何下游读取；改它反而会让并发的重下载把
+ * 旧文件留成孤儿）。缓存行的 contentType 只影响缓存命中时发给客户端的响应头。
  *
  * 魔数判据与 lib/server/audio-sniff.ts 的 CONTAINER_TYPES 一一对应（TS 模块不能被 .mjs
  * 直接 require，故此处内联同一张表）。mp4 / asf / avi / realmedia 等可承载视频的容器
@@ -19,7 +20,7 @@
  *
  * 用法：
  *   node scripts/fix-library-container-ext.mjs            # 只看报告，不落盘
- *   node scripts/fix-library-container-ext.mjs --apply    # 真正改名
+ *   node scripts/fix-library-container-ext.mjs --apply    # 执行改名 + 纠正缓存 contentType
  */
 import fs from 'fs'
 import fsp from 'fs/promises'
@@ -212,6 +213,7 @@ async function main() {
   }
 
   let cacheWrong = 0
+  let cacheFixed = 0
   const cacheRows = await prisma.audioCache.findMany({ select: { cacheKey: true, filePath: true, contentType: true } })
   const cacheRoot = path.resolve(root, process.env.AUDIO_CACHE_DIR || 'data/audio-cache')
   for (const r of cacheRows) {
@@ -220,10 +222,15 @@ async function main() {
     if (!declared) continue
     const canon = MIME_ALIASES[declared] ?? declared
     const container = fs.existsSync(abs) ? sniffContainer(abs) : null
-    if (container && container.mime !== canon) {
-      cacheWrong++
+    if (!container || container.mime === canon) continue
+    cacheWrong++
+    if (!apply) {
       console.log(`[缓存谎报] ${r.cacheKey} 记录=${declared} 字节=${container.mime}`)
+      continue
     }
+    await prisma.audioCache.update({ where: { cacheKey: r.cacheKey }, data: { contentType: container.mime } })
+    cacheFixed++
+    console.log(`[缓存纠正] ${r.cacheKey} ${declared} -> ${container.mime}`)
   }
 
   const applied = apply ? `（已改名 ${renamed}，冲突跳过 ${conflicts}，占用失败 ${failed}，歌词边车随迁 ${sidecarMoved}）` : '（dry 未落盘，加 --apply 执行）'
@@ -231,7 +238,9 @@ async function main() {
     `\n库内共 ${rows.length} 条：命名相符 ${ok}，待改名 ${plan.length}${applied}，` +
       `文件缺失 ${missing}，容器未识别或可能是视频 ${unknown}`
   )
-  console.log(`AudioCache 里 contentType 与容器不符的记录 ${cacheWrong} 条（本脚本不改动；该记录只影响缓存命中时的响应头）`)
+  console.log(
+    `AudioCache 里 contentType 与容器不符 ${cacheWrong} 条${apply ? `，已纠正 ${cacheFixed} 条` : '（dry 未改动，加 --apply 执行）'}`
+  )
   await prisma.$disconnect()
 }
 
