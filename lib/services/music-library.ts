@@ -23,6 +23,7 @@ import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import type { LibrarySong } from '@/lib/generated/prisma'
 import { logger } from '@/lib/logger'
 import { isIncompleteTrial, parseDurationFromFile } from '@/lib/server/audio-integrity'
+import { judgeUpstreamPayload, readHeadBytes } from '@/lib/server/audio-sniff'
 import { getAudioServeConfig, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, removeAudioCacheFiles, extFromContentType } from '@/lib/audio-serve'
 import { sanitizeFilename, extForQuality } from '@/lib/server/download-utils'
 import { QUALITY_ORDER, getAvailableQualities } from '@/lib/quality-options'
@@ -147,6 +148,21 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     // （1-4 秒），旧逻辑在 checkTrialAudio 跳过探测（interval<120）时回退
     // 脏 interval，导致登记时长错误。interval 仅用于试听比对。
     const intervalSec = parseIntervalToSeconds(musicInfo.interval)
+
+    // 容器嗅探门槛：库是不可自愈的永久层（播放时优先于在线源，且「库内已有
+    // 更高音质」判定会挡住后续好文件），字节无法证明是已知音频容器的一律
+    // 不入库，只留在缓存里继续可用（LRU 自然淘汰）。判据来自全库实测：
+    // 302 个可正常播放的文件全部匹配已知容器魔数，唯一未匹配的正是那条
+    // 「随机数据被误存为 mp3」的坏文件（audio-serve 现已在上游侧拦截同类载荷）。
+    const headBytes = await readHeadBytes(srcPath)
+    const sniff = judgeUpstreamPayload({ contentType: record.contentType, head: headBytes })
+    if (sniff.verdict !== 'audio') {
+      logger.warn(
+        `[music-library] 载荷未通过容器校验，跳过入库: ${musicInfo.name} — ${sniff.reason}`
+      )
+      return { status: 'skip-error', message: `容器校验未通过：${sniff.reason}` }
+    }
+
     const probedSec = await parseDurationFromFile(srcPath)
     if (isIncompleteTrial(probedSec ?? 0, intervalSec)) {
       return { status: 'skip-error', message: '试听片段，不入库' }
@@ -438,6 +454,13 @@ export async function rebuildLibraryIndex(): Promise<{ scanned: number; added: n
         const quality = ext === '.flac' ? 'flac' : '320k'
         const stat = await fsp.stat(full).catch(() => null)
         if (!stat) continue
+        // 与入库同门槛：容器校验不过的文件不登记（rebuild 是 DB 丢失后的
+        // 修复路径，登记坏文件同样会形成永久毒化）
+        const sniff = judgeUpstreamPayload({ contentType: null, head: await readHeadBytes(full) })
+        if (sniff.verdict !== 'audio') {
+          logger.warn(`[music-library] 重建索引跳过非音频容器文件: ${full} — ${sniff.reason}`)
+          continue
+        }
         await prisma.librarySong.create({
           data: {
             dedupeKey: buildDedupeKey(fileName, fileSinger),

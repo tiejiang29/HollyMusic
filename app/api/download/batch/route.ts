@@ -6,6 +6,7 @@ import { logger } from '@/lib/logger'
 import { resolveMusicInfoById } from '@/lib/db'
 import { musicSourceManager } from '@/lib/music-source-manager'
 import { audioServe } from '@/lib/audio-serve'
+import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import { buildFilenameFromMusicInfo, buildContentDisposition, sanitizeFilename } from '@/lib/server/download-utils'
@@ -103,7 +104,8 @@ export async function GET(request: NextRequest) {
         const cacheKey = `${mi.source}:${mi.songmid}:${quality}`
         const resp = await audioServe.serve({
           cacheKey,
-          upstreamUrlResolver: () => musicSourceManager.getMusicUrl(mi, quality),
+          upstreamUrlResolver: ((excludeProviders: ReadonlySet<string>) =>
+            musicSourceManager.getMusicUrlWithProvider(mi, quality, { excludeProviders })) as UpstreamUrlResolver,
           rangeHeader: null,
           isHead: false,
           intervalSec: parseIntervalToSeconds(mi.interval),

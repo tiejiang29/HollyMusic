@@ -4,6 +4,7 @@ import { subsonicError } from '@/lib/subsonic'
 import { selectQuality } from '@/lib/subsonic-media'
 import { musicSourceManager } from '@/lib/music-source-manager'
 import { audioServe } from '@/lib/audio-serve'
+import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { logger } from '@/lib/logger'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import type { MusicInfo, QualityType } from '@/lib/types/music'
@@ -81,11 +82,13 @@ export async function handleStream(request: NextRequest): Promise<Response> {
     await audioServe.ensureInitialized()
 
     const cacheKey = `${musicInfo.source}:${musicInfo.songmid}:${quality}`
-    const upstreamUrlResolver = async (): Promise<string> => {
+    const upstreamUrlResolver: UpstreamUrlResolver = async (excludeProviders) => {
       if (!musicSourceManager.isInitialized()) {
         await musicSourceManager.initialize()
       }
-      return musicSourceManager.getMusicUrl(musicInfo as MusicInfo, quality)
+      return musicSourceManager.getMusicUrlWithProvider(musicInfo as MusicInfo, quality, {
+        excludeProviders,
+      })
     }
 
     const rangeHeader = request.headers.get('range')

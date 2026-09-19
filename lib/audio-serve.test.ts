@@ -45,6 +45,7 @@ vi.mock('@/lib/logger', () => ({
 
 const { audioServe, _resetAudioServeConfigForTest } = await import('@/lib/audio-serve')
 const { prisma } = await import('@/lib/db')
+type UpstreamUrlResolver = import('@/lib/audio-serve').UpstreamUrlResolver
 
 // --- 辅助 --------------------------------------------------------------------
 
@@ -256,6 +257,148 @@ describe('AudioServe.serve() 缓存 miss → 跟随交付', () => {
     expect(b2.byteLength).toBe(total)
     expect(Buffer.from(b1).equals(expected)).toBe(true)
     expect(Buffer.from(b2).equals(expected)).toBe(true)
+  })
+})
+
+// ===========================================================================
+// 假地址识别与换源重试（3a）
+// ===========================================================================
+
+describe('AudioServe.serve() 假地址识别与换源重试', () => {
+  /** 合法音频载荷（ID3 头 + 填充字节，能通过容器嗅探） */
+  const AUDIO = Buffer.concat([Buffer.from('ID3\x03\x00'), Buffer.alloc(4096, 0x42)])
+  const HTML = '<!DOCTYPE html><html><body>需要开通VIP</body></html>'
+
+  function payloadResponse(data: Buffer | string, ct: string): Response {
+    const body = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf-8')
+    return new Response(new Uint8Array(body), {
+      status: 200,
+      headers: { 'content-type': ct, 'content-length': String(body.length) },
+    })
+  }
+
+  it('上游返回 HTML 假地址 → 排除该音源重新解析，第二个源成功（客户端无感知）', async () => {
+    const fetchUrls: string[] = []
+    const seenExcludes: string[][] = []
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      fetchUrls.push(url)
+      return url.includes('bad.example')
+        ? payloadResponse(HTML, 'text/html')
+        : payloadResponse(AUDIO, 'audio/mpeg')
+    }) as unknown as typeof fetch
+
+    const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders => {
+      seenExcludes.push([...excludeProviders])
+      return excludeProviders.has('坏源A')
+        ? { url: 'https://good.example/a.mp3', provider: '好源B' }
+        : { url: 'https://bad.example/a.mp3', provider: '坏源A' }
+    }
+
+    const onCached = vi.fn(async () => {})
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:fake1:320k',
+      upstreamUrlResolver,
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+      onCached,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(fetchUrls).toHaveLength(2)
+    expect(fetchUrls[1]).toContain('good.example')
+    expect(seenExcludes[1]).toContain('坏源A')
+    // 交付的是第二个源的真实字节，且正常缓存 + 入库
+    expect(Buffer.from(await resp.arrayBuffer()).equals(AUDIO)).toBe(true)
+    expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1)
+    expect(onCached).toHaveBeenCalledTimes(1)
+  })
+
+  it('上游 404 → 同样换源重试（坏链路不再挡路）', async () => {
+    const fetchUrls: string[] = []
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      fetchUrls.push(url)
+      if (url.includes('dead.example')) return new Response('gone', { status: 404 })
+      return payloadResponse(AUDIO, 'audio/mpeg')
+    }) as unknown as typeof fetch
+
+    const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders =>
+      excludeProviders.has('挂源')
+        ? { url: 'https://good.example/b.mp3', provider: '好源B' }
+        : { url: 'https://dead.example/b.mp3', provider: '挂源' }
+
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:fake2:320k',
+      upstreamUrlResolver,
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(fetchUrls).toHaveLength(2)
+    expect(fetchUrls[1]).toContain('good.example')
+  })
+
+  it('所有音源都返回假地址 → 尝试 1+maxFakeRetries 次后失败（502，不落库）', async () => {
+    const fetchSpy = vi.fn(async () => payloadResponse(HTML, 'text/html'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:fake3:320k',
+      upstreamUrlResolver: async () => ({ url: 'https://bad.example/c.mp3', provider: '坏源' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(resp.status).toBe(502)
+    expect(fetchSpy).toHaveBeenCalledTimes(3)
+    expect(prisma.audioCache.upsert).not.toHaveBeenCalled()
+  })
+
+  it('resolver 只回传裸地址（provider 未知）→ 无法排除重试，一次失败即终止', async () => {
+    const fetchSpy = vi.fn(async () => payloadResponse(HTML, 'text/html'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:fake4:320k',
+      upstreamUrlResolver: async () => 'https://bad.example/d.mp3',
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(resp.status).toBe(502)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('unverified 载荷（声称 audio 但字节是未知容器）→ 正常交付 + 进缓存，但不触发入库', async () => {
+    // 实测坏文件的首块特征：高熵、无控制字符外特征、非文本开头 → unverified
+    const body = Buffer.concat([
+      Buffer.from('\x15W\n"N76ZqTHbxw\x9c\xd9\xdc', 'latin1'),
+      Buffer.alloc(4096, 0x07),
+    ])
+    globalThis.fetch = vi.fn(async () =>
+      payloadResponse(body, 'audio/mpeg')
+    ) as unknown as typeof fetch
+
+    const onCached = vi.fn(async () => {})
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:suspect1:320k',
+      upstreamUrlResolver: async () => ({ url: 'https://weird.example/e.mp3', provider: '怪源' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+      onCached,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(body)).toBe(true)
+    expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1) // 仍进缓存
+    expect(onCached).not.toHaveBeenCalled() // 但不入永久库
   })
 })
 

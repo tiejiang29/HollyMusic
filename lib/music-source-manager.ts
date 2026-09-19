@@ -294,8 +294,26 @@ class MusicSourceManager {
     requestedQuality: QualityType = '320k',
     ctx?: { toggle?: SourceToggleInfo | null }
   ): Promise<string> {
+    return (await this.getMusicUrlWithProvider(musicInfo, requestedQuality, ctx)).url
+  }
+
+  /**
+   * 同 getMusicUrl，但同时回传命中的音源名（provider）。
+   *
+   * 用途：调用方（audio-serve）在下载阶段发现上游返回的是 HTML/JSON 假地址时，
+   * 需要知道「是哪个音源给的」，才能把它排除后重新解析（见 excludeProviders）。
+   */
+  async getMusicUrlWithProvider(
+    musicInfo: MusicInfo,
+    requestedQuality: QualityType = '320k',
+    ctx?: { toggle?: SourceToggleInfo | null; excludeProviders?: ReadonlySet<string> }
+  ): Promise<{ url: string; provider: string | null }> {
     try {
-      return await this._getMusicUrlSamePlatform(musicInfo, requestedQuality)
+      return await this._getMusicUrlSamePlatform(
+        musicInfo,
+        requestedQuality,
+        ctx?.excludeProviders
+      )
     } catch (err) {
       // 同平台全部失败 → 尝试跨平台换源（仅一次，替代版本失败不再递归）
       if (!musicInfo.name) throw err
@@ -304,7 +322,11 @@ class MusicSourceManager {
       )
       const alternative = await findBestAlternative(musicInfo)
       if (!alternative) throw err
-      const url = await this._getMusicUrlSamePlatform(alternative, requestedQuality)
+      const result = await this._getMusicUrlSamePlatform(
+        alternative,
+        requestedQuality,
+        ctx?.excludeProviders
+      )
       if (ctx) {
         ctx.toggle = {
           from: musicInfo.source,
@@ -313,7 +335,7 @@ class MusicSourceManager {
           singer: alternative.singer,
         }
       }
-      return url
+      return result
     }
   }
 
@@ -321,8 +343,13 @@ class MusicSourceManager {
    * 获取音乐 URL（智能降级）——原同平台瀑布逻辑
    * 依次尝试所有音源，支持音质降级
    * 支持配置文件热重载
+   * @param excludeProviders 需跳过的音源名（上层已证实其返回假地址，见 audio-serve）
    */
-  private async _getMusicUrlSamePlatform(musicInfo: MusicInfo, requestedQuality: QualityType = '320k'): Promise<string> {
+  private async _getMusicUrlSamePlatform(
+    musicInfo: MusicInfo,
+    requestedQuality: QualityType = '320k',
+    excludeProviders?: ReadonlySet<string>
+  ): Promise<{ url: string; provider: string | null }> {
     // 在获取 URL 时检查配置是否变更
     if (this.initialized && this.checkConfigChanged()) {
       logger.info('配置文件已变更，重新加载音源...')
@@ -362,6 +389,12 @@ class MusicSourceManager {
 
     // 尝试所有音源和音质组合
     outer: for (const instance of availableInstances) {
+      // 上层已证实该音源返回假地址（HTML/JSON/垃圾字节）→ 本次解析跳过，
+      // 避免「换源后又被同一个坏源挡住」（见 audio-serve 的重试逻辑）
+      if (excludeProviders?.has(instance.config.name)) {
+        logger.debug(`跳过已排除音源: ${instance.config.name}`)
+        continue
+      }
       // pt 优先：用户配置的 pt 未包含该平台则跳过（即使脚本声明支持）
       if (!this.isAllowedByPt(instance, musicInfo.source)) {
         continue
@@ -418,7 +451,7 @@ class MusicSourceManager {
             logger.info(
               `获取成功: ${instance.config.name} - ${quality} - ${musicInfo.name}`
             )
-            return url
+            return { url, provider: instance.config.name }
           }
         } catch (error) {
           logger.debug(

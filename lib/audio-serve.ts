@@ -27,11 +27,31 @@ import { EventEmitter } from 'events'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { checkTrialAudio } from '@/lib/server/audio-integrity'
+import { judgeUpstreamPayload } from '@/lib/server/audio-sniff'
 import {
   getLyricSidecarPath,
   getTranslationLyricSidecarPath,
   isLyricSidecarPath,
 } from '@/lib/server/lyric-cache'
+
+// ============================================================================
+// 上游 URL 解析契约
+// ============================================================================
+
+/** 一次解析的产物：地址 + 命中的音源名（用于假地址时排除重试） */
+export interface ResolvedUpstream {
+  url: string
+  /** 提供该地址的音源名（provider）；未知传 null */
+  provider: string | null
+}
+
+/**
+ * 上游 URL 解析器。
+ *
+ * 返回裸字符串时视为「provider 未知」，此时假地址无法排除重试（只换音质重试）。
+ * 需要精确排除坏源时返回 ResolvedUpstream（见 music-source-manager.getMusicUrlWithProvider）。
+ */
+export type UpstreamUrlResolver = (excludeProviders: ReadonlySet<string>) => Promise<string | ResolvedUpstream>
 
 // ============================================================================
 // 配置
@@ -156,6 +176,12 @@ interface InflightEntry {
   error: Error | null
   /** 进度事件总线 */
   emitter: EventEmitter
+  /**
+   * 首块载荷判定结果（openUpstream 写入）。
+   * 供 post-cache 任务（边听边下入库）判断该文件是否可信——
+   * `unverified` 的文件可正常播放但不应进永久音乐库。
+   */
+  payloadVerdict: 'audio' | 'unverified' | null
 }
 
 class AudioServe {
@@ -175,6 +201,13 @@ class AudioServe {
   private readonly verifiedKeys = new Set<string>()
   /** verifiedKeys 上限：超过后整体清空（粗粒度防泄漏，重新校验一遍代价可接受） */
   private static readonly VERIFIED_KEYS_LIMIT = 10_000
+  /**
+   * 假地址换源重试上限（不含首次尝试）。
+   * 上游返回 HTML/JSON/垃圾字节时，排除该音源重新解析——这类地址会被当成
+   * 「成功」遮蔽后续可用音源（见 lib/server/audio-sniff.ts 的说明）。
+   * 上限 2 次，避免坏源连锁时把客户端等待时间拖长。
+   */
+  private readonly maxFakeRetries = readInt('AUDIO_FAKE_URL_RETRIES', 2, 0)
   /** 初始化幂等 */
   private initPromise: Promise<void> | null = null
 
@@ -223,7 +256,7 @@ class AudioServe {
    */
   async serve(opts: {
     cacheKey: string
-    upstreamUrlResolver: () => Promise<string>
+    upstreamUrlResolver: UpstreamUrlResolver
     rangeHeader: string | null
     isHead: boolean
     intervalSec: number
@@ -234,7 +267,8 @@ class AudioServe {
 
     // 总开关关闭 → 流式透传（不缓存、不支持 seek）
     if (!cfg.enabled) {
-      const url = await opts.upstreamUrlResolver()
+      const resolved = await opts.upstreamUrlResolver(new Set())
+      const url = typeof resolved === 'string' ? resolved : resolved.url
       return this.passthroughUpstream(url, opts.rangeHeader)
     }
 
@@ -398,7 +432,7 @@ class AudioServe {
 
   private async startDownload(
     cacheKey: string,
-    upstreamUrlResolver: () => Promise<string>,
+    upstreamUrlResolver: UpstreamUrlResolver,
     intervalSec: number,
     onCached?: () => Promise<void>
   ): Promise<InflightEntry> {
@@ -411,6 +445,7 @@ class AudioServe {
       done: false,
       error: null,
       emitter: new EventEmitter(),
+      payloadVerdict: null,
     }
     this.inflight.set(cacheKey, entry)
 
@@ -431,53 +466,20 @@ class AudioServe {
   private async runDownload(
     cacheKey: string,
     entry: InflightEntry,
-    upstreamUrlResolver: () => Promise<string>,
+    upstreamUrlResolver: UpstreamUrlResolver,
     intervalSec: number,
     onCached?: () => Promise<void>
   ): Promise<void> {
     let stallTimer: NodeJS.Timeout | null = null
     try {
-      // ① URL 解析：洛雪脚本挂起时不再永久卡死（inflight entry 也不残留）
-      const url = await this.withTimeout(
-        upstreamUrlResolver(),
-        this.resolveTimeoutMs,
-        '解析上游 URL 超时',
-      )
-      const controller = new AbortController()
-      stallTimer = setTimeout(() => controller.abort(), this.fetchTimeoutMs)
-      if (stallTimer.unref) stallTimer.unref()
+      // ① 打开上游：解析 URL → fetch → 读首块 → 嗅探载荷真伪。
+      //    命中假地址（HTML/JSON/垃圾字节）时排除该音源重新解析——这一步
+      //    发生在 entry.size 置位之前，客户端响应尚未构造，换源对其无感知。
+      const opened = await this.openUpstream(cacheKey, entry, upstreamUrlResolver)
+      stallTimer = opened.stallTimer
       // stall 超时覆盖 fetch header + body 全程：每次有新数据进展就续期
       const refreshTimer = () => stallTimer?.refresh()
-
-      let resp: Response
-      try {
-        resp = await fetch(url, {
-          signal: controller.signal,
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        })
-      } catch (e) {
-        throw e
-      }
-      // fetch 返回后 stallTimer 保留，继续覆盖 body 读取阶段
-      refreshTimer()
-
-      if (!resp.ok) {
-        throw new Error(`upstream ${resp.status} ${resp.statusText}`)
-      }
-
-      const cl = resp.headers.get('content-length')
-      const size = cl ? parseInt(cl, 10) : NaN
-      entry.contentType = resp.headers.get('content-type')
-
-      // 无 Content-Length → 无法缓存，直接 passthrough 给首个客户端
-      // 但本设计的 serve() 走的是「全部从磁盘读」语义，不支持 passthrough 分支
-      // 故这里把 body 消费掉 + 把 entry 标记成 error，让调用方走 503 重试逻辑
-      // （极端情况，上游 API 一般都返回 CL）
-      if (!Number.isFinite(size) || size <= 0) {
-        // 消费 body 释放连接
-        await resp.body?.cancel().catch(() => {})
-        throw new Error('上游未返回 Content-Length，无法缓存（建议启用透传模式）')
-      }
+      const { reader, firstChunk, size } = opened
 
       entry.size = size
       entry.paths = resolvePaths(cacheKey, entry.contentType)
@@ -489,21 +491,28 @@ class AudioServe {
 
       // 边下边写盘（错误路径销毁句柄并清半成品，避免 Windows 文件锁与孤儿文件删不掉）
       const writeStream = fs.createWriteStream(entry.paths.filePath)
+
+      // 写一块 + 推进进度（首块与后续块共用）
+      const writeChunk = async (chunk: Uint8Array): Promise<void> => {
+        refreshTimer()
+        await new Promise<void>((resolve, reject) => {
+          writeStream.write(chunk, err => (err ? reject(err) : resolve()))
+        })
+        entry.downloadedBytes += chunk.length
+        entry.emitter.emit('progress', entry.downloadedBytes)
+      }
+
       try {
-        const reader = resp.body?.getReader()
         if (!reader) throw new Error('upstream body empty')
 
         try {
+          // 首块已在 openUpstream 中读出（用于嗅探），先落盘再继续读剩余块
+          if (firstChunk) await writeChunk(firstChunk)
           for (;;) {
             const { done, value } = await reader.read()
             if (done) break
             // 每收到一块数据就续期 stall 定时器（慢速但持续的下载不误杀）
-            refreshTimer()
-            await new Promise<void>((resolve, reject) => {
-              writeStream.write(value, err => (err ? reject(err) : resolve()))
-            })
-            entry.downloadedBytes += value.length
-            entry.emitter.emit('progress', entry.downloadedBytes)
+            await writeChunk(value)
           }
         } finally {
           await reader.cancel().catch(() => {})
@@ -555,7 +564,16 @@ class AudioServe {
             lastAccessAt: new Date(),
           },
         })
-        this.runPostCacheTask(cacheKey, onCached)
+        // 载荷未经证实（未知容器）→ 只当缓存用，不触发入库等 post-cache 任务。
+        // 缓存命中路径完全不查源，坏文件留在缓存里影响有限且会随 LRU 淘汰；
+        // 而永久音乐库优先于在线源且无自愈路径（见 music-library），不能进。
+        if (entry.payloadVerdict === 'audio') {
+          this.runPostCacheTask(cacheKey, onCached)
+        } else {
+          logger.warn(
+            `[AudioServe] 载荷未证实，跳过入库等缓存后任务: ${cacheKey}（文件保留为缓存）`
+          )
+        }
       }
 
       entry.done = true
@@ -582,6 +600,127 @@ class AudioServe {
     void task().catch(error => {
       logger.warn(`[AudioServe] 缓存后任务失败 ${cacheKey}:`, error)
     })
+  }
+
+  // --------------------------------------------------------------------------
+  // 上游打开（解析 → fetch → 首块嗅探 → 假地址换源重试）
+  // --------------------------------------------------------------------------
+
+  /**
+   * 打开上游并返回可读流 + 首块字节。
+   *
+   * 关键点：**在 entry.size 置位之前完成载荷嗅探**。假地址（HTML/JSON/垃圾字节）
+   * 在此阶段被识别并排除该音源重新解析——因为客户端响应要等 waitForReadiness
+   * （size 非空）才构造，换源对客户端完全无感知，也不会交付错误字节。
+   *
+   * 判定为 `unverified`（未知容器但非文本）时按可交付处理：可能是罕见容器，
+   * 交给播放器判断；但这类文件不会进永久音乐库（见 music-library 的入库门槛）。
+   */
+  private async openUpstream(
+    cacheKey: string,
+    entry: InflightEntry,
+    upstreamUrlResolver: UpstreamUrlResolver,
+  ): Promise<{
+    reader: ReadableStreamDefaultReader<Uint8Array> | null
+    firstChunk: Uint8Array | null
+    size: number
+    stallTimer: NodeJS.Timeout
+  }> {
+    const excluded = new Set<string>()
+    let attempt = 0
+
+    for (;;) {
+      // ① URL 解析：洛雪脚本挂起时不再永久卡死（inflight entry 也不残留）
+      const resolved = await this.withTimeout(
+        upstreamUrlResolver(excluded),
+        this.resolveTimeoutMs,
+        '解析上游 URL 超时',
+      )
+      const url = typeof resolved === 'string' ? resolved : resolved.url
+      const provider = typeof resolved === 'string' ? null : resolved.provider
+
+      const controller = new AbortController()
+      const stallTimer = setTimeout(() => controller.abort(), this.fetchTimeoutMs)
+      if (stallTimer.unref) stallTimer.unref()
+
+      let resp: Response
+      try {
+        resp = await fetch(url, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        })
+      } catch (e) {
+        clearTimeout(stallTimer)
+        throw e
+      }
+
+      // 非 2xx 属上游侧失败：换源重试（此前直接抛错，慢源会一直挡路）
+      if (!resp.ok) {
+        await resp.body?.cancel().catch(() => {})
+        clearTimeout(stallTimer)
+        if (provider && attempt < this.maxFakeRetries) {
+          attempt++
+          excluded.add(provider)
+          logger.warn(
+            `[AudioServe] 上游返回 ${resp.status}，换源重试（排除 ${provider}）: ${cacheKey}`
+          )
+          continue
+        }
+        throw new Error(`upstream ${resp.status} ${resp.statusText}`)
+      }
+
+      const cl = resp.headers.get('content-length')
+      const size = cl ? parseInt(cl, 10) : NaN
+      const contentType = resp.headers.get('content-type')
+
+      // 无 Content-Length → 无法缓存（消费 body 释放连接后走错误路径）
+      if (!Number.isFinite(size) || size <= 0) {
+        await resp.body?.cancel().catch(() => {})
+        clearTimeout(stallTimer)
+        throw new Error('上游未返回 Content-Length，无法缓存（建议启用透传模式）')
+      }
+
+      // ② 读首块用于嗅探（后续块在 runDownload 中继续读同一个 reader）
+      const reader = resp.body?.getReader() ?? null
+      if (!reader) {
+        clearTimeout(stallTimer)
+        throw new Error('upstream body empty')
+      }
+
+      let firstChunk: Uint8Array | null = null
+      const first = await reader.read()
+      if (!first.done && first.value) firstChunk = first.value
+
+      const judgment = judgeUpstreamPayload({ contentType, head: firstChunk })
+
+      if (judgment.verdict === 'reject') {
+        await reader.cancel().catch(() => {})
+        clearTimeout(stallTimer)
+        if (provider && attempt < this.maxFakeRetries) {
+          attempt++
+          excluded.add(provider)
+          logger.warn(
+            `[AudioServe] 假地址换源重试（排除 ${provider}）: ${cacheKey} — ${judgment.reason}`
+          )
+          continue
+        }
+        logger.warn(
+          `[AudioServe] 上游返回非音频内容（无可换音源）: ${cacheKey} — ${judgment.reason}`
+        )
+        throw new Error(`上游返回非音频内容：${judgment.reason}`)
+      }
+
+      if (judgment.verdict === 'unverified') {
+        // 可交付但不可信：可能是罕见容器，也可能是伪装成音频的垃圾数据
+        logger.warn(
+          `[AudioServe] 上游载荷无法识别（按可交付处理，不落永久库）: ${cacheKey} — ${judgment.reason}`
+        )
+      }
+
+      entry.contentType = contentType
+      entry.payloadVerdict = judgment.verdict === 'audio' ? 'audio' : 'unverified'
+      return { reader, firstChunk, size, stallTimer }
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1222,4 +1361,8 @@ export async function deleteOrphanFiles(
 // 惰性初始化触发（首次 import 时排队，route 调用 ensureInitialized 再等待）
 // ============================================================================
 
-void audioServe.ensureInitialized()
+// 惰性初始化：此处的 void 是不等它完成（route 会 await ensureInitialized），
+// 但必须挂 catch —— 磁盘配额统计/缓存清理失败若抛成未处理拒绝，Node 会直接终止进程
+void audioServe.ensureInitialized().catch((err) => {
+  logger.error('[audio-serve] 初始化失败（route 首次调用会重试）:', err)
+})

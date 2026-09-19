@@ -26,6 +26,7 @@ import { musicSourceManager } from '@/lib/music-source-manager'
 import type { QualityType } from '@/lib/types/music'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import { audioServe } from '@/lib/audio-serve'
+import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { getAuthState } from '@/lib/services/user-context'
 import { verifyShareAudioToken } from '@/lib/services/auth'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
@@ -80,11 +81,12 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
 
     // URL resolver 下沉到 audioServe 内部：只在真正 miss 时调用一次。
     // 已缓存 / 进行中的请求完全不触发 URL 解析（解决重复打上游问题）。
-    const upstreamUrlResolver = async (): Promise<string> => {
+    // 回传 provider：audioServe 发现假地址时可排除该音源重新解析。
+    const upstreamUrlResolver: UpstreamUrlResolver = async (excludeProviders) => {
       if (!musicSourceManager.isInitialized()) {
         await musicSourceManager.initialize()
       }
-      return musicSourceManager.getMusicUrl(musicInfo, quality)
+      return musicSourceManager.getMusicUrlWithProvider(musicInfo, quality, { excludeProviders })
     }
 
     return await audioServe.serve({
