@@ -285,3 +285,53 @@ model RecentContext {
   @@unique([username, itemType, itemId])
   @@index([username, playedAt])
 }
+
+/// 周测批次：一行一次运行。重启后靠它判断"上次什么时候测过、要不要补跑"。
+model SourceProbeRun {
+  id         Int       @id @default(autoincrement())
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  /// 'schedule'（定时器/补跑）| 'manual'（面板按钮）
+  trigger    String
+  /// 'running' | 'done' | 'failed'
+  status     String    @default("running")
+  /// 本批计划探测的格子数与实际探测数（跳过的不计）
+  total      Int       @default(0)
+  probed     Int       @default(0)
+  okCount    Int       @default(0)
+  badCount   Int       @default(0)
+  /// 本批用的基准样本快照（平台 → 曲目），让跨批次结果可比、也能事后复现
+  samples    String?
+  /// 失败原因或备注
+  detail     String?
+
+  @@index([startedAt])
+}
+
+/// 周测单格结果（append-only：一个 源×平台×曲目 一行，按 runAt 取最近一次）。
+///
+/// 与内存账本（lib/server/source-health.ts）的关系：账本记"真实流量上发生了什么"，
+/// 重启即清零；本表记"主动探测发生了什么"，用来在冷启动时给账本注入先验，否则
+/// 3c 每次重启都是全盲的（实测：面板上只有 1/31 格有数据）。
+model SourceProbeResult {
+  id        Int      @id @default(autoincrement())
+  /// 所属批次开始时间（同一批共享，便于按批聚合与清理）
+  runAt     DateTime
+  /// 音源名，与账本键口径一致（config.name || path）
+  source    String
+  platform  String
+  songmid   String
+  quality   String
+  /// ok | no-address | timeout | error | ssrf | fake | http-error | unverified | head-error
+  outcome   String
+  /// 取址耗时（首块阶段不计入，单列在 reason 里说明）
+  latencyMs Int?
+  /// 人类可读的坏因（面板 title 直接展示）
+  reason    String?
+  /// 首块魔数认出的容器（mp3/flac/mp4…），用于观察各源真实回的是什么
+  container String?
+  createdAt DateTime @default(now())
+
+  @@index([source, platform, runAt])
+  @@index([runAt])
+}

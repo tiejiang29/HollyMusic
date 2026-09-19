@@ -18,6 +18,10 @@ export async function register() {
   const { startCoverBackfillScheduler } = await import('@/lib/services/cover-backfill')
   startCoverBackfillScheduler()
 
+  // 音源周测不挂在这里：它要写的是**取址侧那份**内存账本（3c 的跳过依据），而 Next 给
+  // instrumentation 单独一套 lib 模块副本，从这边写进去路由读不到。改由
+  // MusicSourceManager.initialize() 末尾拉起，见 lib/music-source-manager.ts 的 wireSourceProbe。
+
   // 首页「大家都在听」预热：trending 虽有 10 分钟内存缓存，但重启即空，冷启动首开
   // 要现场拉五平台热歌榜（秒级）。启动 5 秒后后台拉一次填掉第一跳——topPerSource=20
   // 与 Web/App 默认请求参数一致（缓存键含该值）；失败静默，getTrending 对空结果不缓存，

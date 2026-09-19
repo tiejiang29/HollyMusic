@@ -12,6 +12,7 @@ import {
   ForbiddenError,
 } from '@/lib/services/user-context'
 import { addSource, listSourcesWithStatus } from '@/lib/services/source-manager-service'
+import { attachProbeVerdicts, probeEnabled, probeStatus } from '@/lib/services/source-probe'
 import { logger } from '@/lib/logger'
 
 function guard(err: unknown) {
@@ -27,7 +28,10 @@ export async function GET(request: NextRequest) {
   try {
     await requireAdmin(request)
     const list = await listSourcesWithStatus()
-    return createSuccessResponse({ list })
+    // 周测结论与批次状态一起带回，面板不必再发第二个请求
+    await attachProbeVerdicts(list)
+    const probe = probeEnabled() ? await probeStatus() : { running: false, last: null, disabled: true }
+    return createSuccessResponse({ list, probe })
   } catch (err) {
     const g = guard(err)
     if (g) return g

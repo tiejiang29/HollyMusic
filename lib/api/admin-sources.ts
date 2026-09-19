@@ -5,15 +5,42 @@
 import { apiGet, apiPost, apiPut, apiDelete } from './client'
 import type { SourceConfig } from '@/lib/types/music'
 import type { SourceHealthView } from '@/lib/server/source-health'
+import type { SourceProbeVerdict } from '@/lib/services/source-manager-service'
 
 export interface AdminSource extends SourceConfig {
   scriptExists: boolean
   /** 运行实测健康度（内存账本，按平台分别；重启清零） */
   health?: SourceHealthView[]
+  /** 最近一次周测的结论（落库，跨重启） */
+  probe?: SourceProbeVerdict[]
 }
 
-export function listSources(): Promise<{ list: AdminSource[] }> {
-  return apiGet<{ list: AdminSource[] }>('admin/sources')
+export interface ProbeRunStatus {
+  id: number
+  startedAt: string
+  finishedAt: string | null
+  trigger: string
+  status: string
+  total: number
+  probed: number
+  okCount: number
+  badCount: number
+  detail: string | null
+}
+
+export interface ProbeStatus {
+  running: boolean
+  last: ProbeRunStatus | null
+  disabled?: boolean
+}
+
+export function listSources(): Promise<{ list: AdminSource[]; probe?: ProbeStatus }> {
+  return apiGet<{ list: AdminSource[]; probe?: ProbeStatus }>('admin/sources')
+}
+
+/** 立刻跑一批周测（服务端异步执行，靠 listSources 的 probe 字段轮询进度） */
+export function startSourceProbe(): Promise<{ started: boolean }> {
+  return apiPost<{ started: boolean }>('admin/sources/probe', {})
 }
 
 export function createSource(opts: {

@@ -267,6 +267,24 @@ class SourceHealthLedger {
     return true
   }
 
+  /**
+   * 用外部证据（周测）注入冷却先验，让刚重启、账本全空的进程也知道"上次主动探测说这格是坏的"。
+   *
+   * 只设冷却 + 一条标明出处的坏样本，不伪造成功样本：真实流量的证据必须是自己的，否则面板上
+   * "窗口 N 次：出货 x"就成了假数。到期后照常放半开，一次真实成功即彻底恢复——先验判错最多
+   * 浪费一首歌。已经有实测冷却在跑时不覆盖（先验不该比实测更悲观）。
+   */
+  seedCooldown(source: string, platform: string, opts: { hangLike: boolean; reason: string }): void {
+    if (!source || this.inOutage()) return
+    const st = this.touch(source, platform)
+    const now = Date.now()
+    if (st.coolUntil > now) return
+    this.push(st, { t: now, bad: true, ms: null, kind: 'probe-inherited', reason: opts.reason })
+    st.coolUntil = now + (opts.hangLike ? COOL_BASE_HANG_MS : COOL_BASE_FAST_MS)
+    st.backoffs = 0
+    st.probeStartedAt = null
+  }
+
   /** 本机网络疑似故障：此后 OUTAGE_MS 内不记坏。返回是否真的进入了豁免窗 */
   markNetworkOutage(ms = OUTAGE_MS): boolean {
     const until = Date.now() + ms

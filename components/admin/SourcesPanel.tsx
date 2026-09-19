@@ -13,12 +13,15 @@ import {
   importSourceSubscription,
   uploadScript,
   updateSourceSubscription,
+  startSourceProbe,
   type AdminSource,
+  type ProbeStatus,
 } from '@/lib/api/admin-sources'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import type { SourceHealthView } from '@/lib/server/source-health'
-import { Plus, Pencil, Trash2, Music, X, Loader2, Upload, AlertCircle, CheckCircle2, FileWarning, RefreshCw, Rss } from 'lucide-react'
+import type { SourceProbeVerdict } from '@/lib/services/source-manager-service'
+import { Plus, Pencil, Trash2, Music, X, Loader2, Upload, AlertCircle, CheckCircle2, FileWarning, RefreshCw, Rss, Radar } from 'lucide-react'
 
 const PLATFORMS = ['tx', 'wy', 'kw', 'kg', 'mg'] as const
 const PLATFORM_LABELS: Record<string, string> = {
@@ -119,6 +122,59 @@ export function HealthCell({ health, pt }: { health?: SourceHealthView[]; pt?: s
   )
 }
 
+/** 周测结论标签：口径与「健康」列不同——这里是主动探测说的，不是真实用户身上发生的 */
+const PROBE_OUTCOME_LABEL: Record<string, string> = {
+  ok: '出货',
+  'no-address': '无地址',
+  timeout: '挂起',
+  error: '报错',
+  ssrf: '私网地址',
+  fake: '假地址',
+  'http-error': 'HTTP错',
+  'head-error': '取不到字节',
+  unverified: '认不出',
+  unsupported: '不适用',
+}
+const PROBE_BAD = new Set(['timeout', 'error', 'ssrf', 'fake', 'http-error', 'head-error'])
+
+function formatAgo(ms: number): string {
+  const min = Math.max(0, Math.round((Date.now() - ms) / 60_000))
+  if (min < 60) return `${min} 分钟前`
+  const hour = Math.round(min / 60)
+  if (hour < 48) return `${hour} 小时前`
+  return `${Math.round(hour / 24)} 天前`
+}
+
+export function ProbeCell({ probe }: { probe?: SourceProbeVerdict[] }) {
+  // 从没测过 ≠ 坏：周测可以手动关（SOURCE_PROBE_ENABLED=0），也可以只是还没到第一轮
+  if (!probe || probe.length === 0) {
+    return <span className="text-xs text-muted-foreground">未测过</span>
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {probe.map(v => (
+        <span
+          key={v.platform}
+          title={
+            `${PLATFORM_LABELS[v.platform] || v.platform}｜周测（${formatAgo(v.runAt)}）结局 ${PROBE_OUTCOME_LABEL[v.outcome] || v.outcome}` +
+            `｜取址 ${v.latencyMs ?? '-'}ms` +
+            (v.reason ? `｜${v.reason}` : '')
+          }
+          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+            v.outcome === 'ok'
+              ? 'bg-green-500/15 text-green-600'
+              : PROBE_BAD.has(v.outcome)
+                ? 'bg-red-500/15 text-red-600'
+                : 'bg-muted text-muted-foreground'
+          }`}
+        >
+          {PLATFORM_LABELS[v.platform] || v.platform} {PROBE_OUTCOME_LABEL[v.outcome] || v.outcome}
+        </span>
+      ))}
+    </div>
+  )
+}
+
 type DialogMode =
   | { kind: 'create' }
   | { kind: 'edit'; source: AdminSource }
@@ -134,24 +190,51 @@ export function SourcesPanel() {
   const [subscribing, setSubscribing] = useState(false)
   const [updatingSubscriptionPath, setUpdatingSubscriptionPath] = useState<string | null>(null)
   const [uploadMsg, setUploadMsg] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const [probe, setProbe] = useState<ProbeStatus | null>(null)
+  const [startingProbe, setStartingProbe] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const reload = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  const reload = useCallback(async (opts: { quiet?: boolean } = {}) => {
+    // quiet：轮询用。不关掉 loading 的话每 5 秒整张表闪一次骨架屏
+    if (!opts.quiet) {
+      setLoading(true)
+      setError(null)
+    }
     try {
-      const { list } = await listSources()
+      const { list, probe: probeStatus } = await listSources()
       setSources(list)
+      if (probeStatus) setProbe(probeStatus)
     } catch (e) {
-      setError(e instanceof Error ? e.message : '加载失败')
+      if (!opts.quiet) setError(e instanceof Error ? e.message : '加载失败')
     } finally {
-      setLoading(false)
+      if (!opts.quiet) setLoading(false)
     }
   }, [])
 
   useEffect(() => {
     reload()
   }, [reload])
+
+  // 一批周测要跑几分钟（全矩阵串行 + 每格拉一次首块），运行中每 5 秒轻量刷一次，跑完自动停
+  const probeRunning = !!probe?.running
+  useEffect(() => {
+    if (!probeRunning) return
+    const timer = setInterval(() => { void reload({ quiet: true }) }, 5_000)
+    return () => clearInterval(timer)
+  }, [probeRunning, reload])
+
+  const handleProbe = async () => {
+    setStartingProbe(true)
+    try {
+      await startSourceProbe()
+      setUploadMsg({ kind: 'success', text: '周测已启动（全矩阵串行探测，一般 1-2 分钟），跑完这一列会自动刷新' })
+      await reload({ quiet: true })
+    } catch (e) {
+      setUploadMsg({ kind: 'error', text: e instanceof Error ? e.message : '启动周测失败' })
+    } finally {
+      setStartingProbe(false)
+    }
+  }
 
   const handleUpload = async (file: File) => {
     setUploading(true)
@@ -248,8 +331,28 @@ export function SourcesPanel() {
             音源管理
           </h2>
           <p className="text-sm text-muted-foreground">管理自定义音源脚本与配置</p>
+          {probe?.last && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              上次周测：{formatAgo(new Date(probe.last.startedAt).getTime())} ·
+              出货 {probe.last.okCount}/{probe.last.probed} · 坏 {probe.last.badCount}
+              {probe.last.status === 'failed' && ` · 本批失败：${probe.last.detail || '未知原因'}`}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={handleProbe}
+            disabled={startingProbe || probeRunning || !!probe?.disabled}
+            title={
+              probe?.disabled
+                ? '周测已被 SOURCE_PROBE_ENABLED=0 关闭'
+                : '主动跑一遍「源 × 平台」全矩阵：逐源取址 + 拉首块验真伪，结果落库，并作为进程重启后 3c 的先验'
+            }
+            className="flex items-center gap-1 rounded-full border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-accent disabled:opacity-50"
+          >
+            {startingProbe || probeRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Radar className="h-4 w-4" />}
+            {probeRunning ? '周测中…' : '立即周测'}
+          </button>
           <button
             onClick={() => setSubscriptionDialogOpen(true)}
             className="flex items-center gap-1 rounded-full border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-accent"
@@ -322,6 +425,12 @@ export function SourcesPanel() {
                 >
                   健康
                 </th>
+                <th
+                  className="px-4 py-3 font-medium"
+                  title="最近一次周测（主动全矩阵探测）的结论：落库、跨重启，进程刚起来时 3c 就是靠它知道该跳过谁。与「健康」列口径不同，别混着读"
+                >
+                  周测
+                </th>
                 <th className="px-4 py-3 font-medium">优先级</th>
                 <th className="px-4 py-3 font-medium">平台</th>
                 <th className="px-4 py-3 font-medium">脚本路径</th>
@@ -356,6 +465,9 @@ export function SourcesPanel() {
                   </td>
                   <td className="px-4 py-3">
                     <HealthCell health={s.health} pt={s.pt} />
+                  </td>
+                  <td className="px-4 py-3">
+                    <ProbeCell probe={s.probe} />
                   </td>
                   <td className="px-4 py-3 text-muted-foreground">{s.priority}</td>
                   <td className="px-4 py-3">

@@ -335,6 +335,22 @@ export interface SourceWithStatus extends SourceConfig {
    * health 是真实取址与字节校验跑出来的。来自内存账本，重启即清零。
    */
   health?: SourceHealthView[]
+  /** 最近一次周测（主动全矩阵探测）的结论，按平台分别；库里没记录时缺省 */
+  probe?: SourceProbeVerdict[]
+}
+
+/**
+ * 周测结论的一份快照。与 health 的分工：health 是"真实用户身上发生了什么"（重启清零），
+ * probe 是"上次主动探测说这格怎么样"（落库，跨重启）。两者口径不同，界面上也不能合并。
+ */
+export interface SourceProbeVerdict {
+  platform: string
+  /** ok | no-address | timeout | error | ssrf | fake | http-error | head-error | unverified */
+  outcome: string
+  reason: string | null
+  /** 该批次开始时刻（ms epoch），面板据此说明"什么时候测的" */
+  runAt: number
+  latencyMs: number | null
 }
 
 export async function listSourcesWithStatus(): Promise<SourceWithStatus[]> {

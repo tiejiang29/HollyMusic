@@ -126,6 +126,16 @@ export interface UrlBudgets {
  */
 const MIN_USEFUL_ATTEMPT_MS = 250
 
+/** 周测单源取址的结局（unsupported = 压根不该测这格，不计坏） */
+export type ProbeResolveResult =
+  | { ok: true; url: string; latencyMs: number }
+  | {
+      ok: false
+      outcome: 'timeout' | 'error' | 'ssrf' | 'no-address' | 'unsupported'
+      reason: string
+      latencyMs: number
+    }
+
 function readBudget(envVar: string, fallback: number): number {
   const raw = process.env[envVar]
   if (raw === undefined || raw === '') return fallback
@@ -332,6 +342,25 @@ export class MusicSourceManager {
     logger.info(`音源管理器初始化完成，成功: ${successCount}/${this.instances.length}`)
 
     this.initialized = true
+    // 周测（先验注入 + 每周排期）挂在这里，而不是挂在 instrumentation：Next 给 instrumentation
+    // 单独一套 lib 模块副本，从那边写内存账本路由侧读不到（dev 实测：先验日志说注入了 3 格，
+    // /api/health 始终 cooling:0），而且它那份 manager 单例会再拉起一个 runner 子进程。
+    void this.wireSourceProbe()
+  }
+
+  private probeWired = false
+
+  /** 每进程一次；失败不影响取址——先验只是让冷启动少踩坑，不是取址的前置条件 */
+  private async wireSourceProbe(): Promise<void> {
+    if (this.probeWired) return
+    this.probeWired = true
+    try {
+      const m = await import('@/lib/services/source-probe')
+      await m.seedHealthFromProbe()
+      m.startSourceProbeScheduler()
+    } catch (err) {
+      logger.warn('[source-probe] 先验注入/排期启动失败（不影响取址）:', err)
+    }
   }
 
   /**
@@ -387,6 +416,56 @@ export class MusicSourceManager {
         }
       }
       return result
+    }
+  }
+
+  /**
+   * 周测专用：只让指定音源取一次址，**故意不写健康账本**。
+   *
+   * 为什么不复用 getMusicUrlWithProvider + excludeProviders：
+   * 1. 那条路会把探测结果记进实时账本，3c 于是会拿"探测时的抖动"当真实用户的坏证据；
+   * 2. 瀑布在头源出货后就短路了，根本轮不到被测的源——探测要的是"只有它在场"。
+   */
+  async probeSourceUrl(
+    sourceName: string,
+    musicInfo: MusicInfo,
+    quality: QualityType,
+    timeoutMs: number
+  ): Promise<ProbeResolveResult> {
+    const platform = musicInfo.source
+    const unsupported = (reason: string): ProbeResolveResult => ({ ok: false, outcome: 'unsupported', reason, latencyMs: 0 })
+
+    const instance = this.instances.find(i => i.initialized && i.config.name === sourceName)
+    if (!instance) return unsupported('音源未初始化或已停用')
+    if (!this.isAllowedByPt(instance, platform)) return unsupported(`pt 白名单未包含 ${platform}`)
+    const sourceConfig = instance.sourceInfo?.sources[platform]
+    if (!sourceConfig?.actions.includes('musicUrl')) return unsupported('脚本未声明该平台可取址')
+
+    const started = Date.now()
+    try {
+      const url = await this.withTimeout(
+        instance.simulator.getMusicUrl(platform, musicInfo, quality),
+        timeoutMs,
+        `周测取址 ${sourceName} - ${platform} - ${quality}`,
+      )
+      const latencyMs = Date.now() - started
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        return { ok: false, outcome: 'no-address', reason: '脚本返回空地址', latencyMs }
+      }
+      if (!isTrustworthyUrl(url)) {
+        return { ok: false, outcome: 'ssrf', reason: '返回私网/非 http(s) 地址', latencyMs }
+      }
+      return { ok: true, url, latencyMs }
+    } catch (err) {
+      const latencyMs = Date.now() - started
+      const message = err instanceof Error ? err.message : String(err)
+      // 顶到预算才算挂起，否则是脚本内部报错——与瀑布同一套归因口径
+      return {
+        ok: false,
+        outcome: latencyMs >= timeoutMs ? 'timeout' : 'error',
+        reason: message.slice(0, 120),
+        latencyMs,
+      }
     }
   }
 
