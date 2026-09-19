@@ -112,3 +112,7 @@ preview-dev.log
 /HANDOFF.md
 /docs/ANDROID_API.md
 /docs/PLAYLIST_TAG_MAP.md
+
+# 本地草稿与工具产物（设计稿 / 会话 token 报告），不进仓库
+/my/
+/.qoder-credits/
