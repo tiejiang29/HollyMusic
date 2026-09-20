@@ -161,24 +161,57 @@ describe('runSourceProbe', () => {
 })
 
 describe('pickProbeSamples', () => {
+  /** 造 MusicInfo 行：data 列就是源脚本实际拿到的对象，取址键要放进 data 才有效 */
+  const rowOf = (id: number, source: string, extra: Record<string, unknown> = {}) => ({
+    id, source, songmid: `${source}-${id}`, data: JSON.stringify({ name: `歌${id}`, singer: '歌手', songmid: `${source}-${id}`, ...extra }),
+    name: `歌${id}`, singer: '歌手', durationSeconds: 200, hash: null, copyrightId: null,
+    songId: null, albumId: null, albumMid: null, strMediaMid: null,
+  })
+  const mockRows = (rows: ReturnType<typeof rowOf>[]) => {
+    mocks.prisma.musicInfo.findMany.mockImplementation(async (arg: { where: { id?: { in?: number[] } } }) => {
+      const ids = arg.where.id?.in
+      if (!ids) return []
+      return rows.filter(r => ids.includes(r.id))
+    })
+  }
+
   it('优先用「上一批有源真出货过」的歌做基准样本', async () => {
     // 选样候选与"上一批哪个歌被解出过"是两回事：冷门歌让 7 个源里 6 个报"无数据"，
     // 会被误读成"这些源都坏了"（NAS 首批的 kg 就是这样）
     mocks.prisma.$queryRaw.mockResolvedValue([{ id: 11 }, { id: 12 }])
-    mocks.prisma.musicInfo.findMany.mockImplementation(async (arg: { where: { id?: { in?: number[] } } }) => {
-      const ids = arg.where.id?.in
-      if (!ids) return []
-      return ids.map(id => ({
-        id, source: 'kw', songmid: `kw-${id}`, data: JSON.stringify({ name: `歌${id}`, singer: '歌手' }),
-        name: `歌${id}`, singer: '歌手', durationSeconds: 200, hash: null, copyrightId: null,
-        songId: null, albumId: null, albumMid: null, strMediaMid: null,
-      }))
-    })
+    // kw 取址要 songmid+albumId，样本得带齐才会被选中（见下一条用例）
+    mockRows([rowOf(11, 'kw', { albumId: 'a11' }), rowOf(12, 'kw', { albumId: 'a12' })])
     mocks.prisma.sourceProbeRun.findFirst.mockResolvedValue({ startedAt: new Date() } as never)
     mocks.prisma.sourceProbeResult.findMany.mockResolvedValue([{ songmid: 'kw-12' }] as never)
 
     const samples = await pickProbeSamples(2)
     expect(samples.kw.map(m => m.songmid)).toEqual(['kw-12', 'kw-11'])
+  })
+
+  it('缺取址键的行即便「上一批出货过」也不选：它会让整列好源被判坏', async () => {
+    // NAS 实测：全库 kg 只有 6 行缺 hash，而这 6 行恰好都被真人播过 1 次，
+    // 于是"优先播过的"规则把它们全推进基准样本，7 个源里 4 个解不出被记成坏源
+    mocks.prisma.$queryRaw.mockResolvedValue([{ id: 21 }, { id: 22 }, { id: 23 }])
+    mockRows([
+      rowOf(21, 'kg'),
+      rowOf(22, 'kg', { hash: 'H22' }),
+      rowOf(23, 'kg', { hash: 'H23' }),
+    ])
+    mocks.prisma.sourceProbeRun.findFirst.mockResolvedValue({ startedAt: new Date() } as never)
+    mocks.prisma.sourceProbeResult.findMany.mockResolvedValue([{ songmid: 'kg-21' }] as never)
+
+    const samples = await pickProbeSamples(2)
+    expect(samples.kg.map(m => m.songmid)).toEqual(['kg-22', 'kg-23'])
+  })
+
+  it('整平台一首合格样本都没有时退回不过滤，不能让整平台没样本', async () => {
+    mocks.prisma.$queryRaw.mockResolvedValue([{ id: 31 }, { id: 32 }])
+    mockRows([rowOf(31, 'kg'), rowOf(32, 'kg')])
+    mocks.prisma.sourceProbeRun.findFirst.mockResolvedValue({ startedAt: new Date() } as never)
+    mocks.prisma.sourceProbeResult.findMany.mockResolvedValue([{ songmid: 'kg-32' }] as never)
+
+    const samples = await pickProbeSamples(2)
+    expect(samples.kg.map(m => m.songmid)).toEqual(['kg-32', 'kg-31'])
   })
 })
 

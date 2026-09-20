@@ -106,17 +106,44 @@ async function provenSongmids(): Promise<Set<string>> {
 }
 
 /**
- * 基准样本。三条规则都是被实测逼出来的：
+ * 除 songmid 外还需额外键才能取址的平台。缺这些键的行不是坏数据，但会让所有源退化成
+ * "按歌名+歌手再搜一遍"，冷门歌就全体解不出 —— 一格好源都被记成坏源（NAS 实测：全库 kg
+ * 只有 6 行缺 hash，而这 6 行恰好都是被真人播过的，于是全被"优先播过的"规则选成基准曲）。
+ * wy/mg 用 songmid 本身即可取址，不设额外要求。
+ */
+const EXTRA_RESOLVE_KEYS: Record<string, (d: Record<string, unknown>) => boolean> = {
+  kg: d => !!d.hash,
+  tx: d => !!(d.mid || d.strMediaMid),
+  kw: d => !!d.songmid && !!d.albumId,
+}
+
+function hasResolveKeys(platform: string, dataJson: string | null): boolean {
+  const check = EXTRA_RESOLVE_KEYS[platform]
+  if (!check) return true
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(dataJson || '') as Record<string, unknown>
+  } catch {
+    return false
+  }
+  return check(parsed)
+}
+
+/**
+ * 基准样本。四条规则都是被实测逼出来的：
  * 1. 优先"真被播过"的歌（被播过即说明有源解得动），不足再退推荐白名单、退不限时长
  *    ——NAS 首批 mg 一首都没选上（那几行 MusicInfo 时长为空），而家人正好在连听 mg；
- * 2. **上一批有源出货过的歌优先**：避免一次选样把整列带偏（NAS 上两首 kg 冷门歌让 7 个源
+ * 2. **先滤掉取址键不全的行**（见 hasResolveKeys）：这类行会让整列好源被误判为坏；
+ * 3. **上一批有源出货过的歌优先**：避免一次选样把整列带偏（NAS 上两首 kg 冷门歌让 7 个源
  *    里 6 个被判"全格皆坏"，实际是这些源没这首歌的版权）；
- * 3. 排序带 id 兜底，同一份库每次选出的是同一批样本，跨批次才可比。
+ * 4. 排序带 id 兜底，同一份库每次选出的是同一批样本，跨批次才可比。
  */
 export async function pickProbeSamples(perPlatform = SAMPLES_PER_PLATFORM): Promise<Record<string, MusicInfo[]>> {
   const out: Record<string, MusicInfo[]> = {}
   const proven = await provenSongmids()
-  const pool = Math.max(perPlatform * 3, perPlatform)
+  // 候选窗口要明显宽于 perPlatform：NAS 实测 kg 播过的只有 13 首，且前 6 首全是缺 hash 的
+  // 稀疏行（弱源入库），窗口开 6 时过滤后凑不满 2 首 → 直接退回，等于没过滤。
+  const pool = Math.max(perPlatform * 20, 40)
   for (const platform of PLATFORMS) {
     const played = await prisma.$queryRaw<{ id: number }[]>`
       SELECT m.id AS id
@@ -146,8 +173,11 @@ export async function pickProbeSamples(perPlatform = SAMPLES_PER_PLATFORM): Prom
     const picked = ids
       .map(id => rows.find(r => r.id === id))
       .filter((r): r is NonNullable<typeof r> => r !== undefined)
+    // 合格样本够用才过滤；一个平台一首都不合格时退回全部候选，不能让整平台没样本
+    const qualified = picked.filter(r => hasResolveKeys(platform, r.data))
+    const usable = qualified.length >= perPlatform ? qualified : picked
     const rank = (row: { songmid: string }) => (proven.has(row.songmid) ? 0 : 1)
-    const ranked = [...picked].sort((a, b) => rank(a) - rank(b) || a.id - b.id)
+    const ranked = [...usable].sort((a, b) => rank(a) - rank(b) || a.id - b.id)
     out[platform] = ranked.slice(0, perPlatform).map(toProbeMusicInfo)
   }
   return out
