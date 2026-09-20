@@ -91,6 +91,38 @@ describe('COOKIE_SECURE resolution (lib/services/auth.ts)', () => {
 })
 
 /**
+ * `cookieSecurityWarning()`：生产 + 明文 HTTP 时要给部署者一句提醒，
+ * 但**绝不能**因此改动 COOKIE_SECURE 默认值（会打断局域网 HTTP 直连登录）。
+ */
+describe('cookieSecurityWarning', () => {
+  it('生产环境未开 Secure → 给出可重放风险的提醒', async () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('AUTH_SECRET', 'a'.repeat(32))
+    vi.stubEnv('COOKIE_SECURE', '')
+    const mod = await import('@/lib/services/auth')
+    const msg = mod.cookieSecurityWarning()
+    expect(msg).toContain('COOKIE_SECURE')
+    expect(msg).toContain('无过期时间')
+  })
+
+  it('生产环境已开 Secure → 不提醒', async () => {
+    vi.resetModules()
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('AUTH_SECRET', 'a'.repeat(32))
+    vi.stubEnv('COOKIE_SECURE', 'true')
+    expect((await import('@/lib/services/auth')).cookieSecurityWarning()).toBeNull()
+  })
+
+  it('开发环境 → 不提醒（免得本机跑一下就刷警告）', async () => {
+    vi.resetModules()
+    vi.stubEnv('NODE_ENV', 'development')
+    vi.stubEnv('AUTH_SECRET', 'a'.repeat(32))
+    vi.stubEnv('COOKIE_SECURE', '')
+    expect((await import('@/lib/services/auth')).cookieSecurityWarning()).toBeNull()
+  })
+})
+
+/**
  * 会话版本（sessionVersion）回归守卫：
  * 签名 = HMAC(username:sessionVersion)，改密码后版本递增 → 旧 cookie 签名即失效。
  * holly_sv 缺失按 0 兼容（升级前签发的旧格式 cookie 不强制重登）；非数字视为伪造拒绝。

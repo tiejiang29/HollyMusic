@@ -14,6 +14,12 @@ export async function register() {
     .then(r => console.info('[startup] config-sync result', r))
     .catch(e => console.warn('[startup] config-sync error', e))
 
+  // 明文 HTTP 部署提醒（纯打印，不写任何内存态——写内存态的启动逻辑必须放路由侧模块，
+  // 见 lib/music-source-manager.ts 的 wireSourceProbe 注释）
+  const { cookieSecurityWarning } = await import('@/lib/services/auth')
+  const cookieWarn = cookieSecurityWarning()
+  if (cookieWarn) console.warn(cookieWarn)
+
   // 封面自动回填：启动首轮 + 每 6 小时自愈轮（kw/kg/tx 库内空 img 自动补齐）
   const { startCoverBackfillScheduler } = await import('@/lib/services/cover-backfill')
   startCoverBackfillScheduler()

@@ -96,6 +96,25 @@ export function verify(username: string, sig: string, sessionVersion = 0): boole
 // 若强制 Secure 会导致浏览器拒绝保存 cookie，登录后所有请求"未登录"。
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 
+/**
+ * 明文 HTTP 部署时该让运维知道的一句话，由启动钩子打印。
+ *
+ * 为什么值得单独提醒：会话签名 `holly_sig` 的消息只有 `username:sessionVersion`，不含
+ * 时间戳/nonce（见 `sign()`），所以对给定账号与会话版本**永久可重放**；截到一次明文 HTTP
+ * 请求就等于长期账号访问，而唯一的撤销手段是让用户自己改密码。
+ *
+ * 但这里刻意只告警、不改 `COOKIE_SECURE` 默认值：局域网 HTTP 直连是本项目的正常用法，
+ * 翻默认值会让浏览器拒存 cookie、表现为"登录后所有未登录"（`auth.test.ts` 有回归守卫钉这条）。
+ */
+export function cookieSecurityWarning(): string | null {
+  if (process.env.NODE_ENV !== 'production' || COOKIE_SECURE) return null
+  return (
+    '[auth] COOKIE_SECURE 未开启：登录 cookie 会经明文 HTTP 传输，且 holly_sig 无过期时间，' +
+    '被截包即等于长期账号访问（撤销只能靠改密）。走 HTTPS 反代的部署请设 COOKIE_SECURE=true；' +
+    '局域网 HTTP 直连可忽略本条。'
+  )
+}
+
 const baseCookieOptions: Omit<CookieOption, 'name' | 'value'> = {
   httpOnly: true,
   path: '/',
