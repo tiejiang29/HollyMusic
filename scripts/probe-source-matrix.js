@@ -15,6 +15,9 @@
  *   node scripts/probe-source-matrix.js                      # 跑全矩阵
  *   node scripts/probe-source-matrix.js --sources=屿溪,星海   # 名称子串过滤
  *   node scripts/probe-source-matrix.js --platforms=wy,tx --quality=flac --samples=1
+ *   node scripts/probe-source-matrix.js --pinned=samples.json --platforms=kg
+ *       # pinned：跳过自选样本，直接用文件里的曲目（{平台:[MusicInfo行]}）。
+ *       #   跨机器对齐必须有同一批输入，否则本机好/生产坏只能说明样本不同，不能说明环境不同。
  *   node scripts/probe-source-matrix.js --json=probe-report.json
  *
  * 每格 = 源×平台×基准样本。成本上限 = 格数 × (取址预算 + 首块预算)，默认串行。
@@ -41,6 +44,7 @@ const OPT = {
   headBytes: Number(arg('head-bytes', '65536')),
   sources: arg('sources', ''),
   platforms: arg('platforms', ''),
+  pinned: arg('pinned', ''),
   json: arg('json', ''),
   gapMs: Number(arg('gap', '300')),
 }
@@ -294,8 +298,10 @@ const cellLabel = r => ({
   }
   const wantedPlatforms = OPT.platforms ? OPT.platforms.split(',').map(x => x.trim()) : ALL_PLATFORMS
 
-  const samples = await pickSamples(prisma, Math.max(1, OPT.samplesPerPlatform))
-  write('==== 基准样本（按播放量取，跨次运行可比）====')
+  const samples = OPT.pinned
+    ? JSON.parse(fs.readFileSync(path.resolve(ROOT, OPT.pinned), 'utf-8'))
+    : await pickSamples(prisma, Math.max(1, OPT.samplesPerPlatform))
+  write(`==== 基准样本${OPT.pinned ? `（pinned：${OPT.pinned}，未自动选样）` : '（按播放量取，跨次运行可比）'}====`)
   for (const p of ALL_PLATFORMS) {
     const list = samples[p] || []
     write(`  ${p}: ${list.length ? list.map(r => `${r.name}-${r.singer}[${r.songmid}]`).join('、') : '库内无候选'}`)
