@@ -128,6 +128,40 @@ export interface SourceHealthView {
   band: 'no-data' | 'healthy' | 'degraded' | 'cooling'
 }
 
+/**
+ * 「这首歌真没有」类文案 → 记 no-address（不计坏）的判据。
+ *
+ * 为什么必须有：很多音源脚本对"没有版权/没有该版本"不是返回空地址，而是**抛错**
+ * （`播放地址解析失败`、`所有后端均失败…无数据`、`Failed to get audio URL at all quality
+ * levels`）。全矩阵摸底实测过：NAS 上按播放量选出的两首 kg 基准曲，7 个源里 6 个都这样抛错
+ * ——那是样本没版权，不是源坏了，却被记成坏证据。真实播放路径同理：用户连点两首冷门歌，
+ * 就能把一个只是没版权的好源推进冷却。
+ *
+ * 刻意**不收**的一类：`服务端返回非 JSON 数据`、`get url failed` 这类**传输层**失败。
+ * 它们说的是"这次请求没谈拢"，不是"这首歌没有"——HYWmusic 在 NAS 首批里 8/8 报前者，
+ * 30 分钟后同一容器同一请求 8/8 正常，正是需要被记坏的那种抖动。
+ *
+ * 残余风险（已知、先不处理）：一个源若对所有歌都回"无数据"，就再也不会被记坏。
+ * 缓解是 noMatch 计数在面板上可见（长期高 noMatch 一眼能看出来），而不是靠熔断。
+ */
+const CONTENT_MISS_PATTERNS: readonly RegExp[] = [
+  /无数据/, /没有(找到|相关)/, /未找到/, /无版权/, /暂无/, /需要\s*vip/i, /无该?音质/, /不支持的?(歌曲|音质)/,
+  /播放地址解析失败/, /all quality levels/i, /no\s+(such\s+)?(track|song|result)/i, /not\s+found/i,
+]
+
+/** 传输层/协议类失败：无论消息里还带什么词，都算坏（优先级高于上面的白名单） */
+const TRANSPORT_FAIL_PATTERNS: readonly RegExp[] = [
+  /非\s*JSON/, /解析\s*(响应|JSON)/i, /超时/, /timeout/i, /(返回|响应)\s*(码|status)?\s*[45]\d\d/, /\b[45]\d\d\s+(bad|forbidden|unauthor)/i,
+  /get url failed/i, /请求失败/, /网络/, /ECONN/i, /限流/, /频繁/,
+]
+
+/** 一次抛错是"这首歌真没有"（true）还是"源这次不行"（false） */
+export function isContentMiss(message: string | null | undefined): boolean {
+  if (!message) return false
+  if (TRANSPORT_FAIL_PATTERNS.some(re => re.test(message))) return false
+  return CONTENT_MISS_PATTERNS.some(re => re.test(message))
+}
+
 /** 我们自己 abort 的 stall 超时不算本机故障，故不含 ABORT_ERR */
 const NETWORK_FAULT_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOENT_NETWORK'])
 const NETWORK_FAULT_MESSAGES = ['getaddrinfo', 'Unable to resolve', 'network unreachable', 'No such host is known']

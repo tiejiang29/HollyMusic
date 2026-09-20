@@ -30,7 +30,7 @@ vi.mock('@/lib/music-source-manager', () => ({
   readUrlBudgets: () => ({ urlMs: 15_000, perSourceMs: 8_000, totalMs: 18_000 }),
 }))
 
-const { planCells, latestProbeCells, seedHealthFromProbe, runSourceProbe } = await import('@/lib/services/source-probe')
+const { planCells, pickProbeSamples, latestProbeCells, seedHealthFromProbe, runSourceProbe } = await import('@/lib/services/source-probe')
 const { listSourcesWithStatus } = await import('@/lib/services/source-manager-service')
 const { sourceHealth } = await import('@/lib/server/source-health')
 
@@ -79,6 +79,9 @@ beforeEach(() => {
   sourceHealth.reset()
   mocks.prisma.sourceProbeRun.create.mockResolvedValue({ id: 7 })
   mocks.prisma.sourceProbeRun.update.mockResolvedValue({})
+  // 默认"还没有成功批次"，让选样预筛走冷启动分支；个别用例自行覆盖
+  mocks.prisma.sourceProbeRun.findFirst.mockResolvedValue(null)
+  mocks.prisma.sourceProbeResult.findMany.mockResolvedValue([])
   mocks.prisma.sourceProbeResult.create.mockResolvedValue({})
   stubSampleQueries()
 })
@@ -145,6 +148,37 @@ describe('runSourceProbe', () => {
     expect(summary.badCount).toBe(2) // kw 的两首基准曲都算进这一格
     expect(mocks.safePublicFetch).not.toHaveBeenCalled()
     expect(mocks.prisma.sourceProbeResult.create.mock.calls[0][0].data).toMatchObject({ outcome: 'timeout', latencyMs: 8_000 })
+  })
+
+  it('源把各后端失败原因拼成多行时，入库前压成一行', async () => {
+    vi.mocked(listSourcesWithStatus).mockResolvedValue([{ name: '多行源', path: 'a.js', enabled: true, pt: ['kw'] }] as never)
+    mocks.probeSourceUrl.mockResolvedValue({ ok: false, outcome: 'error', reason: '后端A: 无数据\n   后端B: 请求超时', latencyMs: 10 })
+
+    await runSourceProbe('manual')
+
+    expect(mocks.prisma.sourceProbeResult.create.mock.calls[0][0].data.reason).toBe('后端A: 无数据 后端B: 请求超时')
+  })
+})
+
+describe('pickProbeSamples', () => {
+  it('优先用「上一批有源真出货过」的歌做基准样本', async () => {
+    // 选样候选与"上一批哪个歌被解出过"是两回事：冷门歌让 7 个源里 6 个报"无数据"，
+    // 会被误读成"这些源都坏了"（NAS 首批的 kg 就是这样）
+    mocks.prisma.$queryRaw.mockResolvedValue([{ id: 11 }, { id: 12 }])
+    mocks.prisma.musicInfo.findMany.mockImplementation(async (arg: { where: { id?: { in?: number[] } } }) => {
+      const ids = arg.where.id?.in
+      if (!ids) return []
+      return ids.map(id => ({
+        id, source: 'kw', songmid: `kw-${id}`, data: JSON.stringify({ name: `歌${id}`, singer: '歌手' }),
+        name: `歌${id}`, singer: '歌手', durationSeconds: 200, hash: null, copyrightId: null,
+        songId: null, albumId: null, albumMid: null, strMediaMid: null,
+      }))
+    })
+    mocks.prisma.sourceProbeRun.findFirst.mockResolvedValue({ startedAt: new Date() } as never)
+    mocks.prisma.sourceProbeResult.findMany.mockResolvedValue([{ songmid: 'kw-12' }] as never)
+
+    const samples = await pickProbeSamples(2)
+    expect(samples.kw.map(m => m.songmid)).toEqual(['kw-12', 'kw-11'])
   })
 })
 

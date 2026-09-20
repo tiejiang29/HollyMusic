@@ -93,12 +93,30 @@ export function probeEnabled(): boolean {
   return process.env.SOURCE_PROBE_ENABLED !== '0'
 }
 
+/** 上一批里"至少有一个源真出过货"的歌——用来给基准曲排序，见 pickProbeSamples */
+async function provenSongmids(): Promise<Set<string>> {
+  const last = await prisma.sourceProbeRun.findFirst({
+    where: { status: 'done' }, orderBy: { startedAt: 'desc' }, select: { startedAt: true },
+  })
+  if (!last) return new Set()
+  const rows = await prisma.sourceProbeResult.findMany({
+    where: { runAt: last.startedAt, outcome: 'ok' }, select: { songmid: true }, distinct: ['songmid'],
+  })
+  return new Set(rows.map(r => r.songmid))
+}
+
 /**
- * 基准样本：优先取"真被播过"的歌（被播过即说明至少有一个源真出过货），不足再退回推荐
- * 白名单、最近更新。排序带 id 兜底，保证同一份库每次选出的是同一批样本。
+ * 基准样本。三条规则都是被实测逼出来的：
+ * 1. 优先"真被播过"的歌（被播过即说明有源解得动），不足再退推荐白名单、退不限时长
+ *    ——NAS 首批 mg 一首都没选上（那几行 MusicInfo 时长为空），而家人正好在连听 mg；
+ * 2. **上一批有源出货过的歌优先**：避免一次选样把整列带偏（NAS 上两首 kg 冷门歌让 7 个源
+ *    里 6 个被判"全格皆坏"，实际是这些源没这首歌的版权）；
+ * 3. 排序带 id 兜底，同一份库每次选出的是同一批样本，跨批次才可比。
  */
 export async function pickProbeSamples(perPlatform = SAMPLES_PER_PLATFORM): Promise<Record<string, MusicInfo[]>> {
   const out: Record<string, MusicInfo[]> = {}
+  const proven = await provenSongmids()
+  const pool = Math.max(perPlatform * 3, perPlatform)
   for (const platform of PLATFORMS) {
     const played = await prisma.$queryRaw<{ id: number }[]>`
       SELECT m.id AS id
@@ -106,20 +124,21 @@ export async function pickProbeSamples(perPlatform = SAMPLES_PER_PLATFORM): Prom
       WHERE m.source = ${platform} AND m.durationSeconds > 0
       GROUP BY m.id
       ORDER BY SUM(p.playCount) DESC, MAX(p.playedAt) DESC, m.id ASC
-      LIMIT ${perPlatform}
+      LIMIT ${pool}
     `
     let ids = played.map(r => Number(r.id))
-    if (ids.length < perPlatform) {
+    if (ids.length < pool) {
       const recommended = await prisma.musicInfo.findMany({
         where: { source: platform, durationSeconds: { gt: 0 }, isRecommended: true, id: { notIn: ids } },
-        orderBy: { updatedAt: 'desc' }, take: perPlatform - ids.length, select: { id: true },
+        orderBy: { updatedAt: 'desc' }, take: pool - ids.length, select: { id: true },
       })
       ids = ids.concat(recommended.map(r => r.id))
     }
     if (ids.length < perPlatform) {
+      // 最后一级不限时长：宁可测一首时长未知的歌，也不能让整个平台没样本
       const any = await prisma.musicInfo.findMany({
-        where: { source: platform, durationSeconds: { gt: 0 }, id: { notIn: ids } },
-        orderBy: { updatedAt: 'desc' }, take: perPlatform - ids.length, select: { id: true },
+        where: { source: platform, id: { notIn: ids } },
+        orderBy: { updatedAt: 'desc' }, take: pool - ids.length, select: { id: true },
       })
       ids = ids.concat(any.map(r => r.id))
     }
@@ -127,7 +146,9 @@ export async function pickProbeSamples(perPlatform = SAMPLES_PER_PLATFORM): Prom
     const picked = ids
       .map(id => rows.find(r => r.id === id))
       .filter((r): r is NonNullable<typeof r> => r !== undefined)
-    out[platform] = picked.map(toProbeMusicInfo)
+    const rank = (row: { songmid: string }) => (proven.has(row.songmid) ? 0 : 1)
+    const ranked = [...picked].sort((a, b) => rank(a) - rank(b) || a.id - b.id)
+    out[platform] = ranked.slice(0, perPlatform).map(toProbeMusicInfo)
   }
   return out
 }
@@ -266,7 +287,10 @@ async function doRun(trigger: 'manual' | 'schedule'): Promise<ProbeSummary> {
         data: {
           runAt: startedAt, source: result.source, platform: result.platform, songmid: result.songmid,
           quality: PROBE_QUALITY, outcome: result.outcome, latencyMs: result.latencyMs,
-          reason: result.reason, container: result.container,
+          // 源脚本抛的错常整段带换行（墨澜把所有后端的失败原因拼在一起），不压平会把
+          // 面板 title 与日志排版撑坏
+          reason: result.reason ? result.reason.replace(/\s+/g, ' ').trim().slice(0, 160) : null,
+          container: result.container,
         },
       })
       await sleep(GAP_BETWEEN_CELLS_MS)

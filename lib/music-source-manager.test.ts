@@ -175,6 +175,43 @@ describe('取址瀑布的单源累计预算', () => {
  * 3c：瀑布开始消费健康账本。参数依据见 source-health.test.ts 顶部的摸底实测说明。
  * 要点是"排序不动、临时跳过、同平台保底留一个"，不是自动改 priority。
  */
+/**
+ * 「这首歌真没有」不能当成「这个源坏了」。真实播放路径同样会踩：冷门歌让脚本抛
+ * `播放地址解析失败` 之类的错，若记坏，用户连点两首就能把一个只是没版权的好源冷却掉。
+ */
+describe('无版权类抛错不计坏', () => {
+  it('脚本抛「播放地址解析失败」→ 只累计 noMatch，不产生坏样本、不进冷却', async () => {
+    const m = managerWith(
+      [
+        fakeSource('没这首歌的源', async () => { throw new Error('播放地址解析失败') }),
+        fakeSource('出货源', async () => 'https://ok/hit.flac'),
+      ],
+      { urlMs: 1000, perSourceMs: 800, totalMs: 5000 }
+    )
+    const r = await m.getMusicUrlWithProvider(musicInfo, 'flac')
+
+    expect(r.provider).toBe('出货源')
+    const v = sourceHealth.view('没这首歌的源', 'kw')
+    expect(v?.bad).toBe(0)
+    expect(v?.noMatch).toBeGreaterThan(0)
+    expect(sourceHealth.coolStatus('没这首歌的源', 'kw').skip).toBe(false)
+  })
+
+  it('两次「服务端返回非 JSON 数据」仍要能把源冷却（真不可用不能被判成没版权）', async () => {
+    const instances = [
+      fakeSource('抽风的源', async () => { throw new Error('服务端返回非 JSON 数据') }),
+      fakeSource('出货源', async () => 'https://ok/hit.flac'),
+    ]
+    const m = managerWith(instances, { urlMs: 1000, perSourceMs: 800, totalMs: 5000 })
+
+    await m.getMusicUrlWithProvider(musicInfo, 'flac')
+    await m.getMusicUrlWithProvider({ ...musicInfo, songmid: 'sm-2' } as never, 'flac')
+
+    expect(sourceHealth.view('抽风的源', 'kw')?.bad).toBe(2)
+    expect(sourceHealth.coolStatus('抽风的源', 'kw').skip).toBe(true)
+  })
+})
+
 describe('3c：按账本跳过冷却中的源', () => {
   /** 连记两次坏，把一个 `源×平台` 推进冷却（快速失败档 = 60s） */
   function tripCooldown(name: string, platform = 'kw') {

@@ -13,7 +13,7 @@ import { logger } from './logger'
 import { decodeLyricEntities } from './server/lyric-decode'
 import { normalizeStructuredLyricText } from './server/lyric-normalize'
 import { findBestAlternative } from './services/source-toggle'
-import { sourceHealth, type ResolveOutcome } from './server/source-health'
+import { sourceHealth, isContentMiss, type ResolveOutcome } from './server/source-health'
 
 /** 换源元信息：本次取址发生跨平台自动换源时填充，供 API 层透出给前端展示 */
 export interface SourceToggleInfo {
@@ -459,13 +459,14 @@ export class MusicSourceManager {
     } catch (err) {
       const latencyMs = Date.now() - started
       const message = err instanceof Error ? err.message : String(err)
-      // 顶到预算才算挂起，否则是脚本内部报错——与瀑布同一套归因口径
-      return {
-        ok: false,
-        outcome: latencyMs >= timeoutMs ? 'timeout' : 'error',
-        reason: message.slice(0, 120),
-        latencyMs,
+      // 顶到预算才算挂起；"这首歌没有"归到 no-address；其余算脚本内部报错
+      if (latencyMs >= timeoutMs) {
+        return { ok: false, outcome: 'timeout', reason: message.slice(0, 120), latencyMs }
       }
+      if (isContentMiss(message)) {
+        return { ok: false, outcome: 'no-address', reason: message.slice(0, 120), latencyMs }
+      }
+      return { ok: false, outcome: 'error', reason: message.slice(0, 120), latencyMs }
     }
   }
 
@@ -620,6 +621,13 @@ export class MusicSourceManager {
         } catch (error) {
           const tookMs = Date.now() - attemptAt
           const message = error instanceof Error ? error.message : String(error)
+          // 源在说"这首歌我没有"而不是"我不行"：不少脚本对没版权是抛错而非返回空地址，
+          // 若照记坏，用户连点两首冷门歌就能把一个只是没版权的好源推进冷却（见账本判据）
+          if (tookMs < callTimeoutMs && isContentMiss(message)) {
+            sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'no-address', tookMs)
+            logger.debug(`该源无此曲: ${instance.config.name} - ${quality}`, message)
+            continue
+          }
           // 耗时顶到本次上限即视为挂起，否则是脚本内部报错——两者都算坏，分开记便于归因
           recordBad(tookMs >= callTimeoutMs ? 'timeout' : 'error', tookMs, message.slice(0, 120))
           logger.debug(`获取失败: ${instance.config.name} - ${quality}`, message)

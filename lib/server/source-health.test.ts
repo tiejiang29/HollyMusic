@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
-const { sourceHealth, isLikelyLocalNetworkFault } = await import('./source-health')
+const { sourceHealth, isLikelyLocalNetworkFault, isContentMiss } = await import('./source-health')
 
 const T0 = new Date('2026-09-19T12:00:00Z').getTime()
 
@@ -258,5 +258,42 @@ describe('3c 冷却状态机', () => {
     resolveTimes('源AB', 'kw', 'timeout', 6, 8000)
     expect(sourceHealth.view('源AB', 'kw')).toBeNull()
     expect(sourceHealth.coolStatus('源AB', 'kw').skip).toBe(false)
+  })
+})
+
+/**
+ * 「这首歌真没有」与「这个源这次不行」的分开判据。
+ * 前者来自 NAS 首批周测：两首 kg 冷门歌让 7 个源里 6 个被判"全格皆坏"，实际是它们没版权；
+ * 后者也必须守住：HYWmusic 8/8 报「服务端返回非 JSON 数据」是真的不可用，30 分钟后同请求全好。
+ */
+describe('isContentMiss：内容性无数据 vs 传输性失败', () => {
+  it('明确说"没有这首歌/没有这个版本"的抛错算内容性', () => {
+    for (const msg of [
+      '播放地址解析失败',
+      '所有后端均失败（共16个） 长青海棠: 无数据',
+      'Failed to get audio URL at all quality levels',
+      '该歌曲暂无版权，需要 VIP',
+      '未找到相关结果',
+      'track not found',
+    ]) {
+      expect(isContentMiss(msg), msg).toBe(true)
+    }
+  })
+
+  it('传输层/协议类失败绝不当成"没这首歌"（否则真坏的源再也判不出来）', () => {
+    for (const msg of [
+      '服务端返回非 JSON 数据',
+      'get url failed',
+      '获取音乐URL超时: 源 - 320k（8s）',
+      'HTTP 404｜响应是文本/HTML/JSON，不是音频',
+      '请求被限流，请稍后重试',
+      'socket hang up',
+    ]) {
+      expect(isContentMiss(msg), msg).toBe(false)
+    }
+  })
+
+  it('两类都提到时以传输层为准（脚本常把各后端失败原因拼成一串）', () => {
+    expect(isContentMiss('长青海棠: 无数据；其余后端返回非 JSON 数据')).toBe(false)
   })
 })
