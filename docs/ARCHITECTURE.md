@@ -259,7 +259,7 @@ failed`、HTTP 4xx/5xx 这类**传输层**失败留在"坏"里）、**缓存与�
 
 | 方法 | 路径 | 说明 | 鉴权 |
 |---|---|---|---|
-| GET/HEAD | `/api/audio?uid=&quality=` | **音频流主入口**：三级命中（库→缓存→回源），支持 Range，假地址自动换源 | opt（匿名仅放行分享 st token） |
+| GET/HEAD | `/api/audio?uid=&quality=` | **音频流主入口**：三级命中（库→缓存→回源），支持 Range，假地址自动换源 | opt（匿名仅放行分享 st token）；未认证+无 Range+像取图（`UA=Dalvik/*` 或 `Accept` 含 `image/`）的 GET → 302 到 `/api/cover/<uid>`，为车机卡片拿封面 |
 | POST | `/api/music-url` | 获取播放直链（`{musicInfo, quality}`），带跨平台换源 toggle 信息 | user |
 | GET | `/api/download?uid=&quality=` | 单曲下载（uid 模式，文件名后端组装） | user |
 | POST | `/api/download` | url 模式下载兼容（`{url, filename?}`） | user |

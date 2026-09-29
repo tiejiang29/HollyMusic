@@ -455,7 +455,7 @@ admin 登录后，侧边栏头像下拉 →「音源管理」：
 | `/rest/[method]` | GET/POST | Subsonic 协议入口，外部客户端（DSub / Ultrasonic 等）接入点（token 认证） |
 | `/api/share` | GET | 分享落地页（服务端渲染 HTML，`?uid=` 单曲试听，含 og 卡片；匿名可访问） |
 | `/api/track` | GET | 曲目元数据反查（`?uid=`，分享链接自动播放用；需登录） |
-| `/api/audio` | GET/HEAD | 音频流（磁盘缓存 + Range；分享试听链路，保持匿名可访问） |
+| `/api/audio` | GET/HEAD | 音频流（磁盘缓存 + Range）。v1.0.7 起需登录，匿名仅凭分享落地页签发的 `st` 放行；v2.1.2 起未认证且"像取图"的 GET（无 Range + `Dalvik/*` 或 `Accept: image/`）会 302 到 `/api/cover/<uid>`，供小米车机卡片拿封面 |
 | `/api/cover/[id]` | GET | 封面代理（分享落地页封面来源，匿名可访问） |
 | `/api/download` | GET | 下载代理（需登录） |
 | `/api/health` | GET | 健康检查（Docker / 反代探活） |
