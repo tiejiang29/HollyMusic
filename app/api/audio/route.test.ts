@@ -71,10 +71,10 @@ const { GET, HEAD } = await import('./route')
 
 // --- 辅助 ----------------------------------------------------------------------
 
-function makeRequest(params: Record<string, string>): NextRequest {
+function makeRequest(params: Record<string, string>, headers?: Record<string, string>): NextRequest {
   const url = new URL('http://localhost:3000/api/audio')
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
-  return new NextRequest(url)
+  return new NextRequest(url, { headers })
 }
 
 const UID = 'kw-196030664'
@@ -143,5 +143,66 @@ describe('GET /api/audio 鉴权矩阵', () => {
     authMode = 'ok'
     const res = await GET(makeRequest({ uid: 'not-found', quality: '320k' }))
     expect(res.status).toBe(404)
+  })
+})
+
+/**
+ * 车机封面改道。判据来自 2026-09-29 车机实测（同一次播放里两个客户端的形状对比）：
+ * CarWith 的 Glide = 未认证 + 无 cookie + 无 Range + **不发 Accept** + UA=Dalvik/2.1.0(…)，
+ * 一首歌重试 22 次；我们自己的 App（okhttp）首个请求**同样不带 Range**，只靠 cookie 保住。
+ * 所以"无 Range"不能单独当判据，必须叠正向特征，且鉴权条件必须在最前面。
+ */
+const CAR_HEADERS = { 'user-agent': 'Dalvik/2.1.0 (Linux; U; Android 16; 25019PNF3C Build/BP2A.250605.031.A3)' }
+
+describe('未认证的取图式请求改道到公开封面', () => {
+  beforeEach(() => {
+    authMode = 'unauth'
+  })
+
+  it('车机实测形状 → 302 到 /api/cover/<uid>，并 no-store', async () => {
+    const res = await GET(makeRequest({ uid: UID, quality: 'flac' }, CAR_HEADERS))
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe(`/api/cover/${UID}`)
+    expect(res.headers.get('cache-control')).toBe('no-store')
+  })
+
+  it('Accept 声明 image 也算取图（第二个正向信号：万一小米把取图器换成 OkHttp）', async () => {
+    const res = await GET(makeRequest({ uid: UID, quality: '320k' }, { accept: 'image/webp,*/*' }))
+    expect(res.status).toBe(302)
+  })
+
+  it('带 Range 就不改道：那是来取音频的，仍然 401', async () => {
+    const res = await GET(makeRequest({ uid: UID, quality: '320k' }, { ...CAR_HEADERS, range: 'bytes=0-1023' }))
+    expect(res.status).toBe(401)
+  })
+
+  it('HEAD 永不改道（探测/预取不该被引到图片上）', async () => {
+    const res = await HEAD(makeRequest({ uid: UID, quality: '320k' }, CAR_HEADERS))
+    expect(res.status).toBe(401)
+  })
+
+  it('curl 与 okhttp 形状不改道：401 仍然是可信的鉴权断言，运维探针不破', async () => {
+    const curl = await GET(makeRequest({ uid: UID, quality: '320k' }, { 'user-agent': 'curl/8.12.1', accept: '*/*' }))
+    const ourApp = await GET(makeRequest({ uid: UID, quality: 'flac' }, { 'user-agent': 'okhttp/4.12.0' }))
+    expect(curl.status).toBe(401)
+    expect(ourApp.status).toBe(401)
+  })
+
+  it('有效 st + 车机 UA → 出音频不改道（借分享链接听歌的人不该拿到一张图）', async () => {
+    const st = createShareAudioToken(UID, '320k')
+    const res = await GET(makeRequest({ uid: UID, quality: '320k', st }, CAR_HEADERS))
+    expect(res.status).toBe(200)
+  })
+
+  it('已登录 + 车机 UA + 无 Range → 出音频（鉴权在最前面，判据碰不到合法客户端）', async () => {
+    authMode = 'ok'
+    const res = await GET(makeRequest({ uid: UID, quality: 'flac' }, CAR_HEADERS))
+    expect(res.status).toBe(200)
+  })
+
+  it('uid 进 Location 前被编码，路径穿越出不了 /api/cover/', async () => {
+    const res = await GET(makeRequest({ uid: '../admin', quality: '320k' }, CAR_HEADERS))
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/api/cover/..%2Fadmin')
   })
 })

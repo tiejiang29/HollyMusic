@@ -39,6 +39,13 @@ function buildErrorResponse(status: number, code: string, message: string): Resp
   )
 }
 
+/** 看起来像在取图而不是在取音频：Android HttpURLConnection（Glide）默认不发 Accept，所以只能靠 UA + 显式 image 声明 */
+function looksLikeImageFetch(request: NextRequest): boolean {
+  const ua = request.headers.get('user-agent') ?? ''
+  const accept = request.headers.get('accept') ?? ''
+  return ua.startsWith('Dalvik/') || accept.includes('image/')
+}
+
 async function handleAudio(request: NextRequest, isHead: boolean): Promise<Response> {
   const { searchParams } = new URL(request.url)
   const uid = searchParams.get('uid')
@@ -57,22 +64,27 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
   // 放在 ensureInitialized 之前，未认证请求不触发磁盘/上游初始化。
   const rangeHeader = request.headers.get('range')
   const authState = await getAuthState(request)
-
-  // 【临时探路，定完判据即删】想弄清"能不能把未认证的 /api/audio 改道到封面"，得先看真实客户端发了什么头：
-  // CarWith 的 Glide 取图请求，与我们自己 ExoPlayer 的首个取音频请求（"播放器必带 Range"这条目前是断言）。
-  // 只记未认证请求与不带 Range 的请求——播放期每个分片都带 Range，全记会把日志刷满。
-  // cookie/st 只记有无：值里是可长期重放的会话签名，落进日志等于多一条泄露途径。
-  if (!authState.authenticated || !rangeHeader) {
-    const h = (k: string) => request.headers.get(k) ?? '-'
-    logger.info(`[/api/audio 探路] ${request.method} uid=${uid} q=${quality} st=${searchParams.get('st') ? '有' : '无'}`
-      + ` 已登录=${authState.authenticated} cookie=${request.headers.get('cookie') ? '有' : '无'} range=${rangeHeader ?? '无'}`
-      + ` accept=${h('accept')} ua=${h('user-agent')} referer=${h('referer')} origin=${h('origin')}`
-      + ` sec-fetch-dest=${h('sec-fetch-dest')} sec-fetch-mode=${h('sec-fetch-mode')} connection=${h('connection')}`)
-  }
-
   if (!authState.authenticated) {
     const shareToken = searchParams.get('st') ?? ''
     if (!verifyShareAudioToken(uid, quality, shareToken)) {
+      // 车机封面改道：CarWith 的音乐卡片把当前播放项的 MEDIA_URI（就是我们的音频地址）
+      // 当图片下载，而这条地址必须登录 → 永远 401、永远没封面。
+      // 2026-09-29 车机实测形状：未认证 + 无 cookie + 无 Range + **不发 Accept** +
+      // UA=`Dalvik/2.1.0 (Linux; U; Android 16; …)`，一次播放重试 22 次。
+      // 只用正向特征取或：以后小米换成 OkHttp 拉图，这里只是失效退回 401，
+      // 不会误伤 curl / 浏览器 / 监控探针（它们既不是 Dalvik 也不声明 image）。
+      if (!isHead && !rangeHeader && looksLikeImageFetch(request)) {
+        logger.info(`[/api/audio] 未认证取图请求改道到封面: uid=${uid} ua=${request.headers.get('user-agent') ?? '-'}`)
+        // Location 用相对路径：不用 request.nextUrl.origin 是为了不把 Host 请求头回显进
+        // 跳转目标（伪造 Host 就能把我们变成开放重定向器）。
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: `/api/cover/${encodeURIComponent(uid)}`,
+            'cache-control': 'no-store',
+          },
+        })
+      }
       return buildErrorResponse(401, 'UNAUTHORIZED', '未登录，且未携带有效的分享凭证')
     }
   }
