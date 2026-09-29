@@ -61,10 +61,11 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
   // 【临时探路，定完判据即删】想弄清"能不能把未认证的 /api/audio 改道到封面"，得先看真实客户端发了什么头：
   // CarWith 的 Glide 取图请求，与我们自己 ExoPlayer 的首个取音频请求（"播放器必带 Range"这条目前是断言）。
   // 只记未认证请求与不带 Range 的请求——播放期每个分片都带 Range，全记会把日志刷满。
+  // cookie/st 只记有无：值里是可长期重放的会话签名，落进日志等于多一条泄露途径。
   if (!authState.authenticated || !rangeHeader) {
     const h = (k: string) => request.headers.get(k) ?? '-'
     logger.info(`[/api/audio 探路] ${request.method} uid=${uid} q=${quality} st=${searchParams.get('st') ? '有' : '无'}`
-      + ` 已登录=${authState.authenticated} range=${rangeHeader ?? '无'}`
+      + ` 已登录=${authState.authenticated} cookie=${request.headers.get('cookie') ? '有' : '无'} range=${rangeHeader ?? '无'}`
       + ` accept=${h('accept')} ua=${h('user-agent')} referer=${h('referer')} origin=${h('origin')}`
       + ` sec-fetch-dest=${h('sec-fetch-dest')} sec-fetch-mode=${h('sec-fetch-mode')} connection=${h('connection')}`)
   }
