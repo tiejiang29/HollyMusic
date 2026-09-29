@@ -22,10 +22,28 @@ class Logger {
 
   private formatMessage(level: string, message: string, ...args: unknown[]): string {
     const timestamp = new Date().toISOString()
-    const argsStr = args.length > 0 ? ' ' + args.map(arg => 
-      typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
-    ).join(' ') : ''
+    const argsStr = args.length > 0 ? ' ' + args.map(arg => this.renderArg(arg)).join(' ') : ''
     return `[${timestamp}] [${level}] ${message}${argsStr}`
+  }
+
+  /**
+   * Error 的 name/message/stack 都是**不可枚举**属性，`JSON.stringify(new Error('x'))` 得到 `"{}"`。
+   * 所以此前全仓库几十处 `logger.error('...', err)` 一直在把失败原因打印成空对象
+   * ——`音源初始化失败: 聚合API接口 (CF) v3 {}` 排查数日无果，就是这个而不是脚本没报错。
+   */
+  private renderArg(arg: unknown): string {
+    if (arg instanceof Error) {
+      const frame = (arg.stack || '').split('\n').slice(1, 3).map(s => s.trim()).join(' <- ')
+      return `${arg.name}: ${arg.message}${frame ? `  @ ${frame}` : ''}`
+    }
+    if (arg !== null && typeof arg === 'object') {
+      try {
+        return JSON.stringify(arg)
+      } catch {
+        return String(arg)
+      }
+    }
+    return String(arg)
   }
 
   private shouldLog(level: LogLevel): boolean {
