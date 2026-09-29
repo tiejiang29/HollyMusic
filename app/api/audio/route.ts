@@ -55,7 +55,20 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
 
   // 鉴权前置：登录会话优先；匿名仅放行分享页签发的 st token（绑定 uid+quality）。
   // 放在 ensureInitialized 之前，未认证请求不触发磁盘/上游初始化。
+  const rangeHeader = request.headers.get('range')
   const authState = await getAuthState(request)
+
+  // 【临时探路，定完判据即删】想弄清"能不能把未认证的 /api/audio 改道到封面"，得先看真实客户端发了什么头：
+  // CarWith 的 Glide 取图请求，与我们自己 ExoPlayer 的首个取音频请求（"播放器必带 Range"这条目前是断言）。
+  // 只记未认证请求与不带 Range 的请求——播放期每个分片都带 Range，全记会把日志刷满。
+  if (!authState.authenticated || !rangeHeader) {
+    const h = (k: string) => request.headers.get(k) ?? '-'
+    logger.info(`[/api/audio 探路] ${request.method} uid=${uid} q=${quality} st=${searchParams.get('st') ? '有' : '无'}`
+      + ` 已登录=${authState.authenticated} range=${rangeHeader ?? '无'}`
+      + ` accept=${h('accept')} ua=${h('user-agent')} referer=${h('referer')} origin=${h('origin')}`
+      + ` sec-fetch-dest=${h('sec-fetch-dest')} sec-fetch-mode=${h('sec-fetch-mode')} connection=${h('connection')}`)
+  }
+
   if (!authState.authenticated) {
     const shareToken = searchParams.get('st') ?? ''
     if (!verifyShareAudioToken(uid, quality, shareToken)) {
@@ -73,7 +86,6 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
     }
 
     const cacheKey = `${musicInfo.source}:${musicInfo.songmid}:${quality}`
-    const rangeHeader = request.headers.get('range')
 
     // 本地优先 ①：音乐库命中（uid 精确 → 跨平台模糊），库内音质 ≥ 请求档即服务
     const libraryResp = await serveFromLibrary(musicInfo, quality, rangeHeader, isHead)
