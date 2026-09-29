@@ -115,6 +115,7 @@ async function handleDownloadByUid(
 
   // 3.5 本地优先：音乐库命中（uid 精确 → 跨平台模糊，音质 ≥ 请求档）直接发文件
   //     复用库内音质构造文件名扩展名（后端组装，不信任前端输入）
+  const rangeHeader = request.headers.get('range')
   const libraryRow = await findLibrarySong(musicInfo)
   if (libraryRow && shouldServeLibraryFile(libraryRow, quality, musicInfo.types)) {
     const fstat = await stat(libraryRow.filePath).catch(() => null)
@@ -123,13 +124,21 @@ async function handleDownloadByUid(
         buildFilenameFromMusicInfo(musicInfo, libraryRow.quality as QualityType)
       )
       const contentType = contentTypeForPath(libraryRow.filePath)
+      const disposition = buildContentDisposition(libFilename)
       logger.info(`[download] library 命中 uid=${uid} file=${libraryRow.filePath}`)
+      // 正本同样只做"交付侧换链头"，**绝不写库文件本身** —— 它是全库里最不可重建的数据。
+      // 改写不成（非 flac / 链头异常 / 封面歌词缺失）就退回下面这条原样直发，字节行为与今天一致。
+      const tagged = await deliverTaggedFile({
+        served: { filePath: libraryRow.filePath, size: fstat.size, contentType },
+        musicInfo, uid, disposition, rangeHeader,
+      })
+      if (tagged) return tagged
       return new NextResponse(createReadStream(libraryRow.filePath) as unknown as ReadableStream, {
         status: 200,
         headers: {
           'Content-Type': contentType,
           'Content-Length': String(fstat.size),
-          'Content-Disposition': buildContentDisposition(libFilename),
+          'Content-Disposition': disposition,
         },
       })
     }
@@ -141,7 +150,6 @@ async function handleDownloadByUid(
   // 5. 委托 audioServe（缓存命中 → 磁盘读；miss → 回源 + 边下边落盘 + 跟随交付）
   //    透传客户端 Range 头：普通下载（window.location.href）无 Range，audioServe
   //    返回 200 完整文件；浏览器断点续传携带 Range，返回 206 完整区间
-  const rangeHeader = request.headers.get('range')
   /** 本地整文件交付时 audioServe 告诉我们文件在哪、按记账多大（打标签要预读链头） */
   let servedFromDisk: { filePath: string; size: number; contentType: string } | null = null
   const audioResp = await audioServe.serve({

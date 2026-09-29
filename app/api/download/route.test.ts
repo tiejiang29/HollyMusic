@@ -88,8 +88,12 @@ function makeGetRequest(url: string, headers?: Record<string, string>): NextRequ
 
 // --- mock music-library（本地优先播放：默认未命中，走 audioServe 路径） -----
 
+/** 设了就代表"库里有正本"，路由会在问 audioServe 之前直发这个文件 */
+let libraryRow: { filePath: string; quality: string } | null = null
+
 vi.mock('@/lib/services/music-library', () => ({
-  findLibrarySong: vi.fn(async () => null),
+  findLibrarySong: vi.fn(async () => libraryRow),
+  shouldServeLibraryFile: vi.fn(() => true),
 }))
 
 // 延迟导入，确保 vi.mock 先生效
@@ -117,6 +121,7 @@ describe('GET /api/download (uid 模式)', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
+    libraryRow = null
   })
 
   it('未登录 → 401', async () => {
@@ -320,12 +325,13 @@ describe('GET /api/download 元数据打标', () => {
     }
     servedFromDiskInfo = null
     coverBytes = null
+    libraryRow = null
     audioServeResponse = new Response('audio-bytes', {
       status: 200,
       headers: { 'content-type': 'audio/flac', 'content-length': '11', 'accept-ranges': 'bytes' },
     })
   })
-  afterEach(() => { servedFromDiskInfo = null; coverBytes = null })
+  afterEach(() => { servedFromDiskInfo = null; coverBytes = null; libraryRow = null })
 
   it('FLAC + 本地整文件交付 → 打出标签、长度自洽，且磁盘原件不变', async () => {
     const { p, file } = writeTempFlac()
@@ -421,5 +427,44 @@ describe('GET /api/download 元数据打标', () => {
     expect(res.status).toBe(200)
     expect(res.headers.get('content-length')).toBe('11')
     await res.arrayBuffer()
+  })
+
+  /**
+   * 库正本分支此前完全走不到打标 —— 用户在生产下载"稻香"时命中的就是这条，
+   * 拿到的文件与 NAS 上那份正本 sha 完全相同。正本是全库最不可重建的数据，
+   * 所以这条分支同样只允许"交付侧换链头"，绝不允许写文件。
+   */
+  it('库正本命中 → 同样打标签，正本字节一字节不动', async () => {
+    const { p, file } = writeTempFlac()
+    libraryRow = { filePath: p, quality: 'flac' }
+    coverBytes = { mime: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0x00, 0xff, 0xd9]) }
+
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=flac'))
+    expect(res.status).toBe(200)
+    const declared = Number(res.headers.get('content-length'))
+    const body = Buffer.from(await res.arrayBuffer())
+    expect(body.length).toBe(declared)
+    // 既不是 mock 的 audioServe 响应（11B），也不是未改写的正本 ⇒ 这条分支确实被接上了
+    expect(declared).not.toBe(11)
+    expect(declared).not.toBe(file.length)
+    const md = await parseBuffer(body, { duration: false, skipCovers: false })
+    expect(md.common.title).toBe('杀死那个石家庄人')
+    expect(md.common.artist).toBe('万能青年旅店')
+    expect((md.common.picture || []).length).toBe(1)
+    expect(fs.readFileSync(p)).toEqual(file)
+  })
+
+  it('库正本是 MP3 → 不改写，仍按今天的行为直发正本原样字节', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tag-'))
+    const p = path.join(dir, 'song.mp3')
+    const raw = Buffer.alloc(4096, 0xff)
+    fs.writeFileSync(p, raw)
+    libraryRow = { filePath: p, quality: '320k' }
+
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=320k'))
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-length')).toBe(String(raw.length))
+    expect(res.headers.get('content-disposition')).toContain('.mp3')
+    expect(Buffer.from(await res.arrayBuffer())).toEqual(raw)
   })
 })
