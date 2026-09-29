@@ -276,6 +276,13 @@ class AudioServe {
     intervalSec: number
     /** 音频完整写入缓存后触发的后台任务；失败不影响音频交付。 */
     onCached?: () => Promise<void>
+    /**
+     * 「本地整文件交付」时回调（无 Range、非 HEAD、缓存已完整且通过自愈校验）。
+     * 存在的意义：下载交付要在**响应头发出之前**把 Content-Length 算准，而换写 FLAC
+     * 链头会改变总长度，只有拿到"具体是哪个文件"才能预读链头。调用方不能自己再查一遍
+     * DB——那会和这里的自愈校验（试听片段判定、文件丢失清理）产生两套结论。
+     */
+    onServedFromDisk?: (info: { filePath: string; size: number; contentType: string }) => void
   }): Promise<Response> {
     const cfg = getAudioServeConfig()
 
@@ -291,7 +298,8 @@ class AudioServe {
       opts.cacheKey,
       opts.rangeHeader,
       opts.isHead,
-      opts.intervalSec
+      opts.intervalSec,
+      opts.onServedFromDisk
     )
     if (complete) {
       this.runPostCacheTask(opts.cacheKey, opts.onCached)
@@ -386,7 +394,8 @@ class AudioServe {
     cacheKey: string,
     rangeHeader: string | null,
     isHead: boolean,
-    intervalSec: number
+    intervalSec: number,
+    onServedFromDisk?: (info: { filePath: string; size: number; contentType: string }) => void
   ): Promise<Response | null> {
     try {
       const record = await prisma.audioCache.findUnique({ where: { cacheKey } })
@@ -424,7 +433,11 @@ class AudioServe {
       const contentType = record.contentType || 'audio/mpeg'
       const range = parseRange(rangeHeader, size)
       if (range === 'unsatisfiable') return buildUnsatisfiable(size)
-      if (range === null) return buildFullResponse(filePath, size, contentType, isHead)
+      if (range === null) {
+        // 只有这一种交付形态可供外层做"整文件改写"（206 分片绝不能改，偏移会错）
+        if (!isHead) onServedFromDisk?.({ filePath, size, contentType })
+        return buildFullResponse(filePath, size, contentType, isHead)
+      }
       return buildPartialResponse(filePath, size, contentType, range, isHead)
     } catch (e) {
       logger.error(`[AudioServe] tryServeFromDisk 失败 ${cacheKey}:`, e)

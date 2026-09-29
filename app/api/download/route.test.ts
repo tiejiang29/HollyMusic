@@ -9,6 +9,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { parseBuffer } from 'music-metadata'
 import { NextRequest } from 'next/server'
 
 // --- mock requireUser / AuthError -----------------------------------------
@@ -52,12 +56,23 @@ vi.mock('@/lib/db', () => ({
 // --- mock audioServe -------------------------------------------------------
 
 let audioServeResponse: Response
+/** 设了就代表"这次是本地整文件交付"，路由据此才会尝试打标签 */
+let servedFromDiskInfo: { filePath: string; size: number; contentType: string } | null = null
+let coverBytes: { mime: string; data: Buffer } | null = null
 
 vi.mock('@/lib/audio-serve', () => ({
   audioServe: {
     ensureInitialized: vi.fn(async () => {}),
-    serve: vi.fn(async () => audioServeResponse),
+    serve: vi.fn(async (opts: { onServedFromDisk?: (i: typeof servedFromDiskInfo) => void }) => {
+      if (servedFromDiskInfo) opts.onServedFromDisk?.(servedFromDiskInfo)
+      return audioServeResponse
+    }),
   },
+}))
+
+// 封面走内部函数（不是自环 HTTP），测试里给固定字节
+vi.mock('@/lib/services/cover', () => ({
+  getCoverBytesById: vi.fn(async () => coverBytes),
 }))
 
 // --- 辅助 ------------------------------------------------------------------
@@ -264,5 +279,113 @@ describe('GET /api/download (url 模式)', () => {
     const [, init] = fetchSpy.mock.calls[0]
     const headers = init?.headers as Record<string, string>
     expect(headers['Referer']).toBe('https://haitangw.net')
+  })
+})
+
+// ===========================================================================
+// 元数据打标交付
+// 断言只看可观察面：响应头是否自洽（长度必须等于实际字节数）、第三方解析器读不读得到、
+// 磁盘原件是否被碰过。内部函数调没调不算证据。
+// ===========================================================================
+
+const blkOf = (type: number, len: number, last = false) => {
+  const h = Buffer.alloc(4)
+  h[0] = (last ? 0x80 : 0) | type
+  h[1] = (len >> 16) & 0xff; h[2] = (len >> 8) & 0xff; h[3] = len & 0xff
+  return Buffer.concat([h, Buffer.alloc(len, 0x30 + type)])
+}
+/** 写一个临时 FLAC（链头 + 音频字节），返回路径与原始字节 */
+function writeTempFlac(audio = 4096) {
+  const chain = Buffer.concat([
+    Buffer.from('fLaC', 'latin1'),
+    blkOf(0, 34), blkOf(1, 120), blkOf(3, 64), blkOf(4, 100, true),
+  ])
+  const file = Buffer.concat([chain, Buffer.alloc(audio, 0xcd)])
+  const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tag-')), 'song.flac')
+  fs.writeFileSync(p, file)
+  return { p, file, chainLen: chain.length }
+}
+
+describe('GET /api/download 元数据打标', () => {
+  beforeEach(() => {
+    authMode = 'ok'
+    resolveResult = {
+      songmid: '196030664', source: 'kw',
+      name: '杀死那个石家庄人', singer: '万能青年旅店',
+    }
+    servedFromDiskInfo = null
+    coverBytes = null
+    audioServeResponse = new Response('audio-bytes', {
+      status: 200,
+      headers: { 'content-type': 'audio/flac', 'content-length': '11', 'accept-ranges': 'bytes' },
+    })
+  })
+  afterEach(() => { servedFromDiskInfo = null; coverBytes = null })
+
+  it('FLAC + 本地整文件交付 → 打出标签，长度自洽，并去掉 Accept-Ranges', async () => {
+    const { p, file } = writeTempFlac()
+    servedFromDiskInfo = { filePath: p, size: file.length, contentType: 'audio/flac' }
+    coverBytes = { mime: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0x00, 0xff, 0xd9]) }
+
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=flac'))
+    expect(res.status).toBe(200)
+    const declared = Number(res.headers.get('content-length'))
+    const body = Buffer.from(await res.arrayBuffer())
+    expect(body.length, 'Content-Length 必须等于实际字节数').toBe(declared)
+    expect(declared).not.toBe(file.length)            // 链头被换过，长度必然不同（可大可小）
+    expect(res.headers.get('accept-ranges'), '交付长度与原件不同，不能再声明可分段').toBeNull()
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect(res.headers.get('content-disposition')).toContain('attachment')
+
+    // 第三方解析器读得到（不是自证）
+    const md = await parseBuffer(body, { duration: false, skipCovers: false })
+    expect(md.common.title).toBe('杀死那个石家庄人')
+    expect(md.common.artist).toBe('万能青年旅店')
+    expect((md.common.picture || []).length).toBe(1)
+    /** 磁盘原件一字节都不能变：音频缓存的长度取自 DB 且从不重新 stat() */
+    expect(fs.readFileSync(p)).toEqual(file)
+  })
+
+  it('带 Range → 原样透传，绝不改写（206 分片前插标签会让所有偏移错位）', async () => {
+    const { p, file } = writeTempFlac()
+    servedFromDiskInfo = { filePath: p, size: file.length, contentType: 'audio/flac' }
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=flac', { Range: 'bytes=0-1023' }))
+    expect(res.headers.get('content-length')).toBe('11')       // 还是 audioServe 给的那套头
+    expect(res.headers.get('accept-ranges')).toBe('bytes')
+    const body = Buffer.from(await res.arrayBuffer())
+    expect(body.length).toBe(11)
+    expect(fs.readFileSync(p)).toEqual(file)
+  })
+
+  it('本轮不碰 MP3：容器不是 flac 时响应与今天完全一致', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tag-'))
+    const p = path.join(dir, 'song.mp3')
+    const raw = Buffer.alloc(512, 0xff)
+    fs.writeFileSync(p, raw)
+    servedFromDiskInfo = { filePath: p, size: raw.length, contentType: 'audio/mpeg' }
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=320k'))
+    expect(res.headers.get('content-length')).toBe('11')
+    expect(res.headers.get('accept-ranges')).toBe('bytes')
+    await res.arrayBuffer()
+  })
+
+  it('没走本地整文件（缓存 miss 跟随回源）→ 不改写，也不报错', async () => {
+    servedFromDiskInfo = null
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=flac'))
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-length')).toBe('11')
+    await res.arrayBuffer()
+  })
+
+  it('链头坏掉（文件被截断）→ 退回原样交付，下载不失败', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tag-'))
+    const p = path.join(dir, 'broken.flac')
+    const raw = Buffer.concat([Buffer.from('fLaC', 'latin1'), Buffer.alloc(8, 0x22)])
+    fs.writeFileSync(p, raw)
+    servedFromDiskInfo = { filePath: p, size: raw.length, contentType: 'audio/flac' }
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=flac'))
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-length')).toBe('11')
+    await res.arrayBuffer()
   })
 })

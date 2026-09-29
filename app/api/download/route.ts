@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createReadStream } from 'fs'
-import { stat } from 'fs/promises'
+import { stat, readFile } from 'fs/promises'
+import { Readable } from 'stream'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { logger } from '@/lib/logger'
 import { resolveMusicInfoById } from '@/lib/db'
@@ -8,9 +9,12 @@ import { musicSourceManager } from '@/lib/music-source-manager'
 import { audioServe } from '@/lib/audio-serve'
 import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
+import { getCoverBytesById } from '@/lib/services/cover'
+import { getLyricSidecarPath } from '@/lib/server/lyric-cache'
+import { planTaggedDelivery, createTaggedFileRead } from '@/lib/server/audio-tag-delivery'
 import { findLibrarySong, shouldServeLibraryFile } from '@/lib/services/music-library'
 import { parseIntervalToSeconds } from '@/lib/types/player'
-import type { QualityType } from '@/lib/types/music'
+import type { MusicInfo, QualityType } from '@/lib/types/music'
 import { assertPublicHttpUrl } from '@/lib/server/url-guard'
 import {
   isValidUrl,
@@ -18,6 +22,7 @@ import {
   isAllowedDomain,
   getAllowedDomainsFromEnv,
   sanitizeFilename,
+  stripHtml,
   buildUpstreamHeaders,
   buildContentDisposition,
   buildFilenameFromMusicInfo,
@@ -137,6 +142,8 @@ async function handleDownloadByUid(
   //    透传客户端 Range 头：普通下载（window.location.href）无 Range，audioServe
   //    返回 200 完整文件；浏览器断点续传携带 Range，返回 206 完整区间
   const rangeHeader = request.headers.get('range')
+  /** 本地整文件交付时 audioServe 告诉我们文件在哪、按记账多大（打标签要预读链头） */
+  let servedFromDisk: { filePath: string; size: number; contentType: string } | null = null
   const audioResp = await audioServe.serve({
     cacheKey,
     upstreamUrlResolver,
@@ -144,6 +151,7 @@ async function handleDownloadByUid(
     isHead: false,
     intervalSec: parseIntervalToSeconds(musicInfo.interval),
     onCached: () => cacheNativeLyricForMusic(musicInfo),
+    onServedFromDisk: info => { servedFromDisk = info },
   })
 
   // 6. audioServe 错误响应（502/503）直接透传
@@ -157,12 +165,22 @@ async function handleDownloadByUid(
     })
   }
 
-  // 7. 后端组装文件名（不信任前端输入，从 DB MusicInfo 构造）+
-  //    注入 Content-Disposition: attachment（复制 audioServe 的头 + 追加）
+  // 7. 后端组装文件名（不信任前端输入，从 DB MusicInfo 构造）
   //    非侵入式：不改 audio-serve.ts，仅在外层包装
   const finalFilename = sanitizeFilename(buildFilenameFromMusicInfo(musicInfo, quality))
+  const disposition = buildContentDisposition(finalFilename)
+
+  // 7.5 元数据打标：只有"无 Range 的整文件交付 + 文件已在本地"才换写链头。
+  //     任何一步不成都原样交付 —— 元数据是增益，不是下载的前置条件。
+  if (servedFromDisk && !rangeHeader) {
+    const tagged = await deliverTaggedFile({
+      served: servedFromDisk, musicInfo, uid, disposition, clientIP,
+    })
+    if (tagged) return tagged
+  }
+
   const headers = new Headers(audioResp.headers)
-  headers.set('Content-Disposition', buildContentDisposition(finalFilename))
+  headers.set('Content-Disposition', disposition)
 
   logger.info(
     `[download] ok uid=${uid} cacheKey=${cacheKey} ip=${clientIP} status=${audioResp.status}`
@@ -172,6 +190,89 @@ async function handleDownloadByUid(
     status: audioResp.status,
     headers,
   })
+}
+
+// ============================================================================
+// 元数据打标交付（见 lib/server/audio-tag.ts 的约束说明）
+// ============================================================================
+
+/** 封面抓取内部超时 5s，这里再压一刀：封面再慢也不该把一次下载的首字节拖过 3 秒 */
+const COVER_BUDGET_MS = 3000
+
+/**
+ * 返回打过标签的响应；返回 null 表示"不改写，调用方按原样交付"。
+ * 整段兜 try/catch：读盘、取封面、重写链头任何一步失败都不能让下载变成 500。
+ */
+async function deliverTaggedFile(args: {
+  served: { filePath: string; size: number; contentType: string }
+  musicInfo: MusicInfo
+  uid: string
+  disposition: string
+  clientIP: string
+}): Promise<NextResponse | null> {
+  const { served, musicInfo, uid, disposition } = args
+  try {
+    const lyric = await readSidecarLyric(served.filePath)
+    const picture = await withBudget(getCoverBytesById(uid), COVER_BUDGET_MS)
+
+    const plan = await planTaggedDelivery(served.filePath, served.size, {
+      // 上游数据可能被 HTML 高亮标签污染，与文件名同一把尺清洗
+      TITLE: stripHtml(musicInfo.name || '').trim() || null,
+      ARTIST: stripHtml(musicInfo.singer || '').trim() || null,
+      ALBUM: stripHtml(musicInfo.albumName || '').trim() || null,
+      // 只写已落盘的精确歌词；拿不到就整个字段不写（错配比缺失糟糕得多）
+      LYRICS: lyric,
+    }, picture)
+
+    if ('reason' in plan) {
+      logger.info(`[download] 未打标签 uid=${uid} 原因=${plan.reason}`)
+      return null
+    }
+
+    const headers = new Headers()
+    headers.set('Content-Type', served.contentType)
+    headers.set('Content-Length', String(plan.totalLength))
+    headers.set('Content-Disposition', disposition)
+    // 交付的是"换过链头"的字节，而 Range 分支读的是未改写的原件：留着 Accept-Ranges
+    // 就等于允许客户端拿错的边界拼文件（静默损坏），所以声明不可分段；
+    // 也不让中间代理缓存这份按用户数据拼出来的副本。
+    headers.set('Cache-Control', 'no-store')
+
+    logger.info(
+      `[download] 已写入标签 uid=${uid} 容器=flac 链头 ${plan.audioStart}B→${plan.newHead.length}B `
+      + `长度 ${served.size}→${plan.totalLength} 歌词=${lyric ? '有' : '无'} 封面=${picture ? `${picture.data.length}B` : '无'}`
+    )
+    const stream = createTaggedFileRead(served.filePath, plan)
+    return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream, { status: 200, headers })
+  } catch (err) {
+    logger.warn(`[download] 打标流程异常，按原样交付 uid=${uid}:`, err)
+    return null
+  }
+}
+
+/** 歌词只读缓存旁已有的 sidecar（由播放/下载后置任务写入），绝不为打标签现取上游 */
+async function readSidecarLyric(audioFilePath: string): Promise<string | null> {
+  try {
+    const text = await readFile(getLyricSidecarPath(audioFilePath), 'utf-8')
+    return text.trim() ? text.trim() : null
+  } catch {
+    return null
+  }
+}
+
+/** 超时后给 null，而不是让封面把下载卡住 */
+async function withBudget<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      p,
+      new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), ms) }),
+    ])
+  } catch {
+    return null
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 // ============================================================================

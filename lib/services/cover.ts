@@ -17,9 +17,73 @@ const { getPic: getPicNative } = require('../music-core/music-pic')
 import { searchCache } from '@/lib/cache-manager'
 
 /**
- * 获取指定歌曲的封面图响应。
- * id 为 source-{存储songmid}；查 DB → 原生模块取封面 URL → 抓取图片；失败回退默认图。
+ * 取封面**字节**（供下载打标签等内部调用方使用）。
+ * 与 getCoverResponse 走同一条解析链，但**不返回默认占位图** —— 把 404.png 当专辑封面
+ * 写进用户的文件里是错的，没有就什么都不打。
  */
+export async function getCoverBytesById(id: string): Promise<{ mime: string; data: Buffer } | null> {
+  return resolveCoverBytes(id)
+}
+
+async function resolveCoverBytes(id: string): Promise<{ mime: string; data: Buffer } | null> {
+  if (!id) return null
+  // ar- 为歌手封面（暂无独立封面源）
+  if (id.startsWith('ar-')) return null
+
+  let musicInfo = null
+  try {
+    // Musiver 会给封面 id 拼 al- 前缀，去掉后按歌曲查
+    const coverId = id.startsWith('al-') ? id.slice(3) : id
+    musicInfo = await dbAPI.resolveMusicInfoById(coverId)
+  } catch (err) {
+    logger.warn('[cover] DB lookup failed:', err)
+    return null
+  }
+  if (!musicInfo) return null
+
+  try {
+    // 库内已有封面直链（搜索自带或自动回填）时直接抓取，避免每次打上游
+    if (musicInfo.img) {
+      const direct = await fetchImageFromUrl(musicInfo.img)
+      if (direct) return direct
+    }
+    const picUrl = await getPicCoalesced(musicInfo)
+    if (picUrl) {
+      const fetched = await fetchImageFromUrl(picUrl)
+      if (fetched) return fetched
+    }
+  } catch (err) {
+    logger.debug('[cover] getPic failed:', err)
+  }
+  return null
+}
+
+/**
+ * 获取指定歌曲的封面图响应；失败回退默认图。
+ */
+export async function getCoverResponse(id: string): Promise<Response> {
+  try {
+    const bytes = await resolveCoverBytes(id)
+    if (bytes) return buildImageResponse(bytes)
+    return serveDefaultCoverArt()
+  } catch (err) {
+    logger.error('[cover] error:', err)
+    return serveDefaultCoverArt()
+  }
+}
+
+function buildImageResponse({ mime, data }: { mime: string; data: Buffer }): Response {
+  // Buffer 直接给 Response 会撞上 BodyInit 的泛型签名（ArrayBufferLike vs ArrayBuffer），
+  // 换成 Uint8Array 视图即可，不额外拷贝
+  return new Response(new Uint8Array(data), {
+    status: 200,
+    headers: {
+      'Content-Type': mime,
+      'Content-Length': String(data.byteLength),
+      'Cache-Control': 'public, max-age=86400',
+    },
+  })
+}
 // getPic 在途合并 + 短缓存：并发同曲封面请求共享一次上游签名调用
 // （原实现无合并，网页端 + Subsonic 同时放/前端快速重挂载会把同一签名请求发多次）
 const PIC_URL_CACHE_TTL = 10 * 60 * 1000
@@ -43,50 +107,10 @@ function getPicCoalesced(musicInfo: { source: string; songmid: string }): Promis
   return task
 }
 
-export async function getCoverResponse(id: string): Promise<Response> {
-  try {
-    if (!id) return serveDefaultCoverArt()
-
-    // ar- 为歌手封面（暂无独立封面源），直接返回默认图
-    if (id.startsWith('ar-')) return serveDefaultCoverArt()
-
-    let musicInfo = null
-    try {
-      // Musiver 会给封面 id 拼 al- 前缀，去掉后按歌曲查
-      const coverId = id.startsWith('al-') ? id.slice(3) : id
-      musicInfo = await dbAPI.resolveMusicInfoById(coverId)
-      if (!musicInfo) return serveDefaultCoverArt()
-    } catch (err) {
-      logger.warn('[cover] DB lookup failed:', err)
-      return serveDefaultCoverArt()
-    }
-
-    try {
-      // 库内已有封面直链（搜索自带或自动回填）时直接抓取，避免每次打上游
-      if (musicInfo.img) {
-        const direct = await fetchImageFromUrl(musicInfo.img)
-        if (direct) return direct
-      }
-      const picUrl = await getPicCoalesced(musicInfo)
-      if (picUrl) {
-        const fetched = await fetchImageFromUrl(picUrl)
-        if (fetched) return fetched
-      }
-    } catch (err) {
-      logger.debug('[cover] getPic failed:', err)
-    }
-
-    return serveDefaultCoverArt()
-  } catch (err) {
-    logger.error('[cover] error:', err)
-    return serveDefaultCoverArt()
-  }
-}
-
 /**
- * 从 URL 获取图片，返回图片响应；非图片/失败返回 null。
+ * 从 URL 获取图片字节；非图片/失败返回 null。
  */
-async function fetchImageFromUrl(imageUrl: string): Promise<Response | null> {
+async function fetchImageFromUrl(imageUrl: string): Promise<{ mime: string; data: Buffer } | null> {
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 5000)
@@ -114,14 +138,7 @@ async function fetchImageFromUrl(imageUrl: string): Promise<Response | null> {
     const buffer = await response.arrayBuffer()
     if (!buffer || buffer.byteLength === 0) return null
 
-    return new Response(buffer, {
-      status: 200,
-      headers: {
-        'Content-Type': contentType,
-        'Content-Length': String(buffer.byteLength),
-        'Cache-Control': 'public, max-age=86400',
-      },
-    })
+    return { mime: contentType, data: Buffer.from(buffer) }
   } catch (err) {
     logger.warn('[cover] fetch error:', err)
     return null

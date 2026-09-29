@@ -336,7 +336,7 @@ export function buildUpstreamHeaders(url: string): Record<string, string> {
  * 搜索高亮标签（如 '<em>万能青年旅店<'），直接拼接会导致文件名出现
  * <em> 字面量、Content-Disposition 头非法（ByteString 错误）、或下载路由 500。
  */
-function stripHtml(s: string): string {
+export function stripHtml(s: string): string {
   // 1. 移除所有完整的 HTML 标签（<em>、<b>、<span class="x"> 等）
   const noTags = s.replace(/<[^>]*>/g, '')
   // 2. 解码 HTML 实体（&amp; &lt; &gt; &quot; &#39; &nbsp; …）
