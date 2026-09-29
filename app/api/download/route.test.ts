@@ -60,15 +60,20 @@ let audioServeResponse: Response
 let servedFromDiskInfo: { filePath: string; size: number; contentType: string } | null = null
 let coverBytes: { mime: string; data: Buffer } | null = null
 
-vi.mock('@/lib/audio-serve', () => ({
-  audioServe: {
-    ensureInitialized: vi.fn(async () => {}),
-    serve: vi.fn(async (opts: { onServedFromDisk?: (i: typeof servedFromDiskInfo) => void }) => {
-      if (servedFromDiskInfo) opts.onServedFromDisk?.(servedFromDiskInfo)
-      return audioServeResponse
-    }),
-  },
-}))
+vi.mock('@/lib/audio-serve', async () => {
+  const real = await vi.importActual<typeof import('@/lib/audio-serve')>('@/lib/audio-serve')
+  return {
+    audioServe: {
+      ensureInitialized: vi.fn(async () => {}),
+      serve: vi.fn(async (opts: { onServedFromDisk?: (i: typeof servedFromDiskInfo) => void }) => {
+        if (servedFromDiskInfo) opts.onServedFromDisk?.(servedFromDiskInfo)
+        return audioServeResponse
+      }),
+    },
+    // 路由要用真 parseRange（区间语义必须和 audioServe 一处定义）
+    parseRange: real.parseRange,
+  }
+})
 
 // 封面走内部函数（不是自环 HTTP），测试里给固定字节
 vi.mock('@/lib/services/cover', () => ({
@@ -322,7 +327,7 @@ describe('GET /api/download 元数据打标', () => {
   })
   afterEach(() => { servedFromDiskInfo = null; coverBytes = null })
 
-  it('FLAC + 本地整文件交付 → 打出标签，长度自洽，并去掉 Accept-Ranges', async () => {
+  it('FLAC + 本地整文件交付 → 打出标签、长度自洽，且磁盘原件不变', async () => {
     const { p, file } = writeTempFlac()
     servedFromDiskInfo = { filePath: p, size: file.length, contentType: 'audio/flac' }
     coverBytes = { mime: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0x00, 0xff, 0xd9]) }
@@ -333,7 +338,8 @@ describe('GET /api/download 元数据打标', () => {
     const body = Buffer.from(await res.arrayBuffer())
     expect(body.length, 'Content-Length 必须等于实际字节数').toBe(declared)
     expect(declared).not.toBe(file.length)            // 链头被换过，长度必然不同（可大可小）
-    expect(res.headers.get('accept-ranges'), '交付长度与原件不同，不能再声明可分段').toBeNull()
+    // 续传现在也在"改写后的字节空间"里被满足，所以 Accept-Ranges 是诚实的、该保留
+    expect(res.headers.get('accept-ranges')).toBe('bytes')
     expect(res.headers.get('cache-control')).toBe('no-store')
     expect(res.headers.get('content-disposition')).toContain('attachment')
 
@@ -346,14 +352,42 @@ describe('GET /api/download 元数据打标', () => {
     expect(fs.readFileSync(p)).toEqual(file)
   })
 
-  it('带 Range → 原样透传，绝不改写（206 分片前插标签会让所有偏移错位）', async () => {
+  /** 取一段字节（不带 range 就是整份） */
+  const fetchTagged = async (range?: string) => {
+    const res = await GET(makeGetRequest(
+      '/api/download?uid=kw-196030664&quality=flac',
+      range ? { Range: range } : undefined,
+    ))
+    return { res, body: Buffer.from(await res.arrayBuffer()) }
+  }
+
+  it('带 Range → 在**改写后的字节空间**里给 206；三段拼回来必须等于整份文件', async () => {
     const { p, file } = writeTempFlac()
     servedFromDiskInfo = { filePath: p, size: file.length, contentType: 'audio/flac' }
-    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=flac', { Range: 'bytes=0-1023' }))
-    expect(res.headers.get('content-length')).toBe('11')       // 还是 audioServe 给的那套头
-    expect(res.headers.get('accept-ranges')).toBe('bytes')
-    const body = Buffer.from(await res.arrayBuffer())
-    expect(body.length).toBe(11)
+
+    const full = await fetchTagged()
+    const total = Number(full.res.headers.get('content-length'))
+    expect(total).toBeGreaterThan(200)
+    expect(full.body.length).toBe(total)
+
+    // 三刀刻意跨过链头边界：错一位就会在拼接处留下重复或缺口
+    const a = await fetchTagged('bytes=0-63')
+    const b = await fetchTagged(`bytes=64-${total - 41}`)
+    const c = await fetchTagged(`bytes=${total - 40}-${total - 1}`)
+    expect([a.res.status, b.res.status, c.res.status]).toEqual([206, 206, 206])
+    expect(a.res.headers.get('content-range')).toBe(`bytes 0-63/${total}`)
+    expect(b.res.headers.get('content-range')).toBe(`bytes 64-${total - 41}/${total}`)
+    expect(c.res.headers.get('content-range')).toBe(`bytes ${total - 40}-${total - 1}/${total}`)
+    expect(Buffer.concat([a.body, b.body, c.body])).toEqual(full.body)
+
+    // 后缀式 Range 与 416 也必须按同一套长度说话
+    const suffix = await fetchTagged('bytes=-10')
+    expect(suffix.body).toEqual(full.body.subarray(total - 10))
+    const over = await fetchTagged(`bytes=${total}-`)
+    expect(over.res.status).toBe(416)
+    expect(over.res.headers.get('content-range')).toBe(`*/${total}`)
+
+    /** 客户端拿到的是标签版，磁盘原件仍一字节未动 */
     expect(fs.readFileSync(p)).toEqual(file)
   })
 

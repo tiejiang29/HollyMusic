@@ -76,13 +76,35 @@ export async function planTaggedDelivery(
 }
 
 /**
- * 交付流 = 新链头 ‖ 原文件从 audioStart 到 fileSize-1 的字节。
- * 右界必须显式给：只按 start 读会跑到文件真实末尾，长度就和 Content-Length 不符了。
+ * 交付流 = 新链头 ‖ 原文件从 audioStart 起的字节，但**按"改写后的字节空间"寻址**：
+ * 参数 [start, end] 是客户端看到的偏移（含端点），内部映射成
+ * "新链头的一段 + 原文件 [audioStart + (start-newHeadLen), …] 的一段"。
+ *
+ * 为什么要支持分片而不是只支持整文件：续传请求若走"未改写的原件"，就会把
+ * 打过标签的前半和没打的后半拼在一起，两边偏移差着链头增量 → 静默产出坏文件。
+ * 右界也一律按 `fileSize` 收口（不是文件真实大小），否则 Content-Length 会小于实际字节数。
  */
-export function createTaggedFileRead(filePath: string, plan: TagPlan): Readable {
+export function createTaggedFileRead(
+  filePath: string,
+  plan: TagPlan,
+  start = 0,
+  end = plan.totalLength - 1,
+): Readable {
+  const headLen = plan.newHead.length
+  const lastFileByte = plan.fileSize - 1
+
+  const headFrom = Math.min(Math.max(start, 0), headLen)
+  const headTo = Math.min(Math.max(end + 1, 0), headLen)
+  const headSlice = plan.newHead.subarray(headFrom, headTo)
+
+  const crossesIntoTail = end >= headLen
+  const tailFrom = plan.audioStart + Math.max(start - headLen, 0)
+  const tailTo = Math.min(plan.audioStart + (end - headLen + 1) - 1, lastFileByte)
+
   return Readable.from((async function* () {
-    yield plan.newHead
-    const tail = createReadStream(filePath, { start: plan.audioStart, end: plan.fileSize - 1 })
+    if (headSlice.length) yield headSlice
+    if (!crossesIntoTail || tailTo < tailFrom) return
+    const tail = createReadStream(filePath, { start: tailFrom, end: tailTo })
     try {
       for await (const chunk of tail) yield chunk
     } finally {

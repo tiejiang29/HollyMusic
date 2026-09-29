@@ -6,7 +6,7 @@ import { requireUser, AuthError } from '@/lib/services/user-context'
 import { logger } from '@/lib/logger'
 import { resolveMusicInfoById } from '@/lib/db'
 import { musicSourceManager } from '@/lib/music-source-manager'
-import { audioServe } from '@/lib/audio-serve'
+import { audioServe, parseRange } from '@/lib/audio-serve'
 import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { getCoverBytesById } from '@/lib/services/cover'
@@ -170,11 +170,11 @@ async function handleDownloadByUid(
   const finalFilename = sanitizeFilename(buildFilenameFromMusicInfo(musicInfo, quality))
   const disposition = buildContentDisposition(finalFilename)
 
-  // 7.5 元数据打标：只有"无 Range 的整文件交付 + 文件已在本地"才换写链头。
-  //     任何一步不成都原样交付 —— 元数据是增益，不是下载的前置条件。
-  if (servedFromDisk && !rangeHeader) {
+  // 7.5 元数据打标：只要这次是从本地文件交付就尝试改写（含续传的 Range，见 deliverTaggedFile
+  //     里的字节空间换算）。任何一步不成都原样交付 —— 元数据是增益，不是下载的前置条件。
+  if (servedFromDisk) {
     const tagged = await deliverTaggedFile({
-      served: servedFromDisk, musicInfo, uid, disposition, clientIP,
+      served: servedFromDisk, musicInfo, uid, disposition, rangeHeader,
     })
     if (tagged) return tagged
   }
@@ -208,9 +208,9 @@ async function deliverTaggedFile(args: {
   musicInfo: MusicInfo
   uid: string
   disposition: string
-  clientIP: string
+  rangeHeader: string | null
 }): Promise<NextResponse | null> {
-  const { served, musicInfo, uid, disposition } = args
+  const { served, musicInfo, uid, disposition, rangeHeader } = args
   try {
     const lyric = await readSidecarLyric(served.filePath)
     const picture = await withBudget(getCoverBytesById(uid), COVER_BUDGET_MS)
@@ -229,21 +229,42 @@ async function deliverTaggedFile(args: {
       return null
     }
 
+    // 续传/分段请求一律在**改写后的字节空间**里解析：这样同一个 URL 的任何切片都来自
+    // 同一套字节，不会出现"打过标签的前半 + 没打的后半"拼成坏文件的情况。
+    const range = parseRange(rangeHeader, plan.totalLength)
+    if (range === 'unsatisfiable') {
+      return new NextResponse(null, {
+        status: 416,
+        headers: {
+          'Content-Range': `*/${plan.totalLength}`,
+          'Content-Type': served.contentType,
+          'Cache-Control': 'no-store',
+        },
+      })
+    }
+    const start = range ? range.start : 0
+    const end = range ? range.end : plan.totalLength - 1
+
     const headers = new Headers()
     headers.set('Content-Type', served.contentType)
-    headers.set('Content-Length', String(plan.totalLength))
+    headers.set('Content-Length', String(end - start + 1))
     headers.set('Content-Disposition', disposition)
-    // 交付的是"换过链头"的字节，而 Range 分支读的是未改写的原件：留着 Accept-Ranges
-    // 就等于允许客户端拿错的边界拼文件（静默损坏），所以声明不可分段；
-    // 也不让中间代理缓存这份按用户数据拼出来的副本。
+    // 不骗浏览器"不能续传"：它续传时我们会用同一套空间回应，语义是诚实的。
+    // 但也不给 `public, max-age=3600`：这份副本是按用户元数据拼出来的，缓存下来
+    // 只会让"改了标签还发旧内容"变得难以解释。
+    headers.set('Accept-Ranges', 'bytes')
     headers.set('Cache-Control', 'no-store')
+    if (range) headers.set('Content-Range', `bytes ${start}-${end}/${plan.totalLength}`)
 
     logger.info(
       `[download] 已写入标签 uid=${uid} 容器=flac 链头 ${plan.audioStart}B→${plan.newHead.length}B `
-      + `长度 ${served.size}→${plan.totalLength} 歌词=${lyric ? '有' : '无'} 封面=${picture ? `${picture.data.length}B` : '无'}`
+      + `长度 ${served.size}→${plan.totalLength} 区间=${range ? '206' : '200'} 歌词=${lyric ? '有' : '无'} 封面=${picture ? `${picture.data.length}B` : '无'}`
     )
-    const stream = createTaggedFileRead(served.filePath, plan)
-    return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream, { status: 200, headers })
+    const stream = createTaggedFileRead(served.filePath, plan, start, end)
+    return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream, {
+      status: range ? 206 : 200,
+      headers,
+    })
   } catch (err) {
     logger.warn(`[download] 打标流程异常，按原样交付 uid=${uid}:`, err)
     return null

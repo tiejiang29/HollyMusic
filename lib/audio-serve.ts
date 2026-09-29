@@ -277,10 +277,12 @@ class AudioServe {
     /** 音频完整写入缓存后触发的后台任务；失败不影响音频交付。 */
     onCached?: () => Promise<void>
     /**
-     * 「本地整文件交付」时回调（无 Range、非 HEAD、缓存已完整且通过自愈校验）。
+     * 「从本地文件交付」时回调（非 HEAD；整文件与 206 分片都算），给出文件路径与记账长度。
      * 存在的意义：下载交付要在**响应头发出之前**把 Content-Length 算准，而换写 FLAC
-     * 链头会改变总长度，只有拿到"具体是哪个文件"才能预读链头。调用方不能自己再查一遍
-     * DB——那会和这里的自愈校验（试听片段判定、文件丢失清理）产生两套结论。
+     * 链头会改变总长度，只有拿到"具体是哪个文件"才能预读链头。分片也要回调，是因为外层
+     * 必须把续传的 Range 换算到**同一套改写后的字节空间**，否则"打过标签的前半 +
+     * 没打的后半"会拼成坏文件。调用方不能自己再查一遍 DB——那会和这里的自愈校验
+     * （试听片段判定、文件丢失清理）产生两套结论。
      */
     onServedFromDisk?: (info: { filePath: string; size: number; contentType: string }) => void
   }): Promise<Response> {
@@ -432,12 +434,11 @@ class AudioServe {
       const size = record.size
       const contentType = record.contentType || 'audio/mpeg'
       const range = parseRange(rangeHeader, size)
+      // 本地文件交付（整文件或分片）都要告诉外层：外层要能在**同一套字节空间**里
+      // 响应续传的 Range，否则"打过标签的前半 + 没打的后半"会拼成坏文件。
+      if (!isHead) onServedFromDisk?.({ filePath, size, contentType })
       if (range === 'unsatisfiable') return buildUnsatisfiable(size)
-      if (range === null) {
-        // 只有这一种交付形态可供外层做"整文件改写"（206 分片绝不能改，偏移会错）
-        if (!isHead) onServedFromDisk?.({ filePath, size, contentType })
-        return buildFullResponse(filePath, size, contentType, isHead)
-      }
+      if (range === null) return buildFullResponse(filePath, size, contentType, isHead)
       return buildPartialResponse(filePath, size, contentType, range, isHead)
     } catch (e) {
       logger.error(`[AudioServe] tryServeFromDisk 失败 ${cacheKey}:`, e)
