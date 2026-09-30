@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import path from 'path'
 
-const { findMany, getLyric, fetchNativeLyric, access, readFile, writeFile, rename, unlink } = vi.hoisted(() => ({
+const { findMany, findManyMusic, fetchKugouWordLyric, getLyric, fetchNativeLyric, access, readFile, writeFile, rename, unlink } = vi.hoisted(() => ({
   findMany: vi.fn(),
+  findManyMusic: vi.fn(),
+  fetchKugouWordLyric: vi.fn(),
   getLyric: vi.fn(),
   fetchNativeLyric: vi.fn(),
   access: vi.fn(),
@@ -16,9 +18,9 @@ vi.mock('@/lib/audio-serve', () => ({
   getAudioServeConfig: () => ({ enabled: true, cacheDir: '/audio-cache' }),
 }))
 
-vi.mock('@/lib/db', () => ({ prisma: { audioCache: { findMany } } }))
+vi.mock('@/lib/db', () => ({ prisma: { audioCache: { findMany }, musicInfo: { findMany: findManyMusic } } }))
 vi.mock('@/lib/music-source-manager', () => ({ musicSourceManager: { getLyric } }))
-vi.mock('@/lib/server/music-lyric', () => ({ fetchNativeLyric }))
+vi.mock('@/lib/server/music-lyric', () => ({ fetchNativeLyric, fetchKugouWordLyric }))
 vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
 
 vi.mock('fs/promises', () => {
@@ -155,5 +157,99 @@ describe('fetchLyricForMusic 的逐字通道', () => {
     expect(result).toEqual({ lyric: '[01:20.000]第三方歌词', tlyric: null, wordLyric: null })
     expect(writeFile).not.toHaveBeenCalled() // 标题搜索结果绝不落盘固化
     vi.unstubAllGlobals()
+  })
+})
+
+// ————— 跨源借逐字（本轮只对 tx 开放）—————
+const { parseKrc } = await import('@/lib/server/word-lyric')
+
+/** 酷狗侧：8 行，行起 10000ms 起步、每行 4s，两字一块 */
+const borrowKrc = parseKrc(Array.from({ length: 8 }, (_, i) =>
+  `[${10_000 + i * 4000},3000]<0,2000,0>第${i + 1}行<2000,1000,0>字`).join('\n'))!
+
+/** QQ 侧同一首歌：行时间比酷狗晚 100ms（实测两者本就同一份时间轴） */
+const txLrc = Array.from({ length: 8 }, (_, i) => `[00:${String(10 + i * 4).padStart(2, '0')}.100]第${i + 1}行字`).join('\n')
+
+const txMusicInfo = {
+  source: 'tx', songmid: 'TX001', name: '测试歌曲', singer: '测试歌手',
+  interval: '03:00', types: [], _types: {}, typeUrl: {},
+}
+
+function resetBorrowMocks() {
+  resetSidecarMocks()
+  fetchKugouWordLyric.mockReset()
+  findManyMusic.mockReset().mockResolvedValue([{ songmid: 'KG001', data: JSON.stringify({ source: 'kg', songmid: 'KG001', name: '测试歌曲', hash: 'KGHASH', interval: '03:00' }) }])
+}
+
+describe('跨源借逐字', () => {
+  it('播 QQ 的歌、库里有同款酷狗副本时，借到的字时间挂在本源行时间上，整行文本一字不改', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
+    fetchKugouWordLyric.mockResolvedValue(borrowKrc)
+
+    const result = await fetchLyricForMusic(txMusicInfo)
+    expect(result?.lyric).toBe(txLrc)
+    // 行尾取"下一行的起点"（本源的节奏），不是借来那行自己的时长
+    expect(result?.wordLyric).toContain('[00:10.100]<00:10.100>第1行<00:12.100>字<00:14.100>')
+    expect(rename).toHaveBeenCalledWith(expect.stringContaining('song.wlrc.tmp-'), path.resolve('/audio-cache', 'aa', 'song.wlrc'))
+    expect(fetchKugouWordLyric).toHaveBeenCalledWith(expect.objectContaining({ hash: 'KGHASH' }))
+  })
+
+  it('非 tx 源不借（实测只有 QQ 与酷狗是同一份时间轴）', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
+
+    const result = await fetchLyricForMusic({ ...txMusicInfo, source: 'wy' })
+    expect(result?.wordLyric).toBeNull()
+    expect(findManyMusic).not.toHaveBeenCalled()
+    expect(fetchKugouWordLyric).not.toHaveBeenCalled()
+  })
+
+  it('借来的歌词与本源行文本对不上（不是同一版本）就不借，并删掉残留 .wlrc', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
+    fetchKugouWordLyric.mockResolvedValue(parseKrc(Array.from({ length: 8 }, (_, i) =>
+      `[${10_000 + i * 4000},3000]<0,2000,0>别的<2000,1000,0>词${i}`).join('\n'))!)
+
+    const result = await fetchLyricForMusic(txMusicInfo)
+    expect(result?.wordLyric).toBeNull()
+    expect(unlink).toHaveBeenCalledWith(path.resolve('/audio-cache', 'aa', 'song.wlrc'))
+  })
+
+  it('借来的行时间整体差超过 ±300ms 就不借（网易那种量级）', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue({ lyric: Array.from({ length: 8 }, (_, i) => `[00:${String(13 + i * 4).padStart(2, '0')}.000]第${i + 1}行字`).join('\n'), tlyric: null })
+    fetchKugouWordLyric.mockResolvedValue(borrowKrc)
+
+    await expect(fetchLyricForMusic(txMusicInfo)).resolves.toMatchObject({ wordLyric: null })
+  })
+
+  it('兄弟行没有 hash、或酷狗那边过不了闸门时不借', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
+    fetchKugouWordLyric.mockResolvedValue(null)
+    await expect(fetchLyricForMusic(txMusicInfo)).resolves.toMatchObject({ wordLyric: null })
+
+    resetBorrowMocks()
+    findManyMusic.mockResolvedValue([{ songmid: 'KG002', data: JSON.stringify({ source: 'kg', songmid: 'KG002', name: '测试歌曲' }) }])
+    await expect(fetchLyricForMusic(txMusicInfo)).resolves.toMatchObject({ wordLyric: null })
+    expect(fetchKugouWordLyric).not.toHaveBeenCalled() // 兄弟行没 hash 就不该打上游
+  })
+
+  it('本源自己已有逐字时不去借（不多打一次上游）', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    // 本源自带的逐字：行数与行时间都与整行一致才可用
+    const own = Array.from({ length: 8 }, (_, i) => `[00:${10 + i * 4}.100]<00:${10 + i * 4}.100>第${i + 1}行<00:${12 + i * 4}.100>字<00:${14 + i * 4}.100>`).join('\\n')
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null, wordLyric: own })
+
+    const result = await fetchLyricForMusic(txMusicInfo)
+    expect(result?.wordLyric).toBe(own)
+    expect(fetchKugouWordLyric).not.toHaveBeenCalled()
   })
 })

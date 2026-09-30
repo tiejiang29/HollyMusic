@@ -11,10 +11,12 @@ import { getAudioServeConfig } from '@/lib/audio-serve'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { musicSourceManager } from '@/lib/music-source-manager'
+import { songIdentity } from '@/lib/song-identity'
 import { getLyricSidecarPath, getTranslationLyricSidecarPath, getWordLyricSidecarPath } from '@/lib/server/lyric-cache'
 import { decodeLyricEntities } from '@/lib/server/lyric-decode'
 import { normalizeStructuredLyricText } from '@/lib/server/lyric-normalize'
-import { fetchNativeLyric } from '@/lib/server/music-lyric'
+import { fetchKugouWordLyric, fetchNativeLyric } from '@/lib/server/music-lyric'
+import { alignWordLyricToLines, toEnhancedLrc } from '@/lib/server/word-lyric'
 import type { MusicInfo } from '@/lib/types/music'
 
 export interface ParsedLyricLine {
@@ -143,6 +145,60 @@ async function writeTextAtomically(filePath: string, content: string): Promise<v
   }
 }
 
+/**
+ * 跨源借逐字（本轮只做 tx）。播的是 QQ 的歌，但库里同一首有酷狗副本时，用那行的
+ * hash 取 KRC 的字时间，再挂回 QQ 自己的行时间上 —— 行级文本一个字节都不改。
+ *
+ * 只放开 tx 是实测结论：tx 与酷狗的行时间中位差 4~5ms（本就是同一份时间轴），
+ * 网易差 200~500ms 且常是另一个版本（对齐率低到 22%）。所以闸门很紧：
+ * 行对齐率 ≥70% 且整体时间差 ≤300ms，配不上就不借。
+ */
+const BORROWABLE_SOURCES = new Set(['tx'])
+
+async function borrowWordLyric(musicInfo: MusicInfo, lyric: string): Promise<string | null> {
+  if (!BORROWABLE_SOURCES.has(musicInfo.source)) return null
+  const identity = songIdentity(musicInfo)
+  if (identity === '|') return null
+
+  const parsedLocal = parseLrc(lyric)
+  if (parsedLocal.lines.length < 8) return null
+
+  try {
+    const rows = await prisma.musicInfo.findMany({
+      where: { identity, source: 'kg' },
+      select: { data: true, songmid: true },
+      take: 5,
+    })
+    for (const row of rows) {
+      if (row.songmid === musicInfo.songmid) continue
+      let donor: MusicInfo | null = null
+      try {
+        donor = JSON.parse(row.data ?? '') as MusicInfo
+      } catch {
+        continue // data 列损坏的行跳过
+      }
+      if (!donor?.hash) continue
+      const borrowed = await fetchKugouWordLyric(donor)
+      if (!borrowed) continue
+      const aligned = alignWordLyricToLines(borrowed, parsedLocal.lines.map(line => ({ start: line.time, text: line.text })))
+      if (!aligned.ok) {
+        logger.info('[lyrics] 跨源逐字配不上，不借', { songId: musicInfo.songmid, donor: row.songmid, reason: aligned.reason })
+        continue
+      }
+      logger.info('[lyrics] 跨源借到逐字', {
+        songId: musicInfo.songmid, donor: row.songmid,
+        对齐率: `${(aligned.alignRate * 100).toFixed(0)}%`, 时间差: `${aligned.medianShiftMs}ms`,
+      })
+      // 整行歌词带 [offset:] 时要在逐字里带上同一个值：客户端对两侧都套这个偏移，
+      // 只有一侧带就会判定行时间不一致而退回整行渲染
+      return parsedLocal.offset ? `[offset:${parsedLocal.offset}]\n${toEnhancedLrc(aligned.lyric)}` : toEnhancedLrc(aligned.lyric)
+    }
+  } catch (err) {
+    logger.debug('[lyrics] 跨源借逐字失败（忽略）:', err)
+  }
+  return null
+}
+
 async function getNativeLyricWithDiskCache(musicInfo: MusicInfo): Promise<LyricResult | null> {
   const cached = await getCachedNativeLyric(musicInfo)
   if (cached) return cached
@@ -156,7 +212,9 @@ async function getNativeLyricWithDiskCache(musicInfo: MusicInfo): Promise<LyricR
     if (!nativeLyric) return null
     const lyric = normalizeLyricPayload(nativeLyric.lyric)
     if (!lyric) return null
-    const wordLyric = nativeLyric.wordLyric ? normalizeLyricPayload(nativeLyric.wordLyric) : ''
+    let wordLyric = nativeLyric.wordLyric ? normalizeLyricPayload(nativeLyric.wordLyric) : ''
+    // 本源没有逐字时，才去库里找同款兄弟行借一份（本轮只对 tx 开放）
+    if (!wordLyric) wordLyric = (await borrowWordLyric(musicInfo, lyric)) ?? ''
     // 上游给逐字时整行本应出自同一次解析；不信任到这一步，对不上就只丢逐字，
     // 整行照常落盘，同时把磁盘上残留的旧 .wlrc 删掉（否则它将与新 .lrc 错配）
     const paired = !!wordLyric && isWordLyricConsistent(lyric, wordLyric)

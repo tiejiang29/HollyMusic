@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import {
-  parseKrc, parseMrc, decodeKrcPayload, screenWordLyric, toEnhancedLrc, toPlainLrc,
+  parseKrc, parseMrc, decodeKrcPayload, screenWordLyric, toEnhancedLrc, toPlainLrc, alignWordLyricToLines,
   type WordLyric,
 } from './word-lyric'
 
@@ -277,4 +277,61 @@ describeReal('真机 KRC/MRC 样本（my/capture-word-lyric.mjs 抓取）', () =
       else console.log(`  [真机拒因] ${sample.song}: ${verdict.reason}`)
     })
   }
+})
+
+// ————— 跨源借逐字：把借来的行内相对偏移挂到本地行时间上 —————
+const borrowedKrc = parseKrc([
+  '[ti:借来的歌]',
+  '[10000,3000]<0,1000,0>第一<1000,1000,0>行<2000,1000,0>字',
+  '[14000,3000]<0,1500,0>第二<1500,1500,0>行<3000,0,0>字',
+  '[18000,3000]<0,1000,0>副歌<1000,1000,0>一句<2000,1000,0>唱两遍',
+  '[22000,3000]<0,1000,0>中间<1000,2000,0>行',
+  '[26000,3000]<0,1000,0>副歌<1000,1000,0>一句<2000,1000,0>唱两遍', // 与第三行同文本
+].join('\n'))!
+
+const localOf = (shift: number, texts: string[] = ['第一行字', '第二行字', '副歌一句唱两遍', '中间行', '副歌一句唱两遍']) =>
+  texts.map((text, i) => ({ start: 10_000 + i * 4000 + shift + (text === '中间行' ? 100 : 0), text }))
+
+describe('alignWordLyricToLines（跨源借逐字）', () => {
+  it('行时间用本地的，字时间保留借来的行内相对偏移', () => {
+    const r = alignWordLyricToLines(borrowedKrc, localOf(120))
+    if (!r.ok) return expect.unreachable(r.reason)
+    const second = r.lyric.lines[1]
+    expect(second.start).toBe(14_120)          // 本地行起点，不是借来的 14000
+    expect(second.words.map(w => w.start)).toEqual([14_120, 15_620, 17_120])
+    expect(second.words.map(w => w.text)).toEqual(['第二', '行', '字'])
+    expect(r.alignRate).toBe(1)
+    expect(r.medianShiftMs).toBeGreaterThanOrEqual(100)
+    expect(r.medianShiftMs).toBeLessThanOrEqual(120)
+  })
+
+  it('输出行数与本地一致，配不上的行退化成整行一个块（客户端同源校验仍成立）', () => {
+    const local = localOf(0)
+    const withExtra = [...local, { start: 99_000, text: '借来的歌词里没有这一行' }]
+    const r = alignWordLyricToLines(borrowedKrc, withExtra)
+    if (!r.ok) return expect.unreachable(r.reason)
+    expect(r.lyric.lines).toHaveLength(withExtra.length)
+    const last = r.lyric.lines[r.lyric.lines.length - 1]
+    expect(last.words).toEqual([{ start: 99_000, end: 104_000, text: '借来的歌词里没有这一行' }])
+  })
+
+  it('重复的副歌行按出现顺序配对，不是全部配到第一次出现的位置', () => {
+    const r = alignWordLyricToLines(borrowedKrc, localOf(0))
+    if (!r.ok) return expect.unreachable(r.reason)
+    expect(r.lyric.lines[2].words[0].start).toBe(18_000)
+    expect(r.lyric.lines[4].words[0].start).toBe(26_000) // 第二次出现，不是 18000
+  })
+
+  it('整体时间差超过 ±300ms 就不借（网易那种量级）', () => {
+    const r = alignWordLyricToLines(borrowedKrc, localOf(800))
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('超出')
+  })
+
+  it('行对齐率不足 70% 就不借（大概率不是同一版本）', () => {
+    const local = [...localOf(0, ['第一行字']), ...Array.from({ length: 5 }, (_, i) => ({ start: 30_000 + i * 3000, text: `对不上的第${i}行` }))]
+    const r = alignWordLyricToLines(borrowedKrc, local)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('行对齐率')
+  })
 })

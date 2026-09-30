@@ -2,7 +2,7 @@ import { logger } from '@/lib/logger'
 import type { MusicInfo } from '@/lib/types/music'
 import { inflate } from 'zlib'
 import { promisify } from 'util'
-import { decodeKrcPayload, parseKrc, parseMrc, screenWordLyric, toEnhancedLrc, toPlainLrc } from './word-lyric'
+import { decodeKrcPayload, parseKrc, parseMrc, screenWordLyric, toEnhancedLrc, toPlainLrc, type WordLyric } from './word-lyric'
 
 export type NativeLyricResult = {
   lyric: string
@@ -304,8 +304,9 @@ async function fetchMiguLyric(musicInfo: MusicInfo): Promise<NativeLyricResult |
   return { lyric, tlyric: await fetchMiguTranslation(musicInfo, headers) }
 }
 
-async function fetchKugouLyric(musicInfo: MusicInfo): Promise<NativeLyricResult | null> {
-  if (!musicInfo.hash) return null
+/** 按 hash 确址找到酷狗歌词候选，返回"按格式下载"的闭包；找不到候选返回 null */
+async function openKugouLyric(musicInfo: MusicInfo): Promise<((fmt: 'krc' | 'lrc') => Promise<unknown>) | null> {
+  if (!musicInfo.hash || !musicInfo.name) return null
   const params = new URLSearchParams({
     ver: '1', man: 'yes', client: 'pc', keyword: musicInfo.name, hash: musicInfo.hash,
     timelength: String(parseIntervalSeconds(musicInfo.interval)), lrctxt: '1',
@@ -318,38 +319,63 @@ async function fetchKugouLyric(musicInfo: MusicInfo): Promise<NativeLyricResult 
   const searchResponse = await fetchWithTimeout(`https://lyrics.kugou.com/search?${params}`, { headers })
   if (!searchResponse) return null
   const searchPayload = await searchResponse.json() as { candidates?: unknown }
-  const candidate = Array.isArray(searchPayload.candidates)
-    ? searchPayload.candidates.find((item): item is KugouLyricCandidate => Boolean(item) && typeof item === 'object' && titleMatches(String((item as KugouLyricCandidate).song || ''), musicInfo.name) && artistMatches(String((item as KugouLyricCandidate).singer || ''), musicInfo.singer))
-    : undefined
-  if (!candidate?.id || !candidate.accesskey) return null
+  const list = Array.isArray(searchPayload.candidates) ? searchPayload.candidates : []
+  const candidate = list.find((item): item is KugouLyricCandidate => Boolean(item) && typeof item === 'object' && titleMatches(String((item as KugouLyricCandidate).song || ''), musicInfo.name) && artistMatches(String((item as KugouLyricCandidate).singer || ''), musicInfo.singer))
+  if (!candidate?.id || !candidate.accesskey) {
+    // 没有这行就分不清"同名闸门拦住了"和"上游根本没给候选"（实测连打同一首第二遍会被限速）
+    logger.info('[lyrics] 酷狗无可信候选', { songId: musicInfo.songmid, 候选数: list.length, 首条: String((list[0] as KugouLyricCandidate)?.song ?? '') })
+    return null
+  }
 
-  const download = async (fmt: 'krc' | 'lrc') => {
+  return async (fmt: 'krc' | 'lrc') => {
     const downloadParams = new URLSearchParams({ ver: '1', client: 'pc', id: String(candidate.id), accesskey: String(candidate.accesskey), fmt, charset: 'utf8' })
     const response = await fetchWithTimeout(`https://lyrics.kugou.com/download?${downloadParams}`, { headers })
     if (!response) return null
     const payload = await response.json() as { fmt?: unknown; content?: unknown }
     return payload.fmt === fmt ? payload.content ?? null : null
   }
+}
 
-  // 先试逐字：命中就一次解析同时给出行级与字级；不过闸门才回落到原来的 fmt=lrc，行为不变。
+async function fetchKugouParsedLyricFrom(
+  download: (fmt: 'krc' | 'lrc') => Promise<unknown>,
+  musicInfo: MusicInfo,
+): Promise<WordLyric | null> {
   const krcContent = await download('krc')
   const krcText = typeof krcContent === 'string' ? decodeKrcPayload(krcContent) : null
   const parsed = krcText ? parseKrc(krcText) : null
-  if (parsed) {
-    const verdict = screenWordLyric(parsed, {
-      durationSeconds: parseIntervalSeconds(musicInfo.interval),
-      expectedFileHash: musicInfo.hash,
-    })
-    if (verdict.ok) {
-      logger.info('[lyrics] 酷狗逐字命中', { songId: musicInfo.songmid, lineCount: verdict.lineCount })
-      return { lyric: toPlainLrc(parsed), tlyric: null, wordLyric: toEnhancedLrc(parsed) }
-    }
-    logger.info('[lyrics] 酷狗逐字被闸门拒绝，回落整行', { songId: musicInfo.songmid, reason: verdict.reason })
+  if (!parsed) return null
+  const verdict = screenWordLyric(parsed, {
+    durationSeconds: parseIntervalSeconds(musicInfo.interval),
+    expectedFileHash: musicInfo.hash,
+  })
+  if (verdict.ok) {
+    logger.info('[lyrics] 酷狗逐字命中', { songId: musicInfo.songmid, lineCount: verdict.lineCount })
+    return parsed
   }
+  logger.info('[lyrics] 酷狗逐字被闸门拒绝，回落整行', { songId: musicInfo.songmid, reason: verdict.reason })
+  return null
+}
+
+async function fetchKugouLyric(musicInfo: MusicInfo): Promise<NativeLyricResult | null> {
+  const download = await openKugouLyric(musicInfo)
+  if (!download) return null
+
+  // 先试逐字：命中就一次解析同时给出行级与字级；不过闸门才回落到原来的 fmt=lrc，行为不变。
+  const parsed = await fetchKugouParsedLyricFrom(download, musicInfo)
+  if (parsed) return { lyric: toPlainLrc(parsed), tlyric: null, wordLyric: toEnhancedLrc(parsed) }
 
   const lrcContent = await download('lrc')
   const lyric = typeof lrcContent === 'string' ? decodeBase64(lrcContent) : ''
   return lyric ? { lyric, tlyric: null } : null
+}
+
+/**
+ * 按歌曲自己的 FileHash 确址取酷狗逐字并过结构闸门；取不到返回 null。
+ * 给"跨源借逐字"复用：播的是 A 源，但库里同一首歌有酷狗副本时，用那行的 hash 拿字时间。
+ */
+export async function fetchKugouWordLyric(musicInfo: MusicInfo): Promise<WordLyric | null> {
+  const download = await openKugouLyric(musicInfo)
+  return download ? fetchKugouParsedLyricFrom(download, musicInfo) : null
 }
 
 /**

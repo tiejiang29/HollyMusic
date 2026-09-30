@@ -229,6 +229,90 @@ export function screenWordLyric(lyric: WordLyric, input: WordLyricScreenInput = 
   return { ok: true, lineCount: lines.length }
 }
 
+/** 跨源借逐字时的本地行：只用到行起点与整行文本（毫秒） */
+export interface LocalLyricLine {
+  start: number
+  text: string
+}
+
+export interface AlignOptions {
+  /** 行文本对齐率下限（借来的行数与本地行数按顺序能配上的比例） */
+  minAlignRate?: number
+  /** 允许的整体时间差上限（毫秒）；超过说明不是同一份时间轴 */
+  maxMedianShiftMs?: number
+}
+
+export type AlignResult =
+  | { ok: true; lyric: WordLyric; alignRate: number; medianShiftMs: number }
+  | { ok: false; reason: string }
+
+const normalizeLineText = (value: string): string => value.toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '')
+
+/**
+ * 把"从兄弟源借来的逐字"挂到"正在播的那个源自己的行时间"上。
+ *
+ * 关键是 KRC 的字时间本来就是**行内相对偏移**，所以借的时候不平移绝对时间轴，
+ * 而是保留行内相对量、把行起点换成本地行起点 —— 逐字天然与本行对齐，行级文本
+ * 一个字都不用改（车机/锁屏岛那条"必须是纯行级 LRC"的红线因此不受影响）。
+ *
+ * 借不借由数据说了算：按顺序配对行文本（副歌重复行必须按出现顺序配，
+ * 用文本首现映射会把 20 秒的那句配到 200 秒上，造出上百秒的假偏移），
+ * 对齐率和整体时间差两道闸门过不了就返回 null。
+ * 配不上的行退化成"整行一个块"，行数与本地完全一致，客户端同源校验仍成立。
+ */
+export function alignWordLyricToLines(borrowed: WordLyric, local: LocalLyricLine[], options: AlignOptions = {}): AlignResult {
+  const minAlignRate = options.minAlignRate ?? 0.7
+  const maxMedianShiftMs = options.maxMedianShiftMs ?? 300
+  if (!local.length) return { ok: false, reason: '本地整行歌词为空' }
+  const pool = borrowed.lines
+    .map(line => ({ line, key: normalizeLineText(line.words.map(word => word.text).join('')) }))
+    .filter(item => item.key)
+  if (!pool.length) return { ok: false, reason: '借来的歌词没有可配对的行' }
+
+  const picked: (WordLyricLine | null)[] = []
+  const shifts: number[] = []
+  let cursor = 0
+  for (const line of local) {
+    const key = normalizeLineText(line.text)
+    let hit = -1
+    if (key) {
+      for (let j = cursor; j < pool.length && j < cursor + 12; j++) {
+        if (pool[j].key === key) { hit = j; break }
+      }
+    }
+    if (hit < 0) { picked.push(null); continue }
+    picked.push(pool[hit].line)
+    shifts.push(line.start - pool[hit].line.start)
+    cursor = hit + 1
+  }
+
+  const alignRate = shifts.length / local.length
+  if (alignRate < minAlignRate) return { ok: false, reason: `行对齐率 ${(alignRate * 100).toFixed(0)}% < ${(minAlignRate * 100).toFixed(0)}%（可能不是同一版本）` }
+  const sorted = [...shifts].sort((a, b) => a - b)
+  const medianShiftMs = sorted[Math.floor(sorted.length / 2)]
+  if (Math.abs(medianShiftMs) > maxMedianShiftMs) return { ok: false, reason: `整体时间差 ${medianShiftMs}ms 超出 ±${maxMedianShiftMs}ms` }
+
+  const lines: WordLyricLine[] = local.map((line, index) => {
+    // 行尾取下一行的起点；末行按 5s 兜底。至少留 250ms，避免相邻行挤成零宽
+    const end = index + 1 < local.length
+      ? Math.max(line.start + 250, local[index + 1].start)
+      : line.start + 5000
+    const source = picked[index]
+    if (!source) return { start: line.start, end, words: [{ start: line.start, end, text: line.text.trim() }] }
+    const rels = source.words.map(word => word.start - source.start)
+    const words = source.words
+      .map((word, k) => {
+        const start = clamp(line.start + rels[k], line.start, end)
+        const nextRel = k + 1 < rels.length ? rels[k + 1] : rels[k] + 1
+        return { start, end: clamp(line.start + Math.max(nextRel, rels[k]), start, end), text: word.text }
+      })
+      .filter(word => word.text)
+    return { start: line.start, end, words: words.length ? words : [{ start: line.start, end, text: line.text.trim() }] }
+  })
+
+  return { ok: true, lyric: { lines, headers: {} }, alignRate, medianShiftMs }
+}
+
 function formatTimestamp(milliseconds: number): string {
   const total = Math.max(0, Math.round(milliseconds))
   const minutes = Math.floor(total / 60_000)
