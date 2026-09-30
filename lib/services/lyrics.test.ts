@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import path from 'path'
 
-const { findMany, findManyMusic, fetchKugouWordLyric, getLyric, fetchNativeLyric, access, readFile, writeFile, rename, unlink } = vi.hoisted(() => ({
+const { findMany, findManyMusic, findFirstMusic, fetchKugouWordLyric, getLyric, fetchNativeLyric, access, readFile, writeFile, rename, unlink } = vi.hoisted(() => ({
   findMany: vi.fn(),
   findManyMusic: vi.fn(),
+  findFirstMusic: vi.fn(),
   fetchKugouWordLyric: vi.fn(),
   getLyric: vi.fn(),
   fetchNativeLyric: vi.fn(),
@@ -18,7 +19,7 @@ vi.mock('@/lib/audio-serve', () => ({
   getAudioServeConfig: () => ({ enabled: true, cacheDir: '/audio-cache' }),
 }))
 
-vi.mock('@/lib/db', () => ({ prisma: { audioCache: { findMany }, musicInfo: { findMany: findManyMusic } } }))
+vi.mock('@/lib/db', () => ({ prisma: { audioCache: { findMany }, musicInfo: { findMany: findManyMusic, findFirst: findFirstMusic } } }))
 vi.mock('@/lib/music-source-manager', () => ({ musicSourceManager: { getLyric } }))
 vi.mock('@/lib/server/music-lyric', () => ({ fetchNativeLyric, fetchKugouWordLyric }))
 vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
@@ -64,9 +65,10 @@ describe('cacheNativeLyricForMusic', () => {
 // ————— 逐字（.wlrc）读写与同源约束 —————
 const { fetchLyricForMusic } = await import('./lyrics')
 
+// kg 行必须带 hash：补取闸门靠它判断"这首歌有没有可能拿到逐字"
 const kgMusicInfo = {
   source: 'kg', songmid: 'KGHASH', name: '测试歌曲', singer: '测试歌手',
-  interval: '03:00', types: [], _types: {}, typeUrl: {},
+  interval: '03:00', hash: 'KGFILEHASH', types: [], _types: {}, typeUrl: {},
 }
 const ENHANCED = '[01:20.000]<01:20.000>第1字<01:21.000>末字<01:23.000>'
 
@@ -100,13 +102,16 @@ describe('fetchLyricForMusic 的逐字通道', () => {
     expect(fetchNativeLyric).not.toHaveBeenCalled() // 命中缓存就不打上游
   })
 
-  it('只有 .lrc 时 wordLyric 为 null，不影响整行返回', async () => {
+  it('只有 .lrc 且该源本来没有逐字时，直接用缓存返回、不打上游', async () => {
     resetSidecarMocks()
     stubSidecars({ 'song.lrc': '[01:20.000]第1字末字' })
+    fetchNativeLyric.mockResolvedValue(null)
 
-    await expect(fetchLyricForMusic(kgMusicInfo)).resolves.toEqual({
+    // 用 kw：它没有逐字通道，所以"缓存命中就早退"仍然是对的行为
+    await expect(fetchLyricForMusic({ ...kgMusicInfo, source: 'kw', hash: undefined })).resolves.toEqual({
       lyric: '[01:20.000]第1字末字', tlyric: null, wordLyric: null,
     })
+    expect(fetchNativeLyric).not.toHaveBeenCalled()
   })
 
   it('原生逐字命中时同时写 .lrc 与 .wlrc', async () => {
@@ -251,5 +256,76 @@ describe('跨源借逐字', () => {
     const result = await fetchLyricForMusic(txMusicInfo)
     expect(result?.wordLyric).toBe(own)
     expect(fetchKugouWordLyric).not.toHaveBeenCalled()
+  })
+})
+
+// ————— 早退缺陷的修补：整行命中缓存 ≠ 逐字命中缓存 —————
+describe('缓存里只有整行、缺逐字时的补取', () => {
+  const ownWord = Array.from({ length: 8 }, (_, i) => `[00:${10 + i * 4}.100]<00:${10 + i * 4}.100>第${i + 1}行<00:${12 + i * 4}.100>字<00:${14 + i * 4}.100>`).join('\n')
+
+  it('kg 行（带 hash）会补取一次，并把整行与逐字一起重写', async () => {
+    resetBorrowMocks()
+    stubSidecars({ 'song.lrc': '[00:10.100]第1行字' })   // 只有整行，没有 .wlrc
+    findFirstMusic.mockResolvedValue(null)
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null, wordLyric: ownWord })
+
+    const result = await fetchLyricForMusic({ ...kgMusicInfo, songmid: 'KG_RETRY_1' })
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(1)
+    expect(result?.wordLyric).toBe(ownWord)
+    const written = rename.mock.calls.map(c => String(c[1]))
+    expect(written).toContain(path.resolve('/audio-cache', 'aa', 'song.lrc'))
+    expect(written).toContain(path.resolve('/audio-cache', 'aa', 'song.wlrc'))
+  })
+
+  it('同一首在一轮补取失败后不再重试（否则每次播放都白打上游）', async () => {
+    resetBorrowMocks()
+    stubSidecars({ 'song.lrc': '[00:10.100]第1行字' })
+    findFirstMusic.mockResolvedValue(null)
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })   // 网络有整行、就是没逐字
+
+    const info = { ...kgMusicInfo, songmid: 'KG_RETRY_2' }
+    const first = await fetchLyricForMusic(info)
+    expect(first?.wordLyric).toBeNull()
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(1)
+
+    const second = await fetchLyricForMusic(info)
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(1)   // 第二次直接吃缓存，不再打上游
+    expect(second?.wordLyric).toBeNull()
+  })
+
+  it('mg 行没有 mrcUrl 就不补取（它本来不可能有逐字）', async () => {
+    resetBorrowMocks()
+    stubSidecars({ 'song.lrc': '[00:10.100]第1行字' })
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null, wordLyric: ownWord })
+
+    const result = await fetchLyricForMusic({ ...kgMusicInfo, source: 'mg', songmid: 'MG_NO_MRC', mrcUrl: undefined })
+    expect(result?.wordLyric).toBeNull()
+    expect(fetchNativeLyric).not.toHaveBeenCalled()
+  })
+
+  it('tx 行只在库里确有带 hash 的酷狗兄弟时才补取', async () => {
+    resetBorrowMocks()
+    stubSidecars({ 'song.lrc': '[00:10.100]第1行字' })
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
+    findFirstMusic.mockResolvedValue(null)
+    await fetchLyricForMusic({ ...txMusicInfo, songmid: 'TX_NO_DONOR' })
+    expect(fetchNativeLyric).not.toHaveBeenCalled()
+
+    resetBorrowMocks()
+    stubSidecars({ 'song.lrc': '[00:10.100]第1行字' })
+    findFirstMusic.mockResolvedValue({ songmid: 'KG001' })
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null, wordLyric: ownWord })
+    await fetchLyricForMusic({ ...txMusicInfo, songmid: 'TX_WITH_DONOR' })
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(1)
+  })
+
+  it('缓存里逐字已经在，就直接用、不打上游', async () => {
+    resetBorrowMocks()
+    stubSidecars({ 'song.lrc': '[00:10.100]第1行字', 'song.wlrc': ownWord })
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null, wordLyric: ownWord })
+
+    const result = await fetchLyricForMusic({ ...kgMusicInfo, songmid: 'KG_HAS_WLRC' })
+    expect(result?.wordLyric).toBe(ownWord)
+    expect(fetchNativeLyric).not.toHaveBeenCalled()
   })
 })

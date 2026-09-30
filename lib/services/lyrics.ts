@@ -32,6 +32,37 @@ type LyricResult = { lyric: string; tlyric: string | null; wordLyric: string | n
 
 const nativeLyricInflight = new Map<string, Promise<LyricResult | null>>()
 
+/**
+ * 「整行已缓存、逐字缺失」时的补取账本：每首歌每个进程最多试一次。
+ * 没有它会有两种坏结果 —— 要么老 .lrc 把这首歌永久挡在逐字之外，
+ * 要么每次播放都为拿不到的逐字白打一遍上游。
+ */
+const wordLyricRetried = new Set<string>()
+const WORD_RETRY_LEDGER_LIMIT = 2000
+
+function claimWordLyricRetry(key: string): boolean {
+  if (wordLyricRetried.has(key)) return false
+  if (wordLyricRetried.size >= WORD_RETRY_LEDGER_LIMIT) wordLyricRetried.clear()
+  wordLyricRetried.add(key)
+  return true
+}
+
+/** 这行记录本身有没有拿到逐字的可能 —— 没可能就别打上游 */
+async function mayHaveWordLyric(musicInfo: MusicInfo): Promise<boolean> {
+  if (musicInfo.source === 'kg') return Boolean(musicInfo.hash)
+  if (musicInfo.source === 'mg') return Boolean(musicInfo.mrcUrl)
+  if (musicInfo.source === 'tx') {
+    const identity = songIdentity(musicInfo)
+    if (identity === '|') return false
+    const donor = await prisma.musicInfo.findFirst({
+      where: { identity, source: 'kg', hash: { gt: '' } },
+      select: { songmid: true },
+    })
+    return Boolean(donor)
+  }
+  return false
+}
+
 function getAudioCacheKeyPrefix(musicInfo: MusicInfo): string {
   return `${musicInfo.source}:${musicInfo.songmid}:`
 }
@@ -200,10 +231,15 @@ async function borrowWordLyric(musicInfo: MusicInfo, lyric: string): Promise<str
 }
 
 async function getNativeLyricWithDiskCache(musicInfo: MusicInfo): Promise<LyricResult | null> {
-  const cached = await getCachedNativeLyric(musicInfo)
-  if (cached) return cached
-
   const key = `${musicInfo.source}:${musicInfo.songmid}`
+  const cached = await getCachedNativeLyric(musicInfo)
+  if (cached) {
+    // 早退缺陷的修补：整行命中缓存不等于逐字命中。缺失时补取一次，并且让网络路径
+    // **同时重写** .lrc 与 .wlrc —— 只把新逐字配到旧 .lrc 上，正是实测过的 10ms 混用
+    if (cached.wordLyric || !claimWordLyricRetry(key) || !(await mayHaveWordLyric(musicInfo))) return cached
+    logger.info('[lyrics] 整行已缓存但缺逐字，补取一次', { source: musicInfo.source, songId: musicInfo.songmid })
+  }
+
   const running = nativeLyricInflight.get(key)
   if (running) return running
 
@@ -265,7 +301,7 @@ export async function cacheNativeLyricForMusic(musicInfo: MusicInfo): Promise<vo
   // 仅缓存渠道唯一标识精确取得的歌词；标题搜索等第三方回退结果可能错配，
   // 可以临时返回给页面，但绝不能落盘固化。
   const cached = await getCachedNativeLyric(musicInfo)
-  if (cached) return
+  if (cached?.wordLyric) return
   if (await getNativeLyricWithDiskCache(musicInfo)) return
   await getSourceLyricWithDiskCache(musicInfo)
 }
