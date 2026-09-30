@@ -41,10 +41,14 @@ vi.mock('@/lib/db', () => ({
   })),
 }))
 
+// 逐字是否命中由用例改写（默认无逐字，走整行）
+let nativeWordLyric: string | null = null
+
 vi.mock('@/lib/services/lyrics', () => ({
   fetchLyricForMusic: vi.fn(async () => ({
     lyric: '[00:00.00]杀死那个石家庄人',
     tlyric: null,
+    wordLyric: nativeWordLyric,
   })),
 }))
 
@@ -62,6 +66,7 @@ const { GET } = await import('./route')
 describe('GET /api/lyrics', () => {
   beforeEach(() => {
     authMode = 'ok'
+    nativeWordLyric = null
   })
 
   it('未登录返回 401', async () => {
@@ -80,5 +85,18 @@ describe('GET /api/lyrics', () => {
     expect(json.success).toBe(true)
     expect(json.data.hasLyric).toBe(true)
     expect(json.data.lyric).toContain('石家庄人')
+  })
+
+  it('命中逐字时透传 wordLyric，整行仍是同一次解析的文本', async () => {
+    nativeWordLyric = '[00:00.000]<00:00.000>杀<00:00.400>死<00:01.000>那个<00:02.000>石家庄人<00:04.000>'
+    const json = await (await GET(makeGetRequest('kg-196030664'))).json()
+    expect(json.data.wordLyric).toBe(nativeWordLyric)
+    expect(json.data.lyric).toBe('[00:00.00]杀死那个石家庄人')
+  })
+
+  it('取不到逐字时 wordLyric 明确为 null（老客户端只读 lyric 不受影响）', async () => {
+    const json = await (await GET(makeGetRequest('wy-1'))).json()
+    expect(json.data.wordLyric).toBeNull()
+    expect(json.data.hasLyric).toBe(true)
   })
 })

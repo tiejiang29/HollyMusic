@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
 
     const musicInfo = await dbAPI.resolveMusicInfoById(id)
     if (!musicInfo) {
-      return createSuccessResponse({ songId: id, lyric: null, tlyric: null, hasLyric: false })
+      return createSuccessResponse({ songId: id, lyric: null, tlyric: null, wordLyric: null, hasLyric: false })
     }
 
     const lyric = await fetchLyricForMusic(musicInfo)
@@ -31,6 +31,8 @@ export async function GET(request: NextRequest) {
       songId: id,
       lyric: lyric?.lyric ?? null,
       tlyric: lyric?.tlyric ?? null,
+      // 逐字（增强 LRC）。为 null 时 lyric 仍是普通整行歌词，客户端按行渲染即可。
+      wordLyric: lyric?.wordLyric ?? null,
       hasLyric: !!lyric?.lyric,
     })
   } catch (err) {

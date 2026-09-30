@@ -2,8 +2,17 @@ import { logger } from '@/lib/logger'
 import type { MusicInfo } from '@/lib/types/music'
 import { inflate } from 'zlib'
 import { promisify } from 'util'
+import { decodeKrcPayload, parseKrc, parseMrc, screenWordLyric, toEnhancedLrc, toPlainLrc } from './word-lyric'
 
-export type NativeLyricResult = { lyric: string; tlyric: string | null }
+export type NativeLyricResult = {
+  lyric: string
+  tlyric: string | null
+  /**
+   * 逐字（增强 LRC）。给出时 `lyric` 必然出自**同一次解析**（toPlainLrc），
+   * 不能拿另一条通道的行级文本配它 —— 实测两者差 10ms 级，混用会让高亮抖。
+   */
+  wordLyric?: string | null
+}
 
 type KuwoLyricLine = {
   time?: unknown
@@ -260,21 +269,39 @@ async function fetchNeteaseLyric(songmid: string): Promise<NativeLyricResult | n
   return lyric ? { lyric, tlyric: typeof payload.tlyric?.lyric === 'string' ? payload.tlyric.lyric.trim() || null : null } : null
 }
 
+async function fetchMiguTranslation(musicInfo: MusicInfo, headers: Record<string, string>): Promise<string | null> {
+  if (!musicInfo.trcUrl) return null
+  const response = await fetchWithTimeout(musicInfo.trcUrl, { headers })
+  return response ? (await response.text()).trim() || null : null
+}
+
 async function fetchMiguLyric(musicInfo: MusicInfo): Promise<NativeLyricResult | null> {
   const headers = {
     Referer: 'https://app.c.nf.migu.cn/',
     'User-Agent': 'Mozilla/5.0 (Linux; Android 5.1.1; Nexus 6 Build/LYZ28E) AppleWebKit/537.36 Chrome/59.0.3071.115 Mobile Safari/537.36',
     channel: '0146921',
   }
+
+  // 逐字优先：mrcUrl 是咪咕按这首歌确址给的资源（实测搜歌接口本就返回它），
+  // 不存在按名搜索那条错配面；解不出来或过不了闸门就回落下面的整行路径。
+  if (musicInfo.mrcUrl) {
+    const mrcResponse = await fetchWithTimeout(musicInfo.mrcUrl, { headers })
+    const parsed = mrcResponse ? parseMrc(decryptMiguMrc(await mrcResponse.text())) : null
+    const verdict = parsed ? screenWordLyric(parsed, { durationSeconds: parseIntervalSeconds(musicInfo.interval) }) : null
+    if (parsed && verdict?.ok) {
+      logger.info('[lyrics] 咪咕逐字命中', { songId: musicInfo.songmid, lineCount: verdict.lineCount })
+      return { lyric: toPlainLrc(parsed), tlyric: await fetchMiguTranslation(musicInfo, headers), wordLyric: toEnhancedLrc(parsed) }
+    }
+    if (verdict && !verdict.ok) logger.info('[lyrics] 咪咕逐字被闸门拒绝，回落整行', { songId: musicInfo.songmid, reason: verdict.reason })
+  }
+
   const lrcResponse = musicInfo.lrcUrl ? await fetchWithTimeout(musicInfo.lrcUrl, { headers }) : null
   const mrcResponse = !lrcResponse && musicInfo.mrcUrl ? await fetchWithTimeout(musicInfo.mrcUrl, { headers }) : null
   const rawLyric = lrcResponse ? await lrcResponse.text() : mrcResponse ? decryptMiguMrc(await mrcResponse.text()) : ''
   const lyric = lrcResponse ? rawLyric.trim() : parseMiguMrc(rawLyric)
   if (!lyric) return null
 
-  const trcResponse = musicInfo.trcUrl ? await fetchWithTimeout(musicInfo.trcUrl, { headers }) : null
-  const tlyric = trcResponse ? (await trcResponse.text()).trim() || null : null
-  return { lyric, tlyric }
+  return { lyric, tlyric: await fetchMiguTranslation(musicInfo, headers) }
 }
 
 async function fetchKugouLyric(musicInfo: MusicInfo): Promise<NativeLyricResult | null> {
@@ -296,12 +323,32 @@ async function fetchKugouLyric(musicInfo: MusicInfo): Promise<NativeLyricResult 
     : undefined
   if (!candidate?.id || !candidate.accesskey) return null
 
-  const downloadParams = new URLSearchParams({ ver: '1', client: 'pc', id: String(candidate.id), accesskey: String(candidate.accesskey), fmt: 'lrc', charset: 'utf8' })
-  const downloadResponse = await fetchWithTimeout(`https://lyrics.kugou.com/download?${downloadParams}`, { headers })
-  if (!downloadResponse) return null
-  const payload = await downloadResponse.json() as { fmt?: unknown; content?: unknown }
-  if (payload.fmt !== 'lrc') return null
-  const lyric = decodeBase64(payload.content)
+  const download = async (fmt: 'krc' | 'lrc') => {
+    const downloadParams = new URLSearchParams({ ver: '1', client: 'pc', id: String(candidate.id), accesskey: String(candidate.accesskey), fmt, charset: 'utf8' })
+    const response = await fetchWithTimeout(`https://lyrics.kugou.com/download?${downloadParams}`, { headers })
+    if (!response) return null
+    const payload = await response.json() as { fmt?: unknown; content?: unknown }
+    return payload.fmt === fmt ? payload.content ?? null : null
+  }
+
+  // 先试逐字：命中就一次解析同时给出行级与字级；不过闸门才回落到原来的 fmt=lrc，行为不变。
+  const krcContent = await download('krc')
+  const krcText = typeof krcContent === 'string' ? decodeKrcPayload(krcContent) : null
+  const parsed = krcText ? parseKrc(krcText) : null
+  if (parsed) {
+    const verdict = screenWordLyric(parsed, {
+      durationSeconds: parseIntervalSeconds(musicInfo.interval),
+      expectedFileHash: musicInfo.hash,
+    })
+    if (verdict.ok) {
+      logger.info('[lyrics] 酷狗逐字命中', { songId: musicInfo.songmid, lineCount: verdict.lineCount })
+      return { lyric: toPlainLrc(parsed), tlyric: null, wordLyric: toEnhancedLrc(parsed) }
+    }
+    logger.info('[lyrics] 酷狗逐字被闸门拒绝，回落整行', { songId: musicInfo.songmid, reason: verdict.reason })
+  }
+
+  const lrcContent = await download('lrc')
+  const lyric = typeof lrcContent === 'string' ? decodeBase64(lrcContent) : ''
   return lyric ? { lyric, tlyric: null } : null
 }
 

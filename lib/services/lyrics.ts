@@ -11,7 +11,7 @@ import { getAudioServeConfig } from '@/lib/audio-serve'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { musicSourceManager } from '@/lib/music-source-manager'
-import { getLyricSidecarPath, getTranslationLyricSidecarPath } from '@/lib/server/lyric-cache'
+import { getLyricSidecarPath, getTranslationLyricSidecarPath, getWordLyricSidecarPath } from '@/lib/server/lyric-cache'
 import { decodeLyricEntities } from '@/lib/server/lyric-decode'
 import { normalizeStructuredLyricText } from '@/lib/server/lyric-normalize'
 import { fetchNativeLyric } from '@/lib/server/music-lyric'
@@ -26,7 +26,7 @@ export interface ParsedLyric {
   lines: ParsedLyricLine[]
 }
 
-type LyricResult = { lyric: string; tlyric: string | null }
+type LyricResult = { lyric: string; tlyric: string | null; wordLyric: string | null }
 
 const nativeLyricInflight = new Map<string, Promise<LyricResult | null>>()
 
@@ -37,7 +37,7 @@ function getAudioCacheKeyPrefix(musicInfo: MusicInfo): string {
 function resolveSidecarPaths(
   cacheDir: string,
   relativeAudioPath: string
-): { audioPath: string; lyricPath: string; translationPath: string } | null {
+): { audioPath: string; lyricPath: string; translationPath: string; wordPath: string } | null {
   const audioPath = path.resolve(cacheDir, relativeAudioPath)
   const relative = path.relative(cacheDir, audioPath)
   if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null
@@ -45,6 +45,7 @@ function resolveSidecarPaths(
     audioPath,
     lyricPath: getLyricSidecarPath(audioPath),
     translationPath: getTranslationLyricSidecarPath(audioPath),
+    wordPath: getWordLyricSidecarPath(audioPath),
   }
 }
 
@@ -75,8 +76,10 @@ async function getCachedNativeLyric(musicInfo: MusicInfo): Promise<LyricResult |
         const lyric = (await fsp.readFile(paths.lyricPath, 'utf-8')).trim()
         if (lyric) {
           const tlyric = await fsp.readFile(paths.translationPath, 'utf-8').catch(() => '')
+          // 逐字与整行必须同源，所以只读同一目录的配对文件：persist 时两者同写同删。
+          const wordLyric = await fsp.readFile(paths.wordPath, 'utf-8').catch(() => '')
           logger.debug('[lyrics] disk cache hit', { source: musicInfo.source, songId: musicInfo.songmid })
-          return { lyric, tlyric: tlyric.trim() || null }
+          return { lyric, tlyric: tlyric.trim() || null, wordLyric: wordLyric.trim() || null }
         }
       } catch {
         // 未缓存、缓存文件被删除或内容损坏时，继续检查其他音质及网络回退。
@@ -115,6 +118,12 @@ async function persistNativeLyric(musicInfo: MusicInfo, lyric: LyricResult): Pro
     } else {
       await fsp.unlink(targetPaths.translationPath).catch(() => {})
     }
+    // 逐字要么与这次的整行一起写，要么一起删；留着旧 .wlrc 就会与新的 .lrc 不同源
+    if (lyric.wordLyric) {
+      await writeTextAtomically(targetPaths.wordPath, lyric.wordLyric)
+    } else {
+      await fsp.unlink(targetPaths.wordPath).catch(() => {})
+    }
 
     logger.info('[lyrics] cached precise source lyric to disk', { source: musicInfo.source, songId: musicInfo.songmid })
   } catch (err) {
@@ -147,9 +156,17 @@ async function getNativeLyricWithDiskCache(musicInfo: MusicInfo): Promise<LyricR
     if (!nativeLyric) return null
     const lyric = normalizeLyricPayload(nativeLyric.lyric)
     if (!lyric) return null
+    const wordLyric = nativeLyric.wordLyric ? normalizeLyricPayload(nativeLyric.wordLyric) : ''
+    // 上游给逐字时整行本应出自同一次解析；不信任到这一步，对不上就只丢逐字，
+    // 整行照常落盘，同时把磁盘上残留的旧 .wlrc 删掉（否则它将与新 .lrc 错配）
+    const paired = !!wordLyric && isWordLyricConsistent(lyric, wordLyric)
+    if (wordLyric && !paired) {
+      logger.warn('[lyrics] 逐字与整行不同源，丢弃逐字', { source: musicInfo.source, songId: musicInfo.songmid })
+    }
     const result = {
       lyric,
       tlyric: nativeLyric.tlyric ? normalizeLyricPayload(nativeLyric.tlyric) || null : null,
+      wordLyric: paired ? wordLyric : null,
     }
     await persistNativeLyric(musicInfo, result)
     return result
@@ -175,7 +192,8 @@ async function getSourceLyricWithDiskCache(musicInfo: MusicInfo): Promise<LyricR
     if (!lyric) return null
 
     const tlyric = result.tlyric ? normalizeLyricPayload(result.tlyric) : ''
-    const resolved = { lyric, tlyric: tlyric || null }
+    // 渠道脚本回答的是 lx 协议的 lyric 字段，没有逐字通道
+    const resolved = { lyric, tlyric: tlyric || null, wordLyric: null }
     await persistNativeLyric(musicInfo, resolved)
     return resolved
   } catch (err) {
@@ -196,6 +214,17 @@ export async function cacheNativeLyricForMusic(musicInfo: MusicInfo): Promise<vo
 
 function normalizeLyricPayload(value: string): string {
   return normalizeStructuredLyricText(decodeLyricEntities(value).trim()).trim()
+}
+
+/**
+ * 逐字与整行必须出自同一次解析：行数与每行时间戳全等才允许一起下发/落盘。
+ * 上游若哪天只给逐字或两者来源不同，这里宁可不给逐字，也不让客户端拿到对不上的两套时间。
+ */
+function isWordLyricConsistent(lyric: string, wordLyric: string): boolean {
+  const plain = parseLrc(lyric).lines
+  const word = parseLrc(wordLyric).lines
+  if (!plain.length || plain.length !== word.length) return false
+  return plain.every((line, index) => line.time === word[index].time)
 }
 
 /**
@@ -269,7 +298,7 @@ export async function fetchLyricForMusic(musicInfo: MusicInfo): Promise<LyricRes
   // 3) 回退第三方 API
   const text = await fetchLyricsFromAPI(title, album || title, artist)
   const lyric = text ? normalizeLyricPayload(text) : ''
-  if (lyric) return { lyric, tlyric: null }
+  if (lyric) return { lyric, tlyric: null, wordLyric: null }
 
   return null
 }

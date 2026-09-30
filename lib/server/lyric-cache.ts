@@ -14,7 +14,13 @@ export function getTranslationLyricSidecarPath(audioFilePath: string): string {
   return path.join(parsed.dir, `${parsed.name}.tlyric.lrc`)
 }
 
+/** `song.mp3` → `song.wlrc`，存储可选逐字（增强 LRC）歌词。 */
+export function getWordLyricSidecarPath(audioFilePath: string): string {
+  const parsed = path.parse(audioFilePath)
+  return path.join(parsed.dir, `${parsed.name}.wlrc`)
+}
+
 /** 供孤儿扫描跳过仍由音频缓存记录关联的歌词边车文件。 */
 export function isLyricSidecarPath(filePath: string): boolean {
-  return filePath.endsWith('.lrc')
+  return filePath.endsWith('.lrc') || filePath.endsWith('.wlrc')
 }

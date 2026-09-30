@@ -249,9 +249,19 @@ export function toEnhancedLrc(lyric: WordLyric): string {
 /**
  * 与增强 LRC **同源**的行级文本。必须出自同一次解析：实测同一首 KRC 的行时间与酷狗
  * 另一条 fmt=lrc 通道差 10ms 级（青花瓷 16 行、Come Back To Me 42 行），混用会让高亮抖。
+ *
+ * 头标签按白名单带上：这份文本会落进 `.lrc` sidecar，而下载打标的 LYRICS 就读它，
+ * 静默丢掉 [ti:]/[ar:] 会让文件里的歌词比改动前少信息。KRC 内部的 [id:]/[hash:]/
+ * [total:]/[language:] 属实现细节，不透传。
  */
+const PLAIN_LRC_HEADER_ORDER = ['ti', 'ar', 'al', 'by', 'offset']
+
 export function toPlainLrc(lyric: WordLyric): string {
-  return lyric.lines
+  const headers = PLAIN_LRC_HEADER_ORDER
+    .filter(key => lyric.headers[key])
+    .map(key => `[${key}:${lyric.headers[key]}]`)
+  const body = lyric.lines
     .map(line => `[${formatTimestamp(line.start)}]${lineText(line).trim()}`)
     .join('\n')
+  return [...headers, body].join('\n')
 }

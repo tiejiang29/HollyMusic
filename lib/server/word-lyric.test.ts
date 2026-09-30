@@ -195,21 +195,29 @@ describe('序列化：增强 LRC 与行级 LRC 必须同源', () => {
   const lyric = parseKrc(KRC_TEXT)!
   const enhanced = toEnhancedLrc(lyric)
   const plain = toPlainLrc(lyric)
+  const timedOf = (s: string) => s.split('\n').filter(l => /^\[\d{1,2}:\d{2}/.test(l))
 
   it('增强 LRC 形状：行首方括号 + 每块前一个绝对起始 + 行尾结束时间', () => {
     expect(enhanced.split('\n')[1]).toBe('[00:01.000]<00:01.000>第一<00:02.000>个字<00:03.000>开始<00:04.000>')
   })
 
   it('两者的行时间一一对应且行数相同（接线时靠这条保证高亮不抖）', () => {
-    const tagOf = (s: string) => s.split('\n').map(l => /\[(.*?)\]/.exec(l)![1])
-    expect(tagOf(enhanced)).toEqual(tagOf(plain))
-    expect(enhanced.split('\n')).toHaveLength(plain.split('\n').length)
+    const plainTags = timedOf(plain).map(l => /\[(.*?)\]/.exec(l)![1])
+    const enhancedTags = timedOf(enhanced).map(l => /\[(.*?)\]/.exec(l)![1])
+    expect(enhancedTags).toEqual(plainTags)
+    expect(plainTags).toHaveLength(lyric.lines.length)
   })
 
   it('增强 LRC 去掉尖括号段就等于行级文本', () => {
-    const stripped = enhanced.split('\n').map(l => l.replace(/<[^>]*>/g, '').replace(/^\[[^\]]*\]/, '').trim())
-    const plainTexts = plain.split('\n').map(l => l.replace(/^\[[^\]]*\]/, '').trim())
+    const stripped = timedOf(enhanced).map(l => l.replace(/<[^>]*>/g, '').replace(/^\[[^\]]*\]/, '').trim())
+    const plainTexts = timedOf(plain).map(l => l.replace(/^\[[^\]]*\]/, '').trim())
     expect(stripped).toEqual(plainTexts)
+  })
+
+  it('行级文本带上游的 ti/ar/al/by/offset，不带 KRC 实现细节', () => {
+    const headers = plain.split('\n').filter(l => !/^\[\d{1,2}:\d{2}/.test(l))
+    expect(headers).toEqual(['[ti:合成曲]', '[ar:测试者]', '[al:合成专辑]', '[offset:0]'])
+    expect(plain).not.toMatch(/\[hash:|\[id:|\[total:|\[language:/)
   })
 
   it('MRC 与 KRC 走同一个出口形状', () => {
@@ -244,8 +252,9 @@ describeReal('真机 KRC/MRC 样本（my/capture-word-lyric.mjs 抓取）', () =
         expect(line.words[0].start, '首字应不早于行时间').toBeGreaterThanOrEqual(line.start)
         for (let i = 1; i < line.words.length; i++) expect(line.words[i].start).toBeGreaterThanOrEqual(line.words[i - 1].start)
       }
-      // 出口自洽
-      expect(toPlainLrc(lyric!).split('\n')).toHaveLength(lyric!.lines.length)
+      // 出口自洽：行级文本的时间行数 == 解析出的行数
+      const timed = toPlainLrc(lyric!).split('\n').filter(l => /^\[\d{1,2}:\d{2}/.test(l))
+      expect(timed).toHaveLength(lyric!.lines.length)
       expect(lyric!.lines.some(l => l.words.flatMap(w => w.text).join('').includes('('))).toBe(false)
       if (verdict.ok) expect(verdict.lineCount).toBe(lyric!.lines.length)
       else console.log(`  [真机拒因] ${sample.song}: ${verdict.reason}`)
