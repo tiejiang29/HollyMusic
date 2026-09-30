@@ -42,12 +42,12 @@ async function drain(stream: NodeJS.ReadableStream): Promise<Buffer> {
 }
 
 describe('planTaggedDelivery', () => {
-  it('非 flac 容器直接跳过并说明原因（本轮只接 FLAC）', async () => {
+  it('不认识的容器（既非 FLAC 也非 MP3）跳过并说明原因', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tagtest-'))
-    const p = path.join(dir, 'song.mp3')
+    const p = path.join(dir, 'song.m4a')
     fs.writeFileSync(p, Buffer.alloc(100, 0xff))
     const r = await planTaggedDelivery(p, 100, { TITLE: 'x' })
-    expect('reason' in r ? r.reason : '').toContain('.mp3')
+    expect('reason' in r ? r.reason : '').toContain('.m4a')
   })
 
   it('长度不可信（0/NaN）不改写', async () => {
@@ -104,5 +104,98 @@ describe('打标交付的三条硬性质', () => {
     fs.writeFileSync(p, Buffer.concat([Buffer.from('fLaC', 'latin1'), Buffer.alloc(300, 0x22)]))
     const r = await planTaggedDelivery(p, 304, { TITLE: 'x' })
     expect('reason' in r ? r.reason : '').toMatch(/STREAMINFO|不可解析/)
+  })
+})
+
+// ===========================================================================
+// MP3：换 ID3v2 头部 + 裁掉尾部 ID3v1
+// ===========================================================================
+
+const FRAME_LEN = 417                     // MPEG1 Layer3 · 128kbps · 44.1kHz
+function mpegFrames(n: number): Buffer {
+  const one = Buffer.alloc(FRAME_LEN, 0x10)
+  one[0] = 0xff; one[1] = 0xfb; one[2] = 0x90; one[3] = 0x00
+  return Buffer.concat(Array.from({ length: n }, () => Buffer.from(one)))
+}
+function oldId3v2(frames: number): Buffer {
+  const body = Buffer.alloc(frames, 0x20)
+  const size = Buffer.alloc(4)
+  size[0] = (body.length >>> 21) & 0x7f
+  size[3] = body.length & 0x7f
+  return Buffer.concat([Buffer.from('ID3', 'latin1'), Buffer.from([3, 0, 0]), size, body])
+}
+function id3v1(): Buffer {
+  return Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.alloc(125, 0x41)])   // 恒为 128B
+}
+/** 上游那种"空壳 ID3v2 + 裸帧 +（可选）尾部 ID3v1"的 mp3 */
+function makeTempMp3(oldTagBytes = 48, frames = 8, withV1 = true) {
+  const head = oldId3v2(oldTagBytes)
+  const file = Buffer.concat([head, mpegFrames(frames), withV1 ? id3v1() : Buffer.alloc(0)])
+  const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tagtest-')), 'song.mp3')
+  fs.writeFileSync(p, file)
+  return { p, file, headLen: head.length }
+}
+
+describe('MP3 打标交付', () => {
+  it('计划自洽：totalLength = 新头部 + (音频到 fileLastByte)，且 ID3v1 被算进裁剪', async () => {
+    const { p, file, headLen } = makeTempMp3()
+    const r = await planTaggedDelivery(p, file.length, { TITLE: '稻香', ARTIST: '周杰伦' })
+    if ('reason' in r) throw new Error(r.reason)
+    expect(r.container).toBe('mp3')
+    expect(r.audioStart).toBe(headLen)
+    expect(r.tailTrim).toBe(128)
+    expect(r.fileLastByte).toBe(file.length - 129)
+    expect(r.totalLength).toBe(r.newHead.length + (r.fileLastByte - r.audioStart + 1))
+  })
+
+  it('① 交付字节数 === totalLength；② 尾部 ID3v1 真的没被吐出去', async () => {
+    const { p, file } = makeTempMp3()
+    const r = await planTaggedDelivery(p, file.length, { TITLE: '稻香' })
+    if ('reason' in r) throw new Error(r.reason)
+    const out = await drain(createTaggedFileRead(p, r))
+    expect(out.length).toBe(r.totalLength)
+    expect(out.subarray(0, 3).toString('latin1')).toBe('ID3')
+    // 交付的音频段必须精确等于原文件 [audioStart, fileLastByte]，一字节不多
+    expect(out.subarray(r.newHead.length)).toEqual(file.subarray(r.audioStart, r.fileLastByte + 1))
+    expect(out.subarray(out.length - 128)).not.toEqual(id3v1())
+  })
+
+  it('③ 改写全程不触碰磁盘原件（含 ID3v1 的尾部也还在盘上）', async () => {
+    const { p, file } = makeTempMp3()
+    const r = await planTaggedDelivery(p, file.length, { TITLE: '稻香' })
+    if ('reason' in r) throw new Error(r.reason)
+    await drain(createTaggedFileRead(p, r))
+    expect(fs.readFileSync(p)).toEqual(file)
+  })
+
+  it('分段在"改写后的字节空间"里寻址：三段拼回必须等于整份', async () => {
+    const { p, file } = makeTempMp3()
+    const r = await planTaggedDelivery(p, file.length, { TITLE: '稻香' })
+    if ('reason' in r) throw new Error(r.reason)
+    const hl = r.newHead.length
+    const a = await drain(createTaggedFileRead(p, r, 0, hl - 2))
+    const b = await drain(createTaggedFileRead(p, r, hl - 1, hl + 500))
+    const c = await drain(createTaggedFileRead(p, r, hl + 501, r.totalLength - 1))
+    expect([a.length, b.length, c.length]).toEqual([hl - 1, 502, r.totalLength - hl - 501])
+    expect(Buffer.concat([a, b, c]).equals(await drain(createTaggedFileRead(p, r)))).toBe(true)
+  })
+
+  it('原件比记账长度长时，仍按记账右界收口（不能多吐）', async () => {
+    const { p, file, headLen } = makeTempMp3(48, 8, false)
+    const booked = file.length - 100                 // 假装 DB 记的长度比磁盘小
+    const r = await planTaggedDelivery(p, booked, { TITLE: 'x' })
+    if ('reason' in r) throw new Error(r.reason)
+    expect(r.audioStart).toBe(headLen)
+    const out = await drain(createTaggedFileRead(p, r))
+    expect(out.length).toBe(r.totalLength)
+    expect(out.subarray(r.newHead.length).length).toBe(booked - headLen)
+  })
+
+  it('内容其实不是 MP3（无连续两帧）时拒绝改写并给原因', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tagtest-'))
+    const p = path.join(dir, 'fake.mp3')
+    fs.writeFileSync(p, Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 71 + 5) & 0xff)))
+    const r = await planTaggedDelivery(p, 4096, { TITLE: 'x' })
+    expect('reason' in r ? r.reason : '').toContain('连续两帧')
   })
 })

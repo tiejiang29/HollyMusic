@@ -265,8 +265,9 @@ async function deliverTaggedFile(args: {
     if (range) headers.set('Content-Range', `bytes ${start}-${end}/${plan.totalLength}`)
 
     logger.info(
-      `[download] 已写入标签 uid=${uid} 容器=flac 链头 ${plan.audioStart}B→${plan.newHead.length}B `
-      + `长度 ${served.size}→${plan.totalLength} 区间=${range ? '206' : '200'} 歌词=${lyric ? '有' : '无'} 封面=${picture ? `${picture.data.length}B` : '无'}`
+      `[download] 已写入标签 uid=${uid} 容器=${plan.container} 头部 ${plan.audioStart}B→${plan.newHead.length}B `
+      + `尾部裁 ${plan.tailTrim}B 长度 ${served.size}→${plan.totalLength} 区间=${range ? '206' : '200'} `
+      + `歌词=${lyric ? '有' : '无'} 封面=${picture ? `${picture.data.length}B` : '无'}`
     )
     const stream = createTaggedFileRead(served.filePath, plan, start, end)
     return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream, {

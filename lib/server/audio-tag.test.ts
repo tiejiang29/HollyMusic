@@ -13,6 +13,7 @@ import { parseBuffer } from 'music-metadata'
 import {
   readFlacChain, rewriteFlacHead, buildFlacCommentBlock, buildFlacPictureBlock, parseFlacCommentBlock,
   BLOCK_STREAMINFO, BLOCK_PADDING, BLOCK_SEEKTABLE, BLOCK_VORBIS_COMMENT, BLOCK_CUESHEET, BLOCK_PICTURE,
+  readMp3Layout, buildId3v2Tag, ID3V1_BYTES,
   type FlacChain,
 } from './audio-tag'
 
@@ -219,5 +220,164 @@ describe('用 music-metadata 回读改写结果（不自证）', () => {
         fs.closeSync(fd)
       }
     }
+  })
+})
+
+// ===========================================================================
+// MP3 / ID3v2
+// ===========================================================================
+
+/** MPEG1 Layer3 · 128kbps · 44.1kHz ⇒ 帧长 417B，头 FF FB 90 00（真实上游 mp3 的形状） */
+const MPEG_FRAME_LEN = 417
+function mpegFrames(n: number): Buffer {
+  const one = Buffer.alloc(MPEG_FRAME_LEN, 0x10)
+  one[0] = 0xff; one[1] = 0xfb; one[2] = 0x90; one[3] = 0x00
+  return Buffer.concat(Array.from({ length: n }, () => Buffer.from(one)))
+}
+const id3Frame = (id: string, body: Buffer): Buffer => {
+  const h = Buffer.alloc(10)
+  h.write(id, 0, 4, 'latin1')
+  h.writeUInt32BE(body.length, 4)          // v2.3 帧长度是普通大端，**不是** synchsafe
+  return Buffer.concat([h, body])
+}
+/** 手工拼一个"上游那种空壳 ID3v2.3"：只有机器字段 TLEN/TSSE，没有人类可读键 */
+function legacyId3v2(): Buffer {
+  const frames = Buffer.concat([
+    id3Frame('TLEN', Buffer.concat([Buffer.from([0]), Buffer.from('269', 'latin1')])),
+    id3Frame('TSSE', Buffer.concat([Buffer.from([0]), Buffer.from('Lavf58.76.100', 'latin1')])),
+  ])
+  const size = Buffer.alloc(4)
+  size[0] = (frames.length >>> 21) & 0x7f
+  size[1] = (frames.length >>> 14) & 0x7f
+  size[2] = (frames.length >>> 7) & 0x7f
+  size[3] = frames.length & 0x7f
+  return Buffer.concat([Buffer.from('ID3', 'latin1'), Buffer.from([3, 0, 0]), size, frames])
+}
+/** 定长 30 字节的 latin1 字段 */
+const v1Field = (s: string): Buffer => {
+  const b = Buffer.alloc(30, 0x20)
+  b.write(s.slice(0, 30), 'latin1')
+  return b
+}
+function id3v1Block(name = 'Dao Xiang', artist = 'Jay Chou', album = 'Mo Jie Zuo'): Buffer {
+  // TAG(3) + title(30) + artist(30) + album(30) + year(4) + comment(30) + genre(1) = 128
+  // comment 末两字节 0x00,track ⇒ v1.1 的音轨号约定
+  return Buffer.concat([Buffer.from('TAG', 'latin1'), v1Field(name), v1Field(artist), v1Field(album),
+    Buffer.from('2008', 'latin1'), Buffer.alloc(28, 0x20), Buffer.from([0x00, 0x01]), Buffer.from([0xff])])
+}
+
+describe('readMp3Layout', () => {
+  it('上游真实形态（空壳 ID3v2.3 + 裸帧 + 尾部 ID3v1）：起点落在第一帧，尾部识别出 128B', () => {
+    const head = legacyId3v2()
+    const file = Buffer.concat([head, mpegFrames(6), id3v1Block()])
+    const r = readMp3Layout(file.subarray(0, 64 * 1024), file.subarray(file.length - 512))
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.audioStart).toBe(head.length)          // 旧头部整段被替换
+    expect(r.tailTrim).toBe(ID3V1_BYTES)
+    expect(r.id3v2Version).toBe(3)
+  })
+
+  it('没有任何头部的裸帧 mp3：audioStart=0（照样能加标签）', () => {
+    const file = Buffer.concat([mpegFrames(4), id3v1Block()])
+    const r = readMp3Layout(file, file.subarray(file.length - 512))
+    expect(r.ok && r.audioStart).toBe(0)
+    expect(r.ok && r.tailTrim).toBe(ID3V1_BYTES)
+  })
+
+  it('ID3v2 声明的长度超出已读窗口 ⇒ 拒绝（长度算不准就不能改写）', () => {
+    const head = Buffer.alloc(64 * 1024, 0)                 // 故意小于声明尺寸
+    const declared = 600 * 1024
+    head.write('ID3', 0, 'latin1')
+    head[3] = 3
+    head[6] = (declared >>> 21) & 0x7f
+    head[7] = (declared >>> 14) & 0x7f
+    head[8] = (declared >>> 7) & 0x7f
+    head[9] = declared & 0x7f
+    const r = readMp3Layout(head, Buffer.alloc(128))
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('超出已读窗口')
+  })
+
+  it('尾部有 APEv2 ⇒ 拒绝改写（它按绝对偏移索引，换头部会全错）', () => {
+    const file = Buffer.concat([mpegFrames(4), Buffer.alloc(24, 0), Buffer.from('APETAGEX', 'latin1'), Buffer.alloc(24, 0)])
+    const r = readMp3Layout(file, file.subarray(file.length - 512))
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('APEv2')
+  })
+
+  it('扩展名是 .mp3 但内容其实是 FLAC/MP4 ⇒ 拒绝（不能凭扩展名改写）', () => {
+    const flacish = Buffer.concat([Buffer.from('fLaC', 'latin1'), Buffer.alloc(2048)])
+    const rf = readMp3Layout(flacish, Buffer.alloc(128))
+    expect(rf.ok).toBe(false)
+    if (!rf.ok) expect(rf.reason).toContain('FLAC')
+    const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from('ftyp', 'latin1'), Buffer.alloc(2048)])
+    const r = readMp3Layout(mp4, Buffer.alloc(128))
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('MP4')
+  })
+
+  it('随机字节里没有连续两帧 ⇒ 拒绝（帧同步校验不能省）', () => {
+    const noise = Buffer.alloc(64 * 1024)
+    for (let i = 0; i < noise.length; i++) noise[i] = (i * 37 + 11) & 0xff
+    const r = readMp3Layout(noise, Buffer.alloc(128))
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('连续两帧')
+  })
+
+  it('音频尾块恰好以 "TAG" 开头也不裁（靠三字段可打印性把关，避免吃掉 128B 音频）', () => {
+    const fake = Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.from(Array.from({ length: 125 }, (_, i) => (i * 89 + 130) & 0xff))])
+    const file = Buffer.concat([mpegFrames(4), fake])
+    const r = readMp3Layout(file, file.subarray(file.length - 512))
+    expect(r.ok && r.tailTrim).toBe(0)
+  })
+
+  it('GBK 中文的 ID3v1 不会被认出来 ⇒ 保留原样（这是保守边界，不是回归：留旧尾部=今天的行为）', () => {
+    const gbkName = Buffer.from([0xd6, 0xdc, 0xbd, 0xe0, 0xc2, 0xdb])   // 「周杰伦」GBK
+    const field = (b: Buffer): Buffer => Buffer.concat([b, Buffer.alloc(30 - b.length, 0)])
+    const gbk = Buffer.concat([
+      Buffer.from('TAG', 'latin1'),
+      field(gbkName), field(gbkName), field(gbkName),
+      Buffer.from('2008', 'latin1'), Buffer.alloc(30, 0), Buffer.from([0xff]),
+    ])
+    expect(gbk.length).toBe(ID3V1_BYTES)
+    const file = Buffer.concat([mpegFrames(4), gbk])
+    const r = readMp3Layout(file, file.subarray(file.length - 512))
+    expect(r.ok && r.tailTrim).toBe(0)
+  })
+})
+
+describe('buildId3v2Tag：写出来的标签要被第三方解析器认', () => {
+  const FIELDS = { TITLE: '稻香', ARTIST: '周杰伦', ALBUM: '魔杰座', LYRICS: '[00:00.00]稻香\n[00:05.00]词：周杰伦' }
+
+  it('music-metadata 读得到中文与封面；头部长度是 synchsafe 而帧长度不是', async () => {
+    const built = buildId3v2Tag(FIELDS, { mime: 'image/jpeg', data: JPEG })
+    expect(built.ok).toBe(true)
+    if (!built.ok) return
+    expect(built.frames).toEqual(['TIT2', 'TPE1', 'TALB', 'APIC', 'USLT'])
+
+    const synchsafe = ((built.tag[6] & 0x7f) << 21) | ((built.tag[7] & 0x7f) << 14) | ((built.tag[8] & 0x7f) << 7) | (built.tag[9] & 0x7f)
+    expect(synchsafe).toBe(built.tag.length - 10)          // 标签头：synchsafe
+    // 第一个帧：ID 在偏移 10，长度字段在 14（v2.3 用普通大端，这两处极易搞混）
+    expect(built.tag.subarray(10, 14).toString('latin1')).toBe('TIT2')
+    expect(built.tag.subarray(14, 18).readUInt32BE(0)).toBeLessThanOrEqual(synchsafe)
+
+    const out = Buffer.concat([built.tag, mpegFrames(8)])
+    const md = await parseBuffer(out, { duration: false, skipCovers: false })
+    expect(md.common.title).toBe('稻香')
+    expect(md.common.artist).toBe('周杰伦')
+    expect(md.common.album).toBe('魔杰座')
+    expect((md.common.picture || []).length).toBe(1)
+    expect(md.common.picture![0].format).toBe('image/jpeg')
+    expect(md.native['ID3v2.3']?.find(f => f.id === 'USLT')).toBeDefined()
+  })
+
+  it('空字段一个帧都不写；坏 mime 直接拒绝而不是写坏封面', () => {
+    const empty = buildId3v2Tag({ TITLE: '  ', ARTIST: null, ALBUM: undefined })
+    expect(empty.ok && empty.frames).toEqual([])
+    expect(empty.ok && empty.tag.length).toBe(10)
+    const bad = buildId3v2Tag({ TITLE: 'x' }, { mime: 'application/pdf', data: JPEG })
+    expect(bad.ok).toBe(false)
+    if (!bad.ok) expect(bad.reason).toContain('mime')
   })
 })

@@ -316,6 +316,25 @@ function writeTempFlac(audio = 4096) {
   return { p, file, chainLen: chain.length }
 }
 
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0x00, 0xff, 0xd9])
+/** MPEG1 Layer3 · 128kbps · 44.1kHz ⇒ 417B 一帧，头 FF FB 90 00 */
+function mpegFrames(n: number): Buffer {
+  const one = Buffer.alloc(417, 0x10)
+  one[0] = 0xff; one[1] = 0xfb; one[2] = 0x90; one[3] = 0x00
+  return Buffer.concat(Array.from({ length: n }, () => Buffer.from(one)))
+}
+/** 上游真实形态：空壳 ID3v2.3（只有 TLEN/TSSE 这类机器字段）+ 裸帧 + 尾部 128B ID3v1 */
+function writeTempMp3(frames = 8) {
+  const body = Buffer.alloc(38, 0x20)
+  const size = Buffer.alloc(4)
+  size[3] = body.length & 0x7f
+  const head = Buffer.concat([Buffer.from('ID3', 'latin1'), Buffer.from([3, 0, 0]), size, body])
+  const file = Buffer.concat([head, mpegFrames(frames), Buffer.from(`TAG${'A'.repeat(125)}`, 'latin1')])
+  const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tag-')), 'song.mp3')
+  fs.writeFileSync(p, file)
+  return { p, file, headLen: head.length }
+}
+
 describe('GET /api/download 元数据打标', () => {
   beforeEach(() => {
     authMode = 'ok'
@@ -397,15 +416,36 @@ describe('GET /api/download 元数据打标', () => {
     expect(fs.readFileSync(p)).toEqual(file)
   })
 
-  it('本轮不碰 MP3：容器不是 flac 时响应与今天完全一致', async () => {
+  it('MP3：换掉空壳 ID3v2、裁掉尾部 ID3v1，长度自洽且原件不动', async () => {
+    const { p, file } = writeTempMp3()
+    servedFromDiskInfo = { filePath: p, size: file.length, contentType: 'audio/mpeg' }
+    coverBytes = { mime: 'image/jpeg', data: JPEG }
+
+    const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=320k'))
+    expect(res.status).toBe(200)
+    const declared = Number(res.headers.get('content-length'))
+    const body = Buffer.from(await res.arrayBuffer())
+    expect(body.length, 'Content-Length 必须等于实际字节数').toBe(declared)
+    expect(body.subarray(0, 3).toString('latin1')).toBe('ID3')
+    // 尾部 ID3v1 不该出现在交付流里（它装的是窄字符旧数据，留着就会和新头部互相矛盾）
+    expect(body.subarray(body.length - 128).subarray(0, 3).toString('latin1')).not.toBe('TAG')
+
+    const md = await parseBuffer(body, { duration: false, skipCovers: false })
+    expect(md.common.title).toBe('杀死那个石家庄人')
+    expect(md.common.artist).toBe('万能青年旅店')
+    expect((md.common.picture || []).length).toBe(1)
+    expect(fs.readFileSync(p)).toEqual(file)
+  })
+
+  it('内容其实不是 MP3 的 .mp3 文件（没有帧同步）→ 不改写，也不报错', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tag-'))
-    const p = path.join(dir, 'song.mp3')
-    const raw = Buffer.alloc(512, 0xff)
+    const p = path.join(dir, 'fake.mp3')
+    const raw = Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 71 + 5) & 0xff))
     fs.writeFileSync(p, raw)
     servedFromDiskInfo = { filePath: p, size: raw.length, contentType: 'audio/mpeg' }
     const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=320k'))
-    expect(res.headers.get('content-length')).toBe('11')
-    expect(res.headers.get('accept-ranges')).toBe('bytes')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-length')).toBe('11')      // 原样走 audioServe 的响应
     await res.arrayBuffer()
   })
 
@@ -454,17 +494,20 @@ describe('GET /api/download 元数据打标', () => {
     expect(fs.readFileSync(p)).toEqual(file)
   })
 
-  it('库正本是 MP3 → 不改写，仍按今天的行为直发正本原样字节', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-tag-'))
-    const p = path.join(dir, 'song.mp3')
-    const raw = Buffer.alloc(4096, 0xff)
-    fs.writeFileSync(p, raw)
+  it('库正本是 MP3 → 同样打标，但正本文件一字节不动', async () => {
+    const { p, file } = writeTempMp3()
     libraryRow = { filePath: p, quality: '320k' }
+    coverBytes = { mime: 'image/jpeg', data: JPEG }
 
     const res = await GET(makeGetRequest('/api/download?uid=kw-196030664&quality=320k'))
     expect(res.status).toBe(200)
-    expect(res.headers.get('content-length')).toBe(String(raw.length))
+    const declared = Number(res.headers.get('content-length'))
+    const body = Buffer.from(await res.arrayBuffer())
+    expect(body.length).toBe(declared)
+    expect(declared).not.toBe(file.length)                    // 换过头部，长度必变
     expect(res.headers.get('content-disposition')).toContain('.mp3')
-    expect(Buffer.from(await res.arrayBuffer())).toEqual(raw)
+    const md = await parseBuffer(body, { duration: false, skipCovers: false })
+    expect(md.common.title).toBe('杀死那个石家庄人')
+    expect(fs.readFileSync(p)).toEqual(file)                  // 正本是全库最不可重建的数据
   })
 })
