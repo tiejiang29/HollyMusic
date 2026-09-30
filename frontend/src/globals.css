@@ -153,3 +153,18 @@ body {
 .now-lyric-line {
   animation: now-lyric-line-in 0.35s ease;
 }
+
+/* 逐字（增强 LRC）卡拉OK填充：每块一条 200% 宽的渐变，靠 background-position 平移
+   表示进度；React 只在 250ms 的时间刻度上改 position，块内滑动交给 transition 补齐。
+   暗色部分用 --karaoke-idle，底栏与全屏页背景不同，各自覆盖。 */
+.karaoke-word {
+  --karaoke-idle: color-mix(in oklab, var(--color-primary) 32%, transparent);
+  background-image: linear-gradient(90deg, var(--color-primary) 50%, var(--karaoke-idle) 50%);
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  transition: background-position 240ms linear;
+}

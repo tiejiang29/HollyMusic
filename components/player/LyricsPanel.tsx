@@ -4,6 +4,7 @@ import { usePlayerStore } from '@/lib/store/player-store'
 import { useLyrics } from '@/hooks/useLyrics'
 import { CoverImage } from '@/components/shared/CoverImage'
 import { AudioSpectrum } from './AudioSpectrum'
+import { KaraokeLine } from './KaraokeLine'
 import { ChevronDown, Play, Pause, SkipBack, SkipForward, Loader2 } from 'lucide-react'
 
 interface LyricsPanelProps {
@@ -123,7 +124,10 @@ export function LyricsPanel({ audio }: LyricsPanelProps) {
                           : 'text-base text-muted-foreground/70 hover:text-foreground md:text-lg'
                       }`}
                     >
-                      {line.text}
+                      {/* 只给当前行铺逐字块：面板每 250ms 随时间重渲染，全列表铺块会放大开销 */}
+                      {i === activeIndex && line.words?.length
+                        ? <KaraokeLine line={line} currentTime={currentTime} />
+                        : line.text}
                     </div>
                   )
                 })}
