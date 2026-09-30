@@ -116,6 +116,15 @@ describe('parseKrc：行内相对时间 → 绝对时间', () => {
   it('没有任何时间行时返回 null', () => {
     expect(parseKrc('[ti:x]\n[ar:y]\n纯文本')).toBeNull()
   })
+
+  it('块尾空格是有效内容，逐块 trim 会把英文粘成一坨（真机踩过的坑）', () => {
+    const english = parseKrc([
+      '[0,8000]<0,400,0>The <400,400,0>rain <800,400,0>falls',
+      ...Array.from({ length: 8 }, (_, i) => `[${10000 + i * 1000},900]<0,450,0>wo<450,450,0>rd `),
+    ].join('\n'))!
+    expect(english.lines[0].words.map(w => w.text)).toEqual(['The ', 'rain ', 'falls'])
+    expect(toPlainLrc(english).split('\n').find(l => l.startsWith('[00:00'))).toBe('[00:00.000]The rain falls')
+  })
 })
 
 describe('parseMrc：绝对时间 + 标签在文本之后', () => {
@@ -198,7 +207,7 @@ describe('序列化：增强 LRC 与行级 LRC 必须同源', () => {
   const timedOf = (s: string) => s.split('\n').filter(l => /^\[\d{1,2}:\d{2}/.test(l))
 
   it('增强 LRC 形状：行首方括号 + 每块前一个绝对起始 + 行尾结束时间', () => {
-    expect(enhanced.split('\n')[1]).toBe('[00:01.000]<00:01.000>第一<00:02.000>个字<00:03.000>开始<00:04.000>')
+    expect(timedOf(enhanced)[1]).toBe('[00:01.000]<00:01.000>第一<00:02.000>个字<00:03.000>开始<00:04.000>')
   })
 
   it('两者的行时间一一对应且行数相同（接线时靠这条保证高亮不抖）', () => {
@@ -221,7 +230,15 @@ describe('序列化：增强 LRC 与行级 LRC 必须同源', () => {
   })
 
   it('MRC 与 KRC 走同一个出口形状', () => {
-    expect(toEnhancedLrc(parseMrc(MRC_TEXT)!).split('\n')[0]).toBe('[00:01.000]<00:01.000>第<00:02.000>一<00:03.000>行<00:04.000>')
+    expect(timedOf(toEnhancedLrc(parseMrc(MRC_TEXT)!))[0]).toBe('[00:01.000]<00:01.000>第<00:02.000>一<00:03.000>行<00:04.000>')
+  })
+
+  it('两侧都带同一份头标签（[offset:] 只有一侧带会让逐字被判为不同源）', () => {
+    const headers = (s: string) => s.split('\n').filter(l => !/^\[\d{1,2}:\d{2}/.test(l))
+    expect(headers(enhanced)).toEqual(headers(plain))
+    const withOffset = parseKrc(KRC_TEXT.replace('[offset:0]', '[offset:-500]'))!
+    expect(toEnhancedLrc(withOffset)).toContain('[offset:-500]')
+    expect(toPlainLrc(withOffset)).toContain('[offset:-500]')
   })
 })
 

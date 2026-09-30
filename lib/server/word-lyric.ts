@@ -72,13 +72,14 @@ function parseHeaders(rows: string[]): Record<string, string> {
 interface RawChunk { start: number; end: number; text: string }
 
 /**
- * 一块文本 trim 后为空就丢掉（实测 KRC 有零宽标签）；剩下的块把时间夹回行区间内，
- * 保证下游两条不变量：字不早于行、行内字时间单调。脏数据到此为止，不往外漏。
+ * 只丢"没有文本"的块（实测 KRC 有零宽标签）。
+ * **不能逐块 trim**：英文块的空格是有效内容且带在块尾（实测 `The `、`rain `），
+ * trim 后整行会粘成 `Therainfallsonmywindows`。
  */
 function buildLine(start: number, end: number, chunks: RawChunk[]): WordLyricLine | null {
   const words: WordLyricWord[] = []
   for (const chunk of chunks) {
-    const text = chunk.text.replace(/[\u200b\ufeff]/g, '').trim()
+    const text = chunk.text.replace(/[\u200b\ufeff]/g, '')
     if (!text) continue
     const wordStart = clamp(chunk.start, start, end)
     words.push({ start: wordStart, end: clamp(chunk.end, wordStart, end), text })
@@ -236,32 +237,40 @@ function formatTimestamp(milliseconds: number): string {
 }
 
 /**
+ * 头标签按白名单带上：行级文本会落进 `.lrc` sidecar，而下载打标的 LYRICS 就读它，
+ * 静默丢掉 [ti:]/[ar:] 会让文件里的歌词比改动前少信息。KRC 内部的 [id:]/[hash:]/
+ * [total:]/[language:] 属实现细节，不透传。
+ *
+ * 两个序列化都带同一份头，**[offset:] 尤其关键**：客户端对行级和逐字都套用这个偏移，
+ * 只有一侧带就会导致两侧时间不一致，逐字被判定为不可用而退化成整行。
+ */
+const PLAIN_LRC_HEADER_ORDER = ['ti', 'ar', 'al', 'by', 'offset']
+
+function renderHeaders(lyric: WordLyric): string[] {
+  return PLAIN_LRC_HEADER_ORDER
+    .filter(key => lyric.headers[key])
+    .map(key => `[${key}:${lyric.headers[key]}]`)
+}
+
+/**
  * 增强 LRC：行首 `[mm:ss.xxx]`，每块文本前跟它的绝对起始，行尾再补一个结束时间。
  * 只给起始不给时长：实测相邻块满足「下一块 start == 上一块 start+dur」，末块由行尾收口。
  */
 export function toEnhancedLrc(lyric: WordLyric): string {
-  return lyric.lines.map(line => {
-    const body = line.words.map(word => `<${formatTimestamp(word.start)}>${word.text}`).join('')
-    return `[${formatTimestamp(line.start)}]${body}<${formatTimestamp(line.end)}>`
+  const body = lyric.lines.map(line => {
+    const words = line.words.map(word => `<${formatTimestamp(word.start)}>${word.text}`).join('')
+    return `[${formatTimestamp(line.start)}]${words}<${formatTimestamp(line.end)}>`
   }).join('\n')
+  return [...renderHeaders(lyric), body].join('\n')
 }
 
 /**
  * 与增强 LRC **同源**的行级文本。必须出自同一次解析：实测同一首 KRC 的行时间与酷狗
  * 另一条 fmt=lrc 通道差 10ms 级（青花瓷 16 行、Come Back To Me 42 行），混用会让高亮抖。
- *
- * 头标签按白名单带上：这份文本会落进 `.lrc` sidecar，而下载打标的 LYRICS 就读它，
- * 静默丢掉 [ti:]/[ar:] 会让文件里的歌词比改动前少信息。KRC 内部的 [id:]/[hash:]/
- * [total:]/[language:] 属实现细节，不透传。
  */
-const PLAIN_LRC_HEADER_ORDER = ['ti', 'ar', 'al', 'by', 'offset']
-
 export function toPlainLrc(lyric: WordLyric): string {
-  const headers = PLAIN_LRC_HEADER_ORDER
-    .filter(key => lyric.headers[key])
-    .map(key => `[${key}:${lyric.headers[key]}]`)
   const body = lyric.lines
     .map(line => `[${formatTimestamp(line.start)}]${lineText(line).trim()}`)
     .join('\n')
-  return [...headers, body].join('\n')
+  return [...renderHeaders(lyric), body].join('\n')
 }
