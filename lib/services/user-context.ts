@@ -14,6 +14,8 @@ export interface RequestUser {
   id: number
   username: string
   avatar: number | null
+  /** 蓝牙歌词：把当前歌词行覆写进媒体 session title，供车机/蓝牙设备显示 */
+  bluetoothLyric: boolean
 }
 
 export interface AuthState {
@@ -80,7 +82,7 @@ export async function getAuthState(request: NextRequest): Promise<AuthState> {
       logger.info(`[user-context] 会话版本不匹配（cookie=${session.sessionVersion} db=${u.sessionVersion}），旧会话已失效: ${u.username}`)
       return { authenticated: false, user: null, mustChangePassword: false }
     }
-    return { authenticated: true, user: { id: u.id, username: u.username, avatar: u.avatar }, mustChangePassword: !!u.mustChangePassword }
+    return { authenticated: true, user: { id: u.id, username: u.username, avatar: u.avatar, bluetoothLyric: u.bluetoothLyric }, mustChangePassword: !!u.mustChangePassword }
   } catch (e) {
     logger.error('[user-context] getAuthState: 查询用户失败', e)
     return { authenticated: false, user: null, mustChangePassword: false }

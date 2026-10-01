@@ -13,6 +13,7 @@ export async function GET(request: NextRequest) {
     authenticated: state.authenticated,
     username: state.user?.username ?? null,
     avatar: state.user?.avatar ?? null,
+    bluetoothLyric: state.user?.bluetoothLyric ?? true,
     mustChangePassword: state.authenticated ? state.mustChangePassword : false,
   })
 }
