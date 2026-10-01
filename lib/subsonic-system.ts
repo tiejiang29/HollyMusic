@@ -3,6 +3,7 @@ import { respond, subsonicError, TEXT_KEY, type SubsonicPayload } from './subson
 import { type AuthResult } from './auth'
 import { prisma, resolveMusicInfoById } from './db'
 import { reportPlay } from './services/history-service'
+import { updateLastSeenByUsername, getClientIp, getUa } from './user'
 import { logger } from './logger'
 
 /**
@@ -299,6 +300,9 @@ export async function handleScrobble(request: NextRequest, authRes: AuthResult):
         logger.warn('[scrobble] Failed to record play:', songId, err)
       }
     }))
+    // scrobble 是 Subsonic 客户端唯一的活跃信号（这类客户端不发心跳），
+    // 顺带记一次最近活跃；updateLastSeenByUsername 内部已吞掉写库异常。
+    await updateLastSeenByUsername(username, getClientIp(request), getUa(request))
   }
 
   return respond(request, null)

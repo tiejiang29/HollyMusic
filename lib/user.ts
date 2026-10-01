@@ -1,8 +1,12 @@
 import { prisma } from './db'
 import type { NextRequest } from 'next/server'
 
-/** 在线判定阈值：最近一次活跃在此时间内视为在线 */
-export const ONLINE_TTL_MS = 5 * 60 * 1000
+/**
+ * 在线判定阈值：最近一次活跃在此时间内视为在线。
+ * 不能取得太短：手机端不发心跳，活跃只靠播放上报（听一首歌的间隔就可能超过 5 分钟），
+ * 阈值过短会把正在听歌的人显示成离线。
+ */
+export const ONLINE_TTL_MS = 10 * 60 * 1000
 
 /**
  * 是否信任反向代理转发头（X-Forwarded-For / X-Real-IP）。
@@ -53,7 +57,7 @@ export async function updateLastLoginByUsername(username: string) {
 
 /**
  * 更新用户的最近活跃信息（时间 + IP + UA），best-effort。
- * 登录与心跳均调用，用于在线状态推断。
+ * 登录、心跳与播放上报（含 Subsonic scrobble）均调用，用于在线状态推断。
  */
 export async function updateLastSeenByUsername(
   username: string,

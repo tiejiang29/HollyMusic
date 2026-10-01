@@ -16,6 +16,10 @@ import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Plus, Pencil, Trash2, Shield, X, Loader2, KeyRound } from 'lucide-react'
 import { useAuthStore } from '@/hooks/useAuth'
+import { formatRelativeTime } from '@/lib/utils/format'
+
+/** 在线状态是会自己过期的事实，页面停着不动就会撒谎；30s 重取一次。 */
+const RELOAD_INTERVAL_MS = 30 * 1000
 
 type DialogMode =
   | { kind: 'create' }
@@ -31,21 +35,34 @@ export function UsersPanel() {
   const [error, setError] = useState<string | null>(null)
   const [dialog, setDialog] = useState<DialogMode>(null)
 
-  const reload = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  /** quiet：轮询用。不关掉 loading 的话每 30 秒整张表闪一次骨架屏 */
+  const reload = useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
+    if (!quiet) {
+      setLoading(true)
+      setError(null)
+    }
     try {
       const { list } = await listUsers()
       setUsers(list)
+      // 轮询成功后要把首次加载的失败态清掉，否则面板会一直卡在"加载失败"
+      setError(null)
     } catch (e) {
-      setError(e instanceof Error ? e.message : '加载失败')
+      if (!quiet) setError(e instanceof Error ? e.message : '加载失败')
     } finally {
-      setLoading(false)
+      if (!quiet) setLoading(false)
     }
   }, [])
 
   useEffect(() => {
     reload()
+  }, [reload])
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      // 面板不可见时不查，回到前台后下一个 tick 自然补上
+      if (document.visibilityState === 'visible') void reload({ quiet: true })
+    }, RELOAD_INTERVAL_MS)
+    return () => clearInterval(timer)
   }, [reload])
 
   const handleCreated = async (username: string, password: string) => {
@@ -138,13 +155,19 @@ export function UsersPanel() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <span
-                        className="flex w-fit items-center gap-1 text-xs text-muted-foreground"
+                      <div
+                        className="flex flex-col gap-0.5"
                         title={`最近活跃：${u.lastSeen ? new Date(u.lastSeen).toLocaleString('zh-CN') : '—'}\nIP：${u.lastSeenIp || '—'}\nUA：${u.lastSeenUa || '—'}`}
                       >
-                        <span className={`h-2 w-2 rounded-full ${u.isOnline ? 'bg-green-500' : 'bg-muted-foreground/40'}`} />
-                        {u.isOnline ? '在线' : '离线'}
-                      </span>
+                        <span className="flex w-fit items-center gap-1 text-xs text-muted-foreground">
+                          <span className={`h-2 w-2 rounded-full ${u.isOnline ? 'bg-green-500' : 'bg-muted-foreground/40'}`} />
+                          {u.isOnline ? '在线' : '离线'}
+                        </span>
+                        {/* 离线时这行是唯一能说明"多久没动静"的信息，别再藏进 tooltip */}
+                        <span className="text-[10px] text-muted-foreground/70">
+                          {u.lastSeen ? formatRelativeTime(u.lastSeen) : '无活跃记录'}
+                        </span>
+                      </div>
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">
                       {u.hasPassword ? '已设置' : '未设置'}

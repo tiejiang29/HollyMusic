@@ -9,6 +9,7 @@ import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { requireUser, AuthError } from '@/lib/services/user-context'
 import { reportPlay, listHistory, clearHistory } from '@/lib/services/history-service'
+import { updateLastSeenByUsername, getClientIp, getUa } from '@/lib/user'
 import { logger } from '@/lib/logger'
 import type { MusicInfo } from '@/lib/types/music'
 
@@ -41,6 +42,9 @@ export async function POST(request: NextRequest) {
       return createErrorResponse(ErrorCodes.INVALID_PARAMS, '缺少 musicInfo', 400)
     }
     await reportPlay(user.username, musicInfo)
+    // 手机端不发心跳，播放上报是它唯一的活跃信号，这里顺带记一次最近活跃。
+    // updateLastSeenByUsername 内部已吞掉写库异常，不会把上报打成 500。
+    await updateLastSeenByUsername(user.username, getClientIp(request), getUa(request))
     return createSuccessResponse({ reported: true })
   } catch (err) {
     const guard = authGuard(err)

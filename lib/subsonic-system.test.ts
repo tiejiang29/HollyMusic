@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
-const { resolveMusicInfoById, reportPlay } = vi.hoisted(() => ({
+const { resolveMusicInfoById, reportPlay, updateLastSeen } = vi.hoisted(() => ({
   resolveMusicInfoById: vi.fn(),
   reportPlay: vi.fn(),
+  updateLastSeen: vi.fn(),
 }))
 
 vi.mock('./generated/prisma', () => ({
@@ -13,6 +14,12 @@ vi.mock('./generated/prisma', () => ({
 // getLicense/scrobble 分支不触库，空对象即可
 vi.mock('./db', () => ({ prisma: {}, resolveMusicInfoById }))
 vi.mock('./services/history-service', () => ({ reportPlay }))
+// Subsonic 客户端不发心跳，scrobble 是它唯一的活跃信号，因此这里要记一次最近活跃
+vi.mock('./user', () => ({
+  updateLastSeenByUsername: updateLastSeen,
+  getClientIp: () => '172.16.1.49',
+  getUa: () => 'Symfonium/6.0',
+}))
 
 const { handleGetLicense, handleScrobble } = await import('./subsonic-system')
 
@@ -51,6 +58,7 @@ describe('handleScrobble', () => {
 
     expect(resolveMusicInfoById).toHaveBeenCalledWith('kw-123')
     expect(reportPlay).toHaveBeenCalledWith('tester', musicInfo)
+    expect(updateLastSeen).toHaveBeenCalledWith('tester', '172.16.1.49', 'Symfonium/6.0')
     expect(await response.text()).toContain('status="ok"')
   })
 
@@ -62,6 +70,7 @@ describe('handleScrobble', () => {
 
     expect(resolveMusicInfoById).not.toHaveBeenCalled()
     expect(reportPlay).not.toHaveBeenCalled()
+    expect(updateLastSeen).not.toHaveBeenCalled()
     expect(await response.text()).toContain('status="ok"')
   })
 })
