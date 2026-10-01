@@ -25,7 +25,7 @@ lib/
 |------|------|-------|
 | Multi-source routing | music-source-manager.ts | Priority-based, quality fallback |
 | Cache access | cache-manager.ts | Exports: searchCache, urlCache |
-| Database operations | db.ts | upsertMusicInfo with checksum |
+| Database operations | db.ts | upsertMusicInfo with checksum；update 分支「只补不减」（见 mergeMusicInfoPreserving：载荷缺的字段保住库里旧值，所以无法再用 upsert 主动清空字段） |
 | Download utilities | server/download-utils.ts | isValidUrl, sanitizeFilename, RateLimiter |
 
 ## CONVENTIONS

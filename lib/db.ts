@@ -18,7 +18,7 @@ function stableStringify(obj: any): string {
   return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}'
 }
 
-function computeChecksum(mi: MusicInfo) {
+export function computeChecksum(mi: MusicInfo) {
   const payload = {
     name: mi.name,
     singer: mi.singer,
@@ -389,6 +389,48 @@ function isUniqueConstraintError(error: unknown): boolean {
   )
 }
 
+/**
+ * 这一格到底有没有值。空数组 / 空对象 / 空串都算没有：
+ * 搜索映射常带 `types: []`、`typeUrl: {}`、`img: null`，它们不是"上游说这歌没封面"，
+ * 只是那条路径压根没取这个字段。
+ */
+function hasValue(v: unknown): boolean {
+  if (v === null || v === undefined) return false
+  if (typeof v === 'string') return v.trim() !== ''
+  if (Array.isArray(v)) return v.length > 0
+  if (typeof v === 'object') return Object.keys(v as object).length > 0
+  return true
+}
+
+/**
+ * 用新载荷补旧行，只补不减。
+ *
+ * 为什么必须这样：`MusicInfo` 的入库路径不止一条（搜索 / 发现页榜单 / 歌单导入 / 专辑逐首），
+ * 每条路径从上游拿到的字段完整度不同 —— 例如 music-core 的搜索映射把 `img` 恒写成 null，
+ * 而发现页那份是带封面 URL 的。update 分支原先整行覆盖，于是"搜一次就把更完整的那行改薄"，
+ * 实测一次批量搜索就弄丢 106 行封面、38 行 mrcUrl（逐字地址）。
+ * 真要有值的变更，新载荷必然带着新值，不会被这条规则挡下来；
+ * 代价是**再也没法通过 upsert 主动清空某个字段**（真要清只能直接改库）。
+ */
+export function mergeMusicInfoPreserving(existing: MusicInfo, incoming: MusicInfo): MusicInfo {
+  const src = existing as unknown as Record<string, unknown>
+  const out: Record<string, unknown> = { ...(incoming as unknown as Record<string, unknown>) }
+  for (const key of Object.keys(src)) {
+    if (!hasValue(out[key])) out[key] = src[key]
+  }
+  return out as unknown as MusicInfo
+}
+
+function parseStoredMusicInfo(data: string | null | undefined): MusicInfo | null {
+  if (!data) return null
+  try {
+    const parsed = JSON.parse(data)
+    return parsed && typeof parsed === 'object' ? parsed as MusicInfo : null
+  } catch {
+    return null
+  }
+}
+
 async function upsertMusicInfoWithClient(
   client: MusicInfoWriteClient,
   mi: MusicInfo,
@@ -407,6 +449,8 @@ async function upsertMusicInfoWithClient(
       },
       select: {
         checksum: true,
+        // update 分支要拿旧行的 data 做"只补不减"的合并（见 mergeMusicInfoPreserving）
+        data: true,
       },
     })
 
@@ -466,6 +510,7 @@ async function upsertMusicInfoWithClient(
         },
         select: {
           checksum: true,
+          data: true,
         },
       })
       if (!existing) throw error
@@ -476,8 +521,17 @@ async function upsertMusicInfoWithClient(
     return { action: 'noop' }
   }
 
+  // 新载荷可能只是比库里缺字段（不同入库路径的完整度不一样），整行覆盖会把更完整的那行改薄，
+  // 所以先只补不减地合并；合并结果与库里一致就当 noop，避免每次搜索都白写一遍。
+  const stored = parseStoredMusicInfo(existing.data)
+  const merged = stored ? mergeMusicInfoPreserving(stored, mi) : mi
+  if (stored && computeChecksum(merged) === existing.checksum) {
+    return { action: 'noop' }
+  }
+  const mergedJson = JSON.stringify(merged)
+
   const durationSeconds = (() => {
-    const n = Number(mi.interval)
+    const n = Number(merged.interval)
     return Number.isNaN(n) ? null : n
   })()
 
@@ -489,32 +543,32 @@ async function upsertMusicInfoWithClient(
         },
       },
       data: {
-        data: dataJson,
-        checksum,
+        data: mergedJson,
+        checksum: computeChecksum(merged),
         // 上游改名/换歌手时重算，行会自然迁移到正确的同款歌组
-        identity: songIdentity(mi),
+        identity: songIdentity(merged),
         // update denormalized/searchable fields as above
-        name: mi.name || null,
-        singer: mi.singer || null,
-        albumId: mi.albumId != null ? String(mi.albumId) : null,
-        albumName: mi.albumName || null,
-        img: (mi as any).img || null,
+        name: merged.name || null,
+        singer: merged.singer || null,
+        albumId: merged.albumId != null ? String(merged.albumId) : null,
+        albumName: merged.albumName || null,
+        img: (merged as any).img || null,
         durationSeconds,
 
-        songId: (mi as any).songId != null ? String((mi as any).songId) : null,
-        albumMid: (mi as any).albumMid != null ? String((mi as any).albumMid) : null,
-        strMediaMid: (mi as any).strMediaMid != null ? String((mi as any).strMediaMid) : null,
-        hash: (mi as any).hash || null,
-        copyrightId: (mi as any).copyrightId != null ? String((mi as any).copyrightId) : null,
+        songId: (merged as any).songId != null ? String((merged as any).songId) : null,
+        albumMid: (merged as any).albumMid != null ? String((merged as any).albumMid) : null,
+        strMediaMid: (merged as any).strMediaMid != null ? String((merged as any).strMediaMid) : null,
+        hash: (merged as any).hash || null,
+        copyrightId: (merged as any).copyrightId != null ? String((merged as any).copyrightId) : null,
 
-        typesJson: JSON.stringify(mi.types || []),
-        typesMapJson: JSON.stringify(mi._types || {}),
-        typeUrlJson: JSON.stringify(mi.typeUrl || {}),
+        typesJson: JSON.stringify(merged.types || []),
+        typesMapJson: JSON.stringify(merged._types || {}),
+        typeUrlJson: JSON.stringify(merged.typeUrl || {}),
 
-        lrc: (mi as any).lrc || null,
-        lrcUrl: (mi as any).lrcUrl || null,
-        mrcUrl: (mi as any).mrcUrl || null,
-        trcUrl: (mi as any).trcUrl || null,
+        lrc: (merged as any).lrc || null,
+        lrcUrl: (merged as any).lrcUrl || null,
+        mrcUrl: (merged as any).mrcUrl || null,
+        trcUrl: (merged as any).trcUrl || null,
       },
   })
   return { action: 'update' }

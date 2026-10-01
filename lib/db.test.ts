@@ -14,7 +14,7 @@ vi.mock('./generated/prisma', () => ({
 }))
 vi.mock('./logger', () => ({ logger: { error: vi.fn(), warn: vi.fn() } }))
 
-const { upsertMusicInfo, getMusicInfo } = await import('./db')
+const { upsertMusicInfo, getMusicInfo, mergeMusicInfoPreserving, computeChecksum } = await import('./db')
 
 const musicInfo = {
   source: 'kw' as const,
@@ -25,6 +25,23 @@ const musicInfo = {
   types: [],
   _types: {},
   typeUrl: {},
+}
+
+import type { MusicInfo } from '@/lib/types/music'
+
+/** 库里那种"发现页/歌单入库"的完整行：带封面、带源标识、带音质表 */
+const richRow: MusicInfo = {
+  source: 'tx', songmid: '002NmjQb', name: '曹操', singer: '林俊杰', interval: '04:04',
+  img: 'https://cover/tx/1.jpg', strMediaMid: '003abc', albumId: 'al-1',
+  types: [{ type: 'flac', size: '34M' }],
+  _types: { flac: { size: '34M' } } as MusicInfo['_types'],
+  typeUrl: {},
+}
+
+/** 模拟 music-core 搜索映射那种载荷：img 恒 null、types 可能空、别的源的字段干脆不带 */
+const thinFromSearch: MusicInfo = {
+  ...richRow, interval: '244', img: null, types: [],
+  _types: {} as MusicInfo['_types'],
 }
 
 describe('upsertMusicInfo', () => {
@@ -70,5 +87,70 @@ describe('getMusicInfo 读库边界归一化', () => {
       data: JSON.stringify({ source: 'kw', songmid: 'b', types: [{ type: '320k', size: '7MB' }] }),
     })
     expect((await getMusicInfo('kw', 'b'))?.types).toEqual([{ type: '320k', size: '7MB' }])
+  })
+})
+
+describe('mergeMusicInfoPreserving：只补不减', () => {
+  it('新载荷缺的字段（img null / types 空数组 / 压根没有的键）一律保留库里那份', () => {
+    const merged = mergeMusicInfoPreserving(richRow, thinFromSearch)
+    expect(merged.img).toBe(richRow.img)
+    expect(merged.types).toEqual(richRow.types)
+    expect(merged.strMediaMid).toBe(richRow.strMediaMid)
+    expect(merged.albumId).toBe(richRow.albumId)
+    // 新载荷带的值以新的为准
+    expect(merged.interval).toBe('244')
+  })
+
+  it('上游真改了值（换封面 / 改名）时新值生效，不会被旧值挡掉', () => {
+    const merged = mergeMusicInfoPreserving(richRow, { ...richRow, img: 'https://cover/tx/new.jpg', name: '曹操 (Live)' })
+    expect(merged.img).toBe('https://cover/tx/new.jpg')
+    expect(merged.name).toBe('曹操 (Live)')
+  })
+
+  it('空串/空对象也算没值', () => {
+    const merged = mergeMusicInfoPreserving(
+      { ...richRow, albumName: '建安七年', lrcUrl: 'https://lrc/1' },
+      { ...richRow, albumName: '', lrcUrl: undefined },
+    )
+    expect(merged.albumName).toBe('建安七年')
+    expect(merged.lrcUrl).toBe('https://lrc/1')
+  })
+})
+
+describe('upsertMusicInfo 的 update 分支不再把完整行改薄', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const storedJson = JSON.stringify(richRow)
+
+  it('薄载荷进来：写回的仍是合并后的完整值（合并带来变化时才真写）', async () => {
+    findUnique.mockResolvedValueOnce({ checksum: 'stored-checksum', data: storedJson })
+    update.mockResolvedValueOnce({})
+
+    await expect(upsertMusicInfo(thinFromSearch)).resolves.toEqual({ action: 'update' })
+
+    const arg = update.mock.calls[0][0]
+    expect(arg.data.img).toBe('https://cover/tx/1.jpg')
+    expect(arg.data.strMediaMid).toBe('003abc')
+    expect(arg.data.typesJson).toBe('[{"type":"flac","size":"34M"}]')
+    expect(JSON.parse(arg.data.data).img).toBe('https://cover/tx/1.jpg')
+  })
+
+  it('合并后与库里完全一致 → noop，不白写一遍（否则每次搜索都刷新 updatedAt）', async () => {
+    // 载荷只是"缺字段"、没有真变化时，整条写入应该省掉
+    const onlyMissingFields: MusicInfo = { ...richRow, img: null, types: [], _types: {} as MusicInfo['_types'] }
+    findUnique.mockResolvedValueOnce({ checksum: computeChecksum(richRow), data: storedJson })
+
+    await expect(upsertMusicInfo(onlyMissingFields)).resolves.toEqual({ action: 'noop' })
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('库里 data 是坏 JSON 时退回按新载荷写，不抛错', async () => {
+    findUnique.mockResolvedValueOnce({ checksum: 'x', data: '{oops' })
+    update.mockResolvedValueOnce({})
+
+    await expect(upsertMusicInfo(thinFromSearch)).resolves.toEqual({ action: 'update' })
+    expect(update).toHaveBeenCalledTimes(1)
   })
 })
