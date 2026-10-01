@@ -31,6 +31,7 @@ describe('mgSongToMusicInfo（songItem 映射，与 music-core 老 mg 源同构�
       singerList: [{ name: '周杰伦' }],
       img3: '/data/oss/resource/00/x.webp',
       lrcUrl: 'https://d.musicapp.migu.cn/lrc',
+      mrcUrl: 'https://d.musicapp.migu.cn/mrc',
       audioFormats: [
         { formatType: 'PQ', asize: '3916071' },
         { formatType: 'HQ', asize: '9700000' },
@@ -46,6 +47,8 @@ describe('mgSongToMusicInfo（songItem 映射，与 music-core 老 mg 源同构�
     })
     expect(mi?.types.map(t => t.type)).toEqual(['128k', '320k', 'flac', 'flac24bit'])
     expect(mi?.lrcUrl).toContain('migu.cn')
+    // 逐字（MRC）地址：接口本就返回，我方之前漏读 ⇒ mg 行拿不到逐字
+    expect(mi?.mrcUrl).toBe('https://d.musicapp.migu.cn/mrc')
   })
 
   it('缺 songId/songName 返回 null；相对路径封面补 d.musicapp 前缀', () => {

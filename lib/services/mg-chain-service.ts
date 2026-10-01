@@ -121,6 +121,8 @@ interface MgSongItem {
   img2?: string
   img3?: string
   lrcUrl?: string
+  /** 逐字（MRC）资源地址：接口本就返回，之前我方没读，导致 mg 行拿不到逐字 */
+  mrcUrl?: string
   audioFormats?: Array<{ formatType?: string; asize?: string | number; isize?: string | number }>
 }
 
@@ -168,6 +170,7 @@ export function mgSongToMusicInfo(item: MgSongItem, fallbackAlbum?: { name?: str
     interval: secsToInterval(item.duration),
     img,
     ...(item.lrcUrl ? { lrcUrl: item.lrcUrl } : {}),
+    ...(item.mrcUrl ? { mrcUrl: item.mrcUrl } : {}),
     types,
     _types: _types as MusicInfo['_types'],
     typeUrl: {},
