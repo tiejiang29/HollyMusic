@@ -9,6 +9,7 @@
 import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { requireUser, AuthError } from '@/lib/services/user-context'
+import { logger } from '@/lib/logger'
 import { prisma } from '@/lib/db'
 
 export async function PUT(request: NextRequest) {
@@ -28,6 +29,7 @@ export async function PUT(request: NextRequest) {
     return createSuccessResponse({ enabled: updated.bluetoothLyric })
   } catch (error) {
     if (error instanceof AuthError) return createErrorResponse('UNAUTHORIZED', error.message, 401)
+    logger.error('[api/auth/bluetooth-lyric PUT] error:', error)
     return createErrorResponse(ErrorCodes.INTERNAL_ERROR, '蓝牙歌词设置失败', 500)
   }
 }
