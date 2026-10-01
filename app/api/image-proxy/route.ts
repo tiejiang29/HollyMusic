@@ -16,7 +16,8 @@ import { safePublicFetch, SafeFetchError } from '@/lib/server/url-guard'
 const ALLOWED_HOST_SUFFIXES = [
   'gtimg.cn', // QQ 图片 CDN（y.gtimg.cn / imgcache.gtimg.cn 等）
   'qpic.cn', // QQ 歌单封面（p.qpic.cn）
-  'qpic.y.qq.com', // QQ 歌单封面另一域名族（生产实测）
+  'y.qq.com', // QQ 站内图：music-file.y.qq.com 是用户上传歌单封面的落点（生产实测 403 的就是它），
+              // 原先只列了 qpic.y.qq.com 这一具体主机，同族别的子域一律被拒
   'music.126.net', // 网易云
   'kuwo.cn', // 酷我
   'kugou.com', 'kgimg.com', // 酷狗
@@ -42,6 +43,8 @@ export async function GET(request: NextRequest) {
     return new Response('invalid url', { status: 400 })
   }
   if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || !isAllowedHost(parsed.hostname)) {
+    // 不记日志的话，"某张图在车机/手机上取不到"在服务端完全不可见（生产就这么漏过一次）
+    logger.warn('[api/image-proxy] 拒绝代理请求（协议或域名不在白名单）:', parsed.hostname)
     return new Response('host not allowed', { status: 403 })
   }
 
