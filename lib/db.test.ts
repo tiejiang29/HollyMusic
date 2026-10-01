@@ -14,7 +14,7 @@ vi.mock('./generated/prisma', () => ({
 }))
 vi.mock('./logger', () => ({ logger: { error: vi.fn(), warn: vi.fn() } }))
 
-const { upsertMusicInfo, getMusicInfo, mergeMusicInfoPreserving, computeChecksum } = await import('./db')
+const { upsertMusicInfo, getMusicInfo, mergeMusicInfoPreserving, computeChecksum, intervalToSeconds } = await import('./db')
 
 const musicInfo = {
   source: 'kw' as const,
@@ -152,5 +152,29 @@ describe('upsertMusicInfo 的 update 分支不再把完整行改薄', () => {
 
     await expect(upsertMusicInfo(thinFromSearch)).resolves.toEqual({ action: 'update' })
     expect(update).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('intervalToSeconds：mm:ss 也得算出秒数', () => {
+  it('三种写法都能解，脏值与空值给 null', () => {
+    expect(intervalToSeconds('03:47')).toBe(227)
+    expect(intervalToSeconds('1:02:03')).toBe(3723)
+    expect(intervalToSeconds('297')).toBe(297)
+    expect(intervalToSeconds(297)).toBe(297)
+    expect(intervalToSeconds('0:45')).toBe(45)
+    expect(intervalToSeconds('')).toBeNull()
+    expect(intervalToSeconds(null)).toBeNull()
+    expect(intervalToSeconds(undefined)).toBeNull()
+    expect(intervalToSeconds('0:00')).toBeNull()        // 零时长等于不知道
+    expect(intervalToSeconds('N/A')).toBeNull()
+    expect(intervalToSeconds('3:4:5:6')).toBeNull()
+    expect(intervalToSeconds('abc:def')).toBeNull()
+  })
+
+  it('建形时 mm:ss 会真的落进 durationSeconds 列（旧实现 Number() 得 NaN ⇒ 整源为空）', async () => {
+    findUnique.mockResolvedValueOnce(null)
+    create.mockResolvedValueOnce({})
+    await upsertMusicInfo({ ...musicInfo, interval: '03:47' })
+    expect(create.mock.calls[0][0].data.durationSeconds).toBe(227)
   })
 })

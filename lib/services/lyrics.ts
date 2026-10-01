@@ -48,11 +48,24 @@ function claimWordLyricRetry(key: string): boolean {
   return true
 }
 
+/**
+ * 允许"跨源借逐字"的源：播的是这儿的歌，但库里同一首有酷狗副本时，用那行的 hash 取
+ * KRC 的字时间，再挂回本行自己的行时间上 —— 行级文本一个字节都不改。
+ *
+ * 放开谁、不放谁都是实测结论（14 首抽样，同一 identity + 时长±2.5s 配对）：
+ * - tx：与酷狗行时间中位差 4~5ms，本就是同一份时间轴。
+ * - kw：青花/最熟悉的陌生人/浮夸 三首偏移直接 0ms、对齐率 98~100%，千千阕歌 −251ms 残余 p90 82ms；
+ *   库里 1219 条酷我行有可借兄弟行的 18%（按播放加权 33%），比 tx 的约 9% 更值钱。
+ * - wy：中位差 200~500ms 且常是另一个版本（对齐率低到 22%）⇒ 不放。
+ * 闸门照旧不放宽：行对齐率 ≥70% 且整体时间差 ≤300ms，配不上就不借。
+ */
+const BORROWABLE_SOURCES = new Set(['tx', 'kw'])
+
 /** 这行记录本身有没有拿到逐字的可能 —— 没可能就别打上游 */
 async function mayHaveWordLyric(musicInfo: MusicInfo): Promise<boolean> {
   if (musicInfo.source === 'kg') return Boolean(musicInfo.hash)
   if (musicInfo.source === 'mg') return Boolean(musicInfo.mrcUrl)
-  if (musicInfo.source === 'tx') {
+  if (BORROWABLE_SOURCES.has(musicInfo.source)) {
     const identity = songIdentity(musicInfo)
     if (identity === '|') return false
     const donor = await prisma.musicInfo.findFirst({
@@ -176,16 +189,6 @@ async function writeTextAtomically(filePath: string, content: string): Promise<v
     throw error
   }
 }
-
-/**
- * 跨源借逐字（本轮只做 tx）。播的是 QQ 的歌，但库里同一首有酷狗副本时，用那行的
- * hash 取 KRC 的字时间，再挂回 QQ 自己的行时间上 —— 行级文本一个字节都不改。
- *
- * 只放开 tx 是实测结论：tx 与酷狗的行时间中位差 4~5ms（本就是同一份时间轴），
- * 网易差 200~500ms 且常是另一个版本（对齐率低到 22%）。所以闸门很紧：
- * 行对齐率 ≥70% 且整体时间差 ≤300ms，配不上就不借。
- */
-const BORROWABLE_SOURCES = new Set(['tx'])
 
 async function borrowWordLyric(musicInfo: MusicInfo, lyric: string): Promise<string | null> {
   if (!BORROWABLE_SOURCES.has(musicInfo.source)) return null

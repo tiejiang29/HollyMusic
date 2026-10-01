@@ -169,7 +169,7 @@ describe('fetchLyricForMusic 的逐字通道', () => {
   })
 })
 
-// ————— 跨源借逐字（本轮只对 tx 开放）—————
+// ————— 跨源借逐字（只对实测与酷狗同一份时间轴的 tx / kw 开放）—————
 const { parseKrc } = await import('@/lib/server/word-lyric')
 
 /** 酷狗侧：8 行，行起 10000ms 起步、每行 4s，两字一块 */
@@ -205,7 +205,31 @@ describe('跨源借逐字', () => {
     expect(fetchKugouWordLyric).toHaveBeenCalledWith(expect.objectContaining({ hash: 'KGHASH' }))
   })
 
-  it('非 tx 源不借（实测只有 QQ 与酷狗是同一份时间轴）', async () => {
+  it('播酷我的歌、库里有同款酷狗副本时同样能借（实测两侧行时间 0ms 同一份）', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
+    fetchKugouWordLyric.mockResolvedValue(borrowKrc)
+
+    const result = await fetchLyricForMusic({ ...txMusicInfo, source: 'kw', songmid: 'KW001' })
+    expect(result?.lyric).toBe(txLrc)
+    expect(result?.wordLyric).toContain('[00:10.100]<00:10.100>第1行<00:12.100>字<00:14.100>')
+    expect(fetchKugouWordLyric).toHaveBeenCalledWith(expect.objectContaining({ hash: 'KGHASH' }))
+  })
+
+  it('酷我但库里没有可借的酷狗兄弟行时，一次上游都不打', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    findManyMusic.mockResolvedValue([])
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
+    fetchKugouWordLyric.mockResolvedValue(borrowKrc)
+
+    const result = await fetchLyricForMusic({ ...txMusicInfo, source: 'kw', songmid: 'KW_NODONOR' })
+    expect(result?.wordLyric).toBeNull()
+    expect(fetchKugouWordLyric).not.toHaveBeenCalled()
+  })
+
+  it('网易不借（实测行时间中位差 200~500ms 且常是另一个版本，对齐率低到 22%）', async () => {
     resetBorrowMocks()
     stubSidecars({})
     fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })

@@ -431,6 +431,23 @@ function parseStoredMusicInfo(data: string | null | undefined): MusicInfo | null
   }
 }
 
+/**
+ * `interval` 在各入库路径写法不一：搜索/发现页给 `mm:ss`（或 `h:mm:ss`），
+ * Subsonic 与部分链服务给纯秒数。只按 `Number()` 解的话 `mm:ss` 恒为 NaN，
+ * `durationSeconds` 列就整源为空 —— 专辑匹配、换源、批量解析里的
+ * durationMatches 全都在用这一列判"是不是同一版本"。
+ */
+export function intervalToSeconds(interval: unknown): number | null {
+  if (interval == null || interval === '') return null
+  const s = String(interval).trim()
+  if (/^\d+(?:\.\d+)?$/.test(s)) return Number(s)
+  const parts = s.split(':')
+  if (parts.length < 2 || parts.length > 3 || parts.some(p => !/^\d{1,2}$/.test(p))) return null
+  const [h, m, sec = 0] = parts.length === 3 ? parts.map(Number) : [0, ...parts.map(Number)]
+  const total = h * 3600 + m * 60 + Number(sec)
+  return Number.isFinite(total) && total > 0 ? total : null
+}
+
 async function upsertMusicInfoWithClient(
   client: MusicInfoWriteClient,
   mi: MusicInfo,
@@ -455,10 +472,7 @@ async function upsertMusicInfoWithClient(
     })
 
   if (!existing) {
-    const durationSeconds = (() => {
-        const n = Number(mi.interval)
-        return Number.isNaN(n) ? null : n
-    })()
+    const durationSeconds = intervalToSeconds(mi.interval)
 
     try {
       await client.musicInfo.create({
@@ -530,10 +544,7 @@ async function upsertMusicInfoWithClient(
   }
   const mergedJson = JSON.stringify(merged)
 
-  const durationSeconds = (() => {
-    const n = Number(merged.interval)
-    return Number.isNaN(n) ? null : n
-  })()
+  const durationSeconds = intervalToSeconds(merged.interval)
 
   await client.musicInfo.update({
       where: {
