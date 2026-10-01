@@ -117,3 +117,5 @@ export class CacheManager<T = unknown> {
 // 创建不同类型的缓存实例
 export const searchCache = new CacheManager()
 export const urlCache = new CacheManager()
+/** 歌词取词结果：一次播放会有底栏/全屏页/播放记录多个入口同要一首，没有它就重复打上游 */
+export const lyricCache = new CacheManager()

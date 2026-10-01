@@ -8,6 +8,7 @@
 import fsp from 'fs/promises'
 import path from 'path'
 import { getAudioServeConfig } from '@/lib/audio-serve'
+import { lyricCache } from '@/lib/cache-manager'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { musicSourceManager } from '@/lib/music-source-manager'
@@ -374,27 +375,36 @@ async function fetchLyricsFromAPI(title: string, album: string, artist: string):
 
 /**
  * 统一歌词获取：音源优先，第三方 API 回退。
- * 返回 { lyric, tlyric } 或 null。
+ * 返回 { lyric, tlyric, wordLyric } 或 null。
+ *
+ * 最前面这层 90 秒内存缓存是因为一次播放会有多个入口同要一首歌的歌词
+ * （底栏当前行、全屏歌词页各订阅了时间，实测生产日志同一首连着打三次上游）。
+ * 只记成功结果：取词失败要留给下次播放重试，不能把一次网络抖动固化成"这首歌没歌词"。
  */
+const LYRIC_MEMO_TTL_MS = 90_000
+
 export async function fetchLyricForMusic(musicInfo: MusicInfo): Promise<LyricResult | null> {
+  const key = `${musicInfo.source}:${musicInfo.songmid}`
+  const memo = lyricCache.get(key) as LyricResult | null
+  if (memo) return memo
+
   const title = musicInfo.name || ''
   const artist = musicInfo.singer || ''
   const album = musicInfo.albumName || ''
 
   // 1) 平台原生接口按歌曲唯一标识取词，避免同名歌曲被标题搜索误配。
-  const nativeLyric = await getNativeLyricWithDiskCache(musicInfo)
-  if (nativeLyric) return nativeLyric
-
   // 2) 已配置的渠道音源脚本（以 source + MusicInfo 查询，可作为精确结果缓存）
-  const sourceLyric = await getSourceLyricWithDiskCache(musicInfo)
-  if (sourceLyric) return sourceLyric
+  // 3) 回退第三方标题搜索（可返回给页面，但绝不落盘固化）
+  let result = await getNativeLyricWithDiskCache(musicInfo)
+  if (!result) result = await getSourceLyricWithDiskCache(musicInfo)
+  if (!result) {
+    const text = await fetchLyricsFromAPI(title, album || title, artist)
+    const lyric = text ? normalizeLyricPayload(text) : ''
+    if (lyric) result = { lyric, tlyric: null, wordLyric: null }
+  }
 
-  // 3) 回退第三方 API
-  const text = await fetchLyricsFromAPI(title, album || title, artist)
-  const lyric = text ? normalizeLyricPayload(text) : ''
-  if (lyric) return { lyric, tlyric: null, wordLyric: null }
-
-  return null
+  if (result) lyricCache.set(key, result, LYRIC_MEMO_TTL_MS)
+  return result
 }
 
 // 匹配单个时间标签：[mm:ss] / [mm:ss.xx] / [mm:ss.xxx] / [h:mm:ss.xxx]

@@ -30,6 +30,9 @@ vi.mock('fs/promises', () => {
 })
 
 const { cacheNativeLyricForMusic } = await import('./lyrics')
+// 取词结果有 90 秒内存缓存（一次播放多个入口只打一次上游）；用例之间必须清掉，
+// 否则同一 songmid 的第二个用例会读到上一个用例的结果
+const { lyricCache } = await import('@/lib/cache-manager')
 
 describe('cacheNativeLyricForMusic', () => {
   it('原生接口无结果时，将渠道音源脚本返回的歌词写入缓存音频同级 .lrc', async () => {
@@ -73,6 +76,7 @@ const kgMusicInfo = {
 const ENHANCED = '[01:20.000]<01:20.000>第1字<01:21.000>末字<01:23.000>'
 
 function resetSidecarMocks() {
+  lyricCache.clear()
   findMany.mockReset().mockResolvedValue([{ filePath: 'aa/song.flac' }])
   getLyric.mockReset().mockResolvedValue(null)
   fetchNativeLyric.mockReset()
@@ -181,7 +185,7 @@ const txMusicInfo = {
 }
 
 function resetBorrowMocks() {
-  resetSidecarMocks()
+  resetSidecarMocks()   // 里面已含 lyricCache.clear()
   fetchKugouWordLyric.mockReset()
   findManyMusic.mockReset().mockResolvedValue([{ songmid: 'KG001', data: JSON.stringify({ source: 'kg', songmid: 'KG001', name: '测试歌曲', hash: 'KGHASH', interval: '03:00' }) }])
 }
@@ -327,5 +331,45 @@ describe('缓存里只有整行、缺逐字时的补取', () => {
     const result = await fetchLyricForMusic({ ...kgMusicInfo, songmid: 'KG_HAS_WLRC' })
     expect(result?.wordLyric).toBe(ownWord)
     expect(fetchNativeLyric).not.toHaveBeenCalled()
+  })
+})
+
+describe('取词结果的内存缓存', () => {
+  it('同一首连续要两次（底栏与全屏页各自订阅），上游只被打一次', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue({ lyric: '[00:01.000]一次取词', tlyric: null })
+    const info = { ...kgMusicInfo, songmid: 'MEMO_ONCE' }
+
+    const first = await fetchLyricForMusic(info)
+    const second = await fetchLyricForMusic(info)
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(1)
+    expect(second).toEqual(first)
+  })
+
+  it('取词失败不进缓存：下次播放还要再试（不能把一次抖动固化成"没歌词"）', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric.mockResolvedValue(null)
+    getLyric.mockResolvedValue(null)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 500 })))
+    const info = { ...kgMusicInfo, songmid: 'MEMO_FAIL' }
+
+    await expect(fetchLyricForMusic(info)).resolves.toBeNull()
+    await expect(fetchLyricForMusic(info)).resolves.toBeNull()
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(2)
+    vi.unstubAllGlobals()
+  })
+
+  it('不同歌曲互不干扰', async () => {
+    resetBorrowMocks()
+    stubSidecars({})
+    fetchNativeLyric
+      .mockResolvedValueOnce({ lyric: '[00:01.000]甲歌', tlyric: null })
+      .mockResolvedValueOnce({ lyric: '[00:02.000]乙歌', tlyric: null })
+
+    await expect(fetchLyricForMusic({ ...kgMusicInfo, songmid: 'MEMO_A' })).resolves.toMatchObject({ lyric: '[00:01.000]甲歌' })
+    await expect(fetchLyricForMusic({ ...kgMusicInfo, songmid: 'MEMO_B' })).resolves.toMatchObject({ lyric: '[00:02.000]乙歌' })
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(2)
   })
 })
