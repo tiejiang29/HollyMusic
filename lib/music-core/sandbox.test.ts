@@ -1,5 +1,10 @@
-import { describe, it, expect, vi } from 'vitest'
-import { createScriptSandbox, blockedNetworkReason } from './sandbox'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { createScriptSandbox, blockedNetworkReason, assertPublicUrlForScript } from './sandbox'
+
+// vi.mock 拦不住 CJS 里的 require（沙箱模块被外部化走原生 require），
+// 但沙箱是 `dnsPromises.lookup(...)` 现取属性，所以直接在这同一个模块对象上打桩
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const dnsPromises = require('dns/promises')
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -19,6 +24,19 @@ describe('blockedNetworkReason（SSRF 防护）', () => {
     ['file:///etc/passwd', '危险协议'],
     ['ftp://example.com/x', '危险协议'],
     ['not-a-url', '非法 URL'],
+    // 内嵌 IPv4 的 IPv6 写法：只看首段前缀时全部会漏过（原先连 ::ffff:7f00:1 都放行）
+    ['http://[::ffff:127.0.0.1]/x', 'v4-mapped 回环'],
+    ['http://[::ffff:7f00:1]/x', 'v4-mapped 回环（URL 规范化形态）'],
+    ['http://[::7f00:1]/x', 'v4-compatible 回环'],
+    ['http://[2002:7f00:1::]/x', '6to4 内嵌回环'],
+    ['http://[64:ff9b::7f00:1]/x', 'NAT64 内嵌回环'],
+    ['http://[::ffff:192.168.1.1]/x', 'v4-mapped 私网'],
+    ['http://[::ffff:a9fe:a9fe]/x', 'v4-mapped 云 metadata'],
+    // url-guard 那边已封的段，沙箱这一侧原来漏了
+    ['http://100.64.0.1/x', 'CGNAT'],
+    ['http://198.18.0.1/x', '基准测试段'],
+    ['http://224.0.0.1/x', '组播'],
+    ['http://255.255.255.255/x', '广播'],
   ])('%s 被拒绝（%s）', url => {
     expect(blockedNetworkReason(url)).not.toBeNull()
   })
@@ -27,6 +45,8 @@ describe('blockedNetworkReason（SSRF 防护）', () => {
     ['https://music-api.example.com/v1'],
     ['http://1.2.3.4/x'],
     ['https://[2001:db8::1]/x'],
+    ['http://[::ffff:808:808]/x'], // = ::ffff:8.8.8.8，公网 v4 的映射写法不该误伤
+    ['http://[2002:0808:0808::]/x'], // 6to4 内嵌公网 v4
   ])('%s 放行', url => {
     expect(blockedNetworkReason(url)).toBeNull()
   })
@@ -40,6 +60,65 @@ describe('blockedNetworkReason（SSRF 防护）', () => {
 
   it('172.32.x.x（公网段）不误伤', () => {
     expect(blockedNetworkReason('http://172.32.0.1/x')).toBeNull()
+  })
+})
+
+describe('assertPublicUrlForScript（域名要解析后再判地址）', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const stubLookup = (impl: (...args: unknown[]) => unknown) =>
+    vi.spyOn(dnsPromises, 'lookup').mockImplementation(impl as never)
+
+  it('解析到公网地址才放行，且按 all + verbatim 查询', async () => {
+    const spy = stubLookup(async () => [{ address: '1.2.3.4', family: 4 }])
+    await expect(assertPublicUrlForScript('https://music-api.example.com/v1')).resolves.toBeNull()
+    expect(spy).toHaveBeenCalledWith('music-api.example.com', { all: true, verbatim: true })
+  })
+
+  it('域名直指内网时拒绝，原因里带上解析到的地址', async () => {
+    stubLookup(async () => [{ address: '127.0.0.1', family: 4 }])
+    await expect(assertPublicUrlForScript('http://evil.example.com/admin'))
+      .resolves.toBe('不允许的地址: 127.0.0.1（由 evil.example.com 解析）')
+
+    stubLookup(async () => [{ address: '169.254.169.254', family: 4 }])
+    await expect(assertPublicUrlForScript('http://evil.example.com/meta'))
+      .resolves.toContain('169.254.169.254')
+  })
+
+  it('多地址里只要有一个不合格就拒绝（双栈不能只挑好的那个）', async () => {
+    stubLookup(async () => [
+      { address: '1.2.3.4', family: 4 },
+      { address: 'fe80::1', family: 6 },
+    ])
+    await expect(assertPublicUrlForScript('https://evil.example.com/x')).resolves.toContain('fe80::1')
+  })
+
+  it('解析失败与空结果都按拒绝处理，不退化成判不了就放行', async () => {
+    stubLookup(async () => { throw Object.assign(new Error('queryA ENOTFOUND'), { code: 'ENOTFOUND' }) })
+    await expect(assertPublicUrlForScript('https://nope.example.com/x')).resolves.toBe('地址解析失败: nope.example.com')
+
+    stubLookup(async () => { throw Object.assign(new Error('EAI_AGAIN'), { code: 'EAI_AGAIN' }) })
+    await expect(assertPublicUrlForScript('https://nope.example.com/x')).resolves.toBe('地址解析失败: nope.example.com')
+
+    stubLookup(async () => [])
+    await expect(assertPublicUrlForScript('https://nope.example.com/x')).resolves.toBe('地址解析失败: nope.example.com')
+  })
+
+  it('字面量已经能判死的地址不再发 DNS 查询', async () => {
+    const spy = stubLookup(async () => [{ address: '1.2.3.4', family: 4 }])
+    await expect(assertPublicUrlForScript('http://192.168.1.1/admin')).resolves.toContain('不允许的地址')
+    await expect(assertPublicUrlForScript('file:///etc/passwd')).resolves.toContain('不允许的协议')
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  it('SOURCE_ALLOW_PRIVATE_NET=true 时域名也不解析', async () => {
+    const spy = stubLookup(async () => [{ address: '1.2.3.4', family: 4 }])
+    vi.stubEnv('SOURCE_ALLOW_PRIVATE_NET', 'true')
+    await expect(assertPublicUrlForScript('http://internal.corp/x')).resolves.toBeNull()
+    expect(spy).not.toHaveBeenCalled()
+    vi.unstubAllEnvs()
   })
 })
 

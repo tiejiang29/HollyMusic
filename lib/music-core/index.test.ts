@@ -64,6 +64,33 @@ describe('LXEnvironmentSimulator 沙箱端到端', () => {
     await expect(sim.getMusicUrl('kw', { songmid: 'x' }, '128k')).rejects.toThrow(/blocked:请求被拒绝/)
   })
 
+  it('SSRF 防护：域名解析到内网同样拒绝，且回调在异步校验之后照常触发', async () => {
+    vi.unstubAllEnvs()
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const dnsPromises = require('dns/promises')
+    const spy = vi.spyOn(dnsPromises, 'lookup').mockImplementation(async () => [
+      { address: '127.0.0.1', family: 4 },
+    ] as never)
+    try {
+      const sim = new LXEnvironmentSimulator()
+      await sim.executeScript(`
+        const { EVENT_NAMES, on, send, request } = globalThis.lx
+        on(EVENT_NAMES.request, () => new Promise((resolve, reject) => {
+          request('http://internal-ish.example.com/admin', {}, (err) => {
+            if (err) reject(new Error('blocked:' + err.message))
+            else reject(new Error('no-error'))
+          })
+        }))
+        ${INITED_KW}
+      `)
+      await expect(sim.getMusicUrl('kw', { songmid: 'x' }, '128k'))
+        .rejects.toThrow(/blocked:请求被拒绝.*由 internal-ish\.example\.com 解析/)
+      expect(spy).toHaveBeenCalledWith('internal-ish.example.com', { all: true, verbatim: true })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('正常脚本：握手、musicUrl、lyric 全链路', async () => {
     const sim = new LXEnvironmentSimulator()
     const info = await sim.executeScript(NORMAL_SCRIPT)
