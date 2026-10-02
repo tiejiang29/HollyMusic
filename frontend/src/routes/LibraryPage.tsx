@@ -44,6 +44,8 @@ export function LibraryPage() {
   const [singerGroups, setSingerGroups] = useState<Array<{ singer: string; count: number; initials: string }>>([])
   const [loading, setLoading] = useState(true)
   const [keyword, setKeyword] = useState('')
+  // 真正发查询的是这个"停手之后"的值：服务端按 keyword 扫全库，以前每敲一个字就打一次
+  const [queriedKeyword, setQueriedKeyword] = useState('')
   const [activeSinger, setActiveSinger] = useState('')
   const [page, setPage] = useState(1)
   const [deletingId, setDeletingId] = useState<number | null>(null)
@@ -68,7 +70,7 @@ export function LibraryPage() {
     setLoading(true)
     try {
       const result = await getLibraryList({
-        keyword: keyword.trim() || undefined,
+        keyword: queriedKeyword.trim() || undefined,
         singer: activeSinger || undefined,
         page,
         pageSize,
@@ -86,10 +88,16 @@ export function LibraryPage() {
     }
   }
 
+  // 输入框照旧即时回显（延后 value 会让打字发涩），只有"要查什么"延后 300ms 定稿
+  useEffect(() => {
+    const timer = setTimeout(() => setQueriedKeyword(keyword), 300)
+    return () => clearTimeout(timer)
+  }, [keyword])
+
   useEffect(() => {
     void load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keyword, activeSinger, page])
+  }, [queriedKeyword, activeSinger, page])
 
   // 歌手视图：服务端已拆分聚合（多歌手曲目计入每个参与歌手）+ 按字母/拼音排序
   // + 附带拼音首字母（initials），前端不再本地拆分/转换
