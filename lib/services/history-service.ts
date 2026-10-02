@@ -155,17 +155,15 @@ export async function listHistory(
   })
   const total = await prisma.playHistory.count({ where: { username } })
 
-  const list: HistoryEntry[] = []
-  for (const row of rows) {
-    const musicInfo = row.songmid ? await dbAPI.resolveMusicInfoById(row.songmid) : null
-    list.push({
-      id: row.id,
-      songId: row.songmid,
-      musicInfo,
-      playedAt: row.playedAt.toISOString(),
-      playCount: row.playCount,
-    })
-  }
+  // 一次批量反查，不在循环里逐条 await（列表常是 100~200 条，逐条查是 N+1）
+  const musicInfoMap = await dbAPI.getMusicInfoMapByIds(rows.map(row => row.songmid))
+  const list: HistoryEntry[] = rows.map(row => ({
+    id: row.id,
+    songId: row.songmid,
+    musicInfo: row.songmid ? musicInfoMap.get(row.songmid) ?? null : null,
+    playedAt: row.playedAt.toISOString(),
+    playCount: row.playCount,
+  }))
 
   return { list, total }
 }

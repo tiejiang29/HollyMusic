@@ -1,18 +1,22 @@
 /**
- * lib/services/favorites-service.ts 测试（专辑分支）
+ * lib/services/favorites-service.ts 测试（专辑分支 + 歌曲列表的批量反查）
  *
  * 守专辑收藏的三条口径：
  * 1. starAlbum 走 itemType='album' 并把展示快照透传给数据层（专辑不在本站曲库，
  *    列表渲染全靠这份快照，丢了就只能显示 id）。
  * 2. listFavoriteAlbums 直接读快照；早期 Subsonic 星标只存了 id 的行 name 退化为 id。
  * 3. unstarAlbum 传了 source 时按平台精确删除。
+ *
+ * 另有 listFavoriteSongs 的批量口径：安卓收藏页一次要 500 条，
+ * 逐条 await 反查就是 500 次查库（N+1），必须一次批量搞定。
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const { findFirst, count } = vi.hoisted(() => ({
+const { findFirst, count, getMusicInfoMapByIds } = vi.hoisted(() => ({
   findFirst: vi.fn(),
   count: vi.fn(),
+  getMusicInfoMapByIds: vi.fn(async () => new Map<string, unknown>()),
 }))
 
 vi.mock('../generated/prisma', () => ({
@@ -33,11 +37,13 @@ vi.mock('../db', () => ({
   // prisma 现由 lib/db 统一提供（本 service 不再自建客户端）
   prisma: { favorite: { findFirst, count } },
   resolveMusicInfoById: vi.fn(),
-  getStorageSongmidForMusicInfo: vi.fn(),
+  getMusicInfoMapByIds,
+  getStorageSongmidForMusicInfo: vi.fn((mi: { source: string; songmid: string; hash?: string }) =>
+    mi.source === 'kg' && mi.hash ? String(mi.hash) : String(mi.songmid)),
 }))
 vi.mock('../logger', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }))
 
-const { starAlbum, unstarAlbum, checkAlbumStarred, listFavoriteAlbums } = await import('./favorites-service')
+const { starAlbum, unstarAlbum, checkAlbumStarred, listFavoriteAlbums, listFavoriteSongs } = await import('./favorites-service')
 
 beforeEach(() => {
   findFirst.mockReset()
@@ -166,5 +172,48 @@ describe('listFavoriteAlbums', () => {
 
     expect(listFavorites).toHaveBeenCalledWith(1, { itemType: 'album', limit: 10, offset: 20 })
     expect(count.mock.calls[0][0].where).toEqual({ userId: 1, itemType: 'album' })
+  })
+})
+
+describe('listFavoriteSongs 的 MusicInfo 反查', () => {
+  const favRow = (i: number, itemId = `kw-${2000 + i}`) => ({
+    id: i,
+    itemId,
+    source: itemId.slice(0, itemId.indexOf('-')),
+    createdAt: new Date(1790000000000 - i * 1000),
+  })
+
+  beforeEach(() => {
+    getMusicInfoMapByIds.mockReset().mockResolvedValue(new Map())
+    listFavorites.mockResolvedValue([])
+    count.mockResolvedValue(0)
+  })
+
+  it('500 条收藏只做一次批量反查，不逐条 await', async () => {
+    const rows = Array.from({ length: 500 }, (_, i) => favRow(i))
+    listFavorites.mockResolvedValueOnce(rows as never)
+    count.mockResolvedValueOnce(500)
+
+    const { list, total } = await listFavoriteSongs(7, { limit: 500, offset: 0 })
+
+    expect(getMusicInfoMapByIds).toHaveBeenCalledTimes(1)
+    expect(getMusicInfoMapByIds).toHaveBeenCalledWith(rows.map(r => r.itemId))
+    expect(list).toHaveLength(500)
+    expect(total).toBe(500)
+  })
+
+  it('命中时用 musicInfo 重算 songId（kg 带 hash 落 FileHash 键），查不到的退回原 itemId', async () => {
+    const rows = [favRow(0, 'kg-1083058434'), favRow(1, 'tx-002NmjQb'), favRow(2, 'kw-9999')]
+    listFavorites.mockResolvedValueOnce(rows as never)
+    getMusicInfoMapByIds.mockResolvedValueOnce(new Map<string, unknown>([
+      ['kg-1083058434', { source: 'kg', songmid: '1083058434', hash: 'FILEHASHAAA' }],
+      ['tx-002NmjQb', { source: 'tx', songmid: '002NmjQb' }],
+    ]) as never)
+
+    const { list } = await listFavoriteSongs(7)
+
+    expect(list.map(e => e.songId)).toEqual(['kg-FILEHASHAAA', 'tx-002NmjQb', 'kw-9999'])
+    expect(list[2].musicInfo).toBeNull()
+    expect(list[0].starredAt).toBe(rows[0].createdAt.toISOString())
   })
 })

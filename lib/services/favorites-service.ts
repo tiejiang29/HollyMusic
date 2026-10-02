@@ -87,9 +87,11 @@ export async function listFavoriteSongs(
   const rows = await listFavorites(userId, { itemType: 'song', limit, offset })
   const total = await prisma.favorite.count({ where: { userId, itemType: 'song' } })
 
+  // 一次批量反查：安卓收藏页要 500 条，逐条 await 就是 500 次查库
+  const musicInfoMap = await dbAPI.getMusicInfoMapByIds(rows.map(row => row.itemId))
   const list: FavoriteSong[] = []
   for (const row of rows) {
-    const musicInfo = await dbAPI.resolveMusicInfoById(row.itemId)
+    const musicInfo = musicInfoMap.get(row.itemId) ?? null
     // 用 musicInfo 重算 songId，保证与搜索/随机等出口一致
     const songId = musicInfo
       ? `${musicInfo.source}-${getStorageSongmidForMusicInfo(musicInfo)}`

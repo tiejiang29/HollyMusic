@@ -1,20 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { findUnique, create, update } = vi.hoisted(() => ({
+const { findUnique, findMany, create, update } = vi.hoisted(() => ({
   findUnique: vi.fn(),
+  findMany: vi.fn(),
   create: vi.fn(),
   update: vi.fn(),
 }))
 
 vi.mock('./generated/prisma', () => ({
   PrismaClient: class {
-    musicInfo = { findUnique, create, update }
+    musicInfo = { findUnique, findMany, create, update }
   },
   Prisma: {},
 }))
 vi.mock('./logger', () => ({ logger: { error: vi.fn(), warn: vi.fn() } }))
 
-const { upsertMusicInfo, getMusicInfo, mergeMusicInfoPreserving, computeChecksum, intervalToSeconds } = await import('./db')
+const { upsertMusicInfo, getMusicInfo, getMusicInfoMapByIds, resolveMusicInfoById, mergeMusicInfoPreserving, computeChecksum, intervalToSeconds } = await import('./db')
 
 const musicInfo = {
   source: 'kw' as const,
@@ -155,8 +156,7 @@ describe('upsertMusicInfo 的 update 分支不再把完整行改薄', () => {
   })
 })
 
-describe('intervalToSeconds：mm:ss 也得算出秒数', () => {
-  it('三种写法都能解，脏值与空值给 null', () => {
+describe('intervalToSeconds：mm:ss 也得算出秒数', () => {  it('三种写法都能解，脏值与空值给 null', () => {
     expect(intervalToSeconds('03:47')).toBe(227)
     expect(intervalToSeconds('1:02:03')).toBe(3723)
     expect(intervalToSeconds('297')).toBe(297)
@@ -176,5 +176,77 @@ describe('intervalToSeconds：mm:ss 也得算出秒数', () => {
     create.mockResolvedValueOnce({})
     await upsertMusicInfo({ ...musicInfo, interval: '03:47' })
     expect(create.mock.calls[0][0].data.durationSeconds).toBe(227)
+  })
+})
+
+describe('getMusicInfoMapByIds：列表接口的批量反查（消 N+1）', () => {
+  const kwRow = (songmid: string, over: Record<string, unknown> = {}) => ({
+    source: 'kw', songmid, data: JSON.stringify({ source: 'kw', songmid, name: '歌' + songmid, ...over }),
+  })
+
+  beforeEach(() => {
+    findUnique.mockReset()
+    findMany.mockReset()
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  it('按源分组，每源一条查询，Map 的键就是传进来的原 id', async () => {
+    findMany.mockImplementation(async ({ where }: { where: { source: string; songmid: { in: string[] } } }) =>
+      [...where.songmid.in].map(m => ({
+        source: where.source, songmid: m,
+        data: JSON.stringify({ source: where.source, songmid: m, name: '歌' + m }),
+      })))
+
+    const map = await getMusicInfoMapByIds(['kw-1', 'kw-2', 'tx-002NmjQb', 'kg-C4904D4E3BBA872D41D3BDBF597E2B18'])
+
+    expect(findUnique).not.toHaveBeenCalled()
+    expect(findMany).toHaveBeenCalledTimes(3)
+    expect(new Set(findMany.mock.calls.map(c => c[0].where.source))).toEqual(new Set(['kw', 'tx', 'kg']))
+    expect(findMany.mock.calls.find(c => c[0].where.source === 'kw')[0].where.songmid.in).toEqual(['1', '2'])
+    // kg 的存储键是 FileHash，复合格式里第一段是 source，剩下全是 songmid
+    expect(findMany.mock.calls.find(c => c[0].where.source === 'kg')[0].where.songmid.in).toEqual(['C4904D4E3BBA872D41D3BDBF597E2B18'])
+    expect([...map.keys()].sort()).toEqual(['kg-C4904D4E3BBA872D41D3BDBF597E2B18', 'kw-1', 'kw-2', 'tx-002NmjQb'])
+    // 与单条路径同一套归一化：data 缺 types 的旧行补成空数组，下游 .map 不炸
+    expect(map.get('kw-1')?.types).toEqual([])
+  })
+
+  it('重复 id 只查一次，songmid 里含 "-" 的（本地文件路径）不被切坏', async () => {
+    findMany.mockImplementation(async ({ where }: { where: { source: string; songmid: { in: string[] } } }) =>
+      [...where.songmid.in].map(m => ({ source: where.source, songmid: m, data: JSON.stringify({ source: where.source, songmid: m }) })))
+
+    await getMusicInfoMapByIds(['kw-1', 'kw-1', 'kw-1'])
+    expect(findMany.mock.calls[0][0].where.songmid.in).toEqual(['1'])
+
+    const map = await getMusicInfoMapByIds(['localfile-/music/a-b.mp3'])
+    expect(findMany.mock.calls[1][0].where).toEqual({ source: 'localfile', songmid: { in: ['/music/a-b.mp3'] } })
+    expect(map.get('localfile-/music/a-b.mp3')?.songmid).toBe('/music/a-b.mp3')
+  })
+
+  it('解析不了的 id 直接跳过，不发无谓的查询', async () => {
+    findMany.mockResolvedValue([])
+    const map = await getMusicInfoMapByIds(['noseparator', '-开头', '结尾-', '', null, undefined])
+    expect(findMany).not.toHaveBeenCalled()
+    expect(map.size).toBe(0)
+  })
+
+  it('坏 JSON 的行跳过且不抛，同批正常行照常返回', async () => {
+    findMany.mockResolvedValue([
+      { source: 'kw', songmid: 'bad', data: '{不是 JSON' },
+      { source: 'kw', songmid: 'empty', data: '' },
+      kwRow('ok'),
+    ])
+    const map = await getMusicInfoMapByIds(['kw-bad', 'kw-empty', 'kw-ok'])
+    expect([...map.keys()]).toEqual(['kw-ok'])
+  })
+
+  it('单条入口 resolveMusicInfoById 与批量共用同一口径（畸形 id 两边都不查库）', async () => {
+    findUnique.mockResolvedValue(null)
+    expect(await resolveMusicInfoById('noseparator')).toBeNull()
+    expect(await resolveMusicInfoById('结尾-')).toBeNull()
+    expect(await resolveMusicInfoById('')).toBeNull()
+    expect(findUnique).not.toHaveBeenCalled()
+
+    await resolveMusicInfoById('kw-1')
+    expect(findUnique).toHaveBeenCalledWith({ where: { source_songmid: { source: 'kw', songmid: '1' } } })
   })
 })

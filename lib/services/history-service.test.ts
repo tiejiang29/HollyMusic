@@ -7,21 +7,26 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { prisma, upsertMusicInfo, getStorageSongmidForMusicInfo } = vi.hoisted(() => ({
+const { prisma, upsertMusicInfo, getMusicInfoMapByIds, getStorageSongmidForMusicInfo } = vi.hoisted(() => ({
   prisma: {
     musicInfo: { findUnique: vi.fn(), findMany: vi.fn() },
-    playHistory: { upsert: vi.fn(), count: vi.fn() },
+    playHistory: { upsert: vi.fn(), count: vi.fn(), findMany: vi.fn(), deleteMany: vi.fn() },
   },
   upsertMusicInfo: vi.fn(async () => ({ action: 'insert' })),
+  getMusicInfoMapByIds: vi.fn(async (ids: (string | null | undefined)[]) => {
+    const m = new Map<string, unknown>()
+    for (const id of ids) if (id) m.set(id, { songmid: id })
+    return m
+  }),
   // 与 db.ts 的 getStorageSongmid 同构：kg 用 FileHash，其他源用原 songmid
   getStorageSongmidForMusicInfo: vi.fn((mi: { source: string; songmid: string; hash?: string }) =>
     mi.source === 'kg' && mi.hash ? String(mi.hash) : String(mi.songmid)),
 }))
 
-vi.mock('@/lib/db', () => ({ prisma, upsertMusicInfo, getStorageSongmidForMusicInfo }))
+vi.mock('@/lib/db', () => ({ prisma, upsertMusicInfo, getMusicInfoMapByIds, getStorageSongmidForMusicInfo }))
 vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
 
-const { reportPlay } = await import('./history-service')
+const { reportPlay, listHistory } = await import('./history-service')
 
 import type { MusicInfo } from '@/lib/types/music'
 
@@ -40,6 +45,7 @@ beforeEach(() => {
   prisma.musicInfo.findMany.mockResolvedValue([])
   prisma.playHistory.upsert.mockResolvedValue({ id: 1 })
   prisma.playHistory.count.mockResolvedValue(0)
+  prisma.playHistory.findMany.mockResolvedValue([])
 })
 
 describe('reportPlay', () => {
@@ -127,5 +133,44 @@ describe('reportPlay', () => {
     expect(prisma.playHistory.upsert).toHaveBeenCalledWith(
       expect.objectContaining({ create: expect.objectContaining({ musicInfoId: null }) }),
     )
+  })
+})
+
+describe('listHistory 的 MusicInfo 反查', () => {
+  it('100 条历史只做一次批量反查，不再逐条 await（N+1）', async () => {
+    const rows = Array.from({ length: 100 }, (_, i) => ({
+      id: i + 1,
+      songmid: `kw-${1000 + i}`,
+      // 第 50 条是库里没有的悬空 id，必须容得下
+      musicInfoId: i === 50 ? null : i + 1,
+      playCount: 1,
+      playedAt: new Date(1790000000000 - i * 1000),
+    }))
+    prisma.playHistory.findMany.mockResolvedValue(rows)
+    prisma.playHistory.count.mockResolvedValue(100)
+
+    const { list } = await listHistory('tiejiang', { limit: 100, offset: 0 })
+
+    expect(getMusicInfoMapByIds).toHaveBeenCalledTimes(1)
+    expect(getMusicInfoMapByIds).toHaveBeenCalledWith(rows.map(r => r.songmid))
+    expect(list).toHaveLength(100)
+    // 顺序按 playedAt 倒序原样保留，不按 Map 顺序重排
+    expect(list.map(e => e.songId)).toEqual(rows.map(r => r.songmid))
+    expect(list[0].playedAt).toBe(rows[0].playedAt.toISOString())
+    expect(list[0].musicInfo).toEqual({ songmid: 'kw-1000' })
+  })
+
+  it('库里查不到的那条 musicInfo 为 null，不把整张列表带崩', async () => {
+    getMusicInfoMapByIds.mockResolvedValueOnce(new Map())
+    prisma.playHistory.findMany.mockResolvedValue([
+      { id: 1, songmid: 'kg-DEADBEEF', musicInfoId: null, playCount: 2, playedAt: new Date(1790000000000) },
+    ])
+    prisma.playHistory.count.mockResolvedValue(1)
+
+    const { list, total } = await listHistory('tiejiang')
+    expect(list).toEqual([
+      { id: 1, songId: 'kg-DEADBEEF', musicInfo: null, playedAt: new Date(1790000000000).toISOString(), playCount: 2 },
+    ])
+    expect(total).toBe(1)
   })
 })
