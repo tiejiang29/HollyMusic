@@ -18,7 +18,7 @@ import { useAuthStore } from '@/hooks/useAuth'
 export function PlaylistDetailPage() {
   const { id: idStr } = useParams<{ id: string }>()
   const id = parseInt(idStr ?? '0', 10)
-  const { detail, loading, reload } = usePlaylistDetail(id)
+  const { detail, error, loading, reload } = usePlaylistDetail(id)
   const playTrack = usePlayerStore(s => s.playTrack)
   const navigate = useNavigate()
   const username = useAuthStore(s => s.username)
@@ -98,6 +98,17 @@ export function PlaylistDetailPage() {
     <div className="p-6">
       {loading ? (
         <LoadingSkeleton />
+      ) : error ? (
+        // 取不到 ≠ 不存在：网关失败/会话过期以前也显示成"歌单不存在"，把人误导到删表重来
+        <div className="flex flex-col items-center gap-3">
+          <EmptyState icon={Music} title="没能载入这张歌单" description={error} />
+          <button
+            onClick={() => void reload()}
+            className="rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition hover:bg-accent hover:text-foreground"
+          >
+            重试
+          </button>
+        </div>
       ) : !detail ? (
         <EmptyState icon={Music} title="歌单不存在" />
       ) : (
