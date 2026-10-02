@@ -43,6 +43,9 @@ export function ArtistDetailPage() {
       setDetail(null); setError('无效的歌手'); setLoading(false); return
     }
     setLoading(true); setError(null); setUnsupported(false)
+    // MV 也要跟着换人清掉：不清的话切到下一个歌手时，画面上还是上一个歌手的 MV，
+    // 而下面那条 getArtistMvs 一旦失败（静默 catch）就一直挂着不清
+    setMvs([])
     try {
       const r = source === 'kw' ? await getKwArtistDetail(artistId, nameKey) : source === 'mg' ? await getMgArtistDetail(artistId, nameKey) : source === 'tx' ? await getTxArtistDetail(artistId, nameKey) : await getArtistDetail(artistId)
       if (stale()) return
