@@ -18,13 +18,26 @@ export function RecognizeDialog({ open, onClose }: { open: boolean; onClose: () 
   const [candidates, setCandidates] = useState<RecognizeCandidate[]>([])
   const [countdown, setCountdown] = useState(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const abortRef = useRef<AbortController | null>(null)
   const playTrack = usePlayerStore(s => s.playTrack)
 
   const reset = useCallback(() => {
     setPhase('idle'); setError(null); setCandidates([]); setCountdown(0)
   }, [])
 
+  /** 关弹窗/卸载时叫停：释放麦克风轨道，并丢弃这一次的结果 */
+  const cancel = useCallback(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+  }, [])
+
+  const close = useCallback(() => {
+    cancel()
+    onClose()
+  }, [cancel, onClose])
+
   useEffect(() => { if (open) reset() }, [open, reset])
+  useEffect(() => cancel, [cancel])
 
   // 麦克风倒计时
   useEffect(() => {
@@ -33,31 +46,36 @@ export function RecognizeDialog({ open, onClose }: { open: boolean; onClose: () 
     return () => clearInterval(timer)
   }, [phase])
 
-  const runRecognize = useCallback(async (getBuffer: () => Promise<AudioBuffer>) => {
-    setPhase('recognizing'); setError(null)
+  const runRecognize = useCallback(async (getBuffer: (signal: AbortSignal) => Promise<AudioBuffer>) => {
+    const controller = new AbortController()
+    abortRef.current = controller
+    setError(null)
     try {
-      const buffer = await getBuffer()
+      const buffer = await getBuffer(controller.signal)
+      // 「正在识别…」要等拿到音频再说：以前这行在采集之前就把 phase 改成 recognizing，
+      // 于是录制阶段的「正在聆听… Ns」和倒计时根本不会显示出来
+      setPhase('recognizing')
       // 太短的音频直接报错（指纹至少需要 4 秒）
       if (buffer.duration < 4) throw new Error('音频太短（至少需要 4 秒）')
       const pcm = audioBufferTo48kMonoInt16(buffer)
       const list = await recognizeByPcm(pcm)
+      if (controller.signal.aborted) return   // 等结果期间被关掉，不再改界面
       setCandidates(list)
       setPhase('done')
     } catch (e) {
+      if (controller.signal.aborted) return   // 取消不是失败，别弹"识曲失败"
       setError(e instanceof Error ? e.message : '识曲失败')
       setPhase('error')
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null
     }
   }, [])
 
   const startMic = useCallback(async () => {
     setCountdown(8)
     setPhase('recording'); setError(null)
-    try {
-      await runRecognize(() => recordFromMic(8))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '麦克风不可用（需要 HTTPS 或 localhost）')
-      setPhase('error')
-    }
+    // 采集失败（无权限 / 非 HTTPS）由 recordFromMic 换成一句人话，这里不再各写一套
+    await runRecognize(signal => recordFromMic(8, signal))
   }, [runRecognize])
 
   const handleFile = useCallback(async (file: File) => {
@@ -70,15 +88,15 @@ export function RecognizeDialog({ open, onClose }: { open: boolean; onClose: () 
     if (!c.song) return
     const tracks = candidates.filter(x => x.song).map(x => toTrack({ uid: x.song!.uid, musicInfo: x.song! }))
     playTrack(toTrack({ uid: c.song.uid, musicInfo: c.song }), tracks)
-    onClose()
+    close()
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={close}>
       <div className="w-full max-w-md rounded-xl bg-card p-5 ring-1 ring-border" onClick={e => e.stopPropagation()}>
         <div className="mb-4 flex items-center justify-between">
           <h2 className="flex items-center gap-2 text-base font-semibold"><Music className="h-4 w-4" /> 听音识曲</h2>
-          <button onClick={onClose} className="rounded-full p-1 text-muted-foreground hover:bg-accent" aria-label="关闭"><X className="h-4 w-4" /></button>
+          <button onClick={close} className="rounded-full p-1 text-muted-foreground hover:bg-accent" aria-label="关闭"><X className="h-4 w-4" /></button>
         </div>
 
         {phase === 'idle' && (

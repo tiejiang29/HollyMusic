@@ -41,18 +41,45 @@ export function audioBufferTo48kMonoInt16(buffer: AudioBuffer): ArrayBuffer {
   return pcm
 }
 
-/** 麦克风采集 N 秒 → AudioBuffer（需要 HTTPS 或 localhost） */
-export async function recordFromMic(seconds: number): Promise<AudioBuffer> {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false } })
+/** 录音被取消（关弹窗）时抛这个，调用方据此静默收尾，不该弹"识曲失败" */
+const cancelled = () => new DOMException('录音已取消', 'AbortError')
+
+/**
+ * 麦克风采集 N 秒 → AudioBuffer（需要 HTTPS 或 localhost）
+ *
+ * `signal` 是给"用户把弹窗关了"留的出口：没有它的话，即使界面已经关掉，轨道也要
+ * 一直占到 8 秒录满为止（系统那个录音指示灯亮着不灭），而且那次识别请求照样会发出去。
+ */
+export async function recordFromMic(seconds: number, signal?: AbortSignal): Promise<AudioBuffer> {
+  if (signal?.aborted) throw cancelled()
+  let stream: MediaStream
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false } })
+  } catch (e) {
+    // getUserMedia 原生报 NotAllowedError 之类，用户看不懂"为什么不行"。
+    // 原因并到文案里（不用 Error 的 cause 选参数：SPA 的 tsconfig lib 还没到 ES2022）；
+    // DOMException 不是 Error 的实例，但一样有 message，优先取它，免得把 "XxxError:" 前缀也露出来
+    const reason = e instanceof Error ? e.message : (e as { message?: string })?.message || String(e)
+    throw new Error(`麦克风不可用（需要 HTTPS 或 localhost）：${reason}`)
+  }
   const mediaRecorder = new MediaRecorder(stream)
   const chunks: Blob[] = []
   mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data) }
   const stopped = new Promise<void>(resolve => { mediaRecorder.onstop = () => resolve() })
   mediaRecorder.start()
-  await new Promise(r => setTimeout(r, seconds * 1000))
-  mediaRecorder.stop()
-  await stopped
-  stream.getTracks().forEach(t => t.stop())
+  try {
+    await new Promise<void>((resolve, reject) => {
+      // onAbort 里引用 id 是安全的：它只会在 id 赋值之后被回调
+      const onAbort = () => { clearTimeout(id); reject(cancelled()) }
+      const id = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, seconds * 1000)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+    mediaRecorder.stop()
+    await stopped
+  } finally {
+    // 中止、正常结束、之后解码出错都走这里：轨道一定要被放掉
+    stream.getTracks().forEach(t => t.stop())
+  }
   const blob = new Blob(chunks, { type: mediaRecorder.mimeType })
   const arrayBuffer = await blob.arrayBuffer()
   const audioCtx = new AudioContext()
