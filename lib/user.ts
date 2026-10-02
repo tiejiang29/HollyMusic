@@ -58,6 +58,9 @@ export async function updateLastLoginByUsername(username: string) {
 /**
  * 更新用户的最近活跃信息（时间 + IP + UA），best-effort。
  * 登录、心跳与播放上报（含 Subsonic scrobble）均调用，用于在线状态推断。
+ *
+ * `username` 是 @unique，直接 where:{username} 一次写就够，不必先 findUnique 拿 id
+ * ——用户不存在时 Prisma 抛 P2025，被下面吞掉返回 null（调用点都按"取不到就算了"处理）。
  */
 export async function updateLastSeenByUsername(
   username: string,
@@ -66,18 +69,33 @@ export async function updateLastSeenByUsername(
 ) {
   if (!username) return null
   try {
-    const u = await prisma.user.findUnique({ where: { username } })
-    if (!u) return null
-    const updated = await prisma.user.update({
-      where: { id: u.id },
+    return await prisma.user.update({
+      where: { username },
       data: { lastSeen: new Date(), lastSeenIp: ip, lastSeenUa: ua },
     })
-    return updated
   } catch (e) {
     console.warn('user.updateLastSeenByUsername error', e)
     return null
   }
 }
 
-const userApi = { updateLastLoginByUsername, updateLastSeenByUsername, getClientIp, getUa }
+/**
+ * 登录成功时的活动记录：lastLogin 与最近活跃（时间/IP/UA）一次写完。
+ * 分两次写是白多一趟数据库往返，而这一列每设备每次登录都要用。
+ */
+export async function markLoginActivity(username: string, ip: string | null, ua: string | null) {
+  if (!username) return null
+  const now = new Date()
+  try {
+    return await prisma.user.update({
+      where: { username },
+      data: { lastLogin: now, lastSeen: now, lastSeenIp: ip, lastSeenUa: ua },
+    })
+  } catch (e) {
+    console.warn('user.markLoginActivity error', e)
+    return null
+  }
+}
+
+const userApi = { updateLastLoginByUsername, updateLastSeenByUsername, markLoginActivity, getClientIp, getUa }
 export default userApi

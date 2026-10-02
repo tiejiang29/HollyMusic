@@ -20,7 +20,7 @@ import { createSessionCookies } from '@/lib/services/auth'
 import { logger } from '@/lib/logger'
 import { prisma } from '@/lib/db'
 import { verifyUserPassword, buildCredentials } from '@/lib/server/credentials'
-import { updateLastLoginByUsername, updateLastSeenByUsername, getClientIp, getUa } from '@/lib/user'
+import { markLoginActivity, getClientIp, getUa } from '@/lib/user'
 import { checkLoginRate, recordLoginFailure, resetLoginRate, buildRateLimitKeys } from '@/lib/server/login-rate-limit'
 
 export async function POST(request: NextRequest) {
@@ -99,9 +99,9 @@ export async function POST(request: NextRequest) {
       res.cookies.set(c.name, c.value, c)
     }
 
-    // best-effort 记录登录活动：lastLogin + 最近活跃(IP/UA)，登录即在线
-    try { await updateLastLoginByUsername(username) } catch {}
-    try { await updateLastSeenByUsername(username, clientIp, getUa(request)) } catch {}
+    // best-effort 记录登录活动：lastLogin 与最近活跃(IP/UA) 一次写完，登录即在线。
+    // markLoginActivity 内部已吞掉写库异常，不会把成功的登录打成 500。
+    await markLoginActivity(username, clientIp, getUa(request))
 
     logger.info(`[auth/login] 用户登录成功: ${username}`)
     return res
