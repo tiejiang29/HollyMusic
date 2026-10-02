@@ -67,6 +67,11 @@ data
 custom-sources
 lib/generated
 
+# config/users.json 是本地跑出来的账号数据（含初始明文口令），已 gitignore，CI 上下文里本来就没有。
+# 但本地 docker build 的 `COPY . .` 会把它带进 builder 层——Dockerfile 末尾那句 rm -f 只在新的层里删，
+# 旧层仍能被解出来。挡在上下文这一层才是真删。（镜像运行期由 config-sync 在启动时生成，不需要构建期有它）
+config/users.json
+
 # Other
 *.tmp
 .cache
