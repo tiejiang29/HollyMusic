@@ -10,6 +10,7 @@
 
 import { create } from 'zustand'
 import { getMe, login as apiLogin, logout as apiLogout, heartbeat, changePassword as apiChangePassword } from '@/lib/api/auth'
+import { setUnauthorizedHandler } from '@/lib/api/client'
 
 const HEARTBEAT_INTERVAL_MS = 2 * 60 * 1000
 
@@ -86,3 +87,14 @@ export const useAuthStore = create<AuthStore>((set) => ({
 }))
 
 export const useAuth = useAuthStore
+
+/**
+ * 任何走 lib/api/client 的请求拿到 401，就当场掉登录态，不必等下一次心跳
+ * （最长 2 分钟）才发现会话已经被服务端作废。
+ * 只在"当前确实算已登录"时动手：匿名状态没什么可撤的，也别把没在跑的定时器停掉。
+ */
+setUnauthorizedHandler(() => {
+  if (!useAuthStore.getState().authenticated) return
+  stopHeartbeat()
+  useAuthStore.setState({ authenticated: false, username: null, mustChangePassword: false })
+})

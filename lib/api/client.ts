@@ -5,6 +5,16 @@
 
 import type { ApiResponse } from '@/lib/types/music'
 
+/**
+ * 「会话已失效」的处置由 hooks/useAuth 注册，这里不直接 import store：
+ * useAuth → lib/api/auth → lib/api/client → useAuth 会成环。
+ */
+let unauthorizedHandler: (() => void) | null = null
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler
+}
+
 function buildQuery(params?: Record<string, string | number | undefined>): string {
   if (!params) return ''
   const pairs: [string, string][] = []
@@ -16,11 +26,23 @@ function buildQuery(params?: Record<string, string | number | undefined>): strin
 }
 
 async function parseJson<T>(res: Response): Promise<T> {
-  const json: ApiResponse<T> = await res.json()
-  if (!json.success || json.data === undefined) {
-    throw new Error(json.error?.message || '请求失败')
+  // 先看状态再看 body：nginx 502 直接回 HTML，以前 `await res.json()` 抛
+  // SyntaxError，用户弹到的是 "Unexpected token '<'…" 这种解析器原文。
+  const text = await res.text().catch(() => '')
+  let payload: ApiResponse<T> | null = null
+  try {
+    payload = JSON.parse(text) as ApiResponse<T>
+  } catch {
+    payload = null
   }
-  return json.data
+
+  // 401 = 服务端不认这枚会话（如该账号在别处改了密码），当场掉登录态，
+  // 不等下一次心跳（最长 2 分钟）才把人踢出去
+  if (res.status === 401) unauthorizedHandler?.()
+
+  if (payload && payload.success === true && payload.data !== undefined) return payload.data
+  if (payload?.error?.message) throw new Error(payload.error.message)
+  throw new Error(res.ok ? '服务端返回了无法解析的内容' : `请求失败（HTTP ${res.status}）`)
 }
 
 export async function apiGet<T>(
