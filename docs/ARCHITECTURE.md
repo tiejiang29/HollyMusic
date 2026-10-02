@@ -235,7 +235,7 @@ failed`、HTTP 4xx/5xx 这类**传输层**失败留在"坏"里）、**缓存与�
 - **密码存储**：scrypt 哈希（`scrypt$N$r$p$salt$hash`，node:crypto 零依赖），登录时防用户名枚举（用户不存在也烧等价耗时）。存量明文密码在登录成功时惰性迁移。
 - **Subsonic 凭据**：`User.subsonicSecret` 是每用户随机令牌（与登录密码解耦），客户端按 `t = md5(token + salt)` 校验。令牌唯一获取入口是管理端 `POST /api/admin/users/[id]/subsonic-token`（仅响应内显示一次）；改密时自动轮换。
 - **登录限速**：IP + 用户名双维，5 分钟失败 10 次锁 15 分钟（进程内存态，管理端可解锁）。
-- **SSRF 防护**：音源返回的播放地址过 `isTrustworthyUrl`（拒绝私网/非 http(s)）；订阅 URL 与图片代理走逐跳护栏 + 域名白名单。
+- **SSRF 防护**：音源返回的播放地址过 `isTrustworthyUrl`（拒绝私网/非 http(s)）；订阅 URL 与图片代理走逐跳护栏 + 域名白名单；**音源脚本自己发的请求**（沙箱 `lx.request`）在建连前先解析域名、对每个地址判公网（IPv6 会还原内嵌 IPv4 后再判），`SOURCE_ALLOW_PRIVATE_NET=true` 时整条短路。三处口径同为 `lib/server/url-guard.ts` 的 `isPublicIp` 段表（沙箱侧因是 CommonJS 子进程，另存一份同口径实现，改一段要同时改另一段）。残余风险：校验与实际建连之间的 DNS rebinding 窗口不覆盖。
 - **权限**：管理端全部 `requireAdmin`；C 端 `requireUser`；公开接口仅登录/登出/health/version/share/封面/图片代理及 Subsonic 匿名读（受 `REQUIRE_AUTH` 开关控制）。
 - **分享链接**：`/api/share?uid=` 生成自包含 SSR 播放页（og meta 供微信爬虫），签发 HMAC 的 `st` token（绑定 uid+quality+时效）供匿名播放，不需登录。
 
