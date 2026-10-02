@@ -1,10 +1,10 @@
 /**
  * 缓存管理 API（仅管理员）
  * GET  /api/admin/cache   返回内存缓存 + 磁盘缓存的统计信息
- * POST /api/admin/cache   清理缓存 { type: 'search'|'url'|'audio'|'all' }
+ * POST /api/admin/cache   清理缓存 { type: 'search'|'url'|'image'|'audio'|'all' }
  *
  * 两类缓存：
- * - 内存缓存（searchCache / urlCache）：进程内存，重启即清空，TTL 210 分钟自动过期
+ * - 内存缓存（searchCache / urlCache / imageCache）：进程内存，重启即清空，TTL 自动过期
  * - 磁盘缓存（audio-cache）：持久化文件，多用户共享，LRU 自动淘汰
  */
 
@@ -15,7 +15,7 @@ import {
   AuthError,
   ForbiddenError,
 } from '@/lib/services/user-context'
-import { searchCache, urlCache } from '@/lib/cache-manager'
+import { searchCache, urlCache, imageCache } from '@/lib/cache-manager'
 import {
   getStats,
   getAudioServeConfig,
@@ -51,6 +51,7 @@ export async function GET(request: NextRequest) {
       memory: {
         search: searchCache.getStats(),
         url: urlCache.getStats(),
+        image: imageCache.getStats(),
       },
       disk: {
         ...diskStats,
@@ -72,17 +73,19 @@ export async function POST(request: NextRequest) {
     await requireAdmin(request)
 
     const body = await request.json().catch(() => ({}))
-    const { type = 'all' } = body as { type?: 'search' | 'url' | 'audio' | 'all' | 'scan-orphans' | 'clean-orphans' }
+    const { type = 'all' } = body as { type?: 'search' | 'url' | 'image' | 'audio' | 'all' | 'scan-orphans' | 'clean-orphans' }
 
-    const validTypes = ['all', 'search', 'url', 'audio', 'scan-orphans', 'clean-orphans']
+    const validTypes = ['all', 'search', 'url', 'image', 'audio', 'scan-orphans', 'clean-orphans']
     if (!validTypes.includes(type)) {
       return createErrorResponse('INVALID_PARAMS', `无效的 type: ${type}，支持: ${validTypes.join(', ')}`, 400)
     }
 
+    type MemoryStats = ReturnType<typeof searchCache.getStats>
     const result: {
       type: string
-      search?: { size: number; hits: number; misses: number; hitRate: string }
-      url?: { size: number; hits: number; misses: number; hitRate: string }
+      search?: MemoryStats
+      url?: MemoryStats
+      image?: MemoryStats
       audio?: { count: number; bytes: number } | null
       orphans?: { count: number; bytes: number; files: { relativePath: string; size: number }[] }
       cleaned?: { deleted: number; bytes: number }
@@ -92,6 +95,7 @@ export async function POST(request: NextRequest) {
       case 'all':
         searchCache.clear()
         urlCache.clear()
+        imageCache.clear()
         result.audio = await clearAllAudioCache().catch(() => null)
         logger.info('[cache] admin 清理全部缓存')
         break
@@ -102,6 +106,10 @@ export async function POST(request: NextRequest) {
       case 'url':
         urlCache.clear()
         logger.info('[cache] admin 清理 URL 缓存')
+        break
+      case 'image':
+        imageCache.clear()
+        logger.info('[cache] admin 清理图片缓存')
         break
       case 'audio':
         result.audio = await clearAllAudioCache().catch(() => null)
@@ -130,6 +138,7 @@ export async function POST(request: NextRequest) {
     // 返回清理后的统计
     result.search = searchCache.getStats()
     result.url = urlCache.getStats()
+    result.image = imageCache.getStats()
 
     return createSuccessResponse(result)
   } catch (err) {
