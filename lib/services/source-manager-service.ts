@@ -212,8 +212,14 @@ export async function saveScript(originalName: string, content: string): Promise
   return rel
 }
 
-/** 将已存在的 custom-sources 脚本原子替换为新内容。 */
-async function replaceScript(relativePath: string, content: string): Promise<void> {
+/**
+ * 把脚本相对路径解析成"必须落在 custom-sources 下的 .js 文件"，否则抛错。
+ *
+ * 为什么要单独抽出来：`deleteScript` 删的是磁盘文件、`addSource` 写的 path 会进配置文件
+ * 并被 `removeSource` 原样传回 `deleteScript`。之前只有 `replaceScript` 有这道校验，
+ * 于是"注册一个 path=../../xxx 的源 → 删除它"就能删到 custom-sources 之外的文件。
+ */
+function assertScriptPath(relativePath: string): string {
   const target = path.resolve(process.cwd(), relativePath)
   const relativeToScriptsDir = path.relative(SCRIPTS_DIR, target)
   if (
@@ -222,8 +228,14 @@ async function replaceScript(relativePath: string, content: string): Promise<voi
     path.isAbsolute(relativeToScriptsDir) ||
     path.extname(target).toLowerCase() !== '.js'
   ) {
-    throw new SourceSubscriptionError('订阅脚本必须位于 custom-sources 目录且为 .js 文件', 400)
+    throw new SourceSubscriptionError('脚本路径必须位于 custom-sources 目录且为 .js 文件', 400)
   }
+  return target
+}
+
+/** 将已存在的 custom-sources 脚本原子替换为新内容。 */
+async function replaceScript(relativePath: string, content: string): Promise<void> {
+  const target = assertScriptPath(relativePath)
 
   const tempPath = `${target}.tmp-${process.pid}-${Date.now()}`
   await fsp.writeFile(tempPath, content, 'utf-8')
@@ -314,14 +326,26 @@ async function fetchSubscriptionScript(subscriptionUrl: string): Promise<{ conte
   }
 }
 
-/** 删除脚本文件（忽略不存在） */
+/**
+ * 删除脚本文件（best-effort：不存在就算了，但不再把真错误伪装成"不存在"）。
+ * 路径必须先过目录限定校验——它可能被 `removeSource` 用配置文件里的原值传回来。
+ */
 export async function deleteScript(relativePath: string): Promise<void> {
-  const abs = path.resolve(process.cwd(), relativePath)
+  let target: string
   try {
-    await fsp.unlink(abs)
+    target = assertScriptPath(relativePath)
+  } catch (err) {
+    // 调用点之一是订阅导入失败的回滚（在 catch 里），这里抛异常会盖掉真正的失败原因
+    logger.warn('[source-manager-service] 拒绝删除 custom-sources 之外或非 .js 的路径:', relativePath, err)
+    return
+  }
+  try {
+    await fsp.unlink(target)
     logger.info(`[source-manager-service] 脚本已删除: ${relativePath}`)
-  } catch {
-    // 文件不存在，忽略
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code
+    if (code === 'ENOENT') return
+    logger.warn(`[source-manager-service] 脚本删除失败: ${relativePath}`, err)
   }
 }
 
@@ -378,6 +402,9 @@ export async function addSource(opts: {
   subscription?: SourceConfig['subscription']
 }): Promise<SourceConfig> {
   const config = await readConfig()
+
+  // 注册时就拦住越界路径：这个 path 之后会被 removeSource 原样传回 deleteScript 去删文件
+  assertScriptPath(opts.path)
 
   // path 唯一性
   if (config.sources.some(s => s.path === opts.path)) {

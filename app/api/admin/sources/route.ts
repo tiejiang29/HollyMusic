@@ -11,13 +11,21 @@ import {
   AuthError,
   ForbiddenError,
 } from '@/lib/services/user-context'
-import { addSource, listSourcesWithStatus } from '@/lib/services/source-manager-service'
+import {
+  addSource,
+  listSourcesWithStatus,
+  SourceSubscriptionError,
+} from '@/lib/services/source-manager-service'
 import { attachProbeVerdicts, probeEnabled, probeStatus } from '@/lib/services/source-probe'
 import { logger } from '@/lib/logger'
 
 function guard(err: unknown) {
   if (err instanceof AuthError) return createErrorResponse('UNAUTHORIZED', err.message, 401)
   if (err instanceof ForbiddenError) return createErrorResponse('FORBIDDEN', err.message, 403)
+  // 路径不合法/越界是调用方的错，不能报 500
+  if (err instanceof SourceSubscriptionError) {
+    return createErrorResponse('INVALID_PARAMS', err.message, err.status)
+  }
   if (err instanceof Error && err.message.includes('已存在')) {
     return createErrorResponse('CONFLICT', err.message, 409)
   }

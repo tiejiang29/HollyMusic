@@ -14,7 +14,7 @@ vi.mock('@/lib/logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
 
-const { listSourcesWithStatus } = await import('./source-manager-service')
+const { listSourcesWithStatus, addSource, deleteScript } = await import('./source-manager-service')
 const { sourceHealth } = await import('@/lib/server/source-health')
 
 const CONFIG_PATH = path.resolve(process.cwd(), 'config/music-sources.json')
@@ -50,4 +50,50 @@ describe('listSourcesWithStatus 挂载运行实测', () => {
       }
     }
   )
+})
+
+describe('脚本路径必须限定在 custom-sources 内', () => {
+  // 这条链的真实形状：POST /api/admin/sources 的 path 会写进配置，
+  // 之后 removeSource 又把配置里的 path 原样交给 deleteScript 去 unlink。
+  // 所以注册侧与删除侧都要校验，少一边都能删到 custom-sources 之外的文件。
+
+  it('addSource 拒绝越界 path，并且不动配置文件', async () => {
+    const before = fs.readFileSync(CONFIG_PATH, 'utf8')
+    await expect(addSource({ path: '../../prisma/data/music.db' })).rejects.toThrow(/custom-sources/)
+    await expect(addSource({ path: 'custom-sources/../../config/music-sources.json' })).rejects.toThrow(/custom-sources/)
+    expect(fs.readFileSync(CONFIG_PATH, 'utf8')).toBe(before)
+  })
+
+  it('deleteScript 拒删目录外与非 .js 的文件，调用方拿到的是"什么都没发生"', async () => {
+    // 用一次性哨兵当受害者，不要拿仓库里真实的文件赌测试有没有写错
+    const outside = path.resolve(process.cwd(), `__sentinel-outside__-${Date.now()}.js`)
+    const notJs = path.resolve(process.cwd(), 'custom-sources', `__sentinel-notjs__-${Date.now()}.txt`)
+    fs.writeFileSync(outside, '// keep me\n', 'utf8')
+    fs.writeFileSync(notJs, 'keep me\n', 'utf8')
+    try {
+      await expect(deleteScript(path.relative(process.cwd(), outside))).resolves.toBeUndefined()
+      await expect(deleteScript(`../${path.basename(outside)}`)).resolves.toBeUndefined()
+      await expect(deleteScript(path.relative(process.cwd(), notJs))).resolves.toBeUndefined()
+
+      expect(fs.existsSync(outside)).toBe(true)
+      expect(fs.existsSync(notJs)).toBe(true)
+    } finally {
+      for (const f of [outside, notJs]) if (fs.existsSync(f)) fs.unlinkSync(f)
+    }
+  })
+
+  it('正控制：custom-sources 下的 .js 仍然删得掉（校验没把正常路径一起堵死）', async () => {
+    const target = path.resolve(process.cwd(), 'custom-sources', `__probe-${Date.now()}.js`)
+    fs.writeFileSync(target, '// 探针文件\n', 'utf8')
+    try {
+      await deleteScript(path.relative(process.cwd(), target))
+      expect(fs.existsSync(target)).toBe(false)
+    } finally {
+      if (fs.existsSync(target)) fs.unlinkSync(target)
+    }
+  })
+
+  it('不存在的 .js 路径不报错（保持 best-effort 语义），但越界路径也不会被当成不存在而静默放过', async () => {
+    await expect(deleteScript('custom-sources/__does-not-exist__.js')).resolves.toBeUndefined()
+  })
 })
