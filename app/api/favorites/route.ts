@@ -12,6 +12,7 @@
 import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { requireUser, AuthError } from '@/lib/services/user-context'
+import { readIntParam } from '@/lib/server/params'
 import {
   listFavoriteSongs,
   starSong,
@@ -42,8 +43,8 @@ export async function GET(request: NextRequest) {
     const user = await requireUser(request)
     const params = request.nextUrl.searchParams
     const type = readType(params.get('type'))
-    const limit = parseInt(params.get('limit') || '200')
-    const offset = parseInt(params.get('offset') || '0')
+    const limit = readIntParam(params.get('limit'), { def: 200, min: 1, max: 1000 })
+    const offset = readIntParam(params.get('offset'), { def: 0, min: 0, max: 100000 })
     const data = type === 'album'
       ? await listFavoriteAlbums(user.id, { limit, offset })
       : await listFavoriteSongs(user.id, { limit, offset })

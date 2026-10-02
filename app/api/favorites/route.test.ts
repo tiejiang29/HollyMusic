@@ -166,3 +166,18 @@ describe('GET /api/favorites/check', () => {
     expect(checkAlbumStarred).not.toHaveBeenCalled()
   })
 })
+
+describe('GET /api/favorites 分页参数收敛', () => {
+  // 老写法把 parseInt 的结果直传 Prisma take：limit=1e9 就是全表拉取，limit=abc 是 NaN 直接 500
+  it.each<[string, { limit: number; offset: number }]>([
+    ['limit=1000000&offset=-5', { limit: 1000, offset: 0 }],
+    ['limit=0&offset=0', { limit: 1, offset: 0 }],
+    ['limit=abc&offset=xyz', { limit: 200, offset: 0 }],
+    ['limit=30.7&offset=1.9', { limit: 30, offset: 1 }],
+  ])('?%s 交给 service 的值必须落在安全区间内', async (query, expected) => {
+    const res = await route.GET(new NextRequest(`http://localhost:3000/api/favorites?${query}`))
+
+    expect(res.status).toBe(200)
+    expect(listFavoriteSongs).toHaveBeenCalledWith(7, expected)
+  })
+})

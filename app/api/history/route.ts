@@ -8,6 +8,7 @@
 import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { requireUser, AuthError } from '@/lib/services/user-context'
+import { readIntParam } from '@/lib/server/params'
 import { reportPlay, listHistory, clearHistory } from '@/lib/services/history-service'
 import { updateLastSeenByUsername, getClientIp, getUa } from '@/lib/user'
 import { logger } from '@/lib/logger'
@@ -21,8 +22,9 @@ function authGuard(err: unknown) {
 export async function GET(request: NextRequest) {
   try {
     const user = await requireUser(request)
-    const limit = parseInt(request.nextUrl.searchParams.get('limit') || '100')
-    const offset = parseInt(request.nextUrl.searchParams.get('offset') || '0')
+    // 历史上限是每用户 MAX_HISTORY_PER_USER（默认 500），limit 再大也没有意义，收敛掉
+    const limit = readIntParam(request.nextUrl.searchParams.get('limit'), { def: 100, min: 1, max: 500 })
+    const offset = readIntParam(request.nextUrl.searchParams.get('offset'), { def: 0, min: 0, max: 100000 })
     const data = await listHistory(user.username, { limit, offset })
     return createSuccessResponse(data)
   } catch (err) {

@@ -10,6 +10,7 @@
 import { NextRequest } from 'next/server'
 import { createSuccessResponse, createErrorResponse, ErrorCodes } from '@/lib/api-response'
 import { searchCache } from '@/lib/cache-manager'
+import { readIntParam } from '@/lib/server/params'
 import { getMusicInfo, prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
@@ -70,8 +71,8 @@ export async function GET(request: NextRequest) {
     const searchParams = request.nextUrl.searchParams
     const source = searchParams.get('source') as SourceType | 'all' | 'local'
     const keyword = searchParams.get('keyword')
-    const page = parseInt(searchParams.get('page') || '1')
-    const limit = parseInt(searchParams.get('limit') || '30')
+    const page = readIntParam(searchParams.get('page'), { def: 1, min: 1, max: 100 })
+    const limit = readIntParam(searchParams.get('limit'), { def: 30, min: 1, max: 100 })
 
     // 参数验证
     if (!keyword) {
