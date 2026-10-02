@@ -15,7 +15,7 @@ vi.mock('./generated/prisma', () => ({
 }))
 vi.mock('./logger', () => ({ logger: { error: vi.fn(), warn: vi.fn() } }))
 
-const { upsertMusicInfo, getMusicInfo, getMusicInfoMapByIds, resolveMusicInfoById, mergeMusicInfoPreserving, computeChecksum, intervalToSeconds } = await import('./db')
+const { upsertMusicInfo, getMusicInfo, getMusicInfoMapByIds, getMusicInfoRowIdsByUids, resolveMusicInfoById, mergeMusicInfoPreserving, computeChecksum, intervalToSeconds } = await import('./db')
 
 const musicInfo = {
   source: 'kw' as const,
@@ -248,5 +248,42 @@ describe('getMusicInfoMapByIds：列表接口的批量反查（消 N+1）', () =
 
     await resolveMusicInfoById('kw-1')
     expect(findUnique).toHaveBeenCalledWith({ where: { source_songmid: { source: 'kw', songmid: '1' } } })
+  })
+})
+
+describe('getMusicInfoRowIdsByUids：只要行主键的批量反查', () => {
+  beforeEach(() => {
+    findMany.mockReset()
+  })
+
+  it('每源一条查询，且 select 里不带 data（这正是它区别于 getMusicInfoMapByIds 的地方）', async () => {
+    findMany.mockImplementation(async ({ where }: { where: { source: string; songmid: { in: string[] } } }) =>
+      [...where.songmid.in].map((m, i) => ({ id: 1000 + i, songmid: m })))
+
+    const ids = await getMusicInfoRowIdsByUids(['kw-1', 'kw-2', 'tx-002NmjQb', 'kg-ABC'])
+
+    expect(findMany).toHaveBeenCalledTimes(3)
+    for (const call of findMany.mock.calls) {
+      expect(call[0].select).toEqual({ id: true, songmid: true })
+      expect(call[0].where.data).toBeUndefined()
+    }
+    expect([...ids.entries()].sort()).toEqual([['kg-ABC', 1000], ['kw-1', 1000], ['kw-2', 1001], ['tx-002NmjQb', 1000]])
+  })
+
+  it('库里没有这首歌的 id 不会出现在 Map 里（调用方据此落 null，而不是把不存在的行挂上）', async () => {
+    findMany.mockImplementation(async ({ where }: { where: { source: string; songmid: { in: string[] } } }) =>
+      where.source === 'kw' ? [{ id: 7, songmid: '1' }] : [])
+
+    const ids = await getMusicInfoRowIdsByUids(['kw-1', 'kw-404', 'tx-999'])
+
+    expect([...ids.keys()]).toEqual(['kw-1'])
+    expect(ids.get('kw-404')).toBeUndefined()
+  })
+
+  it('畸形 id 与空输入都不发查询', async () => {
+    expect(await getMusicInfoRowIdsByUids([])).toEqual(new Map())
+    const ids = await getMusicInfoRowIdsByUids(['noseparator', '-开头', '结尾-', ''])
+    expect(ids.size).toBe(0)
+    expect(findMany).not.toHaveBeenCalled()
   })
 })

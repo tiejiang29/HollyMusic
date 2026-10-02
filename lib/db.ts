@@ -128,6 +128,36 @@ export async function getMusicInfoMapByIds(ids: readonly (string | null | undefi
 }
 
 /**
+ * 批量 id → MusicInfo **行主键**（`MusicInfo.id`）。
+ *
+ * 歌单加歌要把 `PlaylistEntry.musicInfoId` 填上，只需要主键，不需要整条 MusicInfo——
+ * 用 getMusicInfoMapByIds 会把每行的 `data` JSON 解析出来再丢掉。分组方式与那条一样：
+ * 按 source 合并成 `songmid IN (...)`，一批 300 首就是 ≤5 条查询而不是 300 条。
+ * 键为传入的原 id（与 getMusicInfoMapByIds 同口径），库里没有的 id 不会出现。
+ */
+export async function getMusicInfoRowIdsByUids(uids: readonly string[]): Promise<Map<string, number>> {
+  const bySource = new Map<string, Set<string>>()
+  for (const uid of uids) {
+    const parsed = splitSongId(uid)
+    if (!parsed) continue
+    const [source, songmid] = parsed
+    const set = bySource.get(source)
+    if (set) set.add(songmid)
+    else bySource.set(source, new Set([songmid]))
+  }
+
+  const out = new Map<string, number>()
+  for (const [source, songmids] of bySource) {
+    const rows = await prisma.musicInfo.findMany({
+      where: { source, songmid: { in: [...songmids] } },
+      select: { id: true, songmid: true },
+    })
+    for (const row of rows) out.set(`${source}-${row.songmid}`, row.id)
+  }
+  return out
+}
+
+/**
  * 统一的 id → MusicInfo 解析入口。
  *
  * 对外 song id 统一为 `source-songmid` 复合格式（见 subsonic-search / subsonic-getstarred），
