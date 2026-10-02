@@ -11,7 +11,7 @@ import { respond, subsonicError } from '@/lib/subsonic'
 import { handleGetLicense, handleGetOpenSubsonicExtensions, handleGetUser, handleGetAlbumList2, handleScrobble, handleGetSimilarSongs } from '@/lib/subsonic-system'
 import { handleStream } from '@/lib/subsonic-stream'
 import auth, { type AuthResult } from '@/lib/auth'
-import { logger } from '@/lib/logger'
+import { logger, redactRequestUrl } from '@/lib/logger'
 
 // 同步启动配置中的用户（非阻塞）
 
@@ -175,8 +175,8 @@ export async function GET(request: NextRequest, context: { params: Promise<Recor
   const raw = params?.method
   const method = normalizeMethod(raw)
 
-  // 打印参数日志，便于调试
-  logger.debug('[rest] params:', params, 'raw:', raw, 'method:', method, 'requestUrl:', request.url)
+  // 打印参数日志，便于调试。URL 必须脱敏：/rest 的 `t`/`s` 是无时效的凭据对
+  logger.debug('[rest] params:', params, 'raw:', raw, 'method:', method, 'requestUrl:', redactRequestUrl(request.url))
 
   return handleMethod(request, method)
 }

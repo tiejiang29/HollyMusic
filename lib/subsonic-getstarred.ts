@@ -4,7 +4,7 @@ import { resolveSubsonicMediaMeta } from '@/lib/subsonic-media'
 import { type AuthResult } from '@/lib/auth'
 import favorites from '@/lib/favorites'
 import dbAPI, { getStorageSongmidForMusicInfo } from '@/lib/db'
-import { logger } from '@/lib/logger'
+import { logger, redactRequestUrl } from '@/lib/logger'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -57,8 +57,8 @@ export async function handleGetStarred(
     }
 
     const userId = authRes.user.id
-    const url = new URL(request.url)
-    logger.debug('[getStarred] Request URL:', url.toString(), 'userId:', userId, 'user:', authRes.user.username)
+    // 这里的 URL 走脱敏：/rest 的 `t`/`s` 是无时效的凭据对，不能进日志
+    logger.debug('[getStarred] Request URL:', redactRequestUrl(request.url), 'userId:', userId, 'user:', authRes.user.username)
 
     // 获取用户的所有收藏
     const favorites_list = await favorites.listFavorites(userId, { limit: 500 })

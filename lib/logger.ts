@@ -10,6 +10,35 @@ export enum LogLevel {
   ERROR = 3,
 }
 
+/**
+ * 打日志前对请求 URL 脱敏。
+ *
+ * Subsonic 的 `t`/`s` 是一对长期有效的凭据（`t = md5(服务端密钥 + s)`），**没有时效**，
+ * 落进日志文件就等于把一把随时能重放的钥匙留在明文里；`p` 是一些第三方客户端会带的明文口令。
+ * 用户名 `u` 不遮——它本来就已经单独打在多处日志里，留着才好对齐"这条请求是谁发的"。
+ */
+const SECRET_QUERY_KEYS = ['t', 's', 'p']
+
+export function redactRequestUrl(value: string | URL): string {
+  const raw = typeof value === 'string' ? value : value.toString()
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    // 拿不到可解析的绝对 URL 就原样返回：脱敏失败不该把日志本身打成异常
+    return raw
+  }
+  let touched = false
+  for (const key of SECRET_QUERY_KEYS) {
+    if (parsed.searchParams.has(key)) {
+      parsed.searchParams.set(key, '***')
+      touched = true
+    }
+  }
+  // 没有要遮的东西就原样返回：重新序列化会把 %20 之类改写成 +，白白打乱既有日志格式
+  return touched ? parsed.toString() : raw
+}
+
 class Logger {
   private level: LogLevel
   private isDevelopment: boolean

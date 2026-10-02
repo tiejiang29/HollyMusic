@@ -6,7 +6,11 @@
  * 这种日志连续几天看不出真正原因。
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { logger } from '@/lib/logger'
+import { logger, LogLevel, redactRequestUrl } from '@/lib/logger'
+
+// 测试环境里 NODE_ENV≠development，logger 默认只到 INFO；改级别用完后要还原，
+// 否则会污染同文件其它用例（其中一条就是钉"debug 不落输出"）
+const originalLevel = logger.getLevel()
 
 function capture(spyTarget: 'log' | 'warn' | 'error', run: () => void): string {
   const spy = vi.spyOn(console, spyTarget).mockImplementation(() => {})
@@ -57,5 +61,50 @@ describe('logger 参数渲染', () => {
   it('字符串与数字参数原样拼接（logger.info 走的是 console.log，不是 console.info）', () => {
     const out = capture('log', () => logger.info('周测完成', 'manual', 58))
     expect(out).toContain('周测完成 manual 58')
+  })
+})
+
+describe('redactRequestUrl（/rest 凭据不进日志）', () => {
+  // Subsonic 的 t/s 是一对长期有效的凭据：t = md5(服务端密钥 + s)，没有时效。
+  // 打日志时把整条 URL 抄下来 = 把一把能随时重放的钥匙写进明文文件。
+  const TOKEN = '9a1b2c3d4e5f60718293a4b5c6d7e8f9'
+  const SALT = 's3cr3t-s4lt'
+  const url = `http://nas:3099/rest/getStarred2.view?u=admin&t=${TOKEN}&s=${SALT}&musicId=42`
+
+  it('遮掉 t/s，其它参数（含用户名）原样留着', () => {
+    const out = redactRequestUrl(url)
+
+    expect(out).not.toContain(TOKEN)
+    expect(out).not.toContain(SALT)
+    expect(out).toContain('t=***')            // `*` 在 query 值里合法，不会被编码成 %2A
+    expect(out).toContain('u=admin')
+    expect(out).toContain('musicId=42')
+  })
+
+  it('带明文口令 p 的客户端（部分第三方实现会发）同样遮掉', () => {
+    expect(redactRequestUrl('http://h/rest/getUser.view?u=admin&p=hunter2'))
+      .not.toContain('hunter2')
+  })
+
+  it('没有凭据参数时不改写 URL（避免重编码把既有日志格式打乱）', () => {
+    const clean = 'http://nas:3099/rest/search3.view?query=%E5%91%A8%E6%9D%B0%E4%BC%A6&count=30'
+    expect(redactRequestUrl(clean)).toBe(clean)
+  })
+
+  it('URL 对象与字符串两种入参都行；解析不了的原文返回，不把日志调用炸掉', () => {
+    expect(redactRequestUrl(new URL(url))).not.toContain(TOKEN)
+    expect(redactRequestUrl('/rest/getPing.view?t=abc')).toBe('/rest/getPing.view?t=abc')
+    expect(redactRequestUrl('')).toBe('')
+  })
+
+  it('logger.debug 打出来的整行里没有凭据（把脱敏和渲染串起来验）', () => {
+    logger.setLevel(LogLevel.DEBUG)
+    try {
+      const out = capture('log', () => logger.debug('[rest] requestUrl:', redactRequestUrl(url)))
+      expect(out).not.toContain(TOKEN)
+      expect(out).not.toContain(SALT)
+    } finally {
+      logger.setLevel(originalLevel)
+    }
   })
 })
