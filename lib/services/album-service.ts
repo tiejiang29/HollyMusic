@@ -9,7 +9,7 @@
  *   （mzstatic CDN，218ms 实测），按歌手缓存 24h；失败静默不影响主流程
  */
 
-import { searchCache } from '@/lib/cache-manager'
+import { imageCache, searchCache } from '@/lib/cache-manager'
 import { logger } from '@/lib/logger'
 import { safePublicFetch } from '@/lib/server/url-guard'
 import { prisma, getStorageSongmidForMusicInfo, upsertMusicInfosInTransaction } from '@/lib/db'
@@ -126,15 +126,20 @@ const COVER_IMAGE_DOMAINS = [
 ]
 
 export interface CoverImageBytes {
-  bytes: ArrayBuffer
+  bytes: Uint8Array<ArrayBuffer>
   contentType: string
 }
 
-/** 服务端抓取封面字节（带 24h 缓存，转发给前端——前端不再直连图床）。 */
+/**
+ * 服务端抓取封面字节（转发给前端——前端不再直连图床）。
+ *
+ * 字节走 imageCache 而不是 searchCache：单张可达数 MB，和搜索结果共用无字节预算的
+ * 2000 条额度会互相挤（image-proxy 同一个坑，两处一起补上）。
+ */
 export async function fetchCoverImageBytes(imageUrl: string): Promise<CoverImageBytes | null> {
   if (!COVER_IMAGE_DOMAINS.some(re => re.test(imageUrl))) return null
   const cacheKey = `album:imgbytes:${imageUrl}`
-  const cached = searchCache.get(cacheKey) as CoverImageBytes | null
+  const cached = imageCache.get(cacheKey)
   if (cached) return cached
   try {
     const controller = new AbortController()
@@ -148,10 +153,11 @@ export async function fetchCoverImageBytes(imageUrl: string): Promise<CoverImage
       if (!resp.ok) return null
       const contentType = resp.headers.get('content-type') || 'image/jpeg'
       if (!contentType.startsWith('image/')) return null
-      const bytes = await resp.arrayBuffer()
+      const bytes = new Uint8Array(await resp.arrayBuffer())
       if (bytes.byteLength === 0 || bytes.byteLength > 5 * 1024 * 1024) return null
       const result: CoverImageBytes = { bytes, contentType }
-      searchCache.set(cacheKey, result, 24 * 60 * 60 * 1000)
+      // 与 image-proxy 同口径：单张 >1MB 只透传不缓存，一张就顶十几张常用封面的额度
+      if (bytes.byteLength <= 1024 * 1024) imageCache.set(cacheKey, result, 24 * 60 * 60 * 1000)
       return result
     } finally {
       clearTimeout(timer)

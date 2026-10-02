@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  get, set, searchOneSource,
+  get, set, imgGet, imgSet, safePublicFetch, searchOneSource,
   getArtistAlbumIndex, getItunesAlbumDetail, searchItunesAlbums,
   dbFindFirst, dbGetStorageSongmid, batchResolveAndUpsert,
   searchKwArtists, searchKwAlbums, findKwAlbumId, getKwAlbumDetail, upsertMusicInfosInTransaction,
@@ -9,6 +9,9 @@ const {
 } = vi.hoisted(() => ({
   get: vi.fn(),
   set: vi.fn(),
+  imgGet: vi.fn(() => null),
+  imgSet: vi.fn(),
+  safePublicFetch: vi.fn(),
   searchOneSource: vi.fn(),
   getArtistAlbumIndex: vi.fn(),
   getItunesAlbumDetail: vi.fn(),
@@ -28,7 +31,9 @@ const {
   searchAlbumCardsChain: vi.fn(async () => []),
 }))
 
-vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
+vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set }, imageCache: { get: imgGet, set: imgSet } }))
+// 封面字节抓取走 url-guard 的逐跳公网校验，测试里替成可控返回
+vi.mock('@/lib/server/url-guard', () => ({ safePublicFetch }))
 vi.mock('@/lib/db', () => ({
   prisma: { musicInfo: { findFirst: dbFindFirst } },
   getStorageSongmidForMusicInfo: dbGetStorageSongmid,
@@ -68,7 +73,7 @@ vi.mock('@/lib/services/wiki-service', () => ({
   getAlbumProfile: vi.fn(async () => null),
 }))
 
-const { getAppleAlbumDetail, searchAlbums } = await import('./album-service')
+const { getAppleAlbumDetail, searchAlbums, fetchCoverImageBytes } = await import('./album-service')
 
 
 /** 构造可播 Song */
@@ -179,5 +184,58 @@ describe('searchAlbums（平台链 TX → 酷我 → 咪咕 → Apple）', () =>
 
     expect(result.platformList).toEqual([])
     expect(result.list).toEqual([])
+  })
+})
+
+describe('fetchCoverImageBytes 的缓存归属', () => {
+  const url = 'https://y.gtimg.cn/music/photo_new/T002R300x300.jpg'
+  const respond = (size: number, contentType = 'image/jpeg') =>
+    safePublicFetch.mockResolvedValue({
+      ok: true,
+      headers: { get: (k: string) => (k === 'content-type' ? contentType : null) },
+      arrayBuffer: async () => new Uint8Array(size).buffer,
+    })
+
+  beforeEach(() => {
+    imgGet.mockReset().mockReturnValue(null)
+    imgSet.mockReset()
+    set.mockReset()
+    get.mockReset().mockReturnValue(null)
+    safePublicFetch.mockReset()
+  })
+
+  it('普通尺寸封面写进 imageCache，不再占用无字节预算的 searchCache', async () => {
+    respond(64 * 1024)
+    const image = await fetchCoverImageBytes(url)
+    expect(image?.contentType).toBe('image/jpeg')
+    expect(image?.bytes.byteLength).toBe(64 * 1024)
+    expect(imgSet).toHaveBeenCalledTimes(1)
+    expect(imgSet.mock.calls[0][0]).toBe(`album:imgbytes:${url}`)
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('单张 >1MB 只透传不缓存（一张就顶十几张常用封面的额度）', async () => {
+    respond(2 * 1024 * 1024)
+    const image = await fetchCoverImageBytes(url)
+    expect(image?.bytes.byteLength).toBe(2 * 1024 * 1024)
+    expect(imgSet).not.toHaveBeenCalled()
+  })
+
+  it('命中 imageCache 就不打上游', async () => {
+    imgGet.mockReturnValue({ bytes: new Uint8Array(8), contentType: 'image/png' })
+    const image = await fetchCoverImageBytes(url)
+    expect(image?.contentType).toBe('image/png')
+    expect(safePublicFetch).not.toHaveBeenCalled()
+  })
+
+  it('白名单外的图床一律不抓，也不产生请求', async () => {
+    expect(await fetchCoverImageBytes('https://evil.example.com/a.jpg')).toBeNull()
+    expect(safePublicFetch).not.toHaveBeenCalled()
+  })
+
+  it('上游返回非图片 content-type 时不下发', async () => {
+    respond(1024, 'text/html')
+    expect(await fetchCoverImageBytes(url)).toBeNull()
+    expect(imgSet).not.toHaveBeenCalled()
   })
 })
