@@ -57,17 +57,30 @@ describe('脚本路径必须限定在 custom-sources 内', () => {
   // 之后 removeSource 又把配置里的 path 原样交给 deleteScript 去 unlink。
   // 所以注册侧与删除侧都要校验，少一边都能删到 custom-sources 之外的文件。
 
-  it('addSource 拒绝越界 path，并且不动配置文件', async () => {
-    const before = fs.readFileSync(CONFIG_PATH, 'utf8')
-    await expect(addSource({ path: '../../prisma/data/music.db' })).rejects.toThrow(/custom-sources/)
-    await expect(addSource({ path: 'custom-sources/../../config/music-sources.json' })).rejects.toThrow(/custom-sources/)
-    expect(fs.readFileSync(CONFIG_PATH, 'utf8')).toBe(before)
+  // custom-sources 与 config/music-sources.json 都是 gitignored 的运行时目录/文件，
+  // CI 检出里根本没有它们：这些用例要写哨兵文件，所以自己保证目录存在
+  // （本地已存在时 mkdirSync 是 no-op，不会动任何已有内容）
+  const SCRIPTS_DIR = path.resolve(process.cwd(), 'custom-sources')
+  beforeAll(() => {
+    fs.mkdirSync(SCRIPTS_DIR, { recursive: true })
   })
+
+  // 这一条要读真实配置文件来证明"校验排在任何写操作之前"，没有它就没法验，
+  // 所以在 CI（无此文件）里跳过——不能为了让它跑起来去写仓库里那个 gitignored 副本
+  it.skipIf(!fs.existsSync(CONFIG_PATH))(
+    'addSource 拒绝越界 path，并且不动配置文件',
+    async () => {
+      const before = fs.readFileSync(CONFIG_PATH, 'utf8')
+      await expect(addSource({ path: '../../prisma/data/music.db' })).rejects.toThrow(/custom-sources/)
+      await expect(addSource({ path: 'custom-sources/../../config/music-sources.json' })).rejects.toThrow(/custom-sources/)
+      expect(fs.readFileSync(CONFIG_PATH, 'utf8')).toBe(before)
+    },
+  )
 
   it('deleteScript 拒删目录外与非 .js 的文件，调用方拿到的是"什么都没发生"', async () => {
     // 用一次性哨兵当受害者，不要拿仓库里真实的文件赌测试有没有写错
     const outside = path.resolve(process.cwd(), `__sentinel-outside__-${Date.now()}.js`)
-    const notJs = path.resolve(process.cwd(), 'custom-sources', `__sentinel-notjs__-${Date.now()}.txt`)
+    const notJs = path.resolve(SCRIPTS_DIR, `__sentinel-notjs__-${Date.now()}.txt`)
     fs.writeFileSync(outside, '// keep me\n', 'utf8')
     fs.writeFileSync(notJs, 'keep me\n', 'utf8')
     try {
@@ -83,7 +96,7 @@ describe('脚本路径必须限定在 custom-sources 内', () => {
   })
 
   it('正控制：custom-sources 下的 .js 仍然删得掉（校验没把正常路径一起堵死）', async () => {
-    const target = path.resolve(process.cwd(), 'custom-sources', `__probe-${Date.now()}.js`)
+    const target = path.resolve(SCRIPTS_DIR, `__probe-${Date.now()}.js`)
     fs.writeFileSync(target, '// 探针文件\n', 'utf8')
     try {
       await deleteScript(path.relative(process.cwd(), target))
