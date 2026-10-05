@@ -23,8 +23,9 @@ const TABS = [
 
 type TabKey = (typeof TABS)[number]['key']
 
+// 从 TABS 派生，不要手写清单：P0-a 我加了页签却忘了这里，点「音源发现」直接跳回用户管理
 function isValidTab(v: string | null): v is TabKey {
-  return v === 'users' || v === 'login-locks' || v === 'sources' || v === 'recommend' || v === 'recommend-tasks' || v === 'cache'
+  return v !== null && TABS.some(t => t.key === v)
 }
 
 export function AdminPage() {
