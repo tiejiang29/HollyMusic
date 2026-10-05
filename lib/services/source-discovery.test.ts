@@ -5,7 +5,7 @@
  * - 把 safePublicFetch 桥到 global fetch 上（DNS 解析在测试里没有意义），但**请求形状**照验；
  * - 假脚本正文全部是本文件自己写的特征骨架，不引入任何真实音源脚本内容。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 
@@ -58,7 +58,8 @@ const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
-  runDiscoveryDrain, requestDiscoveryStop, discoveryStatus, _setRunnerForTest,
+  runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
+  startCandidateProbe, startCandidateProbeBatch, _setProbeGapForTest, _setRunnerForTest,
 } = await import('./source-discovery')
 const { gitBlobSha } = await import('@/lib/server/git-blob-sha')
 
@@ -115,7 +116,15 @@ beforeEach(() => {
     if (row) Object.assign(row, data)
     return row
   })
-  prismaMock.sourceCandidate.findMany = vi.fn(async () => rows)
+  // findMany 要**真的按 where 筛**：批量判级靠 `probeJson: ''` 挑没判过的，装样子就等于在测假库
+  prismaMock.sourceCandidate.findMany = vi.fn(async (args?: { where?: Record<string, unknown>; take?: number }) => {
+    const where = (args?.where ?? {}) as { verdict?: string; state?: string; probeJson?: string }
+    let out = rows
+    if (where.verdict) out = out.filter(r => r.verdict === where.verdict)
+    if (where.state) out = out.filter(r => r.state === where.state)
+    if (where.probeJson !== undefined) out = out.filter(r => r.probeJson === where.probeJson)
+    return typeof args?.take === 'number' ? out.slice(0, args.take) : out
+  })
   prismaMock.sourceCandidate.groupBy = vi.fn(async () => [])
   prismaMock.sourceCandidate.count = vi.fn(async () => rows.filter(r => r.verdict === 'pending').length)
 })
@@ -694,5 +703,97 @@ describe('runDiscoveryDrain（连轮清完待判定）', () => {
     const task = runDiscoveryDrain()
     expect(() => runDiscoveryCrawl()).toThrow(/连轮/)
     await task
+  })
+})
+
+// ————— 批量判级 —————
+async function waitProbeBatch(timeoutMs = 5_000) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const batch = discoveryStatus().probeBatch
+    if (batch && !batch.running) return batch
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error('批量判级没在预期时间内收口')
+}
+
+describe('startCandidateProbeBatch（批量判级）', () => {
+  beforeEach(() => {
+    _setProbeGapForTest(0)
+    _setRunnerForTest(fakeRunner())
+  })
+  afterEach(() => {
+    _setProbeGapForTest(null)
+    _setRunnerForTest(null)
+  })
+
+  it('一批最多 50 条，只挑在册且没判过的，判完把结果写回行上', async () => {
+    await enable(['a/b'])
+    for (let i = 0; i < 55; i++) seedSuspect({})
+    const judgedJson = JSON.stringify({ cells: { tx: { outcome: 'ok', latencyMs: 1, container: 'mp3', reason: null } }, shaVerified: true, note: '以前判过' })
+    const judged = seedSuspect({ probeJson: judgedJson })
+    const stale = seedSuspect({ state: 'stale' })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+
+    expect(startCandidateProbeBatch().started).toBe(true)
+    const batch = await waitProbeBatch()
+    expect(batch?.total).toBe(50)
+    expect(batch?.done).toBe(50)
+    expect(batch?.withAddress).toBe(50)
+    // 已判过的没被动、stale 的没被捞进来判
+    expect(rows.find(r => r.id === judged)?.probeJson).toBe(judgedJson)
+    expect(rows.find(r => r.id === stale)?.probeJson).toBe('')
+  })
+
+  it('一条判不成不拦整批：计入失败，后面的照判', async () => {
+    await enable(['a/b'])
+    seedSuspect({})
+    seedSuspect({ path: 'broken.js', rawUrl: 'https://raw.githubusercontent.com/a/b/HEAD/broken.js' })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 5000, limit: 5000, reset: 0 } } })
+      if (url.includes('broken.js')) return new Response('nope', { status: 404 })
+      return new Response(FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
+    }))
+
+    expect(startCandidateProbeBatch().started).toBe(true)
+    const batch = await waitProbeBatch()
+    expect(batch?.done).toBe(2)
+    expect(batch?.failed).toBe(1)
+    expect(batch?.withAddress).toBe(1)
+  })
+
+  it('按停止就不再判下一条（停止标志在同一次点击里就生效，一条也还没开始）', async () => {
+    await enable(['a/b'])
+    seedSuspect({})
+    seedSuspect({})
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+
+    expect(startCandidateProbeBatch().started).toBe(true)
+    expect(requestDiscoveryStop()).toEqual({ stopping: true })
+    const batch = await waitProbeBatch()
+    expect(batch?.stopped).toBe(true)
+    expect(batch?.done).toBe(0)
+    expect(rows.every(r => r.probeJson === '')).toBe(true)
+  })
+
+  it('没有待判的候选：起得来但立刻收，并写明原因', async () => {
+    await enable(['a/b'])
+    seedSuspect({ probeJson: '{"cells":{},"shaVerified":null,"note":"判过"}' })
+
+    expect(startCandidateProbeBatch().started).toBe(true)
+    const batch = await waitProbeBatch()
+    expect(batch?.total).toBe(0)
+    expect(batch?.note).toMatch(/没有待判级的候选/)
+  })
+
+  it('一批在跑时不再起第二批，也不给单条插队', async () => {
+    await enable(['a/b'])
+    seedSuspect({})
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+
+    expect(startCandidateProbeBatch().started).toBe(true)
+    expect(startCandidateProbeBatch()).toEqual({ started: false, reason: '已有一批判级在跑' })
+    expect(startCandidateProbe(1)).toEqual({ started: false, reason: '有一批判级正在跑' })
+    await waitProbeBatch()
   })
 })

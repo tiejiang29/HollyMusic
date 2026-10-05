@@ -29,12 +29,13 @@ vi.mock('@/lib/services/user-context', () => ({
   ForbiddenError: MockForbiddenError,
 }))
 
-const { db, runCrawl, importCandidateMock, drainMock, stopMock } = vi.hoisted(() => ({
+const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock } = vi.hoisted(() => ({
   db: { setting: new Map<string, string>(), candidates: [] as Array<Record<string, unknown>> },
   runCrawl: vi.fn(async () => ({})),
   importCandidateMock: vi.fn(),
   drainMock: vi.fn(async () => ({ rounds: 1, downloaded: 0, suspect: 0, notSource: 0, stale: 0, pendingLeft: 0, stopped: false, note: null })),
   stopMock: vi.fn(() => ({ stopping: true })),
+  probeBatchMock: vi.fn(() => ({ started: true })),
 }))
 
 interface KeyWhere { where: { key: string } }
@@ -60,7 +61,14 @@ vi.mock('@/lib/db', () => ({
 // 部分 mock：只换掉"真会打 GitHub / 真会写生产配置"的那几个，其余保持实现原样
 vi.mock('@/lib/services/source-discovery', async importOriginal => {
   const actual = await importOriginal<Record<string, unknown>>()
-  return { ...actual, runDiscoveryCrawl: runCrawl, runDiscoveryDrain: drainMock, requestDiscoveryStop: stopMock, importCandidate: importCandidateMock }
+  return {
+    ...actual,
+    runDiscoveryCrawl: runCrawl,
+    runDiscoveryDrain: drainMock,
+    requestDiscoveryStop: stopMock,
+    importCandidate: importCandidateMock,
+    startCandidateProbeBatch: probeBatchMock,
+  }
 })
 
 const { GET, POST, PUT } = await import('./route')
@@ -81,6 +89,7 @@ beforeEach(async () => {
   // 这两个带默认实现（route 会 void 它们的返回值），只清调用记录、别把实现清没
   drainMock.mockClear()
   stopMock.mockClear()
+  probeBatchMock.mockClear()
   await saveDiscoverySettings({ enabled: true, repos: ['a/b'], githubToken: 'ghp_supersecret1234' })
 })
 
@@ -189,6 +198,17 @@ describe('动作校验', () => {
     expect(response.status).toBe(202)
     expect((await response.json()).data.started).toBe(true)
     expect(drainMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('probe-batch（批量判级）也是 202，一批在跑时回 started:false', async () => {
+    const response = await POST(request('POST', { action: 'probe-batch' }))
+    expect(response.status).toBe(202)
+    expect(probeBatchMock).toHaveBeenCalledTimes(1)
+
+    probeBatchMock.mockReturnValueOnce({ started: false, reason: '已有一批判级在跑' })
+    const busy = await POST(request('POST', { action: 'probe-batch' }))
+    expect(busy.status).toBe(200)
+    expect((await busy.json()).data.started).toBe(false)
   })
 
   it('stop 原样回服务层的判定（没在跑就是 stopping:false）', async () => {

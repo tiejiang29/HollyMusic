@@ -41,6 +41,17 @@ export interface DiscoveryStatus {
     stopped: boolean
     note: string | null
   } | null
+  /** 正在跑的批量判级（一批 ≤limit 条，串行逐条，真打第三方取址）；null = 没有 */
+  probeBatch: {
+    total: number
+    done: number
+    withAddress: number
+    failed: number
+    stopped: boolean
+    note: string | null
+    running: boolean
+    limit: number
+  } | null
   last: {
     reposScanned: number
     seen: number
@@ -129,6 +140,11 @@ export function stopDiscovery(): Promise<{ stopping: boolean }> {
 /** 起一次判级（服务端异步执行，结果靠 getDiscovery 轮询） */
 export function startCandidateProbe(id: number): Promise<{ started: boolean; reason?: string }> {
   return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe', id })
+}
+
+/** 批量判级：把"在册且没判过"的候选排队逐条判，一批最多 50 条（服务端定死，不在 UI 里另抄） */
+export function startCandidateProbeBatch(): Promise<{ started: boolean; reason?: string }> {
+  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe-batch' })
 }
 
 export function dismissDiscoveryCandidate(id: number): Promise<{ dismissed: number }> {

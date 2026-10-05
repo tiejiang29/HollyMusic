@@ -15,6 +15,7 @@ import {
   importDiscoveryCandidate,
   saveDiscoverySettings,
   startCandidateProbe,
+  startCandidateProbeBatch,
   startDiscoveryCrawl,
   startDiscoveryDrain,
   stopDiscovery,
@@ -25,7 +26,7 @@ import {
 } from '@/lib/api/admin-source-discovery'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download, Layers, Square } from 'lucide-react'
+import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download, Layers, Square, ListChecks } from 'lucide-react'
 import { copyAddress } from '@/lib/utils/clipboard'
 
 const FILTERS = [
@@ -173,16 +174,16 @@ export function SourceDiscoveryPanel() {
     void reload()
   }, [reload])
 
-  // 有一轮发现、一次连轮或一次判级在跑就轮进度，都停下来自动收（不留着空转）
+  // 有一轮发现、一次连轮、一批判级或一次判级在跑就轮进度，都停下来自动收（不留着空转）
   useEffect(() => {
-    if (!status?.running && !status?.draining && status?.probingId == null) {
+    if (!status?.running && !status?.draining && !status?.probeBatch?.running && status?.probingId == null) {
       if (pollRef.current) clearInterval(pollRef.current)
       pollRef.current = null
       return
     }
     pollRef.current = setInterval(() => { void reload() }, 3000)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [status?.running, status?.draining, status?.probingId, reload])
+  }, [status?.running, status?.draining, status?.probeBatch?.running, status?.probingId, reload])
 
   const handleSave = async (extra: Record<string, unknown> = {}) => {
     setSaving(true)
@@ -266,6 +267,16 @@ export function SourceDiscoveryPanel() {
     }
   }
 
+  const handleProbeBatch = async () => {
+    try {
+      const result = await startCandidateProbeBatch()
+      if (!result.started) alert(result.reason ?? '已有一批判级在跑')
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '批量判级起不来')
+    }
+  }
+
   const handleDismiss = async (id: number) => {
     try {
       await dismissDiscoveryCandidate(id)
@@ -342,11 +353,20 @@ export function SourceDiscoveryPanel() {
             {status?.draining ? <Loader2 className="h-4 w-4 animate-spin" /> : <Layers className="h-4 w-4" />}
             {status?.draining ? `连轮中 第 ${status.round} 轮` : '连轮清完'}
           </button>
-          {status?.running || status?.draining ? (
+          <button
+            onClick={handleProbeBatch}
+            disabled={starting || saving || !settings?.enabled || status?.running || status?.draining || Boolean(status?.probeBatch?.running)}
+            title="把「疑似可用」页签里没判过的候选排队逐条判（一批最多 50 条，串行）。实测一条几秒到一分多钟 —— 判不动的平台要等超时档，所以一批约 8 分钟；判级是真打第三方取址接口，所以分批"
+            className="flex items-center gap-1 rounded-full border border-border px-4 py-2 text-sm font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {status?.probeBatch?.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <ListChecks className="h-4 w-4" />}
+            {status?.probeBatch?.running ? `判级中 ${status.probeBatch.done}/${status.probeBatch.total}` : '批量判级'}
+          </button>
+          {status?.running || status?.draining || status?.probeBatch?.running ? (
             <button
               onClick={handleStop}
               disabled={Boolean(status?.stopRequested)}
-              title="已经在抓的那一条会抓完，之后的都停下；连轮不再起下一轮"
+              title="已经在抓的那一条会抓完，之后的都停下；连轮不再起下一轮，判级不再起下一条"
               className="flex items-center gap-1 rounded-full border border-destructive/40 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Square className="h-4 w-4" />
@@ -464,6 +484,21 @@ export function SourceDiscoveryPanel() {
               上一轮失败：{status.lastError}
             </div>
           ) : null}
+          {status?.probeBatch?.running ? (
+            <div className="mb-4 rounded-lg border border-border bg-accent/20 px-4 py-3 text-sm">
+              批量判级：{status.probeBatch.done}/{status.probeBatch.total} 条，
+              {status.probeBatch.withAddress} 条真出货
+              {status.probeBatch.failed ? `，${status.probeBatch.failed} 条没判成` : ''}
+              {status.stopRequested ? ' · 已请求停止，判完手头这条就收' : ''}
+            </div>
+          ) : null}
+          {status?.probeBatch && !status.probeBatch.running ? (
+            <div className="mb-4 text-xs text-muted-foreground">
+              上次批量判级：{status.probeBatch.done}/{status.probeBatch.total} 条，
+              {status.probeBatch.withAddress} 条真出货
+              {status.probeBatch.note ? `｜${status.probeBatch.note}` : ''}
+            </div>
+          ) : null}
           {status?.last && !status.running ? (
             <div className="mb-4 text-xs text-muted-foreground">
               上一轮：扫 {status.last.reposScanned} 仓，候选 {status.last.seen}（新采 {status.last.created}），
@@ -555,7 +590,7 @@ export function SourceDiscoveryPanel() {
                         <div className="flex justify-end gap-1">
                           <button
                             onClick={() => { void handleProbe(row.id) }}
-                            disabled={status?.probingId !== null || row.verdict !== 'suspect'}
+                            disabled={status?.probingId !== null || Boolean(status?.probeBatch?.running) || row.verdict !== 'suspect'}
                             title="下载它、复验 blob sha、在一次性沙箱里真取一次址"
                             className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                           >

@@ -273,6 +273,21 @@ export interface DrainSummary {
   note: string | null
 }
 
+/** 一批判级的进度（面板据此显示"判级中 12/50"并允许停止） */
+interface ProbeBatchProgress {
+  total: number
+  done: number
+  /** 至少一个平台真出货的条数 */
+  withAddress: number
+  /** 下载不到 / sha 对不上 / 脚本报错而跳过的条数 */
+  failed: number
+  stopped: boolean
+  note: string | null
+  running: boolean
+  /** 单次上限（面板写"最多 N 条"用，别在 UI 里另抄一份数字） */
+  limit: number
+}
+
 interface ProgressState {
   running: boolean
   phase: string
@@ -285,6 +300,7 @@ interface ProgressState {
   startedAt: string | null
   last: CrawlSummary | null
   lastError: string | null
+  probeBatch: ProbeBatchProgress | null
   /** 连轮（清存量）里的第几轮；单轮恒为 1 */
   round: number
   /** true = 连轮在跑。面板要靠它决定继续轮询还是收掉，也用来显示"停止" */
@@ -313,6 +329,7 @@ const progress: ProgressState = {
   draining: false,
   stopRequested: false,
   drainLast: null,
+  probeBatch: null,
 }
 
 export function discoveryStatus(): ProgressState {
@@ -409,7 +426,7 @@ export function runDiscoveryDrain(): Promise<DrainSummary> {
 
 /** 请求停止：正在抓的那一条抓完就收（仓内逐条检查），连轮则不再起下一轮 */
 export function requestDiscoveryStop(): { stopping: boolean } {
-  if (!(progress.running || progress.draining)) return { stopping: false }
+  if (!(progress.running || progress.draining || progress.probeBatch?.running)) return { stopping: false }
   progress.stopRequested = true
   return { stopping: true }
 }
@@ -813,6 +830,16 @@ export interface CandidateProbeReport {
 
 const PROBE_CALL_TIMEOUT_MS = 12_000
 const PROBE_LOAD_TIMEOUT_MS = 15_000
+/** 一批最多判 50 条：约 250 次第三方取址，再多就有触发上游风控的风险 */
+const PROBE_BATCH_LIMIT = 50
+/** 条与条之间留 300ms，别把请求打成一串密集突发 */
+const PROBE_BATCH_GAP_MS = 300
+let probeGapMs = PROBE_BATCH_GAP_MS
+
+/** 仅供测试：把条间隔调小，否则一批 50 条要在测试里真等 15 秒 */
+export function _setProbeGapForTest(ms: number | null): void {
+  probeGapMs = ms === null ? PROBE_BATCH_GAP_MS : ms
+}
 /** 与周测同一档，两处结果才可比 */
 const PROBE_QUALITY = '320k'
 const PROBABLE_PLATFORMS = ['kw', 'tx', 'wy', 'kg', 'mg']
@@ -995,6 +1022,7 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
  */
 export function startCandidateProbe(id: number): { started: boolean; reason?: string } {
   if (progress.probingId !== null) return { started: false, reason: `候选 ${progress.probingId} 正在判级中` }
+  if (progress.probeBatch?.running) return { started: false, reason: '有一批判级正在跑' }
   if (progress.running) return { started: false, reason: '有一轮发现正在跑' }
   progress.probingId = id
   progress.lastProbeNote = null
@@ -1006,6 +1034,73 @@ export function startCandidateProbe(id: number): { started: boolean; reason?: st
     })
     .finally(() => { progress.probingId = null })
   return { started: true }
+}
+
+/**
+ * 批量判级：把"疑似在册、从没判过"的候选排队逐条判，上限 50 条一批。
+ *
+ * 为什么串行而不是并发：判级要在一次性子进程里跑**未知代码**，同时开好几个才是把低配 NAS
+ * 压住的元凶；而一条本来就快不了多少 —— 实测（2026-10-05，真候选一批跑到 35 条用了 331 秒）
+ * **平均一条约 9 秒**：秒回的脚本 3 秒，慢的是**判不动的平台要等超时档**（加载 15 秒 + 每平台
+ * 12 秒），所以一批 50 条约 8 分钟。
+ * 为什么设 50：判级是**真打第三方平台**的取址接口，一批就是上百次请求；一口气把全部候选
+ * 打一遍有触发上游风控的风险（源可用性那期的聚合 API 就是这么吃到 CF 429 的）。
+ */
+export function startCandidateProbeBatch(): { started: boolean; reason?: string } {
+  if (progress.probeBatch?.running) return { started: false, reason: '已有一批判级在跑' }
+  if (progress.probingId !== null) return { started: false, reason: `候选 ${progress.probingId} 正在判级中` }
+  if (progress.running || progress.draining) return { started: false, reason: '有发现在跑，先等它结束' }
+  progress.probeBatch = { total: 0, done: 0, withAddress: 0, failed: 0, stopped: false, note: null, running: true, limit: PROBE_BATCH_LIMIT }
+  void runProbeBatch(PROBE_BATCH_LIMIT)
+    .catch(err => {
+      if (progress.probeBatch) progress.probeBatch.note = `这批崩了：${err instanceof Error ? err.message : String(err)}`
+      logger.warn('[discovery] 批量判级异常:', err)
+    })
+    .finally(() => {
+      if (progress.probeBatch) progress.probeBatch.running = false
+      // 停止标志要跟着收掉，否则下一次一点开就被上次的"停止"立刻中断
+      progress.stopRequested = false
+    })
+  return { started: true }
+}
+
+async function runProbeBatch(limit: number): Promise<void> {
+  const rows = await prisma.sourceCandidate.findMany({
+    where: { verdict: 'suspect', state: 'new', probeJson: '' },
+    orderBy: [{ score: 'desc' }, { updatedAt: 'desc' }],
+    take: limit,
+    select: { id: true },
+  })
+  const batch = progress.probeBatch!
+  batch.total = rows.length
+  if (!rows.length) {
+    batch.note = '没有待判级的候选（在册且没判过的都空了）'
+    return
+  }
+  for (const row of rows) {
+    if (progress.stopRequested) {
+      batch.stopped = true
+      batch.note = `已停止，这批判了 ${batch.done}/${batch.total} 条`
+      break
+    }
+    progress.probingId = row.id
+    batch.done++
+    try {
+      const report = await probeCandidate(row.id)
+      if (okCellCount(report) > 0) batch.withAddress++
+      progress.lastProbeNote = report.note ?? '判级完成'
+    } catch (err) {
+      // 一条失败（下载不到、sha 对不上、脚本报错）不该把整批带停
+      batch.failed++
+      progress.lastProbeNote = `候选 ${row.id} 判级失败：${err instanceof Error ? err.message : String(err)}`
+      logger.info('[discovery] 批量判级跳过一条', { id: row.id, reason: progress.lastProbeNote })
+    } finally {
+      progress.probingId = null
+    }
+    if (batch.done < batch.total) await sleep(probeGapMs)
+  }
+  if (!batch.note) batch.note = `这批判完：${batch.withAddress}/${batch.done} 条真出货`
+  logger.info('[discovery] 批量判级结束', { 总数: batch.total, 判了: batch.done, 出货: batch.withAddress, 失败: batch.failed, 停止: batch.stopped })
 }
 
 /** 面板渲染用：读回已存的判级结果，没判过或内容坏都返回 null */
