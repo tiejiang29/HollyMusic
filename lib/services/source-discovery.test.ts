@@ -116,13 +116,25 @@ beforeEach(() => {
     if (row) Object.assign(row, data)
     return row
   })
-  // findMany 要**真的按 where 筛**：批量判级靠 `probeJson: ''` 挑没判过的，装样子就等于在测假库
-  prismaMock.sourceCandidate.findMany = vi.fn(async (args?: { where?: Record<string, unknown>; take?: number }) => {
-    const where = (args?.where ?? {}) as { verdict?: string; state?: string; probeJson?: string }
+  // findMany 要**真的按 where 筛**：批量判级靠 `probeJson` 挑该判的，装样子就等于在测假库
+  prismaMock.sourceCandidate.findMany = vi.fn(async (args?: {
+    where?: Record<string, unknown> & { OR?: Array<Record<string, unknown>> }
+    take?: number
+  }) => {
+    const where = (args?.where ?? {}) as { verdict?: string; state?: string; probeJson?: string; OR?: Array<Record<string, unknown>> }
     let out = rows
     if (where.verdict) out = out.filter(r => r.verdict === where.verdict)
     if (where.state) out = out.filter(r => r.state === where.state)
     if (where.probeJson !== undefined) out = out.filter(r => r.probeJson === where.probeJson)
+    if (where.OR) {
+      const match = (row: Row, branch: Record<string, unknown>) => {
+        const want = row.probeJson as string
+        if (typeof branch.probeJson === 'string') return want === branch.probeJson
+        const contains = (branch.probeJson as { contains?: string } | undefined)?.contains
+        return contains ? want.includes(contains) : true
+      }
+      out = out.filter(row => where.OR!.some(branch => match(row, branch)))
+    }
     return typeof args?.take === 'number' ? out.slice(0, args.take) : out
   })
   prismaMock.sourceCandidate.groupBy = vi.fn(async () => [])
@@ -482,6 +494,37 @@ describe('probeCandidate', () => {
     const id = seedSuspect({ verdict: 'pending' })
     await expect(probeCandidate(id)).rejects.toThrow(/疑似音源/)
   })
+
+  it('一次性进程崩了 ⇒ 记 harness（我们通道没判成），不记成"源不行"', async () => {
+    const id = seedSuspect({ blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner({ probeImpl: async () => ({ ok: false, error: '脚本判级进程异常退出' }) }))
+
+    const report = await probeCandidate(id)
+    expect(report.cells.tx?.outcome).toBe('harness')
+    expect(report.note).toContain('通道没判成')
+    expect(report.note).toContain('可重判')
+  })
+
+  it('脚本上游断连（socket hang up）仍算 error —— 真数据里它从不与进程崩溃同现，不是一回事', async () => {
+    const id = seedSuspect({ blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner({ probeImpl: async () => ({ ok: false, error: 'socket hang up' }) }))
+
+    const report = await probeCandidate(id)
+    expect(report.cells.tx?.outcome).toBe('error')
+    expect(report.note).not.toContain('通道没判成')
+  })
+
+  it('加载阶段就崩 ⇒ 那一格也算 harness', async () => {
+    const id = seedSuspect({ blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    const runner = { ...fakeRunner(), validateScript: vi.fn(async () => ({ ok: false, error: '脚本校验进程异常退出' })) }
+    _setRunnerForTest(runner)
+
+    const report = await probeCandidate(id)
+    expect(report.cells['_']?.outcome).toBe('harness')
+  })
 })
 
 // ————— P0-c：导入闭环 —————
@@ -784,6 +827,21 @@ describe('startCandidateProbeBatch（批量判级）', () => {
     const batch = await waitProbeBatch()
     expect(batch?.total).toBe(0)
     expect(batch?.note).toMatch(/没有待判级的候选/)
+  })
+
+  it('重判只捞"通道没判成"的，判成功或判成真不行的都不重复消耗上游', async () => {
+    await enable(['a/b'])
+    const crashed = seedSuspect({ probeJson: JSON.stringify({ cells: { tx: { outcome: 'harness', latencyMs: 12, container: null, reason: '脚本判级进程异常退出' } }, shaVerified: true, note: null }) })
+    seedSuspect({ probeJson: JSON.stringify({ cells: { tx: { outcome: 'error', latencyMs: 12, container: null, reason: 'socket hang up' } }, shaVerified: true, note: null }) })
+    seedSuspect({ probeJson: JSON.stringify({ cells: { tx: { outcome: 'ok', latencyMs: 12, container: 'mp3', reason: null } }, shaVerified: true, note: null }) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner())
+
+    expect(startCandidateProbeBatch().started).toBe(true)
+    const batch = await waitProbeBatch()
+    expect(batch?.total).toBe(1)
+    expect(batch?.done).toBe(1)
+    expect(rows.find(r => r.id === crashed)?.probeJson).toContain('"ok"')
   })
 
   it('一批在跑时不再起第二批，也不给单条插队', async () => {

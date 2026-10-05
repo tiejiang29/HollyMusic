@@ -813,9 +813,14 @@ export async function dismissCandidate(id: number): Promise<void> {
 
 // ————— P0-b：一次性 slot 判级 —————
 
-/** 单平台一次判级的结果；outcome 与周测同口径，另加两种"没跑到"的形态 */
+/** 单平台一次判级的结果；outcome 与周测同口径，另加三种"没跑到"的形态 */
 export interface CandidateProbeCell {
-  outcome: ProbeCellOutcome | 'load-failed' | 'no-sample'
+  /**
+   * `harness` = 我们自己的通道没跑成（一次性进程崩了/起不来/IPC 断），
+   * **不代表这个源不行**，所以既不算出货也不算脚本报错，允许重判。
+   * 与之相对：`socket hang up` 这类是脚本自己的上游断连，属于真失败（实测两者从不同不同时出现在同一条候选上）。
+   */
+  outcome: ProbeCellOutcome | 'load-failed' | 'no-sample' | 'harness'
   latencyMs: number | null
   container: string | null
   reason: string | null
@@ -904,6 +909,21 @@ async function fetchScriptText(rawUrl: string, token: string): Promise<string> {
   return text
 }
 
+/**
+ * 判别"这条结论是我们通道没跑成，不是源坏了"。
+ *
+ * 只认 runner-client 自己造的那三种形态（进程崩了 / 起不来 / IPC 消息没送出去）。
+ * **故意不认 `socket hang up`**：2026-10-05 用真候选数据对过 —— 带 `socket hang up` 的候选与带
+ * "进程异常退出"的候选**交集为空**（8 条 vs 12 条，无一重合），说明前者是脚本自己的上游断连，
+ * 是真实失败，不能一起算成噪声。
+ */
+const HARNESS_FAILURE = /进程异常退出|进程启动失败|消息发送失败/
+
+/** 判级结论里有没有通道问题（面板据此提示可重判，导入闸门仍按"有没有真出货"算） */
+export function hasHarnessCell(report: CandidateProbeReport | null): boolean {
+  return !!report && Object.values(report.cells).some(cell => cell.outcome === 'harness')
+}
+
 async function saveReport(id: number, report: CandidateProbeReport): Promise<void> {
   await prisma.sourceCandidate.update({
     where: { id },
@@ -954,7 +974,10 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
   )
   if (!loaded.ok) {
     report.note = `脚本初始化失败：${loaded.error ?? '未知原因'}`
-    report.cells['_'] = { outcome: 'load-failed', latencyMs: null, container: null, reason: report.note.slice(0, 120) }
+    report.cells['_'] = {
+      outcome: HARNESS_FAILURE.test(loaded.error ?? '') ? 'harness' : 'load-failed',
+      latencyMs: null, container: null, reason: report.note.slice(0, 120),
+    }
     await saveReport(id, report)
     return report
   }
@@ -985,8 +1008,9 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
     const elapsedMs = Date.now() - started
 
     if (!probed.ok) {
+      const harness = HARNESS_FAILURE.test(String(probed.error ?? ''))
       report.cells[platform] = {
-        outcome: elapsedMs >= PROBE_CALL_TIMEOUT_MS ? 'timeout' : 'error',
+        outcome: harness ? 'harness' : elapsedMs >= PROBE_CALL_TIMEOUT_MS ? 'timeout' : 'error',
         latencyMs: elapsedMs, container: null,
         reason: String(probed.error ?? '一次性进程失败').slice(0, 120),
       }
@@ -1009,8 +1033,11 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
     report.cells[platform] = { ...head, latencyMs: elapsedMs }
   }
 
-  const okCount = Object.values(report.cells).filter(cell => cell.outcome === 'ok').length
-  report.note = `${okCount}/${Object.keys(report.cells).length} 个平台真出货`
+  const cells = Object.values(report.cells)
+  const okCount = cells.filter(cell => cell.outcome === 'ok').length
+  const harnessCount = cells.filter(cell => cell.outcome === 'harness').length
+  report.note = `${okCount}/${cells.length} 个平台真出货`
+    + (harnessCount ? `｜${harnessCount} 格是我们通道没判成，可重判` : '')
   await saveReport(id, report)
   return report
 }
@@ -1066,7 +1093,12 @@ export function startCandidateProbeBatch(): { started: boolean; reason?: string 
 
 async function runProbeBatch(limit: number): Promise<void> {
   const rows = await prisma.sourceCandidate.findMany({
-    where: { verdict: 'suspect', state: 'new', probeJson: '' },
+    where: {
+      verdict: 'suspect',
+      state: 'new',
+      // 没判过的，加上"通道没判成"的（重判就是它们需要的）；判成功或判成"源真不行"的不再重复消耗上游
+      OR: [{ probeJson: '' }, { probeJson: { contains: '"harness"' } }],
+    },
     orderBy: [{ score: 'desc' }, { updatedAt: 'desc' }],
     take: limit,
     select: { id: true },

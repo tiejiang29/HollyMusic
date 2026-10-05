@@ -72,12 +72,18 @@ export function ProbeLights({ cells }: { cells: Record<string, ProbeCellView> })
       {platforms.map(platform => {
         const cell = cells[platform]
         const ok = cell.outcome === 'ok'
+        // 通道没判成用灰色：红=这格真不行，灰=我们没测出来，两者对管理员是不同动作（后者该重判）
+        const harness = cell.outcome === 'harness'
         const label = OUTCOME_LABEL[cell.outcome] ?? cell.outcome
         return (
           <span
             key={platform}
             title={`${PLATFORM_LABELS[platform] ?? platform}：${label}${cell.latencyMs != null ? ` ${cell.latencyMs}ms` : ''}${cell.container ? `｜${cell.container}` : ''}${cell.reason ? `｜${cell.reason}` : ''}`}
-            className={`rounded px-1.5 py-0.5 text-[11px] ${ok ? 'bg-green-600/15 text-green-700' : 'bg-destructive/15 text-destructive'}`}
+            className={`rounded px-1.5 py-0.5 text-[11px] ${
+              ok ? 'bg-green-600/15 text-green-700'
+                : harness ? 'bg-accent text-muted-foreground'
+                  : 'bg-destructive/15 text-destructive'
+            }`}
           >
             {PLATFORM_LABELS[platform] ?? platform}
           </span>
@@ -121,6 +127,7 @@ const OUTCOME_LABEL: Record<string, string> = {
   unsupported: '不支持',
   'load-failed': '初始化失败',
   'no-sample': '库里无基准样本',
+  harness: '通道没判成(可重判)',
 }
 
 const PLATFORM_LABELS: Record<string, string> = {
