@@ -291,4 +291,11 @@ describe('runDiscoveryCrawl', () => {
   it('默认值就是关着的（别因为合并了默认对象被打开）', () => {
     expect(DEFAULT_DISCOVERY_SETTINGS.enabled).toBe(false)
   })
+
+  it('默认仓库清单：形状全都合法、无重复（混进一个拼不出地址的项就会白扣配额）', () => {
+    const repos = DEFAULT_DISCOVERY_SETTINGS.repos
+    expect(repos.length).toBeGreaterThan(30)
+    for (const repo of repos) expect(normalizeRepo(repo), repo).toBe(repo)
+    expect(new Set(repos).size).toBe(repos.length)
+  })
 })

@@ -35,8 +35,12 @@ export interface DiscoverySettings {
 }
 
 /**
- * 起步清单：社区里长期流传的公开音源仓库（事实性的仓库名，不含任何脚本内容）。
- * 用户可以增删；默认关着，所以这份清单本身不产生任何出网行为。
+ * 起步清单：社区里长期流传的公开音源仓库，标识符来自 lx-hunter 公开发布的推荐清单与它的
+ * 内置列表（仓库名是事实性数据，本模块不含它的任何代码）。**38 个已逐个 HEAD 验过还存在**
+ * （2026-10-05，my/repo-seed-check.mjs；当时唯一验掉的是我先前拍脑袋加的 liuyangh/yuting=404）。
+ *
+ * 清单大就有代价：一轮 = 每仓一次树接口调用，匿名配额 60/小时，38 仓刚好还剩得不多；
+ * 所以接口在起轮前做配额预检，不够就直说差多少，而不是硬打到 403。
  */
 export const DEFAULT_DISCOVERY_SETTINGS: DiscoverySettings = {
   enabled: false,
@@ -44,9 +48,41 @@ export const DEFAULT_DISCOVERY_SETTINGS: DiscoverySettings = {
     'pdone/lx-music-source',
     'Huibq/keep-alive',
     'xzh767/lxmusic-source-all',
-    'liuyangh/yuting',
+    'liuyunss/LX-source',
+    'skxingyu/lx_music-',
     'jeffernn/music-source',
     'Qian-Ning/LX-Music-Source',
+    'oozzbb/LxMusicApi',
+    'guoyue2010/lxmusic-',
+    'ZxwyWebSite/lx-script',
+    'ZxwyWebSite/lx-source',
+    'laosunmaker/New_lxmusic_source',
+    'cc2415/lx-custom-music-source',
+    'ycquah00/lx-music-source-v5',
+    'javon4016/xgzy-mysources',
+    'pronii/lx-music-qdy-mini',
+    'yanghook730-sketch/lx-music-source-yuanli',
+    'fengyvle/yyt-music-sources',
+    'peakshuoera/lx-music-source-manager',
+    'wwnbalone/lx-manager',
+    'NeoDtime/lxmusic-source3',
+    'sphenoid-111/LXmusicyy',
+    'lczj1215/lx-music',
+    'a97083435/lxmusic-source',
+    'LXJ-George666/LXMusic-Yinyuan',
+    'LuoXiaohei-2025/LX-music-collection',
+    'Macrohard0001/lx-ikun-music-sources',
+    'lxmusics/lx-music-api-server-python',
+    'hejuworld-droid/lx-music-source',
+    'haonanren118/jiexiang-Music-Source',
+    'hllsg/lx-music-myvip',
+    'ZhonX07/lx-music-source-netease',
+    'Scotlight/lx-music-source-gateway',
+    'HJinTao/Listening',
+    'mlik-git/lx-music',
+    '7878gyc/gdstudio-lx-source',
+    'piko017/-LX-luoxue_yinyuan',
+    'wzh15802/lxmusic',
   ],
   maxCandidatesPerRepo: 300,
   maxDownloadsPerRound: 80,
