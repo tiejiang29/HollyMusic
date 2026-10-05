@@ -17,6 +17,9 @@ export interface DiscoverySettingsView {
 export interface DiscoveryStatus {
   running: boolean
   phase: string
+  /** 正在判级的候选 id；null = 没有（判级一次只允许一个） */
+  probingId: number | null
+  lastProbeNote: string | null
   reposDone: number
   reposTotal: number
   downloaded: number
@@ -40,6 +43,20 @@ export interface DiscoveryStatus {
   lastError: string | null
 }
 
+export interface ProbeCellView {
+  outcome: string
+  latencyMs: number | null
+  container: string | null
+  reason: string | null
+}
+
+export interface CandidateProbeView {
+  cells: Record<string, ProbeCellView>
+  /** null = tree 里本来没给 blob sha（无从校验） */
+  shaVerified: boolean | null
+  note: string | null
+}
+
 export interface DiscoveryCandidate {
   id: number
   repo: string
@@ -52,6 +69,9 @@ export interface DiscoveryCandidate {
   reason: string | null
   sizeBytes: number
   checkedAt: string | null
+  /** P0-b 判级结果；null = 还没判过 */
+  probe: CandidateProbeView | null
+  probedAt: string | null
 }
 
 export interface DiscoveryView {
@@ -71,6 +91,11 @@ export function getDiscovery(filter: { verdict?: string; state?: string } = {}):
 
 export function startDiscoveryCrawl(): Promise<{ started: boolean; reason?: string }> {
   return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'crawl' })
+}
+
+/** 起一次判级（服务端异步执行，结果靠 getDiscovery 轮询） */
+export function startCandidateProbe(id: number): Promise<{ started: boolean; reason?: string }> {
+  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe', id })
 }
 
 export function dismissDiscoveryCandidate(id: number): Promise<{ dismissed: number }> {

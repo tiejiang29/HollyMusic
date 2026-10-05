@@ -10,10 +10,12 @@ import {
   dismissDiscoveryCandidate,
   getDiscovery,
   saveDiscoverySettings,
+  startCandidateProbe,
   startDiscoveryCrawl,
   type DiscoveryCandidate,
   type DiscoverySettingsView,
   type DiscoveryStatus,
+  type ProbeCellView,
 } from '@/lib/api/admin-source-discovery'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -46,6 +48,54 @@ export function AddressCell({ rawUrl, copied, onCopy }: { rawUrl: string; copied
       </button>
     </div>
   )
+}
+
+/**
+ * 判级红绿灯：一格一个平台，颜色只说"真出货没有"，细节全在 title 里。
+ *
+ * 单独导出是为了能直测 —— 这格的语义（ok / 各种坏 / 还没判）是管理员要做决定的依据，
+ * 不能靠"看起来对"。
+ */
+export function ProbeLights({ cells }: { cells: Record<string, ProbeCellView> }) {
+  const platforms = Object.keys(cells)
+  if (!platforms.length) return <span className="text-muted-foreground">—</span>
+  return (
+    <span className="flex flex-wrap gap-1">
+      {platforms.map(platform => {
+        const cell = cells[platform]
+        const ok = cell.outcome === 'ok'
+        const label = OUTCOME_LABEL[cell.outcome] ?? cell.outcome
+        return (
+          <span
+            key={platform}
+            title={`${PLATFORM_LABELS[platform] ?? platform}：${label}${cell.latencyMs != null ? ` ${cell.latencyMs}ms` : ''}${cell.container ? `｜${cell.container}` : ''}${cell.reason ? `｜${cell.reason}` : ''}`}
+            className={`rounded px-1.5 py-0.5 text-[11px] ${ok ? 'bg-green-600/15 text-green-700' : 'bg-destructive/15 text-destructive'}`}
+          >
+            {PLATFORM_LABELS[platform] ?? platform}
+          </span>
+        )
+      })}
+    </span>
+  )
+}
+
+const OUTCOME_LABEL: Record<string, string> = {
+  ok: '真出货',
+  'no-address': '没给地址',
+  timeout: '超时',
+  error: '脚本报错',
+  fake: '假地址(非音频)',
+  ssrf: '私网地址',
+  'http-error': 'HTTP 错',
+  'head-error': '首块拉不动',
+  unverified: '未验证',
+  unsupported: '不支持',
+  'load-failed': '初始化失败',
+  'no-sample': '库里无基准样本',
+}
+
+const PLATFORM_LABELS: Record<string, string> = {
+  tx: '腾讯', wy: '网易', kw: '酷我', kg: '酷狗', mg: '咪咕', _: '加载',
 }
 
 export function SourceDiscoveryPanel() {
@@ -83,20 +133,21 @@ export function SourceDiscoveryPanel() {
   }, [filter])
 
   useEffect(() => {
-    setLoading(true)
-    reload()
+    // 不 setLoading(true)：首屏初值已经是 true。set-state-in-effect 那条告警与既有面板
+    // 同源（LoginLocks/Users 等一共 6 处同型写法），不是这里能单独消掉的
+    void reload()
   }, [reload])
 
-  // 有一轮在跑就轮进度，跑完自动停（不留着空转）
+  // 有一轮发现或有一次判级在跑就轮进度，都停下来自动收（不留着空转）
   useEffect(() => {
-    if (!status?.running) {
+    if (!status?.running && status?.probingId == null) {
       if (pollRef.current) clearInterval(pollRef.current)
       pollRef.current = null
       return
     }
     pollRef.current = setInterval(() => { void reload() }, 3000)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [status?.running, reload])
+  }, [status?.running, status?.probingId, reload])
 
   const handleSave = async (extra: Record<string, unknown> = {}) => {
     setSaving(true)
@@ -135,6 +186,16 @@ export function SourceDiscoveryPanel() {
     } else {
       setCopiedId(null)
       setClipboardBlocked(true)
+    }
+  }
+
+  const handleProbe = async (id: number) => {
+    try {
+      const result = await startCandidateProbe(id)
+      if (!result.started) alert(result.reason ?? '已有判级在跑')
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '判级失败')
     }
   }
 
@@ -298,6 +359,7 @@ export function SourceDiscoveryPanel() {
                     <th className="px-4 py-3 font-medium">分</th>
                     <th className="px-4 py-3 font-medium">大小</th>
                     <th className="px-4 py-3 font-medium">判定依据</th>
+                    <th className="px-4 py-3 font-medium">判级（真跑一次取址）</th>
                     <th className="px-4 py-3 text-right font-medium">操作</th>
                   </tr>
                 </thead>
@@ -319,8 +381,24 @@ export function SourceDiscoveryPanel() {
                         {row.sizeBytes ? `${Math.round(row.sizeBytes / 1024)}KB` : '—'}
                       </td>
                       <td className="max-w-[22rem] px-4 py-3 text-xs text-muted-foreground">{row.reason || '还没抓正文'}</td>
+                      <td className="px-4 py-3 text-xs">
+                        {row.probe
+                          ? <ProbeLights cells={row.probe.cells} />
+                          : <span className="text-muted-foreground">{status?.probingId === row.id ? '判级中…' : '未判'}</span>}
+                      </td>
                       <td className="px-4 py-3">
-                        <div className="flex justify-end">
+                        <div className="flex justify-end gap-1">
+                          <button
+                            onClick={() => { void handleProbe(row.id) }}
+                            disabled={status?.probingId !== null || row.verdict !== 'suspect'}
+                            title="下载它、复验 blob sha、在一次性沙箱里真取一次址"
+                            className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            {status?.probingId === row.id
+                              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              : <Radar className="h-3.5 w-3.5" />}
+                            判级
+                          </button>
                           <button
                             onClick={() => handleDismiss(row.id)}
                             disabled={row.state === 'stale'}

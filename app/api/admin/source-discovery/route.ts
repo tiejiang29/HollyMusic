@@ -20,6 +20,7 @@ import {
   listCandidates,
   runDiscoveryCrawl,
   saveDiscoverySettings,
+  startCandidateProbe,
   type DiscoverySettings,
 } from '@/lib/services/source-discovery'
 import { logger } from '@/lib/logger'
@@ -81,6 +82,16 @@ export async function POST(request: NextRequest) {
       if (!Number.isFinite(id) || id <= 0) return createErrorResponse('INVALID_PARAMS', '缺少合法的候选 id', 400)
       await dismissCandidate(id)
       return createSuccessResponse({ dismissed: id })
+    }
+
+    if (action === 'probe') {
+      const id = Number(body?.id)
+      if (!Number.isFinite(id) || id <= 0) return createErrorResponse('INVALID_PARAMS', '缺少合法的候选 id', 400)
+      const result = startCandidateProbe(id)
+      // 判级会真执行脚本（数秒到数十秒），所以只回 202，结果靠 GET 轮询
+      return result.started
+        ? createSuccessResponse(result, 202)
+        : createSuccessResponse(result)
     }
 
     if (action === 'crawl') {

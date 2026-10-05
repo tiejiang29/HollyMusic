@@ -20,9 +20,21 @@ vi.mock('@/lib/services/source-manager-service', () => ({
   }),
 }))
 
+const { probeDeps } = vi.hoisted(() => ({
+  probeDeps: {
+    pickProbeSamples: vi.fn(async () => ({
+      tx: [{ source: 'tx', songmid: 'sample-1', songId: '8136', name: '样本歌', singer: '样本歌手', interval: '180', types: [], _types: {}, typeUrl: {} }],
+    })),
+    verifyHead: vi.fn(async () => ({ outcome: 'ok' as const, reason: null, container: 'mp3' as const })),
+  },
+}))
+
+vi.mock('./source-probe', () => probeDeps)
+
 const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
+  probeCandidate, gitBlobSha, _setRunnerForTest,
 } = await import('./source-discovery')
 
 interface FetchCallPair { mock: { calls: Array<[string, RequestInit?]> } }
@@ -40,7 +52,6 @@ interface SettingUpsert extends KeyWhere { create: { value: string }; update?: {
 interface PathWhere { where: { repo_path: { repo: string; path: string } } }
 interface CreateArgs { data: Record<string, unknown> }
 interface UpdateArgs { where: { id?: number; repo_path?: { repo: string; path: string } }; data: Record<string, unknown> }
-
 beforeEach(() => {
   rows = []
   nextId = 1
@@ -51,8 +62,12 @@ beforeEach(() => {
     settingRows.set(where.key, update?.value ?? create.value)
     return {}
   })
-  prismaMock.sourceCandidate.findUnique = vi.fn(async ({ where }: PathWhere) =>
-    rows.find(r => r.repo === where.repo_path.repo && r.path === where.repo_path.path) ?? null)
+  prismaMock.sourceCandidate.findUnique = vi.fn(async (args: PathWhere | { where: { id: number } }) => {
+    const where = args.where as { id?: number; repo_path?: { repo: string; path: string } }
+    if (typeof where.id === 'number') return rows.find(r => r.id === where.id) ?? null
+    const target = where.repo_path!
+    return rows.find(r => r.repo === target.repo && r.path === target.path) ?? null
+  })
   prismaMock.sourceCandidate.create = vi.fn(async ({ data }: CreateArgs) => {
     // 补齐 schema 里带 @default 的列：真库由 Prisma 填，假库要自己填，否则测不出真实形状
     const row = {
@@ -297,5 +312,142 @@ describe('runDiscoveryCrawl', () => {
     expect(repos.length).toBeGreaterThan(30)
     for (const repo of repos) expect(normalizeRepo(repo), repo).toBe(repo)
     expect(new Set(repos).size).toBe(repos.length)
+  })
+})
+// ————— P0-b：一次性子进程判级 —————
+const RAW_URL = 'https://raw.githubusercontent.com/a/b/HEAD/lx-source.js'
+
+function seedSuspect(over: Partial<Row> = {}): number {
+  const row = {
+    id: nextId++, repo: 'a/b', path: 'lx-source.js', rawUrl: RAW_URL, blobSha: '',
+    scriptName: '合成测试音源 v1.2.0', nameKey: '合成测试音源', contentHash: '', upstreamAt: '',
+    sizeBytes: 400, score: 8, verdict: 'suspect', state: 'new', reason: null,
+    probeJson: '', probedAt: null, checkedAt: null, ...over,
+  } as Row
+  rows.push(row)
+  return row.id
+}
+
+function stubRawFetch(text: string) {
+  return vi.fn(async (url: string) => {
+    if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+    return new Response(text, { headers: { 'content-type': 'text/plain' } })
+  })
+}
+
+/** 假的一次性子进程通道（真身是 runner-client 的 probeScript/validateScript） */
+function fakeRunner(options: { loadOk?: boolean; loadError?: string; probeImpl?: () => Promise<unknown> } = {}) {
+  return {
+    mode: 'process',
+    validateScript: vi.fn(async () => (options.loadOk === false
+      ? { ok: false, error: options.loadError ?? '脚本没发 inited' }
+      : { ok: true, sourceInfo: { sources: { tx: {} } } })),
+    probeScript: vi.fn(options.probeImpl ?? (async () => ({ ok: true, sourceInfo: {}, callValue: 'https://cdn.example.test/play.mp3' }))),
+  }
+}
+
+describe('gitBlobSha', () => {
+  it('与 `git hash-object` 的权威值对上（不是自己算完自证）', () => {
+    // 对照值由 `git hash-object` 对同样内容算出；换行用 fromCharCode 写，避免转义把源码搅坏
+    const content = `hello git${String.fromCharCode(10)}`
+    expect(gitBlobSha(content)).toBe('8d0e41234f24b6da002d962a26c2495ea16a425f')
+  })
+})
+
+describe('probeCandidate', () => {
+  beforeEach(() => {
+    probeDeps.verifyHead.mockClear()
+    _setRunnerForTest(null)
+  })
+
+  it('blob sha 与 tree 不一致 ⇒ 一次都不交给子进程执行，并把拒绝理由落库', async () => {
+    const id = seedSuspect({ blobSha: '0'.repeat(40) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    const runner = fakeRunner()
+    _setRunnerForTest(runner)
+
+    const report = await probeCandidate(id)
+    expect(report.shaVerified).toBe(false)
+    expect(report.note).toContain('拒绝执行')
+    expect(runner.validateScript).not.toHaveBeenCalled()
+    expect(runner.probeScript).not.toHaveBeenCalled()
+    expect(String(rows.find(r => r.id === id)?.probeJson)).toContain('拒绝执行')
+  })
+
+  it('sha 对得上才执行：先加载拿平台声明，再逐平台真取一次址 + 首块魔数', async () => {
+    const id = seedSuspect({ blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    const runner = fakeRunner()
+    _setRunnerForTest(runner)
+
+    const report = await probeCandidate(id)
+    expect(report.shaVerified).toBe(true)
+    expect(report.cells.tx?.outcome).toBe('ok')
+    expect(report.cells.tx?.container).toBe('mp3')
+    expect(report.note).toBe('1/1 个平台真出货')
+    expect(runner.validateScript).toHaveBeenCalledTimes(1)
+    expect(runner.probeScript).toHaveBeenCalledTimes(1)
+    expect(runner.probeScript.mock.calls[0][1]).toMatchObject({ source: 'tx', quality: '320k' })
+    expect(probeDeps.verifyHead).toHaveBeenCalledWith('https://cdn.example.test/play.mp3')
+  })
+
+  it('tree 没给 sha 时无从校验：照判，但 shaVerified 留成 null（面板要分得开"验过"和"没法验"）', async () => {
+    const id = seedSuspect({ blobSha: '' })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner())
+    const report = await probeCandidate(id)
+    expect(report.shaVerified).toBeNull()
+  })
+
+  it('脚本初始化失败记 load-failed，且绝不再去取址', async () => {
+    const id = seedSuspect({ blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    const runner = fakeRunner({ loadOk: false, loadError: '脚本没发 inited' })
+    _setRunnerForTest(runner)
+
+    const report = await probeCandidate(id)
+    expect(report.cells['_']?.outcome).toBe('load-failed')
+    expect(report.note).toContain('初始化失败')
+    expect(runner.probeScript).not.toHaveBeenCalled()
+  })
+
+  it('inline 模式拒绝判级：跑不可信代码没有隔离可言', async () => {
+    const id = seedSuspect({ blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    const runner = { ...fakeRunner(), mode: 'inline' }
+    _setRunnerForTest(runner)
+
+    const report = await probeCandidate(id)
+    expect(report.note).toContain('inline')
+    expect(runner.validateScript).not.toHaveBeenCalled()
+  })
+
+  it('脚本说"这首歌我没有"归 no-address，不计成脚本报错（与账本口径一致）', async () => {
+    const id = seedSuspect({ blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner({
+      probeImpl: async () => ({ ok: true, sourceInfo: {}, callError: '无版权，无法播放' }),
+    }))
+    const report = await probeCandidate(id)
+    expect(report.cells.tx?.outcome).toBe('no-address')
+  })
+
+  it('下载失败时抛错且不落任何结论（网络抖动不该被固化成"这源不行"）', async () => {
+    const id = seedSuspect({ blobSha: 'x' })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) =>
+      url.endsWith('/rate_limit')
+        ? jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+        : new Response('nope', { status: 404 })))
+    const runner = fakeRunner()
+    _setRunnerForTest(runner)
+
+    await expect(probeCandidate(id)).rejects.toThrow(/HTTP 404/)
+    expect(runner.validateScript).not.toHaveBeenCalled()
+    expect(rows.find(r => r.id === id)?.probeJson).toBe('')
+  })
+
+  it('只给"疑似音源"判级：pending 直接拒', async () => {
+    const id = seedSuspect({ verdict: 'pending' })
+    await expect(probeCandidate(id)).rejects.toThrow(/疑似音源/)
   })
 })

@@ -2,10 +2,12 @@
  * 音源发现 P0-a：从 GitHub 仓库树里挑出"疑似洛雪音源脚本"的候选，静态打分 + 去重后落库供面板查看。
  *
  * 三条边界是这一期存在的理由，改动前先看清：
- * 1. **只发现，不执行、不入库正文**。候选表里只有元数据（地址、blob sha、内容哈希、打分、判定）；
- *    脚本文本抓来做打分就丢，既不占库也不把第三方代码留在我们服务器上。真要导入（P0-c）时再按
- *    rawUrl 重新下载并复验。
- * 2. **不改生产取址路径**：不写 config/music-sources.json、不碰健康账本、不调用沙箱。
+ * 1. **不入库正文**。候选表里只有元数据（地址、blob sha、内容哈希、打分、判定、判级结果）；
+ *    脚本文本只为打分与判级临时落一次系统临时目录，用完即删 —— 既不占库，也不把第三方
+ *    代码长期留在我们服务器上。
+ * 2. **不改生产取址路径**：不写 config/music-sources.json、**不写健康账本**。
+ *    判级（`probeCandidate`）确实会在一次性 slot 里执行第三方脚本，所以**执行前必须先复验
+ *    git blob sha**：内容对不上 tree 里那个 sha，就说明下来的不是同一份东西，绝不执行。
  * 3. **GitHub 仓库地址是唯一可由管理员输入的自由文本**，所以它同时也是本模块的 SSRF 面：
  *    先按 `owner/repo` 白名单形状校验，再逐段 encodeURIComponent，host 恒定两个，最后仍走
  *    safePublicFetch 的 DNS 级闸门。三道里拆掉任一道都不该变成裸请求。
@@ -15,6 +17,8 @@
 
 import { createHash } from 'node:crypto'
 import { logger } from '@/lib/logger'
+import { pickProbeSamples, verifyHead, type ProbeCellOutcome } from '@/lib/services/source-probe'
+import { isContentMiss } from '@/lib/server/source-health'
 import { prisma } from '@/lib/db'
 import { readSetting, writeSetting } from '@/lib/services/app-setting'
 import { safePublicFetch } from '@/lib/server/url-guard'
@@ -252,6 +256,9 @@ interface ProgressState {
   reposDone: number
   reposTotal: number
   downloaded: number
+  /** 正在判级的候选 id；null = 没有。判级要执行脚本，一次只允许一个 */
+  probingId: number | null
+  lastProbeNote: string | null
   startedAt: string | null
   last: CrawlSummary | null
   lastError: string | null
@@ -264,6 +271,8 @@ const progress: ProgressState = {
   reposDone: 0,
   reposTotal: 0,
   downloaded: 0,
+  probingId: null,
+  lastProbeNote: null,
   startedAt: null,
   last: null,
   lastError: null,
@@ -589,6 +598,9 @@ export interface CandidateView {
   reason: string | null
   sizeBytes: number
   checkedAt: string | null
+  /** P0-b 判级结果；null = 还没判过 */
+  probe: CandidateProbeReport | null
+  probedAt: string | null
 }
 
 export async function listCandidates(filter: { verdict?: string; state?: string; take?: number } = {}): Promise<CandidateView[]> {
@@ -612,6 +624,8 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
     reason: row.reason,
     sizeBytes: row.sizeBytes,
     checkedAt: row.checkedAt ? row.checkedAt.toISOString() : null,
+    probe: parseProbeReport(row.probeJson),
+    probedAt: row.probedAt ? row.probedAt.toISOString() : null,
   }))
 }
 
@@ -625,4 +639,239 @@ export async function countCandidates(): Promise<Record<string, number>> {
 /** 面板上手动剔除一条候选（只改 state，不删行） */
 export async function dismissCandidate(id: number): Promise<void> {
   await prisma.sourceCandidate.update({ where: { id }, data: { state: 'stale' } }).catch(() => {})
+}
+
+// ————— P0-b：一次性 slot 判级 —————
+
+/** 单平台一次判级的结果；outcome 与周测同口径，另加两种"没跑到"的形态 */
+export interface CandidateProbeCell {
+  outcome: ProbeCellOutcome | 'load-failed' | 'no-sample'
+  latencyMs: number | null
+  container: string | null
+  reason: string | null
+}
+
+export interface CandidateProbeReport {
+  cells: Record<string, CandidateProbeCell>
+  /** false = blob sha 对不上，直接拒绝执行；null = 这条候选 tree 里本来就没给 sha */
+  shaVerified: boolean | null
+  note: string | null
+}
+
+const PROBE_CALL_TIMEOUT_MS = 12_000
+const PROBE_LOAD_TIMEOUT_MS = 15_000
+/** 与周测同一档，两处结果才可比 */
+const PROBE_QUALITY = '320k'
+const PROBABLE_PLATFORMS = ['kw', 'tx', 'wy', 'kg', 'mg']
+
+/**
+ * git blob 的 sha1：`sha1("blob <字节数>\0" + 内容)`。
+ * 与 `git hash-object` 逐字节对过（不是自己算完自证）。
+ */
+export function gitBlobSha(content: string): string {
+  const buf = Buffer.from(content, 'utf8')
+  const header = Buffer.from(`blob ${buf.length}\0`, 'binary')
+  return createHash('sha1').update(Buffer.concat([header, buf])).digest('hex')
+}
+
+/**
+ * 一次性子进程通道的最小面（runner-client 的真身在生产注入，测试里换假的）。
+ *
+ * 判级**必须**走这条通道而不是共享 runner：实测过一个音源脚本自己内部抛出的未捕获
+ * rejection 会把常驻 runner 整个打挂，连带所有平台的取址请求全部"运行器正在重启"——
+ * 那个 runner 是所有音源共用的，播放路径上不能为了探测未知代码去冒这个险。
+ */
+export interface OneShotRunner {
+  readonly mode: string
+  validateScript(content: string, timeoutMs?: number): Promise<{ ok: boolean; sourceInfo?: unknown; error?: string }>
+  probeScript(content: string, call: { source: string; musicInfo: unknown; quality: string }, timeoutMs?: number):
+    Promise<{ ok: boolean; sourceInfo?: unknown; callValue?: unknown; callError?: string; error?: string }>
+}
+
+let runnerOverride: OneShotRunner | null = null
+
+/** 仅供测试注入假的一次性进程通道 */
+export function _setRunnerForTest(runner: OneShotRunner | null): void {
+  runnerOverride = runner
+}
+
+function getOneShotRunner(): OneShotRunner {
+  if (runnerOverride) return runnerOverride
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('../music-core/runner-client').getSourceRunner()
+}
+
+function withLocalTimeout<T>(promise: Promise<T>, budgetMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | null = null
+  return Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label}超过 ${budgetMs}ms`)), budgetMs)
+    }),
+  ]).finally(() => { if (timer) clearTimeout(timer) }) as Promise<T>
+}
+
+async function fetchScriptText(rawUrl: string, token: string): Promise<string> {
+  let response: Response
+  try {
+    response = await githubFetch(rawUrl, token, { headers: { Accept: 'text/plain' } })
+  } catch (err) {
+    // 超时是 AbortController 触发的，undici 的原文是 "This operation was aborted" ——
+    // 直接透传给管理员等于没说，换成能归因的一句
+    const message = err instanceof Error ? err.message : String(err)
+    if (/abort/i.test(message)) {
+      throw new SourceDiscoveryError(`下载脚本超时（${Math.round(REQUEST_TIMEOUT_MS / 1000)}s），可能是网络抖动或该地址已被限流`, 504)
+    }
+    throw new SourceDiscoveryError(`下载脚本失败：${message.slice(0, 100)}`, 502)
+  }
+  if (!response.ok) throw new SourceDiscoveryError(`下载脚本失败：HTTP ${response.status}`, 502)
+  const contentType = response.headers.get('content-type') || ''
+  if (/text\/html/i.test(contentType)) throw new SourceDiscoveryError('下载脚本失败：返回的是网页不是文件', 502)
+  const text = await response.text()
+  if (Buffer.byteLength(text, 'utf8') > MAX_SCRIPT_BYTES) {
+    throw new SourceDiscoveryError('脚本超过体积上限，拒绝判级', 400)
+  }
+  return text
+}
+
+async function saveReport(id: number, report: CandidateProbeReport): Promise<void> {
+  await prisma.sourceCandidate.update({
+    where: { id },
+    data: { probeJson: JSON.stringify(report), probedAt: new Date(), reason: report.note },
+  })
+}
+
+/**
+ * 判级一条候选：下载 → 复验 blob sha → 一次性子进程里"加载 + 真取一次址" →
+ * 拿到地址后在父进程走与周测同一套首块魔数判据。
+ *
+ * 四个不可让步的点：
+ * - **sha 对不上就不执行**：执行前的完整性校验比导入时校验有意义得多；
+ * - 脚本文本**不落盘**：一次性通道收的是内容本身，用完随进程消失；
+ * - 执行只发生在**一次性子进程**：来路不明的代码崩掉也只崩那个进程（详见 OneShotRunner）；
+ * - 全程不碰 `sourceHealth`：判级不经取址瀑布，结构上写不进账本
+ *   （探测抖动不能变成用户侧的坏证据，这条约束与周测同源）。
+ */
+export async function probeCandidate(id: number): Promise<CandidateProbeReport> {
+  const row = await prisma.sourceCandidate.findUnique({ where: { id } })
+  if (!row) throw new SourceDiscoveryError('候选不存在', 404)
+  if (row.verdict !== 'suspect') throw new SourceDiscoveryError('只给"疑似音源"的候选做判级')
+
+  const settings = await getDiscoverySettings()
+  const content = await fetchScriptText(row.rawUrl, settings.githubToken)
+
+  const expectedSha = (row.blobSha || '').toLowerCase()
+  const report: CandidateProbeReport = { cells: {}, shaVerified: expectedSha ? false : null, note: null }
+
+  if (expectedSha && gitBlobSha(content) !== expectedSha) {
+    report.note = 'blob sha 与仓库 tree 不一致，拒绝执行'
+    await saveReport(id, report)
+    return report
+  }
+  if (expectedSha) report.shaVerified = true
+
+  const runner = getOneShotRunner()
+  if (runner.mode === 'inline') {
+    report.note = 'SOURCE_RUNNER_MODE=inline 时不判级：跑不可信代码没有隔离可言'
+    await saveReport(id, report)
+    return report
+  }
+
+  const loaded = await withLocalTimeout(
+    runner.validateScript(content, PROBE_LOAD_TIMEOUT_MS),
+    PROBE_LOAD_TIMEOUT_MS + 2_000,
+    '脚本加载',
+  )
+  if (!loaded.ok) {
+    report.note = `脚本初始化失败：${loaded.error ?? '未知原因'}`
+    report.cells['_'] = { outcome: 'load-failed', latencyMs: null, container: null, reason: report.note.slice(0, 120) }
+    await saveReport(id, report)
+    return report
+  }
+
+  const declared = Object.keys((loaded.sourceInfo as { sources?: Record<string, unknown> } | undefined)?.sources ?? {})
+  const platforms = declared.filter(platform => PROBABLE_PLATFORMS.includes(platform))
+  if (!platforms.length) {
+    report.note = '脚本没声明任何可判级平台'
+    await saveReport(id, report)
+    return report
+  }
+
+  const samples = await pickProbeSamples(1)
+  for (const platform of platforms) {
+    const sample = (samples[platform] ?? [])[0]
+    if (!sample) {
+      report.cells[platform] = { outcome: 'no-sample', latencyMs: null, container: null, reason: '库里没有该平台的基准样本' }
+      continue
+    }
+    const started = Date.now()
+    const probed = await withLocalTimeout(
+      runner.probeScript(content, { source: platform, musicInfo: sample, quality: PROBE_QUALITY }, PROBE_CALL_TIMEOUT_MS),
+      PROBE_CALL_TIMEOUT_MS + 2_000,
+      `${platform} 取址`,
+    ).catch((err): { ok: boolean; error?: string; callValue?: unknown; callError?: string } => (
+      { ok: false, error: err instanceof Error ? err.message : String(err) }
+    ))
+    const elapsedMs = Date.now() - started
+
+    if (!probed.ok) {
+      report.cells[platform] = {
+        outcome: elapsedMs >= PROBE_CALL_TIMEOUT_MS ? 'timeout' : 'error',
+        latencyMs: elapsedMs, container: null,
+        reason: String(probed.error ?? '一次性进程失败').slice(0, 120),
+      }
+      continue
+    }
+    const failure = 'callError' in probed && probed.callError ? String(probed.callError) : ''
+    if (failure) {
+      report.cells[platform] = {
+        outcome: elapsedMs >= PROBE_CALL_TIMEOUT_MS ? 'timeout' : isContentMiss(failure) ? 'no-address' : 'error',
+        latencyMs: elapsedMs, container: null, reason: failure.slice(0, 120),
+      }
+      continue
+    }
+    const url = probed.callValue
+    if (typeof url !== 'string' || !url.trim()) {
+      report.cells[platform] = { outcome: 'no-address', latencyMs: elapsedMs, container: null, reason: '脚本返回空地址' }
+      continue
+    }
+    const head = await verifyHead(url)
+    report.cells[platform] = { ...head, latencyMs: elapsedMs }
+  }
+
+  const okCount = Object.values(report.cells).filter(cell => cell.outcome === 'ok').length
+  report.note = `${okCount}/${Object.keys(report.cells).length} 个平台真出货`
+  await saveReport(id, report)
+  return report
+}
+
+/**
+ * 起一次判级：立刻返回，结果靠 GET 轮询。
+ * 判级会真执行第三方脚本（数秒到数十秒），不能把这个时间挂在 HTTP 请求上；
+ * 一次只允许一个，避免多个 slot 同时跑把低配 NAS 压住。
+ */
+export function startCandidateProbe(id: number): { started: boolean; reason?: string } {
+  if (progress.probingId !== null) return { started: false, reason: `候选 ${progress.probingId} 正在判级中` }
+  if (progress.running) return { started: false, reason: '有一轮发现正在跑' }
+  progress.probingId = id
+  progress.lastProbeNote = null
+  void probeCandidate(id)
+    .then(report => { progress.lastProbeNote = report.note ?? '判级完成' })
+    .catch(err => {
+      progress.lastProbeNote = `判级失败：${err instanceof Error ? err.message : String(err)}`
+      logger.info('[discovery] 判级失败', { id, reason: progress.lastProbeNote })
+    })
+    .finally(() => { progress.probingId = null })
+  return { started: true }
+}
+
+/** 面板渲染用：读回已存的判级结果，没判过或内容坏都返回 null */
+export function parseProbeReport(probeJson: string): CandidateProbeReport | null {
+  if (!probeJson) return null
+  try {
+    const parsed = JSON.parse(probeJson) as CandidateProbeReport
+    return parsed && typeof parsed === 'object' && parsed.cells ? parsed : null
+  } catch {
+    return null
+  }
 }

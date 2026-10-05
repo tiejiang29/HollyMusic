@@ -381,6 +381,10 @@ model SourceCandidate {
   state       String    @default("new")
   /// 人类可读的判定依据（面板直接展示）
   reason      String?
+  /// 判级结果（P0-b）：{ 平台: { outcome, latencyMs, container, reason } }。
+  /// 空串 = 从没判过。它与周测同判据但**故意不进健康账本**：探测证据不能污染用户侧证据。
+  probeJson   String    @default("")
+  probedAt    DateTime?
   checkedAt   DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt

@@ -212,7 +212,7 @@ function toProbeMusicInfo(row: MusicInfoRow): MusicInfo {
  * 首块验证：把"拿到了地址"与"地址真能给音频字节"分开计。
  * 走 safePublicFetch（逐跳 SSRF 校验），只读头部，不落磁盘缓存也不进音乐库。
  */
-async function verifyHead(url: string): Promise<{ outcome: ProbeCellOutcome; reason: string | null; container: string | null }> {
+export async function verifyHead(url: string): Promise<{ outcome: ProbeCellOutcome; reason: string | null; container: string | null }> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), HEAD_TIMEOUT_MS)
   timer.unref?.()
