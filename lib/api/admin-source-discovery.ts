@@ -65,13 +65,15 @@ export interface DiscoveryCandidate {
   scriptName: string
   score: number
   verdict: 'pending' | 'suspect' | 'not-source' | string
-  state: 'new' | 'stale' | string
+  state: 'new' | 'stale' | 'imported' | string
   reason: string | null
   sizeBytes: number
   checkedAt: string | null
   /** P0-b 判级结果；null = 还没判过 */
   probe: CandidateProbeView | null
   probedAt: string | null
+  /** P0-c：已导入时它在 custom-sources 下的路径；空串 = 没导入过 */
+  importedPath: string
 }
 
 export interface DiscoveryView {
@@ -100,6 +102,14 @@ export function startCandidateProbe(id: number): Promise<{ started: boolean; rea
 
 export function dismissDiscoveryCandidate(id: number): Promise<{ dismissed: number }> {
   return apiPost<{ dismissed: number }>('admin/source-discovery', { action: 'dismiss', id })
+}
+
+/**
+ * 把候选导入成正式音源。只传 id：服务端按自己那行记录重下载并复验 blob sha，
+ * 判级没有一个平台出货时会被 409 挡回来，`force` 是给管理员"看着红绿灯坚持装"的那一档。
+ */
+export function importDiscoveryCandidate(id: number, force = false): Promise<{ imported: { id: number; path: string; name: string } }> {
+  return apiPost<{ imported: { id: number; path: string; name: string } }>('admin/source-discovery', { action: 'import', id, force })
 }
 
 export function saveDiscoverySettings(payload: {

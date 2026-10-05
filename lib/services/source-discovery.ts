@@ -1,16 +1,18 @@
 /**
- * 音源发现 P0-a：从 GitHub 仓库树里挑出"疑似洛雪音源脚本"的候选，静态打分 + 去重后落库供面板查看。
+ * 音源发现：从 GitHub 仓库树里挑出"疑似洛雪音源脚本"的候选，静态打分去重后落库供面板查看（P0-a），
+ * 在一次性子进程里真取一次址判级（P0-b），管理员点认可后导入成正式音源（P0-c）。
  *
- * 三条边界是这一期存在的理由，改动前先看清：
+ * 三条边界是这套流程存在的理由，改动前先看清：
  * 1. **不入库正文**。候选表里只有元数据（地址、blob sha、内容哈希、打分、判定、判级结果）；
- *    脚本文本只为打分与判级临时落一次系统临时目录，用完即删 —— 既不占库，也不把第三方
- *    代码长期留在我们服务器上。
- * 2. **不改生产取址路径**：不写 config/music-sources.json、**不写健康账本**。
- *    判级（`probeCandidate`）确实会在一次性 slot 里执行第三方脚本，所以**执行前必须先复验
- *    git blob sha**：内容对不上 tree 里那个 sha，就说明下来的不是同一份东西，绝不执行。
+ *    脚本文本只为打分与判级临时取一次，用完即弃 —— 既不占库，也不把第三方代码长期留在我们服务器上。
+ *    唯一会落盘的入口是 `importCandidate`，那是管理员明确点了一次"导入"。
+ * 2. **只有导入才碰生产**：`probeCandidate` 判级不写 `config/music-sources.json`、
+ *    **也不写健康账本**。判级与导入都会执行第三方脚本，所以**执行前必须先复验 git blob sha**：
+ *    内容对不上 tree 里那个 sha，就说明下来的不是同一份东西，绝不执行、绝不入库。
  * 3. **GitHub 仓库地址是唯一可由管理员输入的自由文本**，所以它同时也是本模块的 SSRF 面：
  *    先按 `owner/repo` 白名单形状校验，再逐段 encodeURIComponent，host 恒定两个，最后仍走
  *    safePublicFetch 的 DNS 级闸门。三道里拆掉任一道都不该变成裸请求。
+ *    导入用的地址取自**库里那行记录**，不接受客户端传来的 URL。
  *
  * 参考对象是 zlyon/lx-hunter（GPL-3.0）的流程，本文件为独立实现，未复制其代码。
  */
@@ -22,7 +24,9 @@ import { isContentMiss } from '@/lib/server/source-health'
 import { prisma } from '@/lib/db'
 import { readSetting, writeSetting } from '@/lib/services/app-setting'
 import { safePublicFetch } from '@/lib/server/url-guard'
-import { parseScriptMeta } from '@/lib/services/source-manager-service'
+import { gitBlobSha } from '@/lib/server/git-blob-sha'
+import { parseScriptMeta, importSubscription, readConfig, SourceSubscriptionError } from '@/lib/services/source-manager-service'
+import type { SourceConfig } from '@/lib/types/music'
 
 export const DISCOVERY_SETTING_KEY = 'sourceDiscovery'
 
@@ -601,6 +605,8 @@ export interface CandidateView {
   /** P0-b 判级结果；null = 还没判过 */
   probe: CandidateProbeReport | null
   probedAt: string | null
+  /** P0-c：已导入时它在 custom-sources 下的路径；空串 = 没导入过 */
+  importedPath: string
 }
 
 export async function listCandidates(filter: { verdict?: string; state?: string; take?: number } = {}): Promise<CandidateView[]> {
@@ -626,6 +632,7 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
     checkedAt: row.checkedAt ? row.checkedAt.toISOString() : null,
     probe: parseProbeReport(row.probeJson),
     probedAt: row.probedAt ? row.probedAt.toISOString() : null,
+    importedPath: row.importedPath,
   }))
 }
 
@@ -636,8 +643,12 @@ export async function countCandidates(): Promise<Record<string, number>> {
   return out
 }
 
-/** 面板上手动剔除一条候选（只改 state，不删行） */
+/** 面板上手动剔除一条候选（只改 state，不删行）；还在配置里的音源不给剔除，否则它成了孤儿 */
 export async function dismissCandidate(id: number): Promise<void> {
+  const row = await prisma.sourceCandidate.findUnique({ where: { id }, select: { state: true, importedPath: true } })
+  if (row?.state === 'imported' && await isStillInstalled(row.importedPath)) {
+    throw new SourceDiscoveryError('这条已经导入成音源了，请到「音源管理」里删除它', 409)
+  }
   await prisma.sourceCandidate.update({ where: { id }, data: { state: 'stale' } }).catch(() => {})
 }
 
@@ -663,16 +674,6 @@ const PROBE_LOAD_TIMEOUT_MS = 15_000
 /** 与周测同一档，两处结果才可比 */
 const PROBE_QUALITY = '320k'
 const PROBABLE_PLATFORMS = ['kw', 'tx', 'wy', 'kg', 'mg']
-
-/**
- * git blob 的 sha1：`sha1("blob <字节数>\0" + 内容)`。
- * 与 `git hash-object` 逐字节对过（不是自己算完自证）。
- */
-export function gitBlobSha(content: string): string {
-  const buf = Buffer.from(content, 'utf8')
-  const header = Buffer.from(`blob ${buf.length}\0`, 'binary')
-  return createHash('sha1').update(Buffer.concat([header, buf])).digest('hex')
-}
 
 /**
  * 一次性子进程通道的最小面（runner-client 的真身在生产注入，测试里换假的）。
@@ -874,4 +875,67 @@ export function parseProbeReport(probeJson: string): CandidateProbeReport | null
   } catch {
     return null
   }
+}
+
+// ————— P0-c：导入闭环 —————
+
+function okCellCount(report: CandidateProbeReport | null): number {
+  if (!report) return 0
+  return Object.values(report.cells).filter(cell => cell.outcome === 'ok').length
+}
+
+/**
+ * 候选行写着"已导入"，不代表它还在服役 —— 音源管理里删掉那条源时，候选表这行不会跟着变。
+ * 判据取配置文件（它才是驱动取址瀑布的东西），不取状态：源被删了就该能重新导入，
+ * 否则一次误删会把这条候选永久锁死（实测：删完再点导入，回的是"已经导入为 …"）。
+ */
+async function isStillInstalled(importedPath: string): Promise<boolean> {
+  if (!importedPath) return false
+  const config = await readConfig()
+  return config.sources.some(source => source.path === importedPath)
+}
+
+/**
+ * 把一条候选导入成正式音源。接口只收 id —— **地址与 blob sha 都取自库里那行记录**，
+ * 客户端传进来的 URL / 正文一律不认，否则"发现出来的东西"就能被换成任何地址。
+ *
+ * 服务端按记录里的地址重新下载、先复验 blob sha 再走原有订阅通道（一次性进程校验 →
+ * saveScript → addSource → 立即重建实例）。顺序不能反：sha 对不上说明下下来的不是
+ * 打分/判级时那份东西，那种情况下连执行都不该发生。
+ *
+ * 两道闸门，只有一道能越：
+ * - 判级至少一个平台真出货，`force` 可以越过 —— 管理员对着红绿灯坚持要装，是他的决定；
+ * - 已经导入且**那条源还在配置里**的不给重复导入，**这条不给 force 越** —— 点两下就在
+ *   custom-sources 多一个 `-1.js`，那不属于"坚持"，属于垃圾。源已经在「音源管理」里删掉的，
+ *   这条候选重新开放导入（判据看配置文件，不看候选状态）。
+ */
+export async function importCandidate(id: number, opts: { force?: boolean } = {}): Promise<SourceConfig> {
+  const row = await prisma.sourceCandidate.findUnique({ where: { id } })
+  if (!row) throw new SourceDiscoveryError('候选不存在', 404)
+  if (row.verdict !== 'suspect') throw new SourceDiscoveryError('只导入判定为「疑似音源」的候选')
+  if (row.state === 'imported' && await isStillInstalled(row.importedPath)) {
+    throw new SourceDiscoveryError(`这条候选已经导入为 ${row.importedPath}，请到「音源管理」里管理它`, 409)
+  }
+  if (!opts.force && okCellCount(parseProbeReport(row.probeJson)) === 0) {
+    throw new SourceDiscoveryError(
+      '判级里没有一个平台真出货（或还没判过）。先判级确认能用再导入；确实要强行装入请勾选「忽略判级」',
+      409,
+    )
+  }
+
+  let source: SourceConfig
+  try {
+    source = await importSubscription(row.rawUrl, { expectedBlobSha: row.blobSha })
+  } catch (err) {
+    if (err instanceof SourceDiscoveryError) throw err
+    const status = err instanceof SourceSubscriptionError ? err.status : 422
+    const message = err instanceof Error ? err.message : String(err)
+    // 导入失败不动 state：这是一次没成功的操作，不是"这条候选不值得再看"
+    logger.info('[discovery] 导入失败', { id, repo: row.repo, reason: message.slice(0, 160) })
+    throw new SourceDiscoveryError(`导入失败：${message}`, status)
+  }
+
+  await prisma.sourceCandidate.update({ where: { id }, data: { state: 'imported', importedPath: source.path } })
+  logger.info('[discovery] 候选已导入为音源', { id, 仓库: row.repo, 脚本: source.path })
+  return source
 }

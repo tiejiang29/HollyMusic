@@ -2,8 +2,11 @@
  * 音源发现 API（仅管理员）
  *
  * GET  /api/admin/source-discovery  配置视图（token 只回脱敏尾巴）+ 候选列表 + 本轮进度
- * POST /api/admin/source-discovery  { action: 'crawl' } 起一轮发现；{ action:'dismiss', id } 剔除一条
+ * POST /api/admin/source-discovery  { action: 'crawl' } 起一轮发现；{ action:'probe', id } 起一次判级；
+ *                                   { action:'dismiss'|'import', id, force? } 剔除 / 导入成音源
  * PUT  /api/admin/source-discovery  改配置：{ enabled, repos, maxCandidatesPerRepo, maxDownloadsPerRound, githubToken?, clearToken? }
+ *
+ * 导入只认 candidateId：地址与 blob sha 都取自服务端那行记录，客户端传 URL 或正文都没有入口。
  */
 
 import { NextRequest } from 'next/server'
@@ -17,6 +20,7 @@ import {
   discoveryStatus,
   dismissCandidate,
   getDiscoverySettings,
+  importCandidate,
   listCandidates,
   runDiscoveryCrawl,
   saveDiscoverySettings,
@@ -92,6 +96,14 @@ export async function POST(request: NextRequest) {
       return result.started
         ? createSuccessResponse(result, 202)
         : createSuccessResponse(result)
+    }
+
+    if (action === 'import') {
+      const id = Number(body?.id)
+      if (!Number.isFinite(id) || id <= 0) return createErrorResponse('INVALID_PARAMS', '缺少合法的候选 id', 400)
+      // 导入要重下载 + 一次性进程校验，最坏十几秒，但必须等它出结果才知道源名，所以同步返回
+      const source = await importCandidate(id, { force: body?.force === true })
+      return createSuccessResponse({ imported: { id, path: source.path, name: source.name ?? source.path } })
     }
 
     if (action === 'crawl') {

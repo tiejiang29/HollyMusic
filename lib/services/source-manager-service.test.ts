@@ -1,12 +1,14 @@
 /**
  * 音源管理服务的健康度挂载测试
  *
- * 只钉一件事：面板读到的 health 必须能对上账本里的键。manager 用的是
- * `name || path`（name 缺省回退脚本路径），服务侧若各写一套（比如直接用可能为
- * undefined 的 name），结果就是面板对所有源都显示"无实测"——数据在账本里，界面上看不见。
+ * 只钉两件事：
+ * 1. 面板读到的 health 必须能对上账本里的键。manager 用的是
+ *    `name || path`（name 缺省回退脚本路径），服务侧若各写一套（比如直接用可能为
+ *    undefined 的 name），结果就是面板对所有源都显示"无实测"——数据在账本里，界面上看不见。
+ * 2. 导入通道里 **blob sha 的复验排在执行之前**（见文末那一节），这条靠假运行器盯。
  */
 
-import { describe, it, expect, vi, beforeAll } from 'vitest'
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
 import fs from 'fs'
 import path from 'path'
 
@@ -14,7 +16,12 @@ vi.mock('@/lib/logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
 
-const { listSourcesWithStatus, addSource, deleteScript } = await import('./source-manager-service')
+const { listSourcesWithStatus, addSource, deleteScript, importSubscription, SourceSubscriptionError, _setRunnerClientForTest } = await import('./source-manager-service')
+
+/** 假的执行通道：一旦被告知"开始校验脚本"，就说明 sha 那道门没拦住 —— 直接让它报错 */
+const validateScriptMock = vi.hoisted(() => vi.fn(async () => {
+  throw new Error('不该执行到这一步（脚本本该在复验 blob sha 时就被拒掉）')
+}))
 const { sourceHealth } = await import('@/lib/server/source-health')
 
 const CONFIG_PATH = path.resolve(process.cwd(), 'config/music-sources.json')
@@ -108,5 +115,52 @@ describe('脚本路径必须限定在 custom-sources 内', () => {
 
   it('不存在的 .js 路径不报错（保持 best-effort 语义），但越界路径也不会被当成不存在而静默放过', async () => {
     await expect(deleteScript('custom-sources/__does-not-exist__.js')).resolves.toBeUndefined()
+  })
+})
+
+/**
+ * 音源发现导入时会带上 `expectedBlobSha`：这条断言钉的是**顺序**，不是"有没有校验"。
+ *
+ * 只测对不上的那一支 —— 对上以后就会进 `validateScriptContent`（本文件把它隔成假运行器）
+ * 再进 saveScript/addSource（真写 dev 库正在用的那份配置），拿生产路径当测试场地不值当。
+ * "对不上就绝不执行、绝不落盘"恰恰是这唯一的不可让步点，够钉住它。
+ */
+describe('导入前的 blob sha 复验', () => {
+  const SCRIPTS_DIR = path.resolve(process.cwd(), 'custom-sources')
+  const RAW_URL = 'https://raw.githubusercontent.com/a/b/HEAD/lx-source.js'
+  const SCRIPT_TEXT = [
+    '/**',
+    ' * @name 合成测试音源 v1.0.0',
+    ' */',
+    "const lx = globalThis.lx",
+    "lx.send('inited', { status: true, source: { tx: 1 } })",
+  ].join('\n')
+
+  afterEach(() => {
+    _setRunnerClientForTest(null)
+    vi.unstubAllGlobals()
+  })
+
+  beforeEach(() => {
+    validateScriptMock.mockReset()
+    // 换掉真的一次性子进程：这一支要看的就是"有没有走到执行"
+    _setRunnerClientForTest({ mode: 'process', validateScript: validateScriptMock })
+  })
+
+  it('内容与 tree 记录的 sha 不一致 ⇒ 409 拒掉，custom-sources 里一个文件都不多', async () => {
+    fs.mkdirSync(SCRIPTS_DIR, { recursive: true })
+    const before = fs.readdirSync(SCRIPTS_DIR)
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(SCRIPT_TEXT, { headers: { 'content-type': 'text/plain' } })))
+
+    const err = await importSubscription(RAW_URL, { expectedBlobSha: '0'.repeat(40) })
+      .then(() => null, (e: unknown) => e as Error & { status?: number })
+
+    expect(err).toBeInstanceOf(SourceSubscriptionError)
+    expect(err?.status).toBe(409)
+    expect(err?.message).toContain('blob 不一致')
+    // 顺序判据：拒绝必须发生在**执行之前**。把 sha 检查挪到 validate 之后，这一条就会红
+    expect(validateScriptMock).not.toHaveBeenCalled()
+    expect(fs.readdirSync(SCRIPTS_DIR)).toEqual(before)
   })
 })

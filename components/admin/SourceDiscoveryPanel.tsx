@@ -1,5 +1,8 @@
 /**
- * 音源发现面板（admin Tab 子组件，P0-a：只发现、不导入）。
+ * 音源发现面板（admin Tab 子组件）。
+ *
+ * 发现 → 判级 → 导入三步都在这里收口：候选表给元数据，红绿灯给"真能不能出货"，
+ * 导入按钮才碰 config/music-sources.json。
  *
  * 配置全部在这里改（含 GitHub token）——改配置文件要登 NAS，管理员做不到也不该要求。
  * token 是**写入不回显**的：接口只返回脱敏尾巴，输入框留空表示不改动。
@@ -9,6 +12,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   dismissDiscoveryCandidate,
   getDiscovery,
+  importDiscoveryCandidate,
   saveDiscoverySettings,
   startCandidateProbe,
   startDiscoveryCrawl,
@@ -19,13 +23,14 @@ import {
 } from '@/lib/api/admin-source-discovery'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2 } from 'lucide-react'
+import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download } from 'lucide-react'
 import { copyAddress } from '@/lib/utils/clipboard'
 
 const FILTERS = [
   { key: 'suspect', label: '疑似可用', verdict: 'suspect', state: 'new' },
   { key: 'pending', label: '待判定', verdict: 'pending', state: 'new' },
   { key: 'not-source', label: '不像音源', verdict: 'not-source', state: 'new' },
+  { key: 'imported', label: '已导入', verdict: '', state: 'imported' },
   { key: 'stale', label: '已被顶掉', verdict: '', state: 'stale' },
 ] as const
 
@@ -79,6 +84,17 @@ export function ProbeLights({ cells }: { cells: Record<string, ProbeCellView> })
   )
 }
 
+/**
+ * 判级里真出货的平台数 —— 导入按钮的依据。
+ *
+ * 导出是为了能直测：服务端 `importCandidate` 有同一条判据（至少一格 ok），
+ * 两边算得不一样时，按钮会说"可以装"而接口回你 409，管理员看到的就是自相矛盾。
+ */
+export function okPlatformCount(cells: Record<string, ProbeCellView> | undefined): number {
+  if (!cells) return 0
+  return Object.values(cells).filter(cell => cell.outcome === 'ok').length
+}
+
 const OUTCOME_LABEL: Record<string, string> = {
   ok: '真出货',
   'no-address': '没给地址',
@@ -112,6 +128,11 @@ export function SourceDiscoveryPanel() {
   const [starting, setStarting] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  const [importingId, setImportingId] = useState<number | null>(null)
+  // 判级没出货的候选要点两下：第一下只把按钮变成「确认强制导入」。
+  // force 是"管理员对着红灯坚持要装"那一档，不该一次点击就能触发。
+  const [forceConfirmId, setForceConfirmId] = useState<number | null>(null)
+  const [importNote, setImportNote] = useState<string | null>(null)
   // 面板跑在明文 HTTP 上（NAS 局域网），非安全上下文里 navigator.clipboard 直接不存在，
   // 所以必须能降级成"手动选中"，否则这个按钮在真实环境是死的
   const [clipboardBlocked, setClipboardBlocked] = useState(false)
@@ -208,8 +229,34 @@ export function SourceDiscoveryPanel() {
     }
   }
 
-  const countOf = (key: string) => Object.entries(counts)
-    .filter(([compound]) => compound.startsWith(`${key}/`))
+  const handleImport = async (row: DiscoveryCandidate) => {
+    const hasOk = okPlatformCount(row.probe?.cells) > 0
+    if (!hasOk && forceConfirmId !== row.id) {
+      setForceConfirmId(row.id)
+      return
+    }
+    setForceConfirmId(null)
+    setImportingId(row.id)
+    try {
+      const result = await importDiscoveryCandidate(row.id, !hasOk)
+      setImportNote(`已导入为「${result.imported.name}」（${result.imported.path}），到「音源管理」可调优先级或直接停用`)
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '导入失败')
+    } finally {
+      setImportingId(null)
+    }
+  }
+
+  /**
+   * 分类页签上的计数。counts 的键是 `verdict/state`，所以页签给的两个维度都得各自匹配
+   * （空串=不限）—— 之前只按一个键名前缀筛，"已被顶掉/已导入"这类按 state 分的页签恒显示 0。
+   */
+  const countOf = (verdict: string, state: string) => Object.entries(counts)
+    .filter(([compound]) => {
+      const [rowVerdict, rowState] = compound.split('/')
+      return (!verdict || rowVerdict === verdict) && (!state || rowState === state)
+    })
     .reduce((sum, [, n]) => sum + n, 0)
 
   return (
@@ -221,7 +268,8 @@ export function SourceDiscoveryPanel() {
             音源发现
           </h2>
           <p className="text-sm text-muted-foreground">
-            从 GitHub 仓库树里挑出疑似洛雪音源脚本，静态打分去重后进候选表。<b>本期只做发现，导入下一期再开</b>。
+            从 GitHub 仓库树里挑出疑似洛雪音源脚本，静态打分去重后进候选表；「判级」在一次性沙箱里真取一次址，
+            点过「导入」才会把它装进音源列表。
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -338,14 +386,20 @@ export function SourceDiscoveryPanel() {
             {FILTERS.map(item => (
               <button
                 key={item.key}
-                onClick={() => setFilter(item)}
+                onClick={() => { setFilter(item); setForceConfirmId(null) }}
                 className={`rounded-full px-3 py-1.5 text-xs font-medium ${filter.key === item.key ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent'}`}
               >
                 {item.label}
-                <span className="ml-1 opacity-70">{countOf(item.verdict || item.state)}</span>
+                <span className="ml-1 opacity-70">{countOf(item.verdict, item.state)}</span>
               </button>
             ))}
           </div>
+
+          {importNote ? (
+            <div className="mb-3 rounded-lg border border-green-600/40 bg-green-600/10 px-4 py-2 text-xs text-green-800">
+              {importNote}
+            </div>
+          ) : null}
 
           {candidates.length === 0 ? (
             <EmptyState icon={Radar} title="这一类没有候选" description="开一轮发现后再看，或换个分类" />
@@ -354,7 +408,7 @@ export function SourceDiscoveryPanel() {
               <table className="w-full text-sm">
                 <thead className="bg-accent/40 text-left text-xs uppercase text-muted-foreground">
                   <tr>
-                    <th className="px-4 py-3 font-medium">来源与地址（可粘到「音源管理 → 从订阅链接导入」）</th>
+                    <th className="px-4 py-3 font-medium">来源与地址</th>
                     <th className="px-4 py-3 font-medium">@name</th>
                     <th className="px-4 py-3 font-medium">分</th>
                     <th className="px-4 py-3 font-medium">大小</th>
@@ -369,6 +423,9 @@ export function SourceDiscoveryPanel() {
                       <td className="px-4 py-3 font-mono text-xs">
                         <div>{row.repo}</div>
                         <div className="text-muted-foreground">{row.path}</div>
+                        {row.importedPath ? (
+                          <div className="text-green-700">已导入 → {row.importedPath}</div>
+                        ) : null}
                         <AddressCell
                           rawUrl={row.rawUrl}
                           copied={copiedId === row.id}
@@ -399,10 +456,29 @@ export function SourceDiscoveryPanel() {
                               : <Radar className="h-3.5 w-3.5" />}
                             判级
                           </button>
+                          {row.state === 'imported' ? null : (
+                            <button
+                              onClick={() => { void handleImport(row) }}
+                              disabled={row.verdict !== 'suspect' || importingId !== null}
+                              title={okPlatformCount(row.probe?.cells) > 0
+                                ? '按记录里的地址重新下载、复验 blob sha，通过后才装入音源列表'
+                                : '判级里没有平台真出货 —— 再点一次表示坚持导入'}
+                              className={`flex items-center gap-1 rounded px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40 ${
+                                forceConfirmId === row.id
+                                  ? 'bg-destructive/15 text-destructive hover:bg-destructive/25'
+                                  : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+                              }`}
+                            >
+                              {importingId === row.id
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                : <Download className="h-3.5 w-3.5" />}
+                              {forceConfirmId === row.id ? '确认强制导入' : '导入'}
+                            </button>
+                          )}
                           <button
                             onClick={() => handleDismiss(row.id)}
-                            disabled={row.state === 'stale'}
-                            title="从候选里剔除"
+                            disabled={row.state === 'stale' || row.state === 'imported'}
+                            title={row.state === 'imported' ? '它已经是音源了，请到「音源管理」里删除' : '从候选里剔除'}
                             className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             <Ban className="h-3.5 w-3.5" /> 剔除
@@ -423,8 +499,10 @@ export function SourceDiscoveryPanel() {
           ) : null}
 
           <p className="mt-4 text-xs text-muted-foreground">
-            候选表里只有元数据（地址、内容哈希、打分、判定），脚本正文既不落库也不留在服务器上；
-            真要导入时会按地址重新下载并复验，那是下一期的事。
+            候选表里只有元数据（地址、内容哈希、打分、判定），脚本正文既不落库也不留在服务器上。
+            点「导入」时服务端按记录里的地址重新下载，先复验仓库 tree 的 blob sha 再进一次性沙箱校验，
+            对不上就直接拒绝 —— 装进列表的一定是判级时看过的那一份。导入后的源会登记成订阅，
+            上游更新可在「音源管理」里手动拉取。
           </p>
         </>
       )}

@@ -377,7 +377,7 @@ model SourceCandidate {
   score       Int       @default(0)
   /// pending（还没下过正文）| suspect（疑似音源）| not-source（不像音源）
   verdict     String    @default("pending")
-  /// new | stale（被更优的同名/同内容项顶掉）
+  /// new | stale（被更优的同名/同内容项顶掉，或被手动剔除）| imported（已导入为音源）
   state       String    @default("new")
   /// 人类可读的判定依据（面板直接展示）
   reason      String?
@@ -385,6 +385,8 @@ model SourceCandidate {
   /// 空串 = 从没判过。它与周测同判据但**故意不进健康账本**：探测证据不能污染用户侧证据。
   probeJson   String    @default("")
   probedAt    DateTime?
+  /// 导入后落在 custom-sources 下的脚本路径；非空 = 已经进过配置，面板据此显示"已导入"
+  importedPath String    @default("")
   checkedAt   DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt

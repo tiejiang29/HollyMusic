@@ -14,6 +14,7 @@ import fsp from 'fs/promises'
 import path from 'path'
 import dns from 'dns/promises'
 import net from 'net'
+import { gitBlobSha } from '@/lib/server/git-blob-sha'
 import { logger } from '@/lib/logger'
 import { isPublicIp } from '@/lib/server/url-guard'
 import { sourceHealth, type SourceHealthView } from '@/lib/server/source-health'
@@ -149,6 +150,31 @@ export function buildMetaFilename(meta: { name?: string; version?: string }): st
   return `${sanitizeFilename(base || 'unnamed-source')}.js`
 }
 
+/** 一次性进程通道的最小面（真身是 runner-client 的 SourceRunnerClient） */
+interface RunnerClientLike {
+  readonly mode: string
+  validateScript(scriptContent: string, timeoutMs?: number): Promise<ScriptValidationResult>
+}
+
+function getSourceRunnerClient(): RunnerClientLike {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('../music-core/runner-client').getSourceRunner() as RunnerClientLike
+}
+
+let runnerClientOverride: RunnerClientLike | null = null
+
+/**
+ * 仅供测试：把一次性进程通道换成假的。
+ *
+ * 为什么要开这个口子：`validateScriptContent` 取 runner 用的是 `require()`，Vitest 的模块 mock
+ * 拦不住它，于是"blob sha 复验排在执行之前"这条**顺序**判据钉不住 —— 实测把 sha 检查挪到
+ * 执行之后，测试照样全绿。没有假通道就只能验"最后报了 409"，而那恰恰不是这条的性质。
+ * 与 source-discovery 的 `_setRunnerForTest` 同构。
+ */
+export function _setRunnerClientForTest(runner: RunnerClientLike | null): void {
+  runnerClientOverride = runner
+}
+
 /**
  * 预校验脚本（同步等待 inited）。
  * - 默认：在一次性子进程中执行（不可信代码首跑不碰主进程与常驻 runner）
@@ -156,8 +182,7 @@ export function buildMetaFilename(meta: { name?: string; version?: string }): st
  * - 成功 → { ok: true, sourceInfo }；失败 → { ok: false, error }
  */
 export async function validateScriptContent(scriptContent: string): Promise<ScriptValidationResult> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const runner = require('../music-core/runner-client').getSourceRunner()
+  const runner = runnerClientOverride ?? getSourceRunnerClient()
 
   if (runner.mode !== 'inline') {
     return runner.validateScript(scriptContent, SUBSCRIPTION_REQUEST_TIMEOUT_MS)
@@ -434,10 +459,32 @@ export async function addSource(opts: {
   return newSource
 }
 
-/** 从在线链接导入洛雪脚本，校验通过后自动注册为可更新订阅。 */
-export async function importSubscription(subscriptionUrl: string): Promise<SourceConfig> {
+/**
+ * 从在线链接导入洛雪脚本，校验通过后自动注册为可更新订阅。
+ *
+ * `expectedBlobSha` 只给音源发现导入用：候选表存的是 GitHub 树接口给的 blob sha，
+ * 服务端按地址**重新下载**后先复验它，再走校验。顺序不能换 ——
+ * `validateScriptContent` 会真执行这份脚本，内容对不上就不该有执行这一步。
+ */
+export async function importSubscription(
+  subscriptionUrl: string,
+  options: { expectedBlobSha?: string } = {},
+): Promise<SourceConfig> {
   const normalizedUrl = subscriptionUrl.trim()
   const { content, filename } = await fetchSubscriptionScript(normalizedUrl)
+
+  const expected = (options.expectedBlobSha || '').toLowerCase()
+  if (expected) {
+    const actual = gitBlobSha(content)
+    if (actual !== expected) {
+      throw new SourceSubscriptionError(
+        `内容与仓库 tree 记录的 blob 不一致（期望 ${expected.slice(0, 8)}…，实到 ${actual.slice(0, 8)}…），`
+        + '可能上游刚改过、也可能地址被改写，拒绝导入',
+        409,
+      )
+    }
+  }
+
   const validation = await validateScriptContent(content)
   if (!validation.ok) {
     throw new SourceSubscriptionError(`脚本校验失败：${validation.error || '未知错误'}`)

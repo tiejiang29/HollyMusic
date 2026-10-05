@@ -1,5 +1,5 @@
 /**
- * 音源发现（P0-a）的服务层测试。
+ * 音源发现（P0-a 发现 / P0-b 判级 / P0-c 导入）的服务层测试。
  *
  * 两处刻意的做法：
  * - 把 safePublicFetch 桥到 global fetch 上（DNS 解析在测试里没有意义），但**请求形状**照验；
@@ -7,7 +7,11 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { prismaMock } = vi.hoisted(() => ({ prismaMock: { appSetting: {}, sourceCandidate: {} } as Record<string, Record<string, unknown>> }))
+const { prismaMock, importSubscriptionMock, readConfigMock } = vi.hoisted(() => ({
+  prismaMock: { appSetting: {}, sourceCandidate: {} } as Record<string, Record<string, unknown>>,
+  importSubscriptionMock: vi.fn(),
+  readConfigMock: vi.fn(async () => ({ sources: [] as Array<{ path: string }> })),
+}))
 
 vi.mock('@/lib/db', () => ({ prisma: prismaMock }))
 vi.mock('@/lib/server/url-guard', () => ({
@@ -18,6 +22,18 @@ vi.mock('@/lib/services/source-manager-service', () => ({
     name: /@name\s+([^\r\n]+)/.exec(content)?.[1]?.trim(),
     version: /@version\s+([^\r\n]+)/.exec(content)?.[1]?.trim(),
   }),
+  // 导入通道本身有它自己的测试，这里只关心发现层怎么调它（地址与 sha 从哪来、几时不给调）
+  importSubscription: importSubscriptionMock,
+  // "已导入"的判据看配置文件，不是候选状态 —— 用它来演"源被删了"的两种局面
+  readConfig: readConfigMock,
+  SourceSubscriptionError: class SourceSubscriptionError extends Error {
+    readonly status: number
+    constructor(message: string, status = 422) {
+      super(message)
+      this.name = 'SourceSubscriptionError'
+      this.status = status
+    }
+  },
 }))
 
 const { probeDeps } = vi.hoisted(() => ({
@@ -34,8 +50,9 @@ vi.mock('./source-probe', () => probeDeps)
 const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
-  probeCandidate, gitBlobSha, _setRunnerForTest,
+  probeCandidate, importCandidate, dismissCandidate, _setRunnerForTest,
 } = await import('./source-discovery')
+const { gitBlobSha } = await import('@/lib/server/git-blob-sha')
 
 interface FetchCallPair { mock: { calls: Array<[string, RequestInit?]> } }
 /** 读假 fetch 的调用记录：写清楚形状，比在每个断言里 cast any 好 */
@@ -56,6 +73,9 @@ beforeEach(() => {
   rows = []
   nextId = 1
   settingRows.clear()
+  importSubscriptionMock.mockReset()
+  readConfigMock.mockReset()
+  readConfigMock.mockResolvedValue({ sources: [] })
   prismaMock.appSetting.findUnique = vi.fn(async ({ where }: KeyWhere) =>
     settingRows.has(where.key) ? { value: settingRows.get(where.key) } : null)
   prismaMock.appSetting.upsert = vi.fn(async ({ where, create, update }: SettingUpsert) => {
@@ -72,7 +92,7 @@ beforeEach(() => {
     // 补齐 schema 里带 @default 的列：真库由 Prisma 填，假库要自己填，否则测不出真实形状
     const row = {
       blobSha: '', scriptName: '', nameKey: '', contentHash: '', upstreamAt: '', sizeBytes: 0, score: 0,
-      verdict: 'pending', state: 'new', reason: null, checkedAt: null,
+      verdict: 'pending', state: 'new', reason: null, checkedAt: null, probeJson: '', importedPath: '',
       id: nextId++, ...data,
     } as Row
     rows.push(row)
@@ -322,7 +342,7 @@ function seedSuspect(over: Partial<Row> = {}): number {
     id: nextId++, repo: 'a/b', path: 'lx-source.js', rawUrl: RAW_URL, blobSha: '',
     scriptName: '合成测试音源 v1.2.0', nameKey: '合成测试音源', contentHash: '', upstreamAt: '',
     sizeBytes: 400, score: 8, verdict: 'suspect', state: 'new', reason: null,
-    probeJson: '', probedAt: null, checkedAt: null, ...over,
+    probeJson: '', probedAt: null, checkedAt: null, importedPath: '', ...over,
   } as Row
   rows.push(row)
   return row.id
@@ -345,14 +365,6 @@ function fakeRunner(options: { loadOk?: boolean; loadError?: string; probeImpl?:
     probeScript: vi.fn(options.probeImpl ?? (async () => ({ ok: true, sourceInfo: {}, callValue: 'https://cdn.example.test/play.mp3' }))),
   }
 }
-
-describe('gitBlobSha', () => {
-  it('与 `git hash-object` 的权威值对上（不是自己算完自证）', () => {
-    // 对照值由 `git hash-object` 对同样内容算出；换行用 fromCharCode 写，避免转义把源码搅坏
-    const content = `hello git${String.fromCharCode(10)}`
-    expect(gitBlobSha(content)).toBe('8d0e41234f24b6da002d962a26c2495ea16a425f')
-  })
-})
 
 describe('probeCandidate', () => {
   beforeEach(() => {
@@ -449,5 +461,102 @@ describe('probeCandidate', () => {
   it('只给"疑似音源"判级：pending 直接拒', async () => {
     const id = seedSuspect({ verdict: 'pending' })
     await expect(probeCandidate(id)).rejects.toThrow(/疑似音源/)
+  })
+})
+
+// ————— P0-c：导入闭环 —————
+
+/** 造一份判级结果：只关心"哪几格真出货"，其余字段按真形状填 */
+function probeReportOf(outcomes: Record<string, string>): string {
+  return JSON.stringify({
+    cells: Object.fromEntries(Object.entries(outcomes).map(([platform, outcome]) => [
+      platform,
+      { outcome, latencyMs: 120, container: outcome === 'ok' ? 'mp3' : null, reason: null },
+    ])),
+    shaVerified: true,
+    note: null,
+  })
+}
+
+describe('importCandidate', () => {
+  it('判级有平台出货才放行：地址与 blob sha 都取自库里那一行，不给调用方插手', async () => {
+    const sha = gitBlobSha(FAKE_SOURCE_SCRIPT)
+    const id = seedSuspect({ blobSha: sha, probeJson: probeReportOf({ tx: 'ok', kw: 'no-address' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/合成测试音源 v1.2.0.js', name: '合成测试音源' })
+
+    const source = await importCandidate(id)
+    expect(importSubscriptionMock).toHaveBeenCalledWith(RAW_URL, { expectedBlobSha: sha })
+    expect(source.path).toContain('custom-sources')
+    expect(rows.find(r => r.id === id)).toMatchObject({
+      state: 'imported', importedPath: 'custom-sources/合成测试音源 v1.2.0.js',
+    })
+  })
+
+  it('一个平台都没出货 ⇒ 挡住，一次都不碰导入通道（这是唯一会写生产配置的入口）', async () => {
+    const id = seedSuspect({ probeJson: probeReportOf({ tx: 'error' }) })
+    await expect(importCandidate(id)).rejects.toThrow(/没有一个平台真出货/)
+    expect(importSubscriptionMock).not.toHaveBeenCalled()
+  })
+
+  it('从没判过 = 一样挡住：没证据不等于证据是坏的，但更不等于能装', async () => {
+    const id = seedSuspect()
+    await expect(importCandidate(id)).rejects.toThrow(/没有一个平台真出货/)
+    expect(importSubscriptionMock).not.toHaveBeenCalled()
+  })
+
+  it('force 越的是"人没确认"这一道，blob sha 复验照样带着走 —— 完整性不给撤', async () => {
+    const sha = 'a'.repeat(40)
+    const id = seedSuspect({ blobSha: sha, probeJson: probeReportOf({ tx: 'error' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/x.js', name: 'x' })
+
+    await importCandidate(id, { force: true })
+    expect(importSubscriptionMock).toHaveBeenCalledWith(RAW_URL, { expectedBlobSha: sha })
+  })
+
+  it('已导入且那条源还在配置里 ⇒ 不给重复导入，force 也不行（点两下多一个 -1.js 叫垃圾）', async () => {
+    const id = seedSuspect({ state: 'imported', importedPath: 'custom-sources/x.js', probeJson: probeReportOf({ tx: 'ok' }) })
+    readConfigMock.mockResolvedValue({ sources: [{ path: 'custom-sources/x.js' }] })
+    await expect(importCandidate(id, { force: true })).rejects.toThrow(/已经导入为 custom-sources\/x\.js/)
+    expect(importSubscriptionMock).not.toHaveBeenCalled()
+  })
+
+  it('那条源已经在「音源管理」里删掉了 ⇒ 重新开放导入（判据看配置，不是看候选状态）', async () => {
+    const sha = 'b'.repeat(40)
+    const id = seedSuspect({ state: 'imported', importedPath: 'custom-sources/x.js', blobSha: sha, probeJson: probeReportOf({ tx: 'ok' }) })
+    readConfigMock.mockResolvedValue({ sources: [{ path: 'custom-sources/别的源.js' }] })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/x-1.js', name: 'X' })
+
+    await importCandidate(id)
+    expect(importSubscriptionMock).toHaveBeenCalledWith(RAW_URL, { expectedBlobSha: sha })
+    expect(rows.find(r => r.id === id)).toMatchObject({ state: 'imported', importedPath: 'custom-sources/x-1.js' })
+  })
+
+  it('导入通道报错（sha 对不上就是这里拦的）原样带上原因，且不回写 state：失败的操作不该判死候选', async () => {
+    const id = seedSuspect({ probeJson: probeReportOf({ tx: 'ok' }) })
+    const { SourceSubscriptionError } = await import('@/lib/services/source-manager-service')
+    importSubscriptionMock.mockRejectedValue(new SourceSubscriptionError('内容与仓库 tree 记录的 blob 不一致，拒绝导入', 409))
+
+    await expect(importCandidate(id)).rejects.toThrow(/blob 不一致/)
+    const row = rows.find(r => r.id === id)
+    expect(row?.state).toBe('new')
+    expect(row?.importedPath).toBe('')
+  })
+
+  it('非 suspect 的候选不给导入', async () => {
+    const id = seedSuspect({ verdict: 'not-source' })
+    await expect(importCandidate(id)).rejects.toThrow(/疑似音源/)
+  })
+
+  it('已导入的候选不给"剔除" —— 那会让配置里的源变成没人认领的文件', async () => {
+    const id = seedSuspect({ state: 'imported', importedPath: 'custom-sources/x.js' })
+    readConfigMock.mockResolvedValue({ sources: [{ path: 'custom-sources/x.js' }] })
+    await expect(dismissCandidate(id)).rejects.toThrow(/音源管理/)
+    expect(rows.find(r => r.id === id)?.state).toBe('imported')
+  })
+
+  it('源已经被删掉的候选可以正常剔除（状态只是历史，不该把行锁死）', async () => {
+    const id = seedSuspect({ state: 'imported', importedPath: 'custom-sources/x.js' })
+    await dismissCandidate(id)
+    expect(rows.find(r => r.id === id)?.state).toBe('stale')
   })
 })
