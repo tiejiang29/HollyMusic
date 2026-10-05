@@ -2,7 +2,9 @@
  * 音源发现 API（仅管理员）
  *
  * GET  /api/admin/source-discovery  配置视图（token 只回脱敏尾巴）+ 候选列表 + 本轮进度
- * POST /api/admin/source-discovery  { action: 'crawl' } 起一轮发现；{ action:'drain' } 连轮清完待判定；
+ * POST /api/admin/source-discovery  { action: 'crawl', repos? } 起一轮发现（repos 给了就只扫这些仓）；
+ *                                   { action:'drain' } 连轮清完待判定；
+ *                                   { action:'search', query, page?, sort? } 按关键词搜 GitHub 仓库（只返回元数据，不入清单）；
  *                                   { action:'probe', id } 起一次判级；{ action:'probe-batch' } 批量判级（一批≤50）；
  *                                   { action:'stop' } 请求停止；
  *                                   { action:'prune' } 清理已移除仓的候选；
@@ -30,6 +32,7 @@ import {
   runDiscoveryCrawl,
   runDiscoveryDrain,
   saveDiscoverySettings,
+  searchGitHubRepos,
   startCandidateProbe,
   startCandidateProbeBatch,
   type DiscoverySettings,
@@ -140,10 +143,17 @@ export async function POST(request: NextRequest) {
       return createSuccessResponse(requestDiscoveryStop())
     }
 
+    if (action === 'search') {
+      // 同步返回：一次搜索就一个接口调用（约 1 秒），而且搜完就得看到结果
+      const result = await searchGitHubRepos(body?.query, body?.page, body?.sort, body?.pageSize)
+      return createSuccessResponse(result)
+    }
+
     if (action === 'crawl') {
       if (discoveryStatus().running) return createSuccessResponse({ started: false, reason: '已有一轮在跑' })
       // 异步跑：一轮要几分钟，不能让请求挂着；进度靠 GET 轮询
-      void runDiscoveryCrawl().catch(err => {
+      // repos 只当"缩小子集"用：清单外的仓传进来会被丢掉，扫什么仍以库里的清单为准
+      void runDiscoveryCrawl({ onlyRepos: body?.repos }).catch(err => {
         logger.warn('[discovery] 本轮失败:', err instanceof Error ? err.message : err)
       })
       return createSuccessResponse({ started: true }, 202)

@@ -123,8 +123,44 @@ export function getDiscovery(filter: { verdict?: string; state?: string } = {}):
   return apiGet<DiscoveryView>(`admin/source-discovery${suffix}`)
 }
 
-export function startDiscoveryCrawl(): Promise<{ started: boolean; reason?: string }> {
-  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'crawl' })
+export function startDiscoveryCrawl(onlyRepos?: string[]): Promise<{ started: boolean; reason?: string }> {
+  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', {
+    action: 'crawl',
+    // 空数组与不给是同一件事（扫全清单），别把 [] 传上去让人以为"扫 0 个仓"
+    ...(onlyRepos && onlyRepos.length ? { repos: onlyRepos } : {}),
+  })
+}
+
+/** 搜索结果里的一行：只有元数据，正文一个字节都不落地 */
+export interface RepoSearchItemView {
+  repo: string
+  description: string
+  stars: number
+  lastPushAt: string
+  language: string
+  fork: boolean
+  archived: boolean
+  /** 已经在扫描清单里 —— 面板据此置灰，避免重复勾选 */
+  alreadyListed: boolean
+}
+
+export interface RepoSearchResultView {
+  total: number
+  page: number
+  pageSize: number
+  sort: 'best' | 'updated' | 'stars'
+  incomplete: boolean
+  /** 搜索接口自己的配额档，与爬仓库树的 core 额度分开算 */
+  quota: { remaining: number; limit: number; resetAt: number } | null
+  items: RepoSearchItemView[]
+}
+
+/** 按关键词搜 GitHub 仓库。**只返回候选清单**，不会改配置、不会扫描、不会下载正文 */
+export function searchDiscoveryRepos(
+  query: string,
+  opts: { page?: number; sort?: 'best' | 'updated' | 'stars'; pageSize?: number } = {},
+): Promise<RepoSearchResultView> {
+  return apiPost<RepoSearchResultView>('admin/source-discovery', { action: 'search', query, ...opts })
 }
 
 /** 连轮清完待判定（一轮吃满下载额度就自动接下一轮） */

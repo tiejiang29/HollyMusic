@@ -56,6 +56,7 @@ vi.mock('./source-probe', () => probeDeps)
 
 const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
+  searchGitHubRepos, sanitizeRepoQuery, repoSearchItemFromApi,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
@@ -182,6 +183,14 @@ describe('normalizeRepo', () => {
       expect(normalizeRepo(bad), bad).toBeNull()
     }
   })
+
+  it('`..` 单独占一段也是穿越：encodeURIComponent 不编码点，URL 会自己把 /repos/../ 折叠掉', () => {
+    // 实测形状：new URL('https://api.github.com/repos/../etc/git/trees/HEAD').pathname === '/etc/git/trees/HEAD'
+    for (const bad of ['../etc', 'foo/..', '../..', '..../x']) {
+      expect(normalizeRepo(bad), bad).toBeNull()
+    }
+    expect(new URL('https://api.github.com/repos/../etc/git/trees/HEAD').pathname).toBe('/etc/git/trees/HEAD')
+  })
 })
 
 describe('isPlausibleScriptPath', () => {
@@ -243,6 +252,7 @@ describe('runDiscoveryCrawl', () => {
     vi.stubGlobal('fetch', fetch)
     await expect(runDiscoveryCrawl()).rejects.toThrow(/未启用/)
     expect(fetch).not.toHaveBeenCalled()
+    expect(discoveryStatus().lastError).toContain('未启用')
   })
 
   it('配额不够时中止并报出差额，而不是硬打到 403', async () => {
@@ -894,5 +904,178 @@ describe('pruneOrphanCandidates（清理已移除仓留下的候选）', () => {
 
     await expect(pruneOrphanCandidates()).rejects.toThrow(/先加回至少一个仓/)
     expect(rows.length).toBe(1)
+  })
+})
+
+// ————— 按关键词搜 GitHub 仓库 —————
+describe('sanitizeRepoQuery', () => {
+  it('剔控制字符、钳长度；非字符串一律当空', () => {
+    expect(sanitizeRepoQuery('  lxmusic\u0000 source\r\n')).toBe('lxmusic source')
+    expect(sanitizeRepoQuery('x'.repeat(500))).toHaveLength(200)
+    expect(sanitizeRepoQuery(undefined)).toBe('')
+    expect(sanitizeRepoQuery(42)).toBe('')
+  })
+})
+
+describe('repoSearchItemFromApi', () => {
+  const base = {
+    full_name: 'foo/bar', description: '洛雪音乐源', stargazers_count: 12,
+    pushed_at: '2026-10-01T00:00:00Z', language: 'JavaScript', fork: false, archived: false, private: false,
+  }
+
+  it('私有的不进面板；full_name 形状不对的也不进（GitHub 给的不等于免检）', () => {
+    expect(repoSearchItemFromApi({ ...base, private: true }, new Set())).toBeNull()
+    expect(repoSearchItemFromApi({ ...base, full_name: 'foo/bar/baz' }, new Set())).toBeNull()
+    expect(repoSearchItemFromApi({ ...base, full_name: '' }, new Set())).toBeNull()
+  })
+
+  it('已在清单里的要标出来（面板据此置灰，避免重复勾选）', () => {
+    const view = repoSearchItemFromApi(base, new Set(['foo/bar']))
+    expect(view?.alreadyListed).toBe(true)
+    expect(view?.repo).toBe('foo/bar')
+    expect(view?.lastPushAt).toBe('2026-10-01T00:00:00Z')
+  })
+
+  it('没有 pushed_at 才退回 updated_at，两个都没有就是空串（不能编一个时间给面板看）', () => {
+    expect(repoSearchItemFromApi({ full_name: 'foo/bar', updated_at: '2026-09-09T00:00:00Z' }, new Set())?.lastPushAt)
+      .toBe('2026-09-09T00:00:00Z')
+    expect(repoSearchItemFromApi({ full_name: 'foo/bar' }, new Set())?.lastPushAt).toBe('')
+  })
+})
+
+describe('searchGitHubRepos', () => {
+  it('请求形状：q 走查询参数、默认按最近更新排，带 token 时走 Bearer', async () => {
+    await enable(['a/b'], 'tok123')
+    const fetch = vi.fn(async () => jsonResponse({ total_count: 0, items: [] }))
+    vi.stubGlobal('fetch', fetch)
+
+    await searchGitHubRepos('lxmusic source')
+    const [url, init] = callsOf(fetch)[0]
+    expect(url).toContain('https://api.github.com/search/repositories?')
+    expect(new URL(url).searchParams.get('q')).toBe('lxmusic source')
+    expect(new URL(url).searchParams.get('sort')).toBe('updated')
+    expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer tok123')
+  })
+
+  it('sort=best 时不带 sort 参数（交给 GitHub 的最佳匹配）', async () => {
+    await enable(['a/b'])
+    const fetch = vi.fn(async () => jsonResponse({ total_count: 0, items: [] }))
+    vi.stubGlobal('fetch', fetch)
+    await searchGitHubRepos('lx music', 1, 'best')
+    expect(new URL(callsOf(fetch)[0][0]).searchParams.get('sort')).toBeNull()
+  })
+
+  it('不认识 sort 时按 updated，不接受任意值拼进 URL', async () => {
+    await enable(['a/b'])
+    const fetch = vi.fn(async () => jsonResponse({ total_count: 0, items: [] }))
+    vi.stubGlobal('fetch', fetch)
+    await searchGitHubRepos('lx music', 1, 'stars; sort=bad')
+    expect(new URL(callsOf(fetch)[0][0]).searchParams.get('sort')).toBe('updated')
+  })
+
+  it('私有的与形状不对的被丢掉，清单里的标 alreadyListed', async () => {
+    await enable(['a/b', 'known/repo'])
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
+      total_count: 4,
+      items: [
+        { full_name: 'a/b', stargazers_count: 1, pushed_at: '2026-10-01T00:00:00Z' },
+        { full_name: 'known/repo', stargazers_count: 2 },
+        { full_name: 'new/guy', description: '音源', stargazers_count: 3, private: true },
+        { full_name: 'weird/shape/extra', stargazers_count: 4 },
+      ],
+    })))
+
+    const result = await searchGitHubRepos('lxmusic source')
+    expect(result.items.map(i => i.repo)).toEqual(['a/b', 'known/repo'])
+    expect(result.items[0].alreadyListed).toBe(true)
+    expect(result.total).toBe(4)
+  })
+
+  it('配额用完时报的是"这一档与爬树分开"，数字来自搜索接口自己的响应头', async () => {
+    await enable(['a/b'])
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ message: 'API rate limit exceeded' }), {
+      status: 403,
+      headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '0', 'x-ratelimit-limit': '10', 'x-ratelimit-reset': '9999999999' },
+    })))
+    await expect(searchGitHubRepos('lxmusic source')).rejects.toThrow(/搜索配额用尽.*这一档和爬仓库树的额度是分开的/s)
+  })
+
+  it('搜索接口的响应头里有配额，就把它带回去给面板显示', async () => {
+    await enable(['a/b'])
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(
+      { total_count: 1, items: [{ full_name: 'new/guy', stargazers_count: 5, pushed_at: '2026-10-05T00:00:00Z' }] },
+      { 'x-ratelimit-remaining': '27', 'x-ratelimit-limit': '30', 'x-ratelimit-reset': '9999999999' },
+    )))
+    const result = await searchGitHubRepos('lxmusic source')
+    expect(result.quota).toEqual({ remaining: 27, limit: 30, resetAt: 9999999999 })
+    expect(result.items[0].repo).toBe('new/guy')
+  })
+
+  it('空词与太短的词都不打网络', async () => {
+    await enable(['a/b'])
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    await expect(searchGitHubRepos('   ')).rejects.toThrow(/搜索词是空的/)
+    await expect(searchGitHubRepos('lx')).rejects.toThrow(/太短/)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('翻页越界要钳在 GitHub 的 1000 条窗口内，并透传 incomplete_results', async () => {
+    await enable(['a/b'])
+    const fetch = vi.fn(async () => jsonResponse({ total_count: 5000, incomplete_results: true, items: [] }))
+    vi.stubGlobal('fetch', fetch)
+    const result = await searchGitHubRepos('lxmusic source', 9999, 'updated', 30)
+    expect(result.page).toBe(33)
+    expect(new URL(callsOf(fetch)[0][0]).searchParams.get('page')).toBe('33')
+    expect(result.incomplete).toBe(true)
+  })
+
+  it('HTTP 422（写法不被接受）说人话，不把 GitHub 的原文透出去', async () => {
+    await enable(['a/b'])
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"message":"Validation Failed","documentation_url":"https://docs.github.com/rest"}', { status: 422 })))
+    await expect(searchGitHubRepos('音源 in:name')).rejects.toThrow(/GitHub 搜索没接受这个关键词/)
+  })
+})
+
+// ————— 只扫勾选的那几个仓 —————
+describe('runDiscoveryCrawl 的仓子集', () => {
+  it('给了子集就只打这几个仓的树，并把"只扫了 1/2"写进结论', async () => {
+    await enable(['a/b', 'c/d'])
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+      if (url.includes('/git/trees/')) return jsonResponse({ tree: [], truncated: false })
+      throw new Error(`不该下载: ${url}`)
+    }))
+
+    const summary = await runDiscoveryCrawl({ onlyRepos: ['c/d'] })
+    expect(urls.filter(u => u.includes('/git/trees/'))).toEqual([
+      'https://api.github.com/repos/c/d/git/trees/HEAD?recursive=1',
+    ])
+    expect(summary.note).toContain('只扫了勾选的 1/2 个仓')
+  })
+
+  it('子集里清单外的仓带不进来：一个都不剩就明说，绝不退化成"那就扫全清单"', async () => {
+    await enable(['a/b'])
+    const fetch = vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+      return jsonResponse({ tree: [], truncated: false })
+    })
+    vi.stubGlobal('fetch', fetch)
+
+    await expect(runDiscoveryCrawl({ onlyRepos: ['x/y'] })).rejects.toThrow(/还没进扫描清单/)
+    expect(fetch).not.toHaveBeenCalled()
+    // 起轮是 202 + 后台跑，面板唯一的出口就是 lastError：没写进去就是"点了没反应"
+    expect(discoveryStatus().lastError).toContain('勾选的 1 个仓都还没进扫描清单')
+  })
+
+  it('写法全不合法的子集（含 URL、路径穿越）当场拒绝，不打 GitHub', async () => {
+    await enable(['a/b'])
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    // 这一档是同步抛的：请求形状就不对，没必要先起一个后台任务再失败
+    expect(() => runDiscoveryCrawl({ onlyRepos: ['https://evil.test/a/b', '../etc'] })).toThrow(/写法都不合法/)
+    expect(fetch).not.toHaveBeenCalled()
   })
 })

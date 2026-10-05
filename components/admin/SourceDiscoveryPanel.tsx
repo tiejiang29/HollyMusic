@@ -15,6 +15,7 @@ import {
   importDiscoveryCandidate,
   pruneOrphanCandidates,
   saveDiscoverySettings,
+  searchDiscoveryRepos,
   startCandidateProbe,
   startCandidateProbeBatch,
   startDiscoveryCrawl,
@@ -24,10 +25,12 @@ import {
   type DiscoverySettingsView,
   type DiscoveryStatus,
   type ProbeCellView,
+  type RepoSearchItemView,
+  type RepoSearchResultView,
 } from '@/lib/api/admin-source-discovery'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download, Layers, Square, ListChecks } from 'lucide-react'
+import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download, Layers, Square, ListChecks, Search, Save } from 'lucide-react'
 import { copyAddress } from '@/lib/utils/clipboard'
 
 const FILTERS = [
@@ -115,6 +118,47 @@ export function needsForceConfirm(row: Pick<DiscoveryCandidate, 'probe' | 'dupli
   return okPlatformCount(row.probe?.cells) === 0 || row.duplicateOf?.kind === 'name'
 }
 
+/**
+ * 搜索结果的一行，附"多久之前推送"那句话。
+ * 时间差在**拿到结果的那一刻**算好，不在 render 里算：一来 React 要求 render 纯净
+ * （每次重渲染调 Date.now() 会让同一份结果显示着变来变去），二来"上次搜索时它是多久前的仓"
+ * 本来就该跟着那次搜索走。
+ */
+type RepoSearchRow = RepoSearchItemView & { ageBadge: string }
+type RepoSearchView = Omit<RepoSearchResultView, 'items'> & { items: RepoSearchRow[] }
+
+/**
+ * 把搜索勾选的仓并进现有清单：保持原顺序、后面追加新的、去重。
+ *
+ * 导出是为了能直测：服务端 `saveDiscoverySettings` 也会 normalize + 去重，
+ * 但"面板算出来的清单"和"存进去的清单"如果对不上，管理员在文本框里看到的就是假象。
+ */
+export function mergeRepos(current: string[], added: string[]): string[] {
+  const out: string[] = []
+  for (const repo of [...current, ...added]) {
+    const trimmed = repo.trim()
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed)
+  }
+  return out
+}
+
+const STALE_REPO_DAYS = 365
+
+/**
+ * 搜索结果里的"最近推送"给管理员一句人话：清单一次就 27 个仓，引进来一个停更两年的仓
+ * 等于给每轮白加一次树调用（我们上一次清理就是按满一年剔的 11 个仓）。
+ */
+export function repoAgeBadge(lastPushAt: string, nowMs: number): string {
+  if (!lastPushAt) return ''
+  const pushed = Date.parse(lastPushAt)
+  if (!Number.isFinite(pushed)) return ''
+  const days = Math.floor((nowMs - pushed) / 86_400_000)
+  if (days < 0) return ''
+  if (days <= 7) return `${days} 天前动过`
+  if (days < STALE_REPO_DAYS) return `${Math.round(days / 30)} 个月前`
+  return `停更 ${Math.floor(days / 365)} 年+`
+}
+
 const OUTCOME_LABEL: Record<string, string> = {
   ok: '真出货',
   'no-address': '没给地址',
@@ -146,6 +190,17 @@ export function SourceDiscoveryPanel() {
   const [reposText, setReposText] = useState('')
   const [budgetText, setBudgetText] = useState('')
   const [tokenInput, setTokenInput] = useState('')
+  // 文本框里正在编辑的内容别被轮询覆写：dirty 时不跟随服务端，保存成功后再解除
+  const reposDirty = useRef(false)
+  const budgetDirty = useRef(false)
+  const [searchQuery, setSearchQuery] = useState('lxmusic source')
+  const [searchSort, setSearchSort] = useState<'best' | 'updated' | 'stars'>('updated')
+  const [searchResult, setSearchResult] = useState<RepoSearchView | null>(null)
+  const [searchPicked, setSearchPicked] = useState<string[]>([])
+  const [searching, setSearching] = useState(false)
+  const [addingRepos, setAddingRepos] = useState(false)
+  const [scanOnlyAdded, setScanOnlyAdded] = useState(true)
+  const [searchNote, setSearchNote] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [starting, setStarting] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -167,8 +222,10 @@ export function SourceDiscoveryPanel() {
       setStatus(view.status)
       setCandidates(view.candidates)
       setCounts(view.counts)
-      setReposText(prev => (prev === '' && !view.status.running ? view.settings.repos.join('\n') : prev))
-      setBudgetText(prev => (prev === '' && !view.status.running ? String(view.settings.maxDownloadsPerRound) : prev))
+      // 只要没在编辑就跟服务端同步：原先的条件是"空且没在跑才填"，
+      // 于是"边跑边打开面板"会让文本框一直空着，而下方的保存按钮照样会把空清单写进库
+      if (!reposDirty.current) setReposText(view.settings.repos.join('\n'))
+      if (!budgetDirty.current) setBudgetText(String(view.settings.maxDownloadsPerRound))
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载失败')
@@ -194,21 +251,53 @@ export function SourceDiscoveryPanel() {
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [status?.running, status?.draining, status?.probeBatch?.running, status?.probingId, reload])
 
-  const handleSave = async (extra: Record<string, unknown> = {}) => {
+  /**
+   * 只把传进来的那几个字段写回去。
+   * 原先这里是"无论改什么都顺手把文本框里的 repos 一起存"，于是清空文本框再点 token 的
+   * 「保存」就会把扫描清单抹掉 —— 每个字段只管自己，仓库清单只有它自己的按钮能动。
+   */
+  const savePatch = async (patch: Parameters<typeof saveDiscoverySettings>[0]) => {
     setSaving(true)
     try {
-      const repos = reposText.split(/[\n,，]/).map(line => line.trim()).filter(Boolean)
-      const result = await saveDiscoverySettings({ repos, ...extra })
+      const result = await saveDiscoverySettings(patch)
       setSettings(result.settings)
       if (result.rejected.length) {
         alert(`这些写法没被接受（要 owner/repo）：\n${result.rejected.join('\n')}`)
       }
-      setTokenInput('')
+      if (patch.repos !== undefined) {
+        reposDirty.current = false
+        setReposText(result.settings.repos.join('\n'))
+      }
+      if (patch.maxDownloadsPerRound !== undefined) {
+        budgetDirty.current = false
+        setBudgetText(String(result.settings.maxDownloadsPerRound))
+      }
+      // 只在这次真的存了 token 才清空输入框：否则"顺手保存一下仓库清单"会把手打的 token 抹掉
+      if (patch.githubToken !== undefined) setTokenInput('')
+      return result
     } catch (e) {
       alert(e instanceof Error ? e.message : '保存失败')
+      return null
     } finally {
       setSaving(false)
     }
+  }
+
+  const handleRepoSave = async () => {
+    const repos = reposText.split(/[\n,，]/).map(line => line.trim()).filter(Boolean)
+    if (!repos.length && !confirm('仓库清单是空的：保存后「开始发现」会没有目标，之前采到的候选也不会被清掉。确认要清空？')) {
+      return
+    }
+    await savePatch({ repos })
+  }
+
+  const handleTokenSave = async () => {
+    const token = tokenInput.trim()
+    if (!token) {
+      alert('输入框是空的：留空表示不改动 token。要清掉已配的请点右边「清除 token」')
+      return
+    }
+    await savePatch({ githubToken: token })
   }
 
   const handleCrawl = async () => {
@@ -252,7 +341,70 @@ export function SourceDiscoveryPanel() {
       alert('每轮抓正文上限要填 0~2000 的整数')
       return
     }
-    await handleSave({ maxDownloadsPerRound: parsed })
+    await savePatch({ maxDownloadsPerRound: parsed })
+  }
+
+  const handleSearch = async (page = 1) => {
+    setSearching(true)
+    try {
+      const result = await searchDiscoveryRepos(searchQuery.trim(), { page, sort: searchSort })
+      const nowMs = Date.now()
+      setSearchResult({ ...result, items: result.items.map(item => ({ ...item, ageBadge: repoAgeBadge(item.lastPushAt, nowMs) })) })
+      // 换页/换词就重选：跨页留着勾选会让人以为已经勾上，实际看不见
+      setSearchPicked([])
+      setSearchNote(null)
+    } catch (e) {
+      setSearchResult(null)
+      alert(e instanceof Error ? e.message : '搜索失败')
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  const togglePicked = (repo: string) => {
+    setSearchPicked(prev => prev.includes(repo) ? prev.filter(item => item !== repo) : [...prev, repo])
+  }
+
+  /**
+   * 把勾选的仓并进扫描清单（这就是唯一入清单的路，搜索本身不改配置）。
+   * `scanOnlyAdded` 决定要不要顺手只扫这几个新仓 —— 不勾就只是进清单，等下一轮全量扫。
+   */
+  const handleAddPicked = async () => {
+    const rows = (searchResult?.items ?? []).filter(item => searchPicked.includes(item.repo) && !item.alreadyListed)
+    if (!rows.length) {
+      alert('先勾选至少一个还没进清单的仓库')
+      return
+    }
+    setAddingRepos(true)
+    try {
+      const merged = mergeRepos(settings?.repos ?? [], rows.map(row => row.repo))
+      const result = await savePatch({ repos: merged })
+      if (!result) return
+      const addedNow = rows.map(row => row.repo).filter(repo => result.settings.repos.includes(repo))
+      if (!addedNow.length) {
+        setSearchNote('勾选的仓没被接受（要 owner/repo 的写法）')
+        return
+      }
+      if (!scanOnlyAdded) {
+        setSearchNote(`已把 ${addedNow.length} 个仓加进扫描清单，下次点「开始发现」会扫到`)
+        await reload()
+        return
+      }
+      if (!settings?.enabled) {
+        setSearchNote(`已把 ${addedNow.length} 个仓加进清单，但「启用音源发现」还没打开，所以没起扫描`)
+        await reload()
+        return
+      }
+      const started = await startDiscoveryCrawl(addedNow)
+      setSearchNote(!started.started
+        ? `已加进清单（${addedNow.length} 个），但这一轮没起来：${started.reason ?? '已有任务在跑'}`
+        : `已加进清单，并起了一轮「只扫这 ${addedNow.length} 个仓」的发现`)
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '加入清单失败')
+    } finally {
+      setAddingRepos(false)
+    }
   }
 
   const handlePrune = async () => {
@@ -340,6 +492,9 @@ export function SourceDiscoveryPanel() {
     })
     .reduce((sum, [, n]) => sum + n, 0)
 
+  const typedRepos = reposText.split(/[\n,，]/).map(line => line.trim()).filter(Boolean)
+  const pickedNew = (searchResult?.items ?? []).filter(item => searchPicked.includes(item.repo) && !item.alreadyListed)
+
   return (
     <div>
       <div className="mb-6 flex items-start justify-between gap-4">
@@ -414,7 +569,7 @@ export function SourceDiscoveryPanel() {
                 onChange={e => {
                   const enabled = e.target.checked
                   setSettings(prev => prev ? { ...prev, enabled } : prev)
-                  void handleSave({ enabled })
+                  void savePatch({ enabled })
                 }}
               />
               启用音源发现（默认关，因为它会向 GitHub 发起请求）
@@ -424,20 +579,35 @@ export function SourceDiscoveryPanel() {
               <div className="mb-1 text-xs uppercase text-muted-foreground">扫描的仓库（一行一个 owner/repo）</div>
               <textarea
                 value={reposText}
-                onChange={e => setReposText(e.target.value)}
+                onChange={e => { reposDirty.current = true; setReposText(e.target.value) }}
                 rows={6}
                 spellCheck={false}
                 className="w-full rounded border border-border bg-background p-2 font-mono text-xs"
               />
-              <button
-                onClick={handlePrune}
-                disabled={pruning}
-                title="把「已从这个列表里移除的仓」留下的候选行清掉。已导入成音源的行会保留；重新把某个仓加回来会当新候选重采一遍。"
-                className="mt-1 flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
-              >
-                {pruning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
-                清理已移除仓的候选
-              </button>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                <button
+                  onClick={() => { void handleRepoSave() }}
+                  disabled={saving}
+                  title="把文本框里的这份清单写进库。只有这个按钮动仓库清单——改 token、改每轮上限都不会顺手改它"
+                  className="flex items-center gap-1 rounded bg-accent px-3 py-1.5 font-medium hover:bg-accent/70 disabled:opacity-50"
+                >
+                  {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  保存仓库清单
+                </button>
+                <span className="text-muted-foreground">
+                  库里 {settings?.repos.length ?? 0} 个
+                  {typedRepos.length !== (settings?.repos.length ?? 0) ? `，文本框里 ${typedRepos.length} 个（还没保存）` : ''}
+                </span>
+                <button
+                  onClick={handlePrune}
+                  disabled={pruning}
+                  title="把「已从这个列表里移除的仓」留下的候选行清掉。已导入成音源的行会保留；重新把某个仓加回来会当新候选重采一遍。"
+                  className="ml-auto flex items-center gap-1 rounded px-2 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+                >
+                  {pruning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
+                  清理已移除仓的候选
+                </button>
+              </div>
             </div>
 
             <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
@@ -448,7 +618,7 @@ export function SourceDiscoveryPanel() {
                 min={0}
                 max={2000}
                 value={budgetText}
-                onChange={e => setBudgetText(e.target.value)}
+                onChange={e => { budgetDirty.current = true; setBudgetText(e.target.value) }}
                 disabled={saving}
                 className="w-24 rounded border border-border bg-background px-2 py-1 font-mono"
               />
@@ -474,7 +644,7 @@ export function SourceDiscoveryPanel() {
                 className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-xs"
               />
               <button
-                onClick={() => handleSave(tokenInput.trim() ? { githubToken: tokenInput.trim() } : {})}
+                onClick={() => { void handleTokenSave() }}
                 disabled={saving}
                 className="flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-xs font-medium hover:bg-accent/70 disabled:opacity-50"
               >
@@ -483,7 +653,7 @@ export function SourceDiscoveryPanel() {
               </button>
               {settings?.hasToken ? (
                 <button
-                  onClick={() => handleSave({ clearToken: true })}
+                  onClick={() => { void savePatch({ clearToken: true }) }}
                   disabled={saving}
                   className="flex items-center gap-1 rounded px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
                 >
@@ -496,6 +666,146 @@ export function SourceDiscoveryPanel() {
               没 token 时 GitHub 匿名限额 60 次/小时，仓库数一多就会不够；接口会在起轮前直接告诉你差多少。
               token 只存本库、出网一律脱敏，任何接口都不会把它回给你。
             </p>
+          </div>
+
+          <div className="mb-6 rounded-lg border border-border p-4">
+            <div className="mb-1 flex items-center gap-2 text-sm font-medium">
+              <Search className="h-4 w-4 text-primary" />
+              搜索 GitHub 仓库
+            </div>
+            <p className="mb-3 text-xs text-muted-foreground">
+              这一步只搜、只给元数据：勾上再点「加进扫描清单」才会写进库，搜索本身不下载任何正文、不改配置。
+              关键词按空格分；<code className="font-mono">in:name</code> 这类限定符可用，但中文词配
+              <code className="font-mono"> in:name</code> 实测零命中（裸词能命中名字与描述）。
+              搜索配额与爬仓库树的额度是两档（带 token 30 次/分，匿名 10 次/分）。
+            </p>
+
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <input
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') { void handleSearch(1) } }}
+                placeholder="关键词，例：lxmusic source"
+                className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1.5 font-mono text-xs"
+              />
+              <select
+                value={searchSort}
+                onChange={e => setSearchSort(e.target.value as 'best' | 'updated' | 'stars')}
+                className="rounded border border-border bg-background px-2 py-1.5 text-xs"
+              >
+                <option value="updated">按最近更新</option>
+                <option value="stars">按 star 数</option>
+                <option value="best">按最佳匹配</option>
+              </select>
+              <button
+                onClick={() => { void handleSearch(1) }}
+                disabled={searching || saving}
+                className="flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+              >
+                {searching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
+                搜索
+              </button>
+            </div>
+
+            {searchResult ? (
+              <>
+                <div className="mb-2 text-xs text-muted-foreground">
+                  命中 {searchResult.total} 个（第 {searchResult.page} 页 · 每页 {searchResult.pageSize}）
+                  {searchResult.quota ? `｜搜索配额剩 ${searchResult.quota.remaining}/${searchResult.quota.limit}` : ''}
+                  {searchResult.incomplete ? '｜GitHub 说这批没算完，翻不全就换个词' : ''}
+                </div>
+                {searchResult.items.length === 0 ? (
+                  <div className="mb-2 text-xs text-muted-foreground">这一页没有可显示的仓库（私有的不会出现）。</div>
+                ) : (
+                  <div className="overflow-hidden rounded border border-border">
+                    <table className="w-full text-xs">
+                      <thead className="bg-accent/40 text-left uppercase text-muted-foreground">
+                        <tr>
+                          <th className="w-8 px-2 py-2"></th>
+                          <th className="px-2 py-2 font-medium">仓库</th>
+                          <th className="px-2 py-2 font-medium">描述</th>
+                          <th className="px-2 py-2 font-medium">★</th>
+                          <th className="px-2 py-2 font-medium">最近推送</th>
+                          <th className="px-2 py-2 font-medium">标记</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {searchResult.items.map(item => {
+                          const badge = item.ageBadge
+                          const stale = badge.includes('停更')
+                          return (
+                            <tr key={item.repo} className="border-t border-border">
+                              <td className="px-2 py-2">
+                                <input
+                                  type="checkbox"
+                                  checked={searchPicked.includes(item.repo)}
+                                  disabled={item.alreadyListed}
+                                  onChange={() => togglePicked(item.repo)}
+                                />
+                              </td>
+                              <td className="px-2 py-2 font-mono">
+                                {item.repo}
+                                {item.alreadyListed ? <span className="ml-1 text-muted-foreground">（已在清单）</span> : null}
+                              </td>
+                              <td className="max-w-[22rem] px-2 py-2 text-muted-foreground">{item.description || '—'}</td>
+                              <td className="px-2 py-2">{item.stars}</td>
+                              <td className={`px-2 py-2 ${stale ? 'text-amber-600' : 'text-muted-foreground'}`}>{badge || '—'}</td>
+                              <td className="px-2 py-2 text-muted-foreground">
+                                {[item.language, item.fork ? 'fork' : '', item.archived ? '已归档' : ''].filter(Boolean).join(' · ') || '—'}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <label
+                    className="flex items-center gap-1"
+                    title="勾上就只扫新加进来的这几个仓（清单外的仓这个参数带不进去）；不勾只是进清单，等下一次「开始发现」全量扫"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={scanOnlyAdded}
+                      onChange={e => setScanOnlyAdded(e.target.checked)}
+                    />
+                    加进清单后只扫这几个新仓
+                  </label>
+                  <button
+                    onClick={() => { void handleAddPicked() }}
+                    disabled={addingRepos || saving || pickedNew.length === 0}
+                    className="flex items-center gap-1 rounded bg-accent px-3 py-1.5 font-medium hover:bg-accent/70 disabled:opacity-50"
+                  >
+                    {addingRepos ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                    把勾选的 {pickedNew.length} 个加进扫描清单
+                  </button>
+                  <div className="ml-auto flex items-center gap-1">
+                    <button
+                      onClick={() => { void handleSearch(searchResult.page - 1) }}
+                      disabled={searching || searchResult.page <= 1}
+                      className="rounded px-2 py-1 text-muted-foreground hover:bg-accent disabled:opacity-40"
+                    >
+                      上一页
+                    </button>
+                    <button
+                      onClick={() => { void handleSearch(searchResult.page + 1) }}
+                      disabled={searching || searchResult.page * searchResult.pageSize >= searchResult.total}
+                      className="rounded px-2 py-1 text-muted-foreground hover:bg-accent disabled:opacity-40"
+                    >
+                      下一页
+                    </button>
+                  </div>
+                </div>
+
+                {searchNote ? (
+                  <div className="mt-2 rounded border border-green-600/40 bg-green-600/10 px-3 py-1.5 text-xs text-green-800">
+                    {searchNote}
+                  </div>
+                ) : null}
+              </>
+            ) : null}
           </div>
 
           {status?.running ? (

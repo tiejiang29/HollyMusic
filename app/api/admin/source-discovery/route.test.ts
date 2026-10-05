@@ -29,7 +29,7 @@ vi.mock('@/lib/services/user-context', () => ({
   ForbiddenError: MockForbiddenError,
 }))
 
-const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, pruneMock } = vi.hoisted(() => ({
+const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, pruneMock, searchMock } = vi.hoisted(() => ({
   db: { setting: new Map<string, string>(), candidates: [] as Array<Record<string, unknown>> },
   runCrawl: vi.fn(async () => ({})),
   importCandidateMock: vi.fn(),
@@ -37,6 +37,11 @@ const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, 
   stopMock: vi.fn(() => ({ stopping: true })),
   probeBatchMock: vi.fn(() => ({ started: true })),
   pruneMock: vi.fn(async () => ({ removed: 3, keptImported: [] })),
+  searchMock: vi.fn(async () => ({
+    total: 2, page: 1, pageSize: 30, sort: 'updated', incomplete: false,
+    quota: { remaining: 27, limit: 30, resetAt: 0 },
+    items: [{ repo: 'new/guy', description: '洛雪音源', stars: 3, lastPushAt: '2026-10-01T00:00:00Z', language: 'JavaScript', fork: false, archived: false, alreadyListed: false }],
+  })),
 }))
 
 interface KeyWhere { where: { key: string } }
@@ -65,6 +70,7 @@ vi.mock('@/lib/services/source-discovery', async importOriginal => {
   return {
     ...actual,
     runDiscoveryCrawl: runCrawl,
+    searchGitHubRepos: searchMock,
     runDiscoveryDrain: drainMock,
     requestDiscoveryStop: stopMock,
     importCandidate: importCandidateMock,
@@ -93,6 +99,7 @@ beforeEach(async () => {
   stopMock.mockClear()
   probeBatchMock.mockClear()
   pruneMock.mockClear()
+  searchMock.mockClear()
   await saveDiscoverySettings({ enabled: true, repos: ['a/b'], githubToken: 'ghp_supersecret1234' })
 })
 
@@ -194,6 +201,37 @@ describe('动作校验', () => {
     expect(response.status).toBe(202)
     expect((await response.json()).data.started).toBe(true)
     expect(runCrawl).toHaveBeenCalledTimes(1)
+  })
+
+  it('crawl 的 repos 只当"缩小子集"交给服务层；不给就是扫全清单', async () => {
+    await POST(request('POST', { action: 'crawl', repos: ['x/y', 'a/b'] }))
+    expect(runCrawl).toHaveBeenLastCalledWith({ onlyRepos: ['x/y', 'a/b'] })
+
+    await POST(request('POST', { action: 'crawl' }))
+    expect(runCrawl).toHaveBeenLastCalledWith({ onlyRepos: undefined })
+  })
+
+  it('search 把关键词、翻页、排序原样交给服务层，结果透出', async () => {
+    const response = await POST(request('POST', { action: 'search', query: 'lxmusic source', page: 2, sort: 'stars' }))
+    expect(response.status).toBe(200)
+    expect(searchMock).toHaveBeenCalledWith('lxmusic source', 2, 'stars', undefined)
+    const payload = await response.json()
+    expect(payload.data.items[0].repo).toBe('new/guy')
+    expect(payload.data.quota).toEqual({ remaining: 27, limit: 30, resetAt: 0 })
+  })
+
+  it('非管理员连搜都不给（搜索也是要出网的动作）', async () => {
+    authMode = 'user'
+    expect((await POST(request('POST', { action: 'search', query: 'lxmusic source' }))).status).toBe(403)
+    expect(searchMock).not.toHaveBeenCalled()
+  })
+
+  it('搜索失败按服务层的状态码透出：429 被压成 400 就看不出"这是等一会儿的事"', async () => {
+    const { SourceDiscoveryError } = await import('@/lib/services/source-discovery')
+    searchMock.mockRejectedValueOnce(new SourceDiscoveryError('GitHub 搜索配额用尽', 429))
+    const response = await POST(request('POST', { action: 'search', query: 'lxmusic source' }))
+    expect(response.status).toBe(429)
+    expect((await response.json()).error.message).toContain('配额用尽')
   })
 
   it('drain（连轮清完）也是 202，不让人挂着请求等几十分钟', async () => {

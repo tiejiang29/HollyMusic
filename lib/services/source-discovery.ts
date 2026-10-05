@@ -124,6 +124,9 @@ export function normalizeRepo(input: string): string | null {
   const trimmed = input.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '')
   const match = trimmed.match(/^([\w.-]{1,100})\/([\w.-]{1,100})$/)
   if (!match) return null
+  // `..` 单独一段是路径穿越：encodeURIComponent 不编码点，拼进 /repos/{owner}/{repo}/ 后
+  // URL 会自己把它折叠掉（实测 ../etc 会变成 /etc/...）。GitHub 的 owner/repo 名里也不允许连续点。
+  if (match[1].includes('..') || match[2].includes('..')) return null
   return `${match[1]}/${match[2]}`
 }
 
@@ -238,6 +241,141 @@ async function readRateLimit(token: string): Promise<RateLimitInfo | null> {
   } catch (err) {
     logger.debug('[discovery] 配额预检失败（按无配额信息继续）:', err)
     return null
+  }
+}
+
+export const REPO_SEARCH_SORTS = ['best', 'updated', 'stars'] as const
+export type RepoSearchSort = (typeof REPO_SEARCH_SORTS)[number]
+const MAX_QUERY_CHARS = 200
+const MAX_SEARCH_PAGE_SIZE = 50
+/** GitHub 的搜索接口只给看前 1000 条，翻页翻过这个数它是空结果，所以钳在页号上 */
+const MAX_SEARCH_RESULT_WINDOW = 1000
+
+export interface RepoSearchItem {
+  repo: string
+  description: string
+  stars: number
+  /** 最后一次真推代码的时间（不是我们写库的时间）；清单里的仓就是按这个数判停更的 */
+  lastPushAt: string
+  language: string
+  fork: boolean
+  archived: boolean
+  alreadyListed: boolean
+}
+
+export interface RepoSearchResult {
+  total: number
+  page: number
+  pageSize: number
+  sort: RepoSearchSort
+  /** GitHub 明说这一页没算完（多为命中量太大）：结果不完整，别当"就这些" */
+  incomplete: boolean
+  /** 搜索接口自己的配额档，与爬仓库树的 core 额度分开算 */
+  quota: RateLimitInfo | null
+  items: RepoSearchItem[]
+}
+
+/**
+ * 搜索词清洗：剔控制字符、钳长度。
+ * 这个词只会被拼进 `?q=` 参数（host 是常量），所以这里管的不是 SSRF，是"别把换行/NUL 喂进 URL"。
+ */
+export function sanitizeRepoQuery(input: unknown): string {
+  if (typeof input !== 'string') return ''
+  return input.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_QUERY_CHARS)
+}
+
+function normalizeSearchSort(input: unknown): RepoSearchSort {
+  return REPO_SEARCH_SORTS.includes(input as RepoSearchSort) ? (input as RepoSearchSort) : 'updated'
+}
+
+function readQuotaHeaders(response: Response): RateLimitInfo | null {
+  const remaining = response.headers.get('x-ratelimit-remaining')
+  const limit = response.headers.get('x-ratelimit-limit')
+  if (remaining === null || limit === null) return null
+  return { remaining: Number(remaining) || 0, limit: Number(limit) || 0, resetAt: Number(response.headers.get('x-ratelimit-reset')) || 0 }
+}
+
+/**
+ * 把 GitHub 搜索接口的一条仓库记录换成面板要的形状。
+ * 单独导出是为了能直测：`private` 的一律不进面板，`full_name` 仍逐个过 `normalizeRepo`
+ * —— 清单里只可能是 `owner/repo`，不能因为"是 GitHub 给的"就跳过这道校验。
+ */
+export function repoSearchItemFromApi(item: Record<string, unknown>, listed: ReadonlySet<string>): RepoSearchItem | null {
+  if (item.private === true) return null
+  const repo = normalizeRepo(typeof item.full_name === 'string' ? item.full_name : '')
+  if (!repo) return null
+  return {
+    repo,
+    description: typeof item.description === 'string' ? item.description.slice(0, 200) : '',
+    stars: Number(item.stargazers_count) || 0,
+    lastPushAt: typeof item.pushed_at === 'string' ? item.pushed_at : (typeof item.updated_at === 'string' ? item.updated_at : ''),
+    language: typeof item.language === 'string' ? item.language : '',
+    fork: item.fork === true,
+    archived: item.archived === true,
+    alreadyListed: listed.has(repo),
+  }
+}
+
+/**
+ * 按关键词搜 GitHub 仓库，给面板勾选入清单用。
+ * 这一步**只动搜索**，不改扫描清单，也不下载任何正文：入清单是面板另一次显式保存。
+ */
+export async function searchGitHubRepos(
+  rawQuery: unknown,
+  rawPage: unknown = 1,
+  rawSort: unknown = 'updated',
+  rawPageSize: unknown = 30,
+): Promise<RepoSearchResult> {
+  const settings = await getDiscoverySettings()
+  const query = sanitizeRepoQuery(rawQuery)
+  if (!query) throw new SourceDiscoveryError('搜索词是空的（只用空格分关键词即可，例：lxmusic source）')
+  if (query.length < 3) throw new SourceDiscoveryError('搜索词太短，至少 3 个字符')
+
+  const pageSize = Math.min(Math.max(Math.trunc(Number(rawPageSize) || 30), 1), MAX_SEARCH_PAGE_SIZE)
+  const page = Math.min(Math.max(Math.trunc(Number(rawPage) || 1), 1), Math.max(1, Math.floor(MAX_SEARCH_RESULT_WINDOW / pageSize)))
+  const sort = normalizeSearchSort(rawSort)
+
+  const params = new URLSearchParams({ q: query, per_page: String(pageSize), page: String(page) })
+  if (sort !== 'best') params.set('sort', sort)
+  const response = await githubFetch(`${API_HOST}/search/repositories?${params.toString()}`, settings.githubToken)
+  const quota = readQuotaHeaders(response)
+
+  if (!response.ok) {
+    const resetSec = quota && quota.resetAt ? Math.max(0, Math.round((quota.resetAt * 1000 - Date.now()) / 1000)) : null
+    if (response.status === 403 || response.status === 429) {
+      throw new SourceDiscoveryError(
+        `GitHub 搜索配额用尽${resetSec != null ? `，约 ${resetSec} 秒后恢复` : ''}`
+        + `。这一档和爬仓库树的额度是分开的（带 token 30 次/分、匿名 10 次/分）`,
+        429,
+      )
+    }
+    // 422 多半是搜索语法不被接受（例：中文配 in:name）
+    throw new SourceDiscoveryError(`GitHub 搜索没接受这个关键词（HTTP ${response.status}）。限定符只认 GitHub 那套写法，中文词别配 in:name`, 502)
+  }
+
+  const payload = await response.json() as {
+    total_count?: unknown
+    incomplete_results?: unknown
+    items?: Array<Record<string, unknown>>
+  }
+  const listed = new Set(settings.repos)
+  const seen = new Set<string>()
+  const items: RepoSearchItem[] = []
+  for (const raw of Array.isArray(payload.items) ? payload.items : []) {
+    const view = repoSearchItemFromApi(raw, listed)
+    if (!view || seen.has(view.repo)) continue
+    seen.add(view.repo)
+    items.push(view)
+  }
+
+  return {
+    total: Number(payload.total_count) || 0,
+    page,
+    pageSize,
+    sort,
+    incomplete: payload.incomplete_results === true,
+    quota,
+    items,
   }
 }
 
@@ -400,13 +538,23 @@ function buildRawUrl(repo: string, path: string): string {
 /**
  * 起一轮发现。`fromDrain` 只给连轮内部用：那时连轮自己已经占住单飞位（drainTask），
  * 不加这个参数的话，每一轮都会被"已有连轮在跑"拒掉。
+ * `onlyRepos` 是"只扫勾选那几个仓"：它**只能把扫描范围往小里缩**，
+ * 清单里没有的仓传进来会被丢掉（所以这个参数不是第二个自由文本入口）。
  */
-export function runDiscoveryCrawl(fromDrain = false): Promise<CrawlSummary> {
-  if (!fromDrain && drainTask) throw new SourceDiscoveryError('有一轮连轮正在跑，先按停止或等它结束', 409)
+export function runDiscoveryCrawl(opts: { fromDrain?: boolean; onlyRepos?: unknown } = {}): Promise<CrawlSummary> {
+  if (!opts.fromDrain && drainTask) throw new SourceDiscoveryError('有一轮连轮正在跑，先按停止或等它结束', 409)
   if (runningTask) return runningTask
   // 单轮起手要清掉上一次"停止"的痕迹，否则它会立刻把自己停掉
   if (!progress.draining) progress.stopRequested = false
-  runningTask = doCrawl().finally(() => { runningTask = null })
+  const requested = Array.isArray(opts.onlyRepos) ? opts.onlyRepos : null
+  const only = (requested ?? [])
+    .map(item => normalizeRepo(typeof item === 'string' ? item : ''))
+    .filter((item): item is string => Boolean(item))
+  // 给了子集却一个都不合法 ⇒ 报错，不能退化成"那就扫全清单"（缩小范围失败只会放大范围是反的）
+  if (requested?.length && !only.length) {
+    throw new SourceDiscoveryError(`勾选的仓库写法都不合法（要 owner/repo）：${String(requested[0]).slice(0, 40)}`)
+  }
+  runningTask = doCrawl(only).finally(() => { runningTask = null })
   return runningTask
 }
 
@@ -456,7 +604,7 @@ async function doDrain(): Promise<DrainSummary> {
       progress.round = totals.rounds
       let summary: CrawlSummary
       try {
-        summary = await runDiscoveryCrawl(true)
+        summary = await runDiscoveryCrawl({ fromDrain: true })
       } catch (err) {
         // 配额见底这类中断不该让连轮在后台 reject 掉，把原因留在总账里正常结束
         totals.note = `第 ${totals.rounds} 轮起不来：${err instanceof Error ? err.message : String(err)}`
@@ -490,10 +638,24 @@ async function doDrain(): Promise<DrainSummary> {
   }
 }
 
-async function doCrawl(): Promise<CrawlSummary> {
+async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
   const settings = await getDiscoverySettings()
-  if (!settings.enabled) throw new SourceDiscoveryError('音源发现未启用，先在面板上打开开关')
-  if (!settings.repos.length) throw new SourceDiscoveryError('仓库清单是空的，没有可扫描的目标')
+  // 这几条起轮前的检查都在 try 之外，抛出去就是一次"202 然后静默"：
+  // 路由那边是 void + catch 打日志，面板只能读 progress.lastError，所以每个原因都得先落进去
+  if (!settings.enabled) {
+    progress.lastError = '音源发现未启用，先在面板上打开开关'
+    throw new SourceDiscoveryError(progress.lastError)
+  }
+  if (!settings.repos.length) {
+    progress.lastError = '仓库清单是空的，没有可扫描的目标'
+    throw new SourceDiscoveryError(progress.lastError)
+  }
+  // 交集在这里算：勾选的仓必须已经在清单里，否则这个参数就成了绕过清单的入口
+  const targets = onlyRepos.length ? settings.repos.filter(repo => onlyRepos.includes(repo)) : settings.repos
+  if (!targets.length) {
+    progress.lastError = `勾选的 ${onlyRepos.length} 个仓都还没进扫描清单，先保存清单再扫`
+    throw new SourceDiscoveryError(progress.lastError)
+  }
 
   const summary: CrawlSummary = {
     reposScanned: 0, reposSkipped: [], truncatedRepos: [], seen: 0, created: 0, refreshed: 0,
@@ -501,7 +663,7 @@ async function doCrawl(): Promise<CrawlSummary> {
   }
   progress.running = true
   progress.phase = '配额预检'
-  progress.reposTotal = settings.repos.length
+  progress.reposTotal = targets.length
   progress.reposDone = 0
   progress.downloaded = 0
   progress.startedAt = new Date().toISOString()
@@ -510,20 +672,20 @@ async function doCrawl(): Promise<CrawlSummary> {
   try {
     // 一轮里 API 调用数 ≈ 仓库数（树）+ 正文数（raw 不吃 API 配额，但占时间）
     summary.quota = await readRateLimit(settings.githubToken)
-    if (summary.quota && summary.quota.remaining < settings.repos.length) {
+    if (summary.quota && summary.quota.remaining < targets.length) {
       throw new SourceDiscoveryError(
-        `GitHub API 余量 ${summary.quota.remaining}，本轮需要 ${settings.repos.length} 次仓库树调用。`
+        `GitHub API 余量 ${summary.quota.remaining}，本轮需要 ${targets.length} 次仓库树调用。`
         + `配一个只读 token 或删掉些仓库再来（token 只需提升限额，不要求任何 scope）`,
         429,
       )
     }
 
     let downloadBudget = settings.maxDownloadsPerRound
-    for (const repo of settings.repos) {
+    for (const repo of targets) {
       // 停止在仓与仓之间也生效（仓内是逐条检查）：中断点之后剩下的仓这轮不扫，下轮再说
       if (progress.stopRequested) {
         summary.stopped = true
-        summary.reposSkipped.push(`（已停止，剩下 ${settings.repos.length - progress.reposDone} 个仓没扫）`)
+        summary.reposSkipped.push(`（已停止，剩下 ${targets.length - progress.reposDone} 个仓没扫）`)
         break
       }
       progress.phase = `扫描 ${repo}`
@@ -542,11 +704,11 @@ async function doCrawl(): Promise<CrawlSummary> {
     progress.phase = '去重择优'
     summary.stale = await dedupeCandidates()
 
-    summary.note = summary.stopped
-      ? '已按停止中断（这一轮扫过的仓已入库，去重照常做完）'
-      : downloadBudget <= 0
-        ? `本轮下载额度（${settings.maxDownloadsPerRound}）用尽，剩下的候选留在 pending，下轮继续`
-        : null
+    const notes: string[] = []
+    if (summary.stopped) notes.push('已按停止中断（这一轮扫过的仓已入库，去重照常做完）')
+    else if (downloadBudget <= 0) notes.push(`本轮下载额度（${settings.maxDownloadsPerRound}）用尽，剩下的候选留在 pending，下轮继续`)
+    if (targets.length < settings.repos.length) notes.push(`只扫了勾选的 ${targets.length}/${settings.repos.length} 个仓`)
+    summary.note = notes.join('；') || null
     progress.last = summary
     logger.info('[discovery] 一轮发现完成', {
       仓库: summary.reposScanned, 候选: summary.seen, 新采: summary.created, 疑似: summary.suspect,
