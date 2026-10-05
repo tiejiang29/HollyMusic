@@ -11,7 +11,6 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-
 // 跨平台换源会打 DB 与搜索，这里全部屏蔽：本测试只关心同平台瀑布的预算行为
 vi.mock('./services/source-toggle', () => ({
   findBestAlternative: vi.fn(async () => null),
@@ -20,7 +19,7 @@ vi.mock('./logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
 
-const { MusicSourceManager, readUrlBudgets } = await import('./music-source-manager')
+const { MusicSourceManager, readUrlBudgets, SourceTimeoutError } = await import('./music-source-manager')
 const { sourceHealth } = await import('./server/source-health')
 import type { SimulatorInstance } from './music-source-manager'
 
@@ -109,6 +108,44 @@ describe('取址瀑布的单源累计预算', () => {
     const good = sourceHealth.view('后面的好源', 'kw')
     expect(good?.resolveOk).toBe(1)
     expect(good?.bad).toBe(0)
+  })
+
+  it('超时按身份认，不按耗时反推（CI #57 挂的就是这条口径：耗时比预算小 1ms 就记成 error）', async () => {
+    // callTimeoutMs 是在 attemptAt 之前算的，中间还夹着两道 continue 检查，
+    // 所以"定时器触发时的已耗时"天然比预算小 0~N 毫秒。旧判据拿 tookMs >= callTimeoutMs
+    // 反推超时：本地 δ=0 恰好相等、机器一慢 δ=1ms 就把真超时记成脚本内部报错。
+    const m = managerWith(
+      [
+        fakeSource('抛超时错的源', () => Promise.reject(new SourceTimeoutError('获取音乐URL超时（3s）'))),
+        fakeSource('备用好源', async () => 'https://ok.example/backstop.flac'),
+      ],
+      // 预算给满 3s，而这个假源几乎立刻抛错 ⇒ tookMs 远小于 callTimeoutMs，
+      // 正是 CI 上翻车的那个形态；按身份判才站得住
+      { urlMs: 3000, perSourceMs: 3000, totalMs: 20_000 }
+    )
+
+    const { url, provider } = await m.getMusicUrlWithProvider(musicInfo, 'flac')
+    expect(url).toBe('https://ok.example/backstop.flac')
+    expect(provider).toBe('备用好源')
+
+    const bad = sourceHealth.view('抛超时错的源', 'kw')
+    expect(bad?.bad).toBe(1)
+    expect(bad?.badKinds).toEqual({ timeout: 1 })
+  })
+
+  it('脚本自己抛的非超时错误仍然记 error（身份判据不能退化成"一律算超时"）', async () => {
+    const m = managerWith(
+      [
+        fakeSource('真报错的源', () => Promise.reject(new TypeError('cannot read property of undefined'))),
+        fakeSource('备用好源', async () => 'https://ok.example/after-error.flac'),
+      ],
+      { urlMs: 3000, perSourceMs: 3000, totalMs: 20_000 }
+    )
+
+    await expect(m.getMusicUrlWithProvider(musicInfo, 'flac')).resolves.toMatchObject({
+      provider: '备用好源',
+    })
+    expect(sourceHealth.view('真报错的源', 'kw')?.badKinds).toEqual({ error: 1 })
   })
 
   it('能力/平台不符而跳过尝试的源，一条样本都不记（否则版权面窄的好源会被误判成坏源）', async () => {

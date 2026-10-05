@@ -126,6 +126,22 @@ export interface UrlBudgets {
  */
 const MIN_USEFUL_ATTEMPT_MS = 250
 
+/**
+ * 由 `withTimeout` 抛出的"这次是真的到预算了"。
+ *
+ * 为什么要有这个类型而不是继续比时长：`callTimeoutMs` 是在 `attemptAt` **之前**算出来的
+ * （中间还夹着两道 quality/type 的 `continue` 检查），所以"定时器触发时的已耗时"天然比它
+ * 小 0~N 毫秒。原本 `tookMs >= callTimeoutMs` 这条判据在本地 δ=0 恰好相等、在 CI 上 δ=1ms
+ * 就把一次真超时记成 `error`（实测：CI #57 挂的就是这条，本地三遍全绿复现不了）。
+ * 超时这件事有自己的身份，不该靠时长反推。
+ */
+export class SourceTimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SourceTimeoutError'
+  }
+}
+
 /** 周测单源取址的结局（unsupported = 压根不该测这格，不计坏） */
 export type ProbeResolveResult =
   | { ok: true; url: string; latencyMs: number }
@@ -178,7 +194,8 @@ export class MusicSourceManager {
       return await Promise.race([
         p,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error(`${label}（${Math.round(timeoutMs / 1000)}s）`)), timeoutMs)
+          // 抛的是带类型的错：调用方据此认"这次是到预算了"，不再用耗时去反推（见 SourceTimeoutError）
+          timer = setTimeout(() => reject(new SourceTimeoutError(`${label}（${Math.round(timeoutMs / 1000)}s）`)), timeoutMs)
         }),
       ])
     } finally {
@@ -459,8 +476,9 @@ export class MusicSourceManager {
     } catch (err) {
       const latencyMs = Date.now() - started
       const message = err instanceof Error ? err.message : String(err)
-      // 顶到预算才算挂起；"这首歌没有"归到 no-address；其余算脚本内部报错
-      if (latencyMs >= timeoutMs) {
+      // 认身份不认时长（同 SourceTimeoutError 的注释）：这条路的结论会被周测当成先验
+      // 注进健康账本，把一次真超时记成"脚本内部报错"会让冷却分档归错因
+      if (err instanceof SourceTimeoutError) {
         return { ok: false, outcome: 'timeout', reason: message.slice(0, 120), latencyMs }
       }
       if (isContentMiss(message)) {
@@ -621,15 +639,17 @@ export class MusicSourceManager {
         } catch (error) {
           const tookMs = Date.now() - attemptAt
           const message = error instanceof Error ? error.message : String(error)
+          // 到预算就是到预算，看身份不看时长
+          const timedOut = error instanceof SourceTimeoutError
           // 源在说"这首歌我没有"而不是"我不行"：不少脚本对没版权是抛错而非返回空地址，
           // 若照记坏，用户连点两首冷门歌就能把一个只是没版权的好源推进冷却（见账本判据）
-          if (tookMs < callTimeoutMs && isContentMiss(message)) {
+          if (!timedOut && isContentMiss(message)) {
             sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'no-address', tookMs)
             logger.debug(`该源无此曲: ${instance.config.name} - ${quality}`, message)
             continue
           }
-          // 耗时顶到本次上限即视为挂起，否则是脚本内部报错——两者都算坏，分开记便于归因
-          recordBad(tookMs >= callTimeoutMs ? 'timeout' : 'error', tookMs, message.slice(0, 120))
+          // 超时与脚本内部报错都算坏，分开记便于归因
+          recordBad(timedOut ? 'timeout' : 'error', tookMs, message.slice(0, 120))
           logger.debug(`获取失败: ${instance.config.name} - ${quality}`, message)
         }
       }
