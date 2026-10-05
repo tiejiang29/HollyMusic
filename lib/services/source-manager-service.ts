@@ -14,6 +14,7 @@ import fsp from 'fs/promises'
 import path from 'path'
 import dns from 'dns/promises'
 import net from 'net'
+import { createHash } from 'crypto'
 import { gitBlobSha } from '@/lib/server/git-blob-sha'
 import { logger } from '@/lib/logger'
 import { isPublicIp } from '@/lib/server/url-guard'
@@ -462,16 +463,30 @@ export async function addSource(opts: {
 /**
  * 从在线链接导入洛雪脚本，校验通过后自动注册为可更新订阅。
  *
- * `expectedBlobSha` 只给音源发现导入用：候选表存的是 GitHub 树接口给的 blob sha，
- * 服务端按地址**重新下载**后先复验它，再走校验。顺序不能换 ——
- * `validateScriptContent` 会真执行这份脚本，内容对不上就不该有执行这一步。
+ * 两个复验锚点，**都排在执行之前**：`validateScriptContent` 会真跑这份脚本，
+ * 内容对不上就不该有执行这一步。
+ * - `expectedBlobSha`：候选来自仓库 tree 时，树接口给的 blob sha（`git hash-object` 那套算法）；
+ * - `expectedSha256`：候选来自 release 资产时，GitHub 记录的文件 sha256 —— 资产不是 git blob，
+ *   没有 blob sha 可对，这条才是它的同源锚点。
  */
 export async function importSubscription(
   subscriptionUrl: string,
-  options: { expectedBlobSha?: string } = {},
+  options: { expectedBlobSha?: string; expectedSha256?: string } = {},
 ): Promise<SourceConfig> {
   const normalizedUrl = subscriptionUrl.trim()
   const { content, filename } = await fetchSubscriptionScript(normalizedUrl)
+
+  const expectedDigest = (options.expectedSha256 || '').trim().toLowerCase()
+  if (expectedDigest) {
+    const actual = createHash('sha256').update(content, 'utf8').digest('hex')
+    if (actual !== expectedDigest) {
+      throw new SourceSubscriptionError(
+        `内容与发布资产记录的 sha256 不一致（期望 ${expectedDigest.slice(0, 8)}…，实到 ${actual.slice(0, 8)}…），`
+        + '可能上游刚重发过、也可能地址被改写，拒绝导入',
+        409,
+      )
+    }
+  }
 
   const expected = (options.expectedBlobSha || '').toLowerCase()
   if (expected) {

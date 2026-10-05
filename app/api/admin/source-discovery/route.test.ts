@@ -298,6 +298,27 @@ describe('动作校验', () => {
   })
 })
 
+describe('只取最新 release 这个开关', () => {
+  it('默认开，且 GET 的配置视图里带得出来（面板那个勾选框要有依据）', async () => {
+    const payload = await (await GET(request('GET'))).json()
+    expect(payload.data.settings.preferLatestRelease).toBe(true)
+  })
+
+  it('PUT 关掉之后不回落到默认值：改一次就生效，别下次读又变回开', async () => {
+    const off = await (await PUT(request('PUT', { preferLatestRelease: false }))).json()
+    expect(off.data.settings.preferLatestRelease).toBe(false)
+
+    const again = await (await GET(request('GET'))).json()
+    expect(again.data.settings.preferLatestRelease).toBe(false)
+  })
+
+  it('非布尔的值不当成"关掉"：传字符串不改原值', async () => {
+    await PUT(request('PUT', { preferLatestRelease: 'false' }))
+    const after = await (await GET(request('GET'))).json()
+    expect(after.data.settings.preferLatestRelease).toBe(true)
+  })
+})
+
 describe('每轮抓正文上限', () => {
   it('可以调到 2000（清几千条存量时用），再大就夹住', async () => {
     const up = await (await PUT(request('PUT', { maxDownloadsPerRound: 2000 }))).json()

@@ -10,7 +10,7 @@
  *                                   { action:'stop' } 请求停止；
  *                                   { action:'prune' } 清理已移除仓的候选；
  *                                   { action:'dismiss'|'import', id, force? } 剔除 / 导入成音源
- * PUT  /api/admin/source-discovery  改配置：{ enabled, repos, maxCandidatesPerRepo, maxDownloadsPerRound, githubToken?, clearToken? }
+ * PUT  /api/admin/source-discovery  改配置：{ enabled, repos, maxCandidatesPerRepo, maxDownloadsPerRound, preferLatestRelease, githubToken?, clearToken? }
  *
  * 导入只认 candidateId：地址与 blob sha 都取自服务端那行记录，客户端传 URL 或正文都没有入口。
  */
@@ -55,6 +55,7 @@ function toSettingsView(settings: DiscoverySettings) {
     repos: settings.repos,
     maxCandidatesPerRepo: settings.maxCandidatesPerRepo,
     maxDownloadsPerRound: settings.maxDownloadsPerRound,
+    preferLatestRelease: settings.preferLatestRelease,
     hasToken: Boolean(settings.githubToken),
     tokenTail: settings.githubToken ? maskSecret(settings.githubToken) : '',
   }
@@ -186,6 +187,7 @@ export async function PUT(request: NextRequest) {
     if (Array.isArray(body?.repos)) patch.repos = body.repos
     if (typeof body?.maxCandidatesPerRepo === 'number') patch.maxCandidatesPerRepo = body.maxCandidatesPerRepo
     if (typeof body?.maxDownloadsPerRound === 'number') patch.maxDownloadsPerRound = body.maxDownloadsPerRound
+    if (typeof body?.preferLatestRelease === 'boolean') patch.preferLatestRelease = body.preferLatestRelease
     if (typeof body?.githubToken === 'string') patch.githubToken = body.githubToken
 
     const saved = await saveDiscoverySettings(patch)

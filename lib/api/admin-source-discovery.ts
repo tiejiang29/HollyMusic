@@ -9,6 +9,8 @@ export interface DiscoverySettingsView {
   repos: string[]
   maxCandidatesPerRepo: number
   maxDownloadsPerRound: number
+  /** 有 release 的仓只取最新一次发布的 .js 资产（默认开） */
+  preferLatestRelease: boolean
   /** token 永不出网：只给"配没配"和脱敏尾巴 */
   hasToken: boolean
   tokenTail: string
@@ -68,6 +70,12 @@ export interface DiscoveryStatus {
     truncatedRepos: string[]
     /** 本轮跳过的仓库及原因（404 / 配额 / HTTP 错误…） */
     reposSkipped: string[]
+    /** 本轮走"最新 release 资产"采集的仓（面板要说，否则候选数突然塌下去没人能解释） */
+    releaseRepos: string[]
+    /** 查了 release 但回落 tree 的仓与原因（没发过 / 不是 .js 资产 / 这次没查到） */
+    releaseFallbacks: string[]
+    /** 因为改走 release 采集而被标成"已被顶掉"的 tree 历史行数 */
+    releaseSuperseded: number
     quota: { remaining: number; limit: number; resetAt: number } | null
   } | null
   lastError: string | null
@@ -106,6 +114,12 @@ export interface DiscoveryCandidate {
   importedPath: string
   /** P0-c：撞上了**已经装着的源**（content=字节相同 / name=同名不同内容）；null = 没撞 */
   duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
+  /** 非空 = 这条来自某个 release 的资产（此时 path 是资产文件名，不是仓库内路径） */
+  releaseTag: string
+  /** GitHub 记录的资产 sha256（`sha256:<hex>`）；空 = tree 采集或它没给 */
+  assetDigest: string
+  /** 上游时间：release 采集是发布时间；tree 采集通常为空（raw 的 HEAD 路径不回 Last-Modified） */
+  upstreamAt: string
 }
 
 export interface DiscoveryView {
@@ -234,6 +248,7 @@ export function saveDiscoverySettings(payload: {
   repos?: string[]
   maxCandidatesPerRepo?: number
   maxDownloadsPerRound?: number
+  preferLatestRelease?: boolean
   githubToken?: string
   clearToken?: boolean
 }): Promise<{ settings: DiscoverySettingsView; rejected: string[] }> {

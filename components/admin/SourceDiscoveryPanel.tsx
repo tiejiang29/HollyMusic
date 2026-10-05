@@ -736,6 +736,26 @@ export function SourceDiscoveryPanel() {
               </span>
             </div>
 
+            <div className="mb-3">
+              <label className="flex items-start gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={Boolean(settings?.preferLatestRelease)}
+                  onChange={e => { void savePatch({ preferLatestRelease: e.target.checked }) }}
+                />
+                <span>
+                  <span className="font-medium">有 release 的仓只取最新一次发布的 .js 资产</span>
+                  <span className="block text-muted-foreground">
+                    关掉它就一律改扫仓库 tree。实测某个仓的 tree 里堆着 969 个历史版本 .js，
+                    而它最新一次发布只有 1 个资产 —— 开着这一个仓就从 300 行塌成 1 行。
+                    最新 release 里没有 .js（比如发的是 zip）或这仓从没发过，仍会自动回落扫 tree。
+                    代价：每个仓多一次 GitHub 接口调用。
+                  </span>
+                </span>
+              </label>
+            </div>
+
             <div className="mb-3 flex flex-wrap items-center gap-3">
               <div className="text-xs uppercase text-muted-foreground">GitHub Token</div>
               <input
@@ -1073,6 +1093,15 @@ export function SourceDiscoveryPanel() {
                   树被 GitHub 截断（这仓结果不完整）：{status.last.truncatedRepos.join('、')}
                 </div>
               ) : null}
+              {status.last.releaseRepos?.length ? (
+                <div className="mt-1 text-primary">
+                  走最新 release 采集：{status.last.releaseRepos.join('、')}
+                  {status.last.releaseSuperseded ? `；tree 里的 ${status.last.releaseSuperseded} 行历史文件已标成"已被顶掉"` : ''}
+                </div>
+              ) : null}
+              {status.last.releaseFallbacks?.length ? (
+                <div className="mt-1 text-muted-foreground">回落扫 tree：{status.last.releaseFallbacks.join('；')}</div>
+              ) : null}
               {status.last.reposSkipped?.length ? (
                 <div className="mt-1">跳过：{status.last.reposSkipped.join('；')}</div>
               ) : null}
@@ -1119,7 +1148,15 @@ export function SourceDiscoveryPanel() {
                     <tr key={row.id} className="border-t border-border hover:bg-accent/20">
                       <td className="px-4 py-3 font-mono text-xs">
                         <div>{row.repo}</div>
-                        <div className="text-muted-foreground">{row.path}</div>
+                        {row.releaseTag ? (
+                          <div
+                            className="text-primary"
+                            title={row.assetDigest ? `发布资产的 sha256：${row.assetDigest}（导入前会按它复验）` : '这个发布资产 GitHub 没给 digest，导入时无从复验'}
+                          >
+                            来自发布 {row.releaseTag}{row.upstreamAt ? `（${row.upstreamAt.slice(0, 10)}）` : ''}
+                          </div>
+                        ) : null}
+                        <div className="text-muted-foreground">{row.releaseTag ? '资产文件：' : ''}{row.path}</div>
                         {row.importedPath ? (
                           <div className="text-green-700">已导入 → {row.importedPath}</div>
                         ) : null}

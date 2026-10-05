@@ -364,13 +364,19 @@ model SourceCandidate {
   rawUrl      String
   /// GitHub 树里给的 blob sha，用于后续走镜像时校验内容一致（P0-a 只记录不比对）
   blobSha     String    @default("")
+  /// 从 Release 资产采集时的完整性锚点，形如 `sha256:<hex>`（GitHub 给）。
+  /// 资产不是 git blob，没有 blobSha 可对，导入前复验的就是这个值；空 = tree 采集的候选。
+  assetDigest String    @default("")
+  /// 走 Release 采集时的 tag_name；空 = tree 采集。面板据此说明"这条来自某个发布"
+  releaseTag  String    @default("")
   /// 从脚本头注释解析的 @name
   scriptName  String    @default("")
   /// @name 剥掉尾部版本号并归一后的键，用于同名择优
   nameKey     String    @default("")
   contentHash String    @default("")
-  /// 上游给的文件时间（raw 响应的 Last-Modified）。同名择优要用**它**而不是我们的写入时间——
-  /// 同一轮里所有行的 updatedAt 都是刚刚，拿它排序等于随机。
+  /// 上游给的文件时间：tree 采集取 raw 响应的 Last-Modified（实测 HEAD 路径根本不给，
+  /// 于是恒为空），Release 采集取 `published_at`（这才是真能排序的那一档）。
+  /// 同名择优要用**它**而不是我们的写入时间——同一轮里所有行的 updatedAt 都是刚刚，拿它排序等于随机。
   upstreamAt  String    @default("")
   sizeBytes   Int       @default(0)
   /// 静态特征打分，>= 阈值才算疑似

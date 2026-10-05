@@ -55,9 +55,9 @@ const { probeDeps } = vi.hoisted(() => ({
 vi.mock('./source-probe', () => probeDeps)
 
 const {
-  normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
+  normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper, toIsoTime,
   searchGitHubRepos, sanitizeRepoQuery, repoSearchItemFromApi,
-  auditRepoFreshness, daysSincePush,
+  auditRepoFreshness, daysSincePush, verifyContentAnchor, assetDigestHex,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
@@ -97,14 +97,21 @@ beforeEach(() => {
   })
   prismaMock.sourceCandidate.findUnique = vi.fn(async (args: PathWhere | { where: { id: number } }) => {
     const where = args.where as { id?: number; repo_path?: { repo: string; path: string } }
-    if (typeof where.id === 'number') return rows.find(r => r.id === where.id) ?? null
+    // 返回**快照**而不是行本身的引用：真 Prisma 每次查都是新对象，
+    // 给引用的话"先改行再比较"这种自毁式顺序在测试里会看不出来
+    if (typeof where.id === 'number') {
+      const hit = rows.find(r => r.id === where.id)
+      return hit ? { ...hit } : null
+    }
     const target = where.repo_path!
-    return rows.find(r => r.repo === target.repo && r.path === target.path) ?? null
+    const hit = rows.find(r => r.repo === target.repo && r.path === target.path)
+    return hit ? { ...hit } : null
   })
   prismaMock.sourceCandidate.create = vi.fn(async ({ data }: CreateArgs) => {
     // 补齐 schema 里带 @default 的列：真库由 Prisma 填，假库要自己填，否则测不出真实形状
     const row = {
       blobSha: '', scriptName: '', nameKey: '', contentHash: '', upstreamAt: '', sizeBytes: 0, score: 0,
+      assetDigest: '', releaseTag: '',
       verdict: 'pending', state: 'new', reason: null, checkedAt: null, probeJson: '', importedPath: '',
       id: nextId++, ...data,
     } as Row
@@ -255,6 +262,29 @@ describe('betterKeeper', () => {
     expect(betterKeeper({ ...base, score: 9 }, { ...base, score: 7 })).toBe(-1)
     expect(betterKeeper({ ...base, id: 5 }, { ...base, id: 3 })).toBe(1)
   })
+
+  it('两种来源格式混存时按真实时间比，不按字典序 —— HTTP 日期不能因为首字母是 T 就永远赢', () => {
+    const httpDate = 'Tue, 08 Sep 2026 11:23:39 GMT'
+    const isoNewer = '2026-10-01T00:00:00Z'
+    // 字典序里 'T…' > '2…'，这条会判反
+    expect(betterKeeper({ ...base, lastModified: httpDate }, { ...base, lastModified: isoNewer })).toBe(1)
+    expect(betterKeeper({ ...base, lastModified: isoNewer }, { ...base, lastModified: httpDate })).toBe(-1)
+  })
+
+  it('时间读不出的按"最旧"处理，不能顶掉有时间的', () => {
+    expect(betterKeeper({ ...base, lastModified: '' }, base)).toBe(1)
+    expect(betterKeeper({ ...base, lastModified: '不是时间' }, base)).toBe(1)
+  })
+})
+
+describe('toIsoTime', () => {
+  it('HTTP 日期与 ISO 都归一成 ISO；解析不出就留空串', () => {
+    expect(toIsoTime('Tue, 08 Sep 2026 11:23:39 GMT')).toBe('2026-09-08T11:23:39.000Z')
+    expect(toIsoTime('2026-09-08T11:23:47Z')).toBe('2026-09-08T11:23:47.000Z')
+    expect(toIsoTime('')).toBe('')
+    expect(toIsoTime('不是时间')).toBe('')
+    expect(toIsoTime(undefined)).toBe('')
+  })
 })
 
 // ————— 一轮发现的流程 —————
@@ -275,7 +305,17 @@ describe('runDiscoveryCrawl', () => {
       throw new Error(`不该再打了: ${url}`)
     })
     vi.stubGlobal('fetch', fetch)
-    await expect(runDiscoveryCrawl()).rejects.toThrow(/余量 2，本轮需要 3/)
+    // 走 release 的仓最多两次接口调用（发布 + 回落时的树），预检按最坏情况算，不能按 1 次骗自己
+    await expect(runDiscoveryCrawl()).rejects.toThrow(/余量 2，本轮最多需要 6 次/)
+  })
+
+  it('关掉"只取最新 release"后，预检回到一个仓一次调用', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b', 'c/d', 'e/f'], preferLatestRelease: false })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 2, limit: 60, reset: 0 } } })
+      throw new Error(`不该再打了: ${url}`)
+    }))
+    await expect(runDiscoveryCrawl()).rejects.toThrow(/余量 2，本轮最多需要 3 次/)
   })
 
   it('树里的 .js 进候选，正文过阈值的判为疑似；非 .js 不收', async () => {
@@ -355,7 +395,8 @@ describe('runDiscoveryCrawl', () => {
     expect(summary.stale).toBe(1)
     expect(rows.filter(r => r.state === 'stale')).toHaveLength(1)
     expect(rows.find(r => r.state === 'new')?.scriptName).toContain('1.2.0')
-    expect(rows.find(r => r.state === 'new')?.upstreamAt).toBe('Sun, 04 Oct 2026 00:00:00 GMT')
+    // 存的是**响应头那个时间**（不是我们写入的时间），并归一成 ISO —— 两种来源格式混存时字典序会判反
+    expect(rows.find(r => r.state === 'new')?.upstreamAt).toBe('2026-10-04T00:00:00.000Z')
   })
 
   it('抓正文失败时保持 pending，不把临时故障固化成"非音源"', async () => {
@@ -385,10 +426,30 @@ describe('runDiscoveryCrawl', () => {
     expect(headers.Authorization).toBe('Bearer ghp_testtoken')
   })
 
+  it('token 只跟 api.github.com 走：raw 与 release 下载都不带 Authorization', async () => {
+    await enable(['a/b'], 'ghp_testtoken')
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+      if (url.includes('/releases/latest')) {
+        return jsonResponse({ tag_name: 'v1', published_at: '2026-10-01T00:00:00Z', assets: [{ name: 's.js', size: 40, digest: `sha256:${'a'.repeat(64)}` }] })
+      }
+      return new Response(FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
+    }))
+    await runDiscoveryCrawl()
+
+    const calls = callsOf(globalThis.fetch)
+    const api = calls.filter(([u]) => String(u).startsWith('https://api.github.com'))
+    const others = calls.filter(([u]) => !String(u).startsWith('https://api.github.com'))
+    // 两边都得真有调用，否则这个断言就成了空转
+    expect(api.length).toBeGreaterThan(0)
+    expect(others.some(([u]) => String(u).startsWith('https://github.com/'))).toBe(true)
+    for (const [, init] of api) expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer ghp_testtoken')
+    for (const [, init] of others) expect((init?.headers as Record<string, string>).Authorization, String(init?.headers)).toBeUndefined()
+  })
+
   it('默认值就是关着的（别因为合并了默认对象被打开）', () => {
     expect(DEFAULT_DISCOVERY_SETTINGS.enabled).toBe(false)
   })
-
   it('默认仓库清单：形状全都合法、无重复（混进一个拼不出地址的项就会白扣配额）', () => {
     const repos = DEFAULT_DISCOVERY_SETTINGS.repos
     expect(repos.length).toBeGreaterThan(30)
@@ -402,6 +463,7 @@ const RAW_URL = 'https://raw.githubusercontent.com/a/b/HEAD/lx-source.js'
 function seedSuspect(over: Partial<Row> = {}): number {
   const row = {
     id: nextId++, repo: 'a/b', path: 'lx-source.js', rawUrl: RAW_URL, blobSha: '',
+    assetDigest: '', releaseTag: '',
     scriptName: '合成测试音源 v1.2.0', nameKey: '合成测试音源', contentHash: '', upstreamAt: '',
     sizeBytes: 400, score: 8, verdict: 'suspect', state: 'new', reason: null,
     probeJson: '', probedAt: null, checkedAt: null, importedPath: '', ...over,
@@ -1226,5 +1288,206 @@ describe('auditRepoFreshness（停更仓体检）', () => {
     vi.stubGlobal('fetch', fetch)
     await expect(auditRepoFreshness()).rejects.toThrow(/空的/)
     expect(fetch).not.toHaveBeenCalled()
+  })
+})
+
+// ————— 有 release 的仓只取最新那一次发布 —————
+describe('最新 release 采集', () => {
+  const HEX_A = 'a'.repeat(64)
+  const HEX_B = 'b'.repeat(64)
+  const releasePayload = (over: Record<string, unknown> = {}) => ({
+    tag_name: 'v260908',
+    published_at: '2026-09-08T11:23:47Z',
+    assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000, digest: `sha256:${HEX_A}`, browser_download_url: 'https://objects.githubusercontent.com/不该用这个' }],
+    ...over,
+  })
+  const treeOnce = (path = 'lx-music-source.js') => jsonResponse({ tree: [{ path, type: 'blob', sha: 'aaa', size: 500 }], truncated: false })
+
+  /** 一个仓：release 有 .js 资产 ⇒ 不打 tree；正文返回合成脚本 */
+  const releaseStub = (payload: Record<string, unknown>, opts: { releases?: unknown; scriptText?: string } = {}) => {
+    const urls: string[] = []
+    let scriptReads = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+      if (url.includes('/releases/latest')) {
+        return opts.releases !== undefined ? opts.releases as Response : jsonResponse(payload)
+      }
+      if (url.includes('/git/trees/')) return treeOnce()
+      scriptReads++
+      return new Response(opts.scriptText ?? FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
+    }))
+    return { urls, reads: () => scriptReads }
+  }
+
+  it('有 .js 资产就只用它当候选，一次都不打仓库树', async () => {
+    await enable(['a/b'])
+    const { urls } = releaseStub(releasePayload())
+    const summary = await runDiscoveryCrawl()
+
+    expect(summary.releaseRepos).toHaveLength(1)
+    expect(urls.some(u => u.includes('/git/trees/'))).toBe(false)
+    expect(summary.suspect).toBe(1)
+  })
+
+  it('地址与元数据都按 release 记：路径是资产名、url 我们自己拼、上游时间是发布时间、digest 留着复验', async () => {
+    await enable(['a/b'])
+    releaseStub(releasePayload())
+    await runDiscoveryCrawl()
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      repo: 'a/b',
+      path: 'HYWmusic_v1.0.3.js',
+      // 不取 API 给的 browser_download_url —— 那是第二个自由文本入口
+      rawUrl: 'https://github.com/a/b/releases/download/v260908/HYWmusic_v1.0.3.js',
+      releaseTag: 'v260908',
+      assetDigest: `sha256:${HEX_A}`,
+      blobSha: '',
+      // 归一成 ISO 后存（原始来源是 published_at；下载头里没有 Last-Modified）
+      upstreamAt: '2026-09-08T11:23:47.000Z',
+    })
+  })
+
+  it('从没发过 release（404）就照常扫 tree，而且不在结论里每轮刷一句废话', async () => {
+    await enable(['a/b'])
+    const { urls } = releaseStub(releasePayload(), { releases: new Response('{"message":"Not Found"}', { status: 404 }) })
+    const summary = await runDiscoveryCrawl()
+
+    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
+    expect(summary.releaseFallbacks).toEqual([])
+    expect(rows[0]).toMatchObject({ path: 'lx-music-source.js', releaseTag: '', assetDigest: '' })
+  })
+
+  it('最新 release 发的是压缩包 ⇒ 回落扫 tree，并把"没有 .js 资产"连同文件名说清', async () => {
+    await enable(['a/b'])
+    const { urls } = releaseStub(releasePayload({
+      tag_name: 'V261003',
+      assets: [{ name: 'V261003.zip', size: 282_000, digest: `sha256:${HEX_B}` }],
+    }))
+    const summary = await runDiscoveryCrawl()
+
+    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
+    expect(summary.releaseFallbacks.join(' ')).toContain('没有 .js 资产')
+    expect(summary.releaseFallbacks.join(' ')).toContain('V261003.zip')
+  })
+
+  it('release 接口 502 也只是"这次没查到"：回落扫 tree，不把它写成"这仓没发布"', async () => {
+    await enable(['a/b'])
+    const { urls } = releaseStub(releasePayload(), { releases: new Response('bad gateway', { status: 502 }) })
+    const summary = await runDiscoveryCrawl()
+
+    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
+    expect(summary.releaseFallbacks.join(' ')).toContain('HTTP 502')
+  })
+
+  it('release 接口回的不是 JSON 也不该把整个仓判失败：回落扫 tree', async () => {
+    await enable(['a/b'])
+    const { urls } = releaseStub(releasePayload(), { releases: new Response('<html>代理塞进来的网页</html>', { status: 200, headers: { 'content-type': 'text/html' } }) })
+    const summary = await runDiscoveryCrawl()
+
+    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
+    expect(summary.reposSkipped).toEqual([])
+  })
+
+  it('改走 release 之后，tree 里那些不再刷新的历史行标成"已被顶掉"，行留着', async () => {
+    await enable(['a/b'])
+    const old = seedSuspect({ repo: 'a/b', path: '历史版本/v1.0.0.js' })
+    releaseStub(releasePayload())
+
+    const summary = await runDiscoveryCrawl()
+    expect(summary.releaseSuperseded).toBe(1)
+    expect(rows.find(r => r.id === old)?.state).toBe('stale')
+    expect(rows.find(r => r.id === old)?.reason).toContain('改走')
+    expect(rows).toHaveLength(2)
+  })
+
+  it('同一资产换了内容（digest 变了）要重下；digest 没变就不重下', async () => {
+    await enable(['a/b'])
+    const first = releaseStub(releasePayload())
+    await runDiscoveryCrawl()
+    expect(first.reads()).toBe(1)
+
+    const second = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000, digest: `sha256:${HEX_A}` }] }))
+    await runDiscoveryCrawl()
+    expect(second.reads()).toBe(0)
+
+    const changed = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_500, digest: `sha256:${HEX_B}` }] }))
+    await runDiscoveryCrawl()
+    expect(changed.reads()).toBe(1)
+  })
+
+  it('GitHub 没给 digest 时不能拿"两边都是空串"当内容没变 —— 那会把更新固化掉', async () => {
+    await enable(['a/b'])
+    const noDigest = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000 }] }))
+    await runDiscoveryCrawl()
+    expect(noDigest.reads()).toBe(1)
+
+    const again = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000 }] }))
+    await runDiscoveryCrawl()
+    expect(again.reads()).toBe(1)
+  })
+
+  it('关掉开关就回到"只扫 tree"：一次 release 接口都不打', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], preferLatestRelease: false })
+    const { urls } = releaseStub(releasePayload())
+    const summary = await runDiscoveryCrawl()
+
+    expect(urls.some(u => u.includes('/releases/latest'))).toBe(false)
+    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
+    expect(summary.releaseRepos).toEqual([])
+  })
+})
+
+// ————— 完整性锚点 —————
+describe('完整性锚点', () => {
+  it('assetDigestHex 只认 64 位 hex：取不出就当没有锚点，不能拿解析错的串拒掉好源', () => {
+    expect(assetDigestHex(`sha256:${'a'.repeat(64)}`)).toBe('a'.repeat(64))
+    expect(assetDigestHex(`sha256=${'A'.repeat(64)}`)).toBe('a'.repeat(64))
+    expect(assetDigestHex('a'.repeat(64))).toBe('a'.repeat(64))
+    expect(assetDigestHex('sha256:太短')).toBe('')
+    expect(assetDigestHex('')).toBe('')
+    expect(assetDigestHex(undefined)).toBe('')
+  })
+
+  it('verifyContentAnchor：release 看 sha256，tree 看 blob sha，两个都没有是"无从校验"而不是通过', () => {
+    const hex = createHash('sha256').update(FAKE_SOURCE_SCRIPT, 'utf8').digest('hex')
+    expect(verifyContentAnchor(FAKE_SOURCE_SCRIPT, '', `sha256:${hex}`)).toBe(true)
+    expect(verifyContentAnchor(FAKE_SOURCE_SCRIPT, '', `sha256:${'f'.repeat(64)}`)).toBe(false)
+    expect(verifyContentAnchor(FAKE_SOURCE_SCRIPT, gitBlobSha(FAKE_SOURCE_SCRIPT), '')).toBe(true)
+    expect(verifyContentAnchor(FAKE_SOURCE_SCRIPT, '', '')).toBeNull()
+  })
+
+  it('判级遇到 digest 对不上：拒绝执行，说的是 sha256 而不是 blob sha', async () => {
+    await enable(['a/b'])
+    const id = seedSuspect({
+      path: 'HYWmusic_v1.0.3.js', releaseTag: 'v260908', assetDigest: `sha256:${'f'.repeat(64)}`, blobSha: '',
+      rawUrl: 'https://github.com/a/b/releases/download/v260908/HYWmusic_v1.0.3.js',
+    })
+    const runner = fakeRunner()
+    _setRunnerForTest(runner)
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+      return new Response(FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
+    }))
+
+    const report = await probeCandidate(id)
+    expect(report.shaVerified).toBe(false)
+    expect(report.note).toContain('sha256')
+    expect(runner.validateScript).not.toHaveBeenCalled()
+  })
+
+  it('导入一条 release 候选：复验交给导入通道的是 sha256，不再是 blob sha', async () => {
+    await enable(['a/b'])
+    const hex = createHash('sha256').update(FAKE_SOURCE_SCRIPT, 'utf8').digest('hex')
+    const downloadUrl = 'https://github.com/a/b/releases/download/v260908/HYWmusic_v1.0.3.js'
+    const id = seedSuspect({
+      path: 'HYWmusic_v1.0.3.js', rawUrl: downloadUrl, blobSha: '',
+      assetDigest: `sha256:${hex}`, releaseTag: 'v260908', probeJson: probeReportOf({ tx: 'ok' }),
+    })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/合成测试音源.js', name: '合成测试音源' })
+
+    await importCandidate(id)
+    expect(importSubscriptionMock).toHaveBeenCalledWith(downloadUrl, { expectedSha256: hex })
   })
 })

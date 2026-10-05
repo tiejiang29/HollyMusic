@@ -42,6 +42,12 @@ export interface DiscoverySettings {
   maxDownloadsPerRound: number
   /** 只用于提升 API 限额的 token，可以没有任何 scope；出网一律脱敏 */
   githubToken: string
+  /**
+   * 有 release 的仓只取**最新一个 release 的 .js 资产**，不扫 tree。
+   * 默认开：实测一个仓的 tree 里有 969 个像脚本的 .js（全是历史版本堆），
+   * 而它最新一次发布就 1 个资产 —— 关掉它等于每月多收几百行噪音。
+   */
+  preferLatestRelease: boolean
 }
 
 /**
@@ -97,6 +103,7 @@ export const DEFAULT_DISCOVERY_SETTINGS: DiscoverySettings = {
   maxCandidatesPerRepo: 300,
   maxDownloadsPerRound: 80,
   githubToken: '',
+  preferLatestRelease: true,
 }
 
 export class SourceDiscoveryError extends Error {
@@ -110,7 +117,15 @@ export class SourceDiscoveryError extends Error {
 
 const API_HOST = 'https://api.github.com'
 const RAW_HOST = 'https://raw.githubusercontent.com'
+/** release 资产的下载地址在 github.com（会 302 到 objects.githubusercontent.com，逐跳仍过 SSRF 闸门） */
+const DOWNLOAD_HOST = 'https://github.com'
 const REQUEST_TIMEOUT_MS = 15_000
+/**
+ * 抓正文的超时单独放宽：release 资产要走 `github.com → objects.githubusercontent.com` 的 302，
+ * 实测同一条地址在本机有时 15 秒内拿不下（API 调用从来不需要这么久）。
+ * 太紧的后果不是报错，是那条候选每轮都停在 pending 上，谁也不知道为什么。
+ */
+const DOWNLOAD_TIMEOUT_MS = 45_000
 /** 单个脚本正文的上限：实测真音源都在几十到几百 KB，超过这个数基本是打包产物或别的东西 */
 const MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 /** 打分阈值：只靠"文件名像"不够，必须有脚本自身特征才能进 suspect */
@@ -181,8 +196,27 @@ export function toNameKey(name: string): string {
  * 同名/同内容择优。排序口径按可靠性从高到低：
  * 上游更新时间新 → 版本号大 → 打分高 → id 小（稳定 tiebreak）。
  */
+/** 时间一律归一到 ISO：不同来源的格式不能混存（见 betterKeeper） */
+export function toIsoTime(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const parsed = Date.parse(value.trim())
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : ''
+}
+
+/**
+ * 同名/同内容择优。
+ *
+ * 时间一律 `Date.parse` 之后再比，**不能按字符串比**：`upstreamAt` 有两种来源格式
+ * ——raw 响应头的 `Last-Modified` 是 `Tue, 08 Sep 2026 11:23:39 GMT`，
+ * release 的 `published_at` 是 `2026-09-08T11:23:47Z`。字典序里 `T` 大于 `2`，
+ * 混存时 HTTP 日期永远赢，等于把"最新的留下"变成"某种格式的都算最新"。
+ */
 export function betterKeeper(a: { lastModified: string; scriptVersion: string; score: number; id: number }, b: { lastModified: string; scriptVersion: string; score: number; id: number }): -1 | 1 {
-  if (a.lastModified !== b.lastModified) return a.lastModified > b.lastModified ? -1 : 1
+  const timeA = Date.parse(a.lastModified)
+  const timeB = Date.parse(b.lastModified)
+  const rankA = Number.isFinite(timeA) ? timeA : 0
+  const rankB = Number.isFinite(timeB) ? timeB : 0
+  if (rankA !== rankB) return rankA > rankB ? -1 : 1
   const versionA = compareVersion(a.scriptVersion)
   const versionB = compareVersion(b.scriptVersion)
   if (versionA !== versionB) return versionA > versionB ? -1 : 1
@@ -209,9 +243,13 @@ interface RateLimitInfo {
   resetAt: number
 }
 
-async function githubFetch(url: string, token: string, init: Omit<RequestInit, 'redirect'> = {}): Promise<Response> {
+async function githubFetch(url: string, token: string, init: Omit<RequestInit, 'redirect'> = {}, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  // token 只给 api.github.com：raw 与 release 下载都不需要它，而 safePublicFetch 是逐跳带着
+  // 同一份 headers 重发的 —— release 地址会 302 到 objects.githubusercontent.com，
+  // 不加这道限定就等于把凭据一路递给 CDN 域名。
+  const forApi = new URL(url).hostname === 'api.github.com'
   try {
     // 仍然走 safePublicFetch：host 虽然是常量，但 DNS 会重绑，闸门不因为"是我拼的地址"就跳过
     return await safePublicFetch(url, {
@@ -220,7 +258,7 @@ async function githubFetch(url: string, token: string, init: Omit<RequestInit, '
       headers: {
         Accept: 'application/vnd.github+json',
         'User-Agent': 'HollyMusic-source-discovery',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(token && forApi ? { Authorization: `Bearer ${token}` } : {}),
         ...init.headers,
       },
     })
@@ -509,6 +547,12 @@ export interface CrawlSummary {
   reposScanned: number
   reposSkipped: string[]
   truncatedRepos: string[]
+  /** 本轮走"最新 release 资产"采集的仓（面板要说，否则管理员只看到候选数突然塌下去） */
+  releaseRepos: string[]
+  /** 查了 release 但回落到 tree 的仓与原因（404=从没发过、5xx=没查到、资产不是 .js） */
+  releaseFallbacks: string[]
+  /** 因为改走 release 采集而被标成"已被顶掉"的 tree 历史行数量 */
+  releaseSuperseded: number
   seen: number
   created: number
   refreshed: number
@@ -626,6 +670,7 @@ export async function saveDiscoverySettings(patch: Partial<DiscoverySettings>): 
     maxDownloadsPerRound: clampInt(patch.maxDownloadsPerRound, current.maxDownloadsPerRound, 0, 2000),
     // 空串视为"不改动"，清空要走显式的 clearToken，避免面板回显时把 token 抹掉
     githubToken: typeof patch.githubToken === 'string' && patch.githubToken.trim() ? patch.githubToken.trim() : current.githubToken,
+    preferLatestRelease: typeof patch.preferLatestRelease === 'boolean' ? patch.preferLatestRelease : current.preferLatestRelease,
   }
 
   await writeSetting(DISCOVERY_SETTING_KEY, next)
@@ -789,7 +834,8 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
   }
 
   const summary: CrawlSummary = {
-    reposScanned: 0, reposSkipped: [], truncatedRepos: [], seen: 0, created: 0, refreshed: 0,
+    reposScanned: 0, reposSkipped: [], truncatedRepos: [], releaseRepos: [], releaseFallbacks: [], releaseSuperseded: 0,
+    seen: 0, created: 0, refreshed: 0,
     downloaded: 0, suspect: 0, notSource: 0, stale: 0, quota: null, note: null, stopped: false,
   }
   progress.running = true
@@ -801,11 +847,13 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
   progress.lastError = null
 
   try {
-    // 一轮里 API 调用数 ≈ 仓库数（树）+ 正文数（raw 不吃 API 配额，但占时间）
+    // 一轮里 API 调用数 ≈ 仓库数 ×（走 release 时最多 2 次：发布 + 回落时的树）+ 正文数
+    // （raw 与 release 下载不吃 API 配额，但占时间）
     summary.quota = await readRateLimit(settings.githubToken)
-    if (summary.quota && summary.quota.remaining < targets.length) {
+    const callsNeeded = targets.length * (settings.preferLatestRelease ? 2 : 1)
+    if (summary.quota && summary.quota.remaining < callsNeeded) {
       throw new SourceDiscoveryError(
-        `GitHub API 余量 ${summary.quota.remaining}，本轮需要 ${targets.length} 次仓库树调用。`
+        `GitHub API 余量 ${summary.quota.remaining}，本轮最多需要 ${callsNeeded} 次仓库接口调用。`
         + `配一个只读 token 或删掉些仓库再来（token 只需提升限额，不要求任何 scope）`,
         429,
       )
@@ -824,9 +872,10 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
         const counted = await crawlRepo(repo, settings, summary, downloadBudget)
         downloadBudget -= counted
       } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err)
+        // 折成一行：Prisma 的报错自带换行与缩进，原样进"跳过"清单会把面板那行撑成一段代码块
+        const reason = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim()
         summary.reposSkipped.push(`${repo}：${reason.slice(0, 80)}`)
-        logger.info('[discovery] 仓库跳过', { repo, reason })
+        logger.info('[discovery] 仓库跳过', { repo, reason: reason.slice(0, 200) })
       }
       progress.reposDone++
       await sleep(GAP_BETWEEN_REPOS_MS)
@@ -855,12 +904,163 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
   }
 }
 
+/**
+ * 一个仓本轮要登记的候选。tree 里的文件与 release 里的资产从这一步起走同一条路：
+ * 同样的登记、同样的下载额度、同样的打分。
+ */
+interface CandidateEntry {
+  /** tree 里是仓库内路径；release 里是资产文件名（它与 repo 组成唯一键，形状一致） */
+  path: string
+  rawUrl: string
+  size: number
+  blobSha: string
+  /** release 资产的 `sha256:…`；tree 采集时为空 */
+  assetDigest: string
+  releaseTag: string
+  /** release 的 published_at —— tree 那边拿不到（raw 的 HEAD 路径不回 Last-Modified） */
+  upstreamAt: string
+}
+
+function buildReleaseUrl(repo: string): string {
+  const [owner, name] = repo.split('/')
+  return `${API_HOST}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest`
+}
+
+/**
+ * 资产的下载地址由我们自己拼，不取 API 给的 `browser_download_url`：
+ * 形状仍是 owner/repo + 逐段编码，"仓库名是唯一自由文本入口"这条口径才不被绕过。
+ */
+function buildReleaseAssetUrl(repo: string, tag: string, name: string): string {
+  const [owner, repoName] = repo.split('/')
+  return `${DOWNLOAD_HOST}/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`
+}
+
+function entriesFromTree(repo: string, tree: TreeEntry[], maxCandidates: number): CandidateEntry[] {
+  const out: CandidateEntry[] = []
+  for (const entry of tree) {
+    if (out.length >= maxCandidates) break
+    if (entry.type !== 'blob' || typeof entry.path !== 'string') continue
+    if (!isPlausibleScriptPath(entry.path)) continue
+    out.push({
+      path: entry.path, rawUrl: buildRawUrl(repo, entry.path),
+      size: Number(entry.size) || 0, blobSha: typeof entry.sha === 'string' ? entry.sha : '',
+      assetDigest: '', releaseTag: '', upstreamAt: '',
+    })
+  }
+  return out
+}
+
+/**
+ * GitHub 的资产 digest 形如 `sha256:<hex>`（实测两处都带这个前缀）。
+ * 取不出 64 位 hex 就当**没有锚点** —— 宁可不校验，也不能拿一个解析错的串当"内容不一致"拒掉好源。
+ */
+export function assetDigestHex(digest: unknown): string {
+  if (typeof digest !== 'string') return ''
+  const match = digest.trim().toLowerCase().match(/^(?:sha256[:=])?([0-9a-f]{64})$/)
+  return match ? match[1] : ''
+}
+
+/**
+ * 校验"下到的字节就是我们记录的那一份"。两种锚点按强弱排：
+ * - release 资产的 `digest`（GitHub 给的是文件字节的 sha256）；
+ * - tree 的 blob sha（`git hash-object` 那套 `blob <len>\0` 算法）。
+ * 返回 null = 这条记录本来没有可对锚点（**无从校验**），不等于"校验通过"。
+ *
+ * content 是已按 UTF-8 解码的文本：.js 资产是文本，重新编码回字节等价，所以可比。
+ * 真要碰二进制资产（本期不解压别人的压缩包）就不能走这条。
+ */
+export function verifyContentAnchor(content: string, blobSha: string, assetDigest: string): boolean | null {
+  const digestHex = assetDigestHex(assetDigest)
+  if (digestHex) return createHash('sha256').update(content, 'utf8').digest('hex') === digestHex
+  const sha = (blobSha || '').trim().toLowerCase()
+  if (sha) return gitBlobSha(content) === sha
+  return null
+}
+
+/**
+ * 有 release 的仓只取**最新那一个 release 的 .js 资产**。
+ * 理由不是好看：实测 `Macrohard0001/lx-ikun-music-sources` 的 tree 里有 969 个像脚本的 .js
+ * （全是历史版本堆，一家占候选表 39% 的行），而它最新一次发布只有 1 个 .js 资产。
+ *
+ * 回落 tree 的三种情况要分清：
+ * - **404 = 这个仓从没发过 release**（该接口的语义，是正证不是猜）；
+ * - 最新 release 里没有 .js 资产 —— 实测 `guoyue2010/lxmusic-` 发的是 `V261003.zip`，
+ *   本期不解压别人的压缩包（那是新的一整面风险，且这仓 tree 里本来就有散文件）；
+ * - 超时/5xx 只是**这次没查到**，同样回落，但要在结论里留一句，别让它看起来像"这仓没 release"。
+ */
+async function collectLatestRelease(repo: string, settings: DiscoverySettings, summary: CrawlSummary): Promise<CandidateEntry[] | null> {
+  const fallback = (reason: string) => {
+    summary.releaseFallbacks.push(`${repo}：${reason}，本轮按 tree 扫`)
+    return null
+  }
+  let release: { tag_name?: unknown; published_at?: unknown; assets?: unknown }
+  try {
+    const response = await githubFetch(buildReleaseUrl(repo), settings.githubToken)
+    // 404 = 这个仓从没发过 release（该接口的语义），是正证；它不写进回落说明，免得每轮都刷一句
+    if (response.status === 404) return null
+    if (!response.ok) return fallback(`release 返回 HTTP ${response.status}`)
+    // 读体也在同一段 try 里：非 JSON 的响应（截断、代理塞了网页）不该把整个仓判成失败
+    release = await response.json() as typeof release
+  } catch (err) {
+    const reason = (err instanceof Error ? err.message : String(err)).slice(0, 60)
+    return fallback(`release 没查到（${reason}）`)
+  }
+  const tag = typeof release.tag_name === 'string' ? release.tag_name : ''
+  const publishedAt = typeof release.published_at === 'string' ? release.published_at : ''
+  const assets = Array.isArray(release.assets) ? release.assets as Array<Record<string, unknown>> : []
+  const jsAssets = assets.filter(asset => typeof asset.name === 'string' && isPlausibleScriptPath(asset.name))
+  if (!tag || !jsAssets.length) {
+    const names = assets.slice(0, 3).map(asset => String(asset.name ?? '')).filter(Boolean)
+    summary.releaseFallbacks.push(`${repo}：最新 release${tag ? ` ${tag}` : ''} 里没有 .js 资产${names.length ? `（是 ${names.join('、')}）` : ''}，本轮按 tree 扫`)
+    return null
+  }
+
+  summary.releaseRepos.push(`${repo}（${tag}，${jsAssets.length} 个 .js 资产）`)
+  return jsAssets.slice(0, settings.maxCandidatesPerRepo).map(asset => ({
+    path: String(asset.name),
+    rawUrl: buildReleaseAssetUrl(repo, tag, String(asset.name)),
+    size: Number(asset.size) || 0,
+    blobSha: '',
+    assetDigest: typeof asset.digest === 'string' ? asset.digest : '',
+    releaseTag: tag,
+    upstreamAt: publishedAt,
+  }))
+}
+
+/** 改走 release 采集后，tree 里那些不再刷新的历史行标成"已被顶掉"（标行不删行，与去重同一口径） */
+async function supersedeOtherPaths(repo: string, keep: Set<string>, summary: CrawlSummary): Promise<void> {
+  const rows = await prisma.sourceCandidate.findMany({
+    where: { repo, state: 'new' },
+    select: { id: true, path: true, verdict: true },
+  })
+  for (const row of rows) {
+    if (keep.has(row.path)) continue
+    await prisma.sourceCandidate.update({
+      where: { id: row.id },
+      data: { state: 'stale', reason: '这个仓改走"最新 release 的资产"采集，tree 里的历史文件不再刷新' },
+    })
+    summary.releaseSuperseded++
+  }
+}
+
 async function crawlRepo(
   repo: string,
   settings: DiscoverySettings,
   summary: CrawlSummary,
   downloadBudget: number,
 ): Promise<number> {
+  let entries: CandidateEntry[] | null = null
+  let fromRelease = false
+  if (settings.preferLatestRelease) {
+    entries = await collectLatestRelease(repo, settings, summary)
+    fromRelease = entries !== null
+  }
+  if (!entries) entries = await collectTree(repo, settings, summary)
+  if (fromRelease) await supersedeOtherPaths(repo, new Set(entries.map(entry => entry.path)), summary)
+  return registerEntries(repo, entries, settings, summary, downloadBudget)
+}
+
+async function collectTree(repo: string, settings: DiscoverySettings, summary: CrawlSummary): Promise<CandidateEntry[]> {
   const response = await githubFetch(buildTreeUrl(repo), settings.githubToken)
   if (response.status === 404) throw new SourceDiscoveryError('仓库不存在或不可访问', 404)
   if (!response.ok) throw new SourceDiscoveryError(`GitHub 返回 HTTP ${response.status}`, response.status === 403 ? 403 : 502)
@@ -870,35 +1070,52 @@ async function crawlRepo(
     summary.truncatedRepos.push(repo)
     logger.info('[discovery] 仓库树被截断，本仓结果不完整', { repo, 条目: tree.length })
   }
+  return entriesFromTree(repo, tree, settings.maxCandidatesPerRepo)
+}
 
+async function registerEntries(
+  repo: string,
+  entries: CandidateEntry[],
+  settings: DiscoverySettings,
+  summary: CrawlSummary,
+  downloadBudget: number,
+): Promise<number> {
   let used = 0
-  const paths: Array<{ path: string; sha: string; size: number }> = []
-  for (const entry of tree) {
-    if (paths.length >= settings.maxCandidatesPerRepo) break
-    if (entry.type !== 'blob' || typeof entry.path !== 'string') continue
-    if (!isPlausibleScriptPath(entry.path)) continue
-    paths.push({ path: entry.path, sha: typeof entry.sha === 'string' ? entry.sha : '', size: Number(entry.size) || 0 })
-  }
-
-  for (const entry of paths) {
+  for (const entry of entries) {
     // 逐条之间也看停止：一个大仓能一口气吃满整轮额度，只仓间检查的话"停止"要等十几分钟才生效
     if (progress.stopRequested) {
       summary.stopped = true
       break
     }
-    const rawUrl = buildRawUrl(repo, entry.path)
+    // 内容锚点：tree 用 blob sha，release 用资产 digest。两个都没有（GitHub 偶尔不给 size/sha）
+    // 就每轮重下 —— 拿"两边都是空串"当"内容没变"会把更新固化掉。
+    const incomingId = entry.blobSha || entry.assetDigest
     const existing = await prisma.sourceCandidate.findUnique({
       where: { repo_path: { repo, path: entry.path } },
-      select: { id: true, blobSha: true, verdict: true },
+      select: { id: true, blobSha: true, assetDigest: true, verdict: true },
     })
     if (existing) {
-      await prisma.sourceCandidate.update({ where: { id: existing.id }, data: { rawUrl, blobSha: entry.sha, sizeBytes: entry.size } })
+      // 先把旧锚点取出来再写行：update 之后同一个对象的字段已经是新值，
+      // 拿它跟新值比就永远"内容没变"，更新会被自己盖掉（真 Prisma 回的是快照，假库回的是引用——两边都要成立）
+      const existingId = existing.blobSha || existing.assetDigest
+      await prisma.sourceCandidate.update({
+        where: { id: existing.id },
+        data: {
+          rawUrl: entry.rawUrl, blobSha: entry.blobSha, assetDigest: entry.assetDigest,
+          releaseTag: entry.releaseTag, sizeBytes: entry.size,
+        },
+      })
       summary.refreshed++
       summary.seen++
       // 正文没变且已有判定 ⇒ 不必再下一遍；这一条是配额与时间的主要节省点
-      if (existing.verdict !== 'pending' && existing.blobSha === entry.sha) continue
+      if (existing.verdict !== 'pending' && incomingId && existingId === incomingId) continue
     } else {
-      await prisma.sourceCandidate.create({ data: { repo, path: entry.path, rawUrl, blobSha: entry.sha, sizeBytes: entry.size } })
+      await prisma.sourceCandidate.create({
+        data: {
+          repo, path: entry.path, rawUrl: entry.rawUrl, blobSha: entry.blobSha,
+          assetDigest: entry.assetDigest, releaseTag: entry.releaseTag, sizeBytes: entry.size,
+        },
+      })
       summary.created++
       summary.seen++
     }
@@ -912,7 +1129,7 @@ async function crawlRepo(
     used++
     progress.downloaded++
     summary.downloaded++
-    await downloadAndScore(repo, entry.path, rawUrl, settings.githubToken, summary)
+    await downloadAndScore(repo, entry, settings.githubToken, summary)
   }
 
   summary.reposScanned++
@@ -921,15 +1138,14 @@ async function crawlRepo(
 
 async function downloadAndScore(
   repo: string,
-  path: string,
-  rawUrl: string,
+  entry: CandidateEntry,
   token: string,
   summary: CrawlSummary,
 ): Promise<void> {
   let content: string
   let lastModified = ''
   try {
-    const response = await githubFetch(rawUrl, token, { headers: { Accept: 'text/plain' } })
+    const response = await githubFetch(entry.rawUrl, token, { headers: { Accept: 'text/plain' } }, DOWNLOAD_TIMEOUT_MS)
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const contentType = response.headers.get('content-type') || ''
     if (/text\/html/i.test(contentType)) throw new Error('返回的是网页不是文件')
@@ -937,21 +1153,21 @@ async function downloadAndScore(
     content = await response.text()
   } catch (err) {
     // 下载失败保留 pending：这是临时故障，不该把结论固化成"非音源"
-    logger.info('[discovery] 正文抓取失败，留待下轮', { repo, path, reason: err instanceof Error ? err.message : String(err) })
+    logger.info('[discovery] 正文抓取失败，留待下轮', { repo, path: entry.path, reason: err instanceof Error ? err.message : String(err) })
     return
   }
 
   if (Buffer.byteLength(content, 'utf8') > MAX_SCRIPT_BYTES) {
-    await markNotSource(repo, path, '正文超过上限')
+    await markNotSource(repo, entry.path, '正文超过上限')
     summary.notSource++
     return
   }
 
-  const { score, hits } = scoreCandidate(path, content)
+  const { score, hits } = scoreCandidate(entry.path, content)
   const meta = parseScriptMeta(content)
   const suspect = score >= SUSPECT_THRESHOLD
   await prisma.sourceCandidate.update({
-    where: { repo_path: { repo, path } },
+    where: { repo_path: { repo, path: entry.path } },
     data: {
       score,
       verdict: suspect ? 'suspect' : 'not-source',
@@ -960,7 +1176,9 @@ async function downloadAndScore(
       scriptName: meta.name || '',
       // 只按归一后的 @name 分组：同名不同内容也要顶掉旧的（被顶的行不删，面板还能看见）
       nameKey: meta.name ? toNameKey(meta.name) : '',
-      upstreamAt: lastModified || '',
+      // 两种来源都归一成 ISO：raw/release 下载的 Last-Modified 优先（那是文件级的时间），
+      // 没有就用 release 的 published_at；tree 采集通常两个都拿不到，留空串
+      upstreamAt: toIsoTime(lastModified) || toIsoTime(entry.upstreamAt),
       checkedAt: new Date(),
     },
   })
@@ -1053,6 +1271,12 @@ export interface CandidateView {
   importedPath: string
   /** P0-c：与**已装源**撞车的对象（content=字节相同 / name=同名不同内容）；null = 没撞 */
   duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
+  /** 非空 = 这条来自某个 release 的资产（面板据此说"来自发布 vX"，并说明为什么不是仓库路径） */
+  releaseTag: string
+  /** 资产记录的 sha256（`sha256:<hex>`）；空 = tree 采集或 GitHub 没给 */
+  assetDigest: string
+  /** 上游时间：release 采集拿到的是发布时间，tree 采集通常拿不到（raw HEAD 不回 Last-Modified） */
+  upstreamAt: string
 }
 
 export async function listCandidates(filter: { verdict?: string; state?: string; take?: number } = {}): Promise<CandidateView[]> {
@@ -1084,6 +1308,9 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
       probedAt: row.probedAt ? row.probedAt.toISOString() : null,
       importedPath: row.importedPath,
       duplicateOf: twin ? { kind: twin.kind, path: twin.twin.path, name: twin.twin.name } : null,
+      releaseTag: row.releaseTag,
+      assetDigest: row.assetDigest,
+      upstreamAt: row.upstreamAt,
     }
   })
 }
@@ -1182,13 +1409,13 @@ function withLocalTimeout<T>(promise: Promise<T>, budgetMs: number, label: strin
 async function fetchScriptText(rawUrl: string, token: string): Promise<string> {
   let response: Response
   try {
-    response = await githubFetch(rawUrl, token, { headers: { Accept: 'text/plain' } })
+    response = await githubFetch(rawUrl, token, { headers: { Accept: 'text/plain' } }, DOWNLOAD_TIMEOUT_MS)
   } catch (err) {
     // 超时是 AbortController 触发的，undici 的原文是 "This operation was aborted" ——
     // 直接透传给管理员等于没说，换成能归因的一句
     const message = err instanceof Error ? err.message : String(err)
     if (/abort/i.test(message)) {
-      throw new SourceDiscoveryError(`下载脚本超时（${Math.round(REQUEST_TIMEOUT_MS / 1000)}s），可能是网络抖动或该地址已被限流`, 504)
+      throw new SourceDiscoveryError(`下载脚本超时（${Math.round(DOWNLOAD_TIMEOUT_MS / 1000)}s），可能是网络抖动或该地址已被限流`, 504)
     }
     throw new SourceDiscoveryError(`下载脚本失败：${message.slice(0, 100)}`, 502)
   }
@@ -1243,15 +1470,17 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
   const settings = await getDiscoverySettings()
   const content = await fetchScriptText(row.rawUrl, settings.githubToken)
 
-  const expectedSha = (row.blobSha || '').toLowerCase()
-  const report: CandidateProbeReport = { cells: {}, shaVerified: expectedSha ? false : null, note: null }
+  // 锚点两种：release 资产看 digest，tree 文件看 blob sha（两个都没有 = 无从校验，不写成通过）
+  const anchor = verifyContentAnchor(content, row.blobSha, row.assetDigest)
+  const report: CandidateProbeReport = { cells: {}, shaVerified: anchor, note: null }
 
-  if (expectedSha && gitBlobSha(content) !== expectedSha) {
-    report.note = 'blob sha 与仓库 tree 不一致，拒绝执行'
+  if (anchor === false) {
+    report.note = row.assetDigest
+      ? '内容与发布资产记录的 sha256 不一致，拒绝执行'
+      : 'blob sha 与仓库 tree 不一致，拒绝执行'
     await saveReport(id, report)
     return report
   }
-  if (expectedSha) report.shaVerified = true
 
   const runner = getOneShotRunner()
   if (runner.mode === 'inline') {
@@ -1582,7 +1811,11 @@ export async function importCandidate(id: number, opts: { force?: boolean } = {}
 
   let source: SourceConfig
   try {
-    source = await importSubscription(row.rawUrl, { expectedBlobSha: row.blobSha })
+    // 复验锚点按来源分：release 资产不是 git blob，只能对 GitHub 记录的 sha256；
+    // tree 文件仍对 blob sha。两个都没有就交给下游校验（面板会显示"无从校验"）
+    source = await importSubscription(row.rawUrl, assetDigestHex(row.assetDigest)
+      ? { expectedSha256: assetDigestHex(row.assetDigest) }
+      : { expectedBlobSha: row.blobSha })
   } catch (err) {
     if (err instanceof SourceDiscoveryError) throw err
     const status = err instanceof SourceSubscriptionError ? err.status : 422
