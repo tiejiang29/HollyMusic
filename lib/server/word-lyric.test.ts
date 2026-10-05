@@ -6,12 +6,12 @@
  * ② 真机样本（可选）—— 读 gitignored 的 my/word-lyric-captured.json（由 my/capture-word-lyric.mjs
  *    抓取），验证解析对上游真实数据成立。②在本机没有该文件时跳过，**不要**据此当作实测通过。
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import {
-  parseKrc, parseMrc, decodeKrcPayload, screenWordLyric, toEnhancedLrc, toPlainLrc, alignWordLyricToLines,
+  parseKrc, parseMrc, decodeKrcPayload, decodeQrcPayload, decryptQrcField, screenWordLyric, toEnhancedLrc, toPlainLrc, alignWordLyricToLines,
   type WordLyric,
 } from './word-lyric'
 
@@ -71,6 +71,73 @@ describe('decodeKrcPayload', () => {
 
   it('解压成功但没有时间行也判为不可用', () => {
     expect(decodeKrcPayload(encodeKrcPayload('[ti:只有头]'))).toBeNull()
+  })
+})
+
+// ————— QQ 云端 QRC 解码 —————
+// 密文层是私有 3DES，测试里造不出真密文：这里把 ./qrc-des 桩成"十六进制 ↔ 字节"的恒等
+// 编解码，于是本文件验的是**它之后**我写的四步（inflate → 取 LyricContent → 反转义 → 逐字
+// 嗅探），外壳形状照真机响应逐字抄。DES 表序本身的正确性另有 qrc-des.test.ts 的两组真机
+// 已知答案，加 55 份真载荷 55/55 解出的实跑结论（脚本在 gitignored 的 my/qq-qrc-*.py）。
+vi.mock('./qrc-des', () => ({
+  qrcDecryptHex: (encryptedHex: string) => {
+    const clean = String(encryptedHex).trim()
+    return /^[0-9A-Fa-f]*$/.test(clean) ? Uint8Array.from(Buffer.from(clean, 'hex')) : new Uint8Array(0)
+  },
+}))
+
+const QRC_BODY = [
+  '[ti:合成曲]',
+  '[ar:测试者]',
+  '[al:合成专辑]',
+  '[by:]',
+  '[offset:0]',
+  '[1000,3000]第一(1000,1000)个字(2000,1000)开始',
+  '[5000,4000]光(5000,1000)落(6000,1000)在(7000,1000)地(8000,1000)板',
+].join('\n')
+
+/** 真机外壳：正文里是真实换行，收尾是 `\\r\\n"/>`，所以截尾只能靠 lastIndexOf */
+const wrapQrcEnvelope = (body: string): string => [
+  '<?xml version="1.0" encoding="utf-8"?>',
+  '<QrcInfos>',
+  '<QrcHeadInfo SaveTime="191" Version="100"/>',
+  '<LyricInfo LyricCount="1">',
+  `<Lyric_1 LyricType="1" LyricContent="${body}\r\n"/>`,
+  '</LyricInfo>',
+  '</QrcInfos>',
+].join('\r\n')
+
+const encodeQrcHex = (text: string): string => zlib.deflateSync(Buffer.from(text, 'utf8')).toString('hex')
+
+describe('decodeQrcPayload / decryptQrcField', () => {
+  it('解出 XML 外壳里的正文，并去掉收尾的 \\r\\n"/>', () => {
+    expect(decodeQrcPayload(encodeQrcHex(wrapQrcEnvelope(QRC_BODY)))).toBe(QRC_BODY)
+  })
+
+  it('正文里的实体要反转义（真机 LyricContent 属性里全是 &amp; 和数字实体）', () => {
+    const escaped = '[ti:雨&amp;晴]\n[1000,3000]内(1000,1000)&#26377;(2000,1000)心'
+    expect(decryptQrcField(encodeQrcHex(wrapQrcEnvelope(escaped))))
+      .toBe('[ti:雨&晴]\n[1000,3000]内(1000,1000)有(2000,1000)心')
+  })
+
+  it('没有外壳时整段当正文（实测 trans 译文就是裸正文）', () => {
+    const plain = '[ti:合成曲]\n[00:01.20]第一行译文\n[00:05.00]第二行译文'
+    expect(decryptQrcField(encodeQrcHex(plain))).toBe(plain)
+    // 译文是纯行级 ⇒ 逐字那层必须判它不可用，接线才不会被它冒充成字级
+    expect(decodeQrcPayload(encodeQrcHex(plain))).toBeNull()
+  })
+
+  it('密文坏 / 解压不出 / 没有字级标签，一律 null 而不是抛', () => {
+    for (const bad of ['', '!!not-hex!!', '0011223344556677', encodeQrcHex('[ti:只有头]')]) {
+      expect(decodeQrcPayload(bad), bad).toBeNull()
+    }
+  })
+
+  it('解出来的正文交给 parseMrc：行数与末行文本都对得上，不带 XML 尾巴', () => {
+    const parsed = parseMrc(decodeQrcPayload(encodeQrcHex(wrapQrcEnvelope(QRC_BODY)))!)
+    expect(parsed?.lines).toHaveLength(2)
+    expect(parsed?.headers.ti).toBe('合成曲')
+    expect(parsed!.lines[1].words.map(w => w.text).join('')).toBe('光落在地板')
   })
 })
 

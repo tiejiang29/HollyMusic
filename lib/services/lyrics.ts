@@ -16,7 +16,7 @@ import { songIdentity } from '@/lib/song-identity'
 import { getLyricSidecarPath, getTranslationLyricSidecarPath, getWordLyricSidecarPath } from '@/lib/server/lyric-cache'
 import { decodeLyricEntities } from '@/lib/server/lyric-decode'
 import { normalizeStructuredLyricText } from '@/lib/server/lyric-normalize'
-import { fetchKugouWordLyric, fetchNativeLyric } from '@/lib/server/music-lyric'
+import { fetchKugouWordLyric, fetchNativeLyric, qqQrcSongId } from '@/lib/server/music-lyric'
 import { alignWordLyricToLines, toEnhancedLrc } from '@/lib/server/word-lyric'
 import type { MusicInfo } from '@/lib/types/music'
 
@@ -65,6 +65,8 @@ const BORROWABLE_SOURCES = new Set(['tx', 'kw'])
 async function mayHaveWordLyric(musicInfo: MusicInfo): Promise<boolean> {
   if (musicInfo.source === 'kg') return Boolean(musicInfo.hash)
   if (musicInfo.source === 'mg') return Boolean(musicInfo.mrcUrl)
+  // tx 现在有两道可能：自己的云端 QRC（要数字 songID），或去库里借酷狗那份 KRC
+  if (musicInfo.source === 'tx' && qqQrcSongId(musicInfo)) return true
   if (BORROWABLE_SOURCES.has(musicInfo.source)) {
     const identity = songIdentity(musicInfo)
     if (identity === '|') return false

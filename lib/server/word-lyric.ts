@@ -1,10 +1,11 @@
 /**
- * 逐字歌词（word-level）归一化：把酷狗 KRC 与咪咕 MRC 解析成同一个中性行/词结构，
- * 再序列化为增强 LRC。纯函数，不发请求、不碰磁盘；接线是下一步的事。
+ * 逐字歌词（word-level）归一化：把酷狗 KRC、咪咕 MRC 与 QQ QRC 解析成同一个中性行/词
+ * 结构，再序列化为增强 LRC。纯函数，不发请求、不碰磁盘；接线是下一步的事。
  *
- * 这个模块存在的唯一理由是两家坐标系不同：
+ * 这个模块存在的唯一理由是三家坐标系不同：
  * - KRC：`[39622,4417]<0,241,0>釉<241,251,0>色` —— 标签在文本**前**，时间是**行内相对**
  * - MRC：`[14416,2145]你(14416,249)的(14665,300)` —— 标签在文本**后**，时间是**绝对**毫秒
+ * - QRC：`[368,1088]恶(368,151)作(519,136)` —— 与 MRC 同系，故 parseMrc 直接吃（实测解 55 份真载荷）
  * 出口统一成"绝对毫秒 + 标签在文本前"，客户端不必同时懂两套算术。
  *
  * 实测依据（脚本与真机样本在 gitignored 的 my/）：KRC 的 `<start,dur,len>` 第三字段恒为 0，
@@ -12,6 +13,7 @@
  */
 
 import zlib from 'node:zlib'
+import { qrcDecryptHex } from './qrc-des'
 
 export interface WordLyricWord {
   /** 绝对毫秒 */
@@ -157,6 +159,57 @@ export function parseMrc(text: string): WordLyric | null {
   }
 
   return lines.length ? { lines, headers: parseHeaders(rows) } : null
+}
+
+/**
+ * XML/HTML 实体反转义（三家上游的歌词载荷都用得到：QQ 的 LyricContent 属性、
+ * 酷我与 QQ 的 base64 载荷里都见过数字实体）。原先这份逻辑长在 music-lyric 里，
+ * 挪到这里是因为逐字解码也要用，而 music-lyric 是本模块的下游。
+ */
+export function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&#(\d+);/g, (_, decimal: string) => String.fromCodePoint(Number(decimal)))
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+}
+
+/**
+ * 解 QQ 云端 QRC 家族的载荷：十六进制密文 → 私有 3DES（见 ./qrc-des）→ zlib → 取
+ * `LyricContent` 属性 → 反转义。任何一步坏都返回 null，上层据此静默降级成整行。
+ * 这里**不**判断是不是逐字，`trans`（译文）走的也是同一套密文但是纯行级，交给调用方定。
+ *
+ * 外壳实测是 `<QrcInfos><QrcHeadInfo .../><LyricInfo LyricCount="1"><Lyric_1 LyricType="1"
+ * LyricContent="[ti:..]\n[起,时长]字(起,时长)..\r\n"/>` —— 属性值里是**真实换行**，收尾紧跟
+ * `\r\n"/>`。截尾用 lastIndexOf('"/>') 而不是非贪婪正则：歌词里出现 `"/>` 的可能，远小于
+ * 中途截断把末行字切掉的风险；末尾那点空白统一 trim 掉。
+ */
+export function decryptQrcField(content: string): string | null {
+  try {
+    const plain = qrcDecryptHex(content)
+    if (plain.length < 8) return null
+    const xml = zlib.inflateSync(Buffer.from(plain)).toString('utf8')
+    const at = xml.indexOf('LyricContent="')
+    let text: string
+    if (at < 0) {
+      text = xml // 实测 trans 字段就是裸正文，没有 XML 外壳
+    } else {
+      const from = at + 'LyricContent="'.length
+      const end = xml.lastIndexOf('"/>')
+      text = end > from ? xml.slice(from, end) : xml.slice(from)
+    }
+    return decodeXmlEntities(text).trim()
+  } catch {
+    return null
+  }
+}
+
+/** 逐字用的那层：解出来还必须真有 `[起,时长]` 字级标签 */
+export function decodeQrcPayload(content: string): string | null {
+  const text = decryptQrcField(content)
+  return text && TIMED_LINE.test(text) ? text : null
 }
 
 /**

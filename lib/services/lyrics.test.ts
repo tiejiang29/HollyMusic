@@ -21,7 +21,15 @@ vi.mock('@/lib/audio-serve', () => ({
 
 vi.mock('@/lib/db', () => ({ prisma: { audioCache: { findMany }, musicInfo: { findMany: findManyMusic, findFirst: findFirstMusic } } }))
 vi.mock('@/lib/music-source-manager', () => ({ musicSourceManager: { getLyric } }))
-vi.mock('@/lib/server/music-lyric', () => ({ fetchNativeLyric, fetchKugouWordLyric }))
+vi.mock('@/lib/server/music-lyric', () => ({
+  fetchNativeLyric,
+  fetchKugouWordLyric,
+  // 与实现同口径：QRC 只能按数字 songID 寻址，没有它 tx 就只能去借酷狗
+  qqQrcSongId: (musicInfo: { songId?: string | number }) => {
+    const songId = String(musicInfo.songId ?? '')
+    return /^\d{1,12}$/.test(songId) ? songId : null
+  },
+}))
 vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
 
 vi.mock('fs/promises', () => {
@@ -331,7 +339,7 @@ describe('缓存里只有整行、缺逐字时的补取', () => {
     expect(fetchNativeLyric).not.toHaveBeenCalled()
   })
 
-  it('tx 行只在库里确有带 hash 的酷狗兄弟时才补取', async () => {
+  it('tx 行没有数字 songID 时，只在库里确有带 hash 的酷狗兄弟才补取', async () => {
     resetBorrowMocks()
     stubSidecars({ 'song.lrc': '[00:10.100]第1行字' })
     fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null })
@@ -345,6 +353,16 @@ describe('缓存里只有整行、缺逐字时的补取', () => {
     fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null, wordLyric: ownWord })
     await fetchLyricForMusic({ ...txMusicInfo, songmid: 'TX_WITH_DONOR' })
     expect(fetchNativeLyric).toHaveBeenCalledTimes(1)
+  })
+
+  it('tx 行自带数字 songID 时不必等酷狗兄弟，它有自己的云端 QRC', async () => {
+    resetBorrowMocks()
+    stubSidecars({ 'song.lrc': '[00:10.100]第1行字' })
+    findFirstMusic.mockResolvedValue(null)   // 库里没有可借的兄弟行
+    fetchNativeLyric.mockResolvedValue({ lyric: txLrc, tlyric: null, wordLyric: ownWord })
+    const result = await fetchLyricForMusic({ ...txMusicInfo, songmid: 'TX_OWN_QRC', songId: '8136' })
+    expect(fetchNativeLyric).toHaveBeenCalledTimes(1)
+    expect(result?.wordLyric).toBe(ownWord)
   })
 
   it('缓存里逐字已经在，就直接用、不打上游', async () => {

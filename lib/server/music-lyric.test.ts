@@ -184,6 +184,97 @@ describe('fetchNativeLyric 逐字接线', () => {
   })
 })
 
+// ————— QQ 云端逐字（QRC）接线 —————
+// 密文层是私有 3DES，测试里造不出真密文 ⇒ 把 ./qrc-des 桩成"十六进制 ↔ 字节"的恒等编解码，
+// 本文件只验解码之后的接线（闸门、歌名核对、同源、回落、请求参数）。
+vi.mock('./qrc-des', () => ({
+  qrcDecryptHex: (encryptedHex: string) => {
+    const clean = String(encryptedHex).trim()
+    return /^[0-9A-Fa-f]*$/.test(clean) ? Uint8Array.from(Buffer.from(clean, 'hex')) : new Uint8Array(0)
+  },
+}))
+
+/** 9 行 × 3 块、末行到 107s：与 KRC 那份同规格，便于对照同源行级文本 */
+const WORD_QRC = ['[ti:测试歌曲]', '[ar:测试歌手]'].concat(Array.from({ length: 9 }, (_, i) => {
+  const at = 80_000 + i * 3_000
+  return `[${at},3000]第${i + 1}字(${at},1000)中间字(${at + 1000},1000)末字(${at + 2000},1000)`
+})).join('\n')
+
+const encodeQrcHex = (text: string): string => deflateSync(Buffer.from(text, 'utf8')).toString('hex')
+
+const QQ_FALLBACK_LRC = '[01:20.000]整行回落'
+
+function mockQQ(handlers: { qrc?: string; trans?: string } = {}) {
+  return vi.fn(async (url: string) => {
+    if (String(url).includes('musicu.fcg')) {
+      // 'qrc' 未给 ⇒ 模拟上游没载荷（songID 错位/VIP 未登录都会这样）
+      return new Response(JSON.stringify({ request: { code: 0, data: {
+        lyric: handlers.qrc === undefined ? '' : encodeQrcHex(handlers.qrc),
+        trans: handlers.trans ? encodeQrcHex(handlers.trans) : '',
+      } } }))
+    }
+    return new Response(JSON.stringify({ code: 0, lyric: b64(QQ_FALLBACK_LRC), trans: '' }))
+  })
+}
+
+const txInfo = { ...baseMusicInfo, source: 'tx' as const, songmid: '001test', songId: '8136', albumName: '测试专辑' }
+
+describe('fetchNativeLyric QQ 逐字接线', () => {
+  it('QRC 命中时整行与逐字出自同一次解析，译文一并解出，且只打一次上游', async () => {
+    const fetch = mockQQ({ qrc: WORD_QRC, trans: '[01:20.000]译文第一行' })
+    vi.stubGlobal('fetch', fetch)
+    const result = await fetchNativeLyric(txInfo)
+
+    expect(result?.wordLyric).toContain('[01:20.000]<01:20.000>第1字<01:21.000>中间字<01:22.000>末字<01:23.000>')
+    expect(result?.lyric.split('\n').filter(line => /^\[\d/.test(line))).toEqual(
+      Array.from({ length: 9 }, (_, i) => `[01:${20 + i * 3}.000]第${i + 1}字中间字末字`),
+    )
+    expect(result?.tlyric).toBe('[01:20.000]译文第一行')
+    expect(fetch).toHaveBeenCalledTimes(1)
+
+    const sent = JSON.parse(String(fetch.mock.calls[0][1]?.body)) as { request: { param: Record<string, unknown> } }
+    expect(sent.request.param.songID).toBe(8136)          // 数字 id，不是 songmid
+    expect(sent.request.param.songName).toBe(b64('测试歌曲')) // 名字走 base64
+    expect(sent.request.param.crypt).toBe(1)
+    expect(sent.request.param.qrc).toBe(1)
+  })
+
+  it('没有数字 songID 时根本不打 QRC 接口，走原整行通道', async () => {
+    const fetch = mockQQ()
+    vi.stubGlobal('fetch', fetch)
+    await expect(fetchNativeLyric({ ...baseMusicInfo, source: 'tx', songmid: '001test' })).resolves.toEqual({
+      lyric: QQ_FALLBACK_LRC, tlyric: null,
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(String(fetch.mock.calls[0][0])).toContain('fcg_query_lyric_new')
+  })
+
+  it('songID 错位（载荷是另一首歌）时丢弃逐字回落整行 —— 服务端只按 id 寻址，歌名闸门是唯一防线', async () => {
+    const fetch = mockQQ({ qrc: WORD_QRC.replace('[ti:测试歌曲]', '[ti:完全另一首歌]') })
+    vi.stubGlobal('fetch', fetch)
+    await expect(fetchNativeLyric(txInfo)).resolves.toEqual({ lyric: QQ_FALLBACK_LRC, tlyric: null })
+    expect(fetch).toHaveBeenCalledTimes(2) // 回落才打整行接口
+  })
+
+  it('上游只给行级时间（没有字级标签）时不算逐字，回落整行', async () => {
+    const lineOnly = ['[ti:测试歌曲]', '[ar:测试歌手]']
+      .concat(Array.from({ length: 9 }, (_, i) => `[${80_000 + i * 3_000},3000]第${i + 1}行`))
+      .join('\n')
+    const fetch = mockQQ({ qrc: lineOnly })
+    vi.stubGlobal('fetch', fetch)
+    await expect(fetchNativeLyric(txInfo)).resolves.toEqual({ lyric: QQ_FALLBACK_LRC, tlyric: null })
+  })
+
+  it('载荷过不了结构闸门（实测行数不足 8）时回落整行', async () => {
+    const tooShort = ['[ti:测试歌曲]', '[ar:测试歌手]']
+      .concat(Array.from({ length: 4 }, (_, i) => `[${80_000 + i * 3_000},3000]第${i + 1}字(${80_000 + i * 3_000},1000)末字(${81_000 + i * 3_000},2000)`))
+      .join('\n')
+    const fetch = mockQQ({ qrc: tooShort })
+    vi.stubGlobal('fetch', fetch)
+    await expect(fetchNativeLyric(txInfo)).resolves.toEqual({ lyric: QQ_FALLBACK_LRC, tlyric: null })
+  })
+})
+
 // 咪咕 MRC 只有解密版，测试里造不出加密载荷 ⇒ 用真机密文（gitignored），没有就跳过
 const CAPTURED = path.resolve(process.cwd(), 'my/word-lyric-captured.json')
 const captured = fs.existsSync(CAPTURED)

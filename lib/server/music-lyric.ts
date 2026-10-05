@@ -2,7 +2,7 @@ import { logger } from '@/lib/logger'
 import type { MusicInfo } from '@/lib/types/music'
 import { inflate } from 'zlib'
 import { promisify } from 'util'
-import { decodeKrcPayload, parseKrc, parseMrc, screenWordLyric, toEnhancedLrc, toPlainLrc, type WordLyric } from './word-lyric'
+import { decodeKrcPayload, decodeQrcPayload, decodeXmlEntities, decryptQrcField, parseKrc, parseMrc, screenWordLyric, toEnhancedLrc, toPlainLrc, type WordLyric } from './word-lyric'
 
 export type NativeLyricResult = {
   lyric: string
@@ -55,16 +55,6 @@ function decodeBase64(value: unknown): string {
   } catch {
     return ''
   }
-}
-
-function decodeHtmlEntities(value: string): string {
-  return value
-    .replace(/&#(\d+);/g, (_, decimal: string) => String.fromCodePoint(Number(decimal)))
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
 }
 
 function parseIntervalSeconds(interval: string): number {
@@ -254,8 +244,95 @@ async function fetchQQMusicLyric(songmid: string): Promise<NativeLyricResult | n
   if (!response) return null
   const payload = await response.json() as { code?: unknown; lyric?: unknown; trans?: unknown }
   if (payload.code !== 0) return null
-  const lyric = decodeHtmlEntities(decodeBase64(payload.lyric))
-  return lyric ? { lyric, tlyric: decodeHtmlEntities(decodeBase64(payload.trans)) || null } : null
+  const lyric = decodeXmlEntities(decodeBase64(payload.lyric))
+  return lyric ? { lyric, tlyric: decodeXmlEntities(decodeBase64(payload.trans)) || null } : null
+}
+
+const QQ_MUSICU_URL = 'https://u.y.qq.com/cgi-bin/musicu.fcg'
+/**
+ * 免登录：实测裸 comm 就返回完整载荷（GetSession 那一步是多余的，省一次请求）。
+ * 参数照 QQ 轻音乐端填，服务端只认真实字段，多带不影响。
+ */
+const QQ_MUSICU_COMM = {
+  ct: 11, cv: '1003006', v: '1003006', os_ver: '15', phonetype: '24122RKC7C',
+  rom: 'Redmi/miro/miro:15/AE3A.240806.005/OS2.0.105.0.VOMCNXM:user/release-keys',
+  tmeAppID: 'qqmusiclight', nettype: 'NETWORK_WIFI', udid: '0',
+}
+
+const encodeQQName = (value: string): string => Buffer.from(value || '', 'utf8').toString('base64')
+
+/**
+ * QRC 只能按数字 songID 寻址（`songmid` 那条通道没有字时间）。没有它 tx 就没可能出
+ * 原生逐字，只能去借酷狗的 KRC —— 上层据此决定要不要打这一枪。
+ */
+export function qqQrcSongId(musicInfo: MusicInfo): string | null {
+  const songId = String(musicInfo.songId ?? '')
+  return /^\d{1,12}$/.test(songId) ? songId : null
+}
+
+/** 载荷按 songID 寻址、名字只算回执，所以歌名闸门是这里唯一防串台的一道 */
+function qrcBelongsToSong(lyric: WordLyric, musicInfo: MusicInfo): boolean {
+  const title = lyric.headers.ti ?? ''
+  const artist = lyric.headers.ar ?? ''
+  return titleMatches(title, musicInfo.name) && artistMatches(artist, musicInfo.singer)
+}
+
+/**
+ * QQ 云端逐字（QRC）：`GetPlayLyricInfo` 要数字 songID，`crypt:1` 回来的 `lyric` 是
+ * 私有 3DES 十六进制密文（见 ./qrc-des），坐标系与咪咕 MRC 一致，故走 parseMrc。
+ *
+ * 实测两处必须防：`interval` 参数服务端不理（传 0 也回同一份），而 songID 一旦错位就
+ * 会**整份返回另一首歌**的歌词 —— 命中后必须再核 `[ti:]`/`[ar:]`。
+ */
+async function fetchQQQrcLyric(musicInfo: MusicInfo): Promise<NativeLyricResult | null> {
+  const songId = qqQrcSongId(musicInfo)
+  if (!songId) return null
+
+  const response = await fetchWithTimeout(QQ_MUSICU_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+    body: JSON.stringify({
+      comm: QQ_MUSICU_COMM,
+      request: {
+        method: 'GetPlayLyricInfo',
+        module: 'music.musichallSong.PlayLyricInfo',
+        param: {
+          songID: Number(songId),
+          songName: encodeQQName(musicInfo.name),
+          singerName: encodeQQName(musicInfo.singer),
+          albumName: encodeQQName(musicInfo.albumName ?? ''),
+          interval: parseIntervalSeconds(musicInfo.interval),
+          type: 0, qrc: 1, trans: 1, roma: 1, crypt: 1,
+          lrc_t: 0, qrc_t: 0, trans_t: 0, roma_t: 0, ct: 19, cv: 2111,
+        },
+      },
+    }),
+  })
+  if (!response) return null
+  const payload = await response.json() as { request?: { data?: { lyric?: unknown; trans?: unknown } } }
+  const data = payload.request?.data
+  const cipher = typeof data?.lyric === 'string' ? data.lyric : ''
+  if (!cipher) return null
+
+  const text = decodeQrcPayload(cipher)
+  const parsed = text ? parseMrc(text) : null
+  if (!parsed) return null
+
+  const verdict = screenWordLyric(parsed, { durationSeconds: parseIntervalSeconds(musicInfo.interval) })
+  if (!verdict.ok) {
+    logger.info('[lyrics] QQ 逐字被闸门拒绝，回落整行', { songId: musicInfo.songmid, reason: verdict.reason })
+    return null
+  }
+  if (!qrcBelongsToSong(parsed, musicInfo)) {
+    logger.warn('[lyrics] QQ 逐字歌名对不上，丢弃', {
+      songId: musicInfo.songmid, 请求: musicInfo.name, 载荷: parsed.headers.ti ?? '',
+    })
+    return null
+  }
+
+  const trans = typeof data?.trans === 'string' && data.trans ? decryptQrcField(data.trans) : null
+  logger.info('[lyrics] QQ 逐字命中', { songId: musicInfo.songmid, lineCount: verdict.lineCount })
+  return { lyric: toPlainLrc(parsed), tlyric: trans?.trim() || null, wordLyric: toEnhancedLrc(parsed) }
 }
 
 async function fetchNeteaseLyric(songmid: string): Promise<NativeLyricResult | null> {
@@ -390,7 +467,9 @@ export async function fetchNativeLyric(musicInfo: MusicInfo): Promise<NativeLyri
         if (/^\d+$/.test(String(musicInfo.songmid))) result = await fetchKuwoLyric(String(musicInfo.songmid))
         break
       case 'tx':
-        result = await fetchQQMusicLyric(String(musicInfo.songmid))
+        // 先试逐字：命中就一次解析同时给行级与字级；没有数字 songID、过不了闸门
+        // 或上游没给载荷，都回落到原来的整行通道，行为与改动前一致。
+        result = await fetchQQQrcLyric(musicInfo) ?? await fetchQQMusicLyric(String(musicInfo.songmid))
         break
       case 'wy':
         if (/^\d+$/.test(String(musicInfo.songmid))) result = await fetchNeteaseLyric(String(musicInfo.songmid))
