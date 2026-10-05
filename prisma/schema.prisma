@@ -338,3 +338,55 @@ model SourceProbeResult {
   @@index([source, platform, runAt])
   @@index([runAt])
 }
+
+/// 服务端可变的运营配置（键值，值是 JSON 文本）。
+///
+/// 为什么不放配置文件：这类东西要管理员在面板上改（改配置文件得登 NAS，用户明确
+/// 说过不方便），而它又不值得为每个键单独建一张表。**存敏感值前先看这里的约定**：
+/// 值是本库明文列，读接口必须做脱敏（见 lib/services/app-setting.ts 的 mask 口径），
+/// 任何 GET 都不许把 token 原样带出去。
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+/// 音源发现（P0-a）：从 GitHub 仓库树里挑出来的"疑似洛雪音源脚本"候选。
+///
+/// 只存**元数据**（地址、哈希、打分、判定），**不存脚本正文**——那玩意的版权与体积
+/// 都不适合进库；真要导入时再按 rawUrl 重新下载一次并复验。
+model SourceCandidate {
+  id          Int       @id @default(autoincrement())
+  /// owner/repo，与 path 组成主键：重复爬取只刷新不膨胀
+  repo        String
+  /// 仓库内路径（逐段已 encodeURIComponent 过的地址由 rawUrl 承担）
+  path        String
+  rawUrl      String
+  /// GitHub 树里给的 blob sha，用于后续走镜像时校验内容一致（P0-a 只记录不比对）
+  blobSha     String    @default("")
+  /// 从脚本头注释解析的 @name
+  scriptName  String    @default("")
+  /// @name 剥掉尾部版本号并归一后的键，用于同名择优
+  nameKey     String    @default("")
+  contentHash String    @default("")
+  /// 上游给的文件时间（raw 响应的 Last-Modified）。同名择优要用**它**而不是我们的写入时间——
+  /// 同一轮里所有行的 updatedAt 都是刚刚，拿它排序等于随机。
+  upstreamAt  String    @default("")
+  sizeBytes   Int       @default(0)
+  /// 静态特征打分，>= 阈值才算疑似
+  score       Int       @default(0)
+  /// pending（还没下过正文）| suspect（疑似音源）| not-source（不像音源）
+  verdict     String    @default("pending")
+  /// new | stale（被更优的同名/同内容项顶掉）
+  state       String    @default("new")
+  /// 人类可读的判定依据（面板直接展示）
+  reason      String?
+  checkedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([repo, path])
+  @@index([contentHash])
+  @@index([nameKey])
+  @@index([verdict, score])
+}

@@ -8,12 +8,14 @@ import { CachePanel } from '@/components/admin/CachePanel'
 import { RecommendPanel } from '@/components/admin/RecommendPanel'
 import { RecommendTaskPanel } from '@/components/admin/RecommendTaskPanel'
 import { LoginLocksPanel } from '@/components/admin/LoginLocksPanel'
-import { Users, Music, Database, Sparkles, ListTodo, ShieldOff } from 'lucide-react'
+import { SourceDiscoveryPanel } from '@/components/admin/SourceDiscoveryPanel'
+import { Users, Music, Database, Sparkles, ListTodo, ShieldOff, Radar } from 'lucide-react'
 
 const TABS = [
   { key: 'users', label: '用户管理', icon: Users },
   { key: 'login-locks', label: '登录锁定', icon: ShieldOff },
   { key: 'sources', label: '音源管理', icon: Music },
+  { key: 'source-discovery', label: '音源发现', icon: Radar },
   { key: 'recommend', label: '推荐管理', icon: Sparkles },
   { key: 'recommend-tasks', label: '推荐任务', icon: ListTodo },
   { key: 'cache', label: '缓存管理', icon: Database },
@@ -84,6 +86,7 @@ export function AdminPage() {
         {tab === 'users' && <UsersPanel />}
         {tab === 'login-locks' && <LoginLocksPanel />}
         {tab === 'sources' && <SourcesPanel />}
+        {tab === 'source-discovery' && <SourceDiscoveryPanel />}
         {tab === 'recommend' && <RecommendPanel />}
         {tab === 'recommend-tasks' && <RecommendTaskPanel />}
         {tab === 'cache' && <CachePanel />}
