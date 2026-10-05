@@ -31,6 +31,10 @@ export interface DiscoveryStatus {
     notSource: number
     stale: number
     note: string | null
+    /** 树被 GitHub 截断的仓库：这仓的结果是不完整的，不能当"就这些" */
+    truncatedRepos: string[]
+    /** 本轮跳过的仓库及原因（404 / 配额 / HTTP 错误…） */
+    reposSkipped: string[]
     quota: { remaining: number; limit: number; resetAt: number } | null
   } | null
   lastError: string | null

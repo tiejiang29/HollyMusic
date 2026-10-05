@@ -17,7 +17,8 @@ import {
 } from '@/lib/api/admin-source-discovery'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2 } from 'lucide-react'
+import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2 } from 'lucide-react'
+import { copyAddress } from '@/lib/utils/clipboard'
 
 const FILTERS = [
   { key: 'suspect', label: '疑似可用', verdict: 'suspect', state: 'new' },
@@ -25,6 +26,27 @@ const FILTERS = [
   { key: 'not-source', label: '不像音源', verdict: 'not-source', state: 'new' },
   { key: 'stale', label: '已被顶掉', verdict: '', state: 'stale' },
 ] as const
+
+/**
+ * 一行候选的地址格：地址本身**始终可读可选**，复制只是锦上添花。
+ * 单独抽出来是因为它有一档真实环境里的降级行为（HTTP 无剪贴板），值得直测。
+ */
+export function AddressCell({ rawUrl, copied, onCopy }: { rawUrl: string; copied: boolean; onCopy: () => void }) {
+  return (
+    <div className="mt-1 flex items-start gap-2">
+      <code className="min-w-0 flex-1 break-all rounded bg-accent/40 px-1.5 py-0.5 text-[11px]">{rawUrl}</code>
+      <button
+        type="button"
+        onClick={onCopy}
+        title="复制这条 raw 地址；HTTP 下浏览器可能拒绝，那就直接选中复制"
+        className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+      >
+        {copied ? <CheckCircle2 className="h-3 w-3 text-green-600" /> : <Link2 className="h-3 w-3" />}
+        {copied ? '已复制' : '复制'}
+      </button>
+    </div>
+  )
+}
 
 export function SourceDiscoveryPanel() {
   const [settings, setSettings] = useState<DiscoverySettingsView | null>(null)
@@ -39,6 +61,10 @@ export function SourceDiscoveryPanel() {
   const [saving, setSaving] = useState(false)
   const [starting, setStarting] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [copiedId, setCopiedId] = useState<number | null>(null)
+  // 面板跑在明文 HTTP 上（NAS 局域网），非安全上下文里 navigator.clipboard 直接不存在，
+  // 所以必须能降级成"手动选中"，否则这个按钮在真实环境是死的
+  const [clipboardBlocked, setClipboardBlocked] = useState(false)
 
   const reload = useCallback(async () => {
     try {
@@ -98,6 +124,17 @@ export function SourceDiscoveryPanel() {
       alert(e instanceof Error ? e.message : '起不来这一轮')
     } finally {
       setStarting(false)
+    }
+  }
+
+  const handleCopy = async (rawUrl: string, id: number) => {
+    const result = await copyAddress(rawUrl, navigator.clipboard)
+    if (result === 'copied') {
+      setCopiedId(id)
+      setClipboardBlocked(false)
+    } else {
+      setCopiedId(null)
+      setClipboardBlocked(true)
     }
   }
 
@@ -225,6 +262,14 @@ export function SourceDiscoveryPanel() {
               抓正文 {status.last.downloaded}，疑似 {status.last.suspect}，不像音源 {status.last.notSource}，顶掉 {status.last.stale}
               {status.last.quota ? `｜GitHub 余量 ${status.last.quota.remaining}/${status.last.quota.limit}` : ''}
               {status.last.note ? `｜${status.last.note}` : ''}
+              {status.last.truncatedRepos?.length ? (
+                <div className="mt-1 text-amber-600">
+                  树被 GitHub 截断（这仓结果不完整）：{status.last.truncatedRepos.join('、')}
+                </div>
+              ) : null}
+              {status.last.reposSkipped?.length ? (
+                <div className="mt-1">跳过：{status.last.reposSkipped.join('；')}</div>
+              ) : null}
             </div>
           ) : null}
 
@@ -248,7 +293,7 @@ export function SourceDiscoveryPanel() {
               <table className="w-full text-sm">
                 <thead className="bg-accent/40 text-left text-xs uppercase text-muted-foreground">
                   <tr>
-                    <th className="px-4 py-3 font-medium">来源</th>
+                    <th className="px-4 py-3 font-medium">来源与地址（可粘到「音源管理 → 从订阅链接导入」）</th>
                     <th className="px-4 py-3 font-medium">@name</th>
                     <th className="px-4 py-3 font-medium">分</th>
                     <th className="px-4 py-3 font-medium">大小</th>
@@ -262,6 +307,11 @@ export function SourceDiscoveryPanel() {
                       <td className="px-4 py-3 font-mono text-xs">
                         <div>{row.repo}</div>
                         <div className="text-muted-foreground">{row.path}</div>
+                        <AddressCell
+                          rawUrl={row.rawUrl}
+                          copied={copiedId === row.id}
+                          onCopy={() => { void handleCopy(row.rawUrl, row.id) }}
+                        />
                       </td>
                       <td className="px-4 py-3 text-xs">{row.scriptName || '—'}</td>
                       <td className="px-4 py-3 text-xs font-medium">{row.score}</td>
@@ -287,6 +337,12 @@ export function SourceDiscoveryPanel() {
               </table>
             </div>
           )}
+
+          {clipboardBlocked ? (
+            <p className="mt-3 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
+              浏览器在非 HTTPS 环境下不允许脚本写剪贴板 —— 直接选中地址复制即可，功能本身不受影响。
+            </p>
+          ) : null}
 
           <p className="mt-4 text-xs text-muted-foreground">
             候选表里只有元数据（地址、内容哈希、打分、判定），脚本正文既不落库也不留在服务器上；
