@@ -13,6 +13,7 @@ import {
   dismissDiscoveryCandidate,
   getDiscovery,
   importDiscoveryCandidate,
+  auditRepoFreshness,
   pruneOrphanCandidates,
   saveDiscoverySettings,
   searchDiscoveryRepos,
@@ -25,12 +26,13 @@ import {
   type DiscoverySettingsView,
   type DiscoveryStatus,
   type ProbeCellView,
+  type RepoFreshnessReport,
   type RepoSearchItemView,
   type RepoSearchResultView,
 } from '@/lib/api/admin-source-discovery'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download, Layers, Square, ListChecks, Search, Save } from 'lucide-react'
+import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download, Layers, Square, ListChecks, Search, Save, CalendarClock, Eraser } from 'lucide-react'
 import { copyAddress } from '@/lib/utils/clipboard'
 
 const FILTERS = [
@@ -145,6 +147,39 @@ export function mergeRepos(current: string[], added: string[]): string[] {
 const STALE_REPO_DAYS = 365
 
 /**
+ * 从清单里剔掉勾选的仓。
+ * 导出是为了能直测：剔完还要过"清单不能为空"那一档（与服务的 prune 同一条护栏）——
+ * 面板算错一次就能把 28 个仓剔成 0 个，接着那个清理按钮会把整张候选表都当成失效仓删掉。
+ */
+export function reposAfterRemoval(current: string[], removing: string[]): string[] {
+  const doomed = new Set(removing)
+  return current.filter(repo => !doomed.has(repo))
+}
+
+type FreshnessRow = { daysSince: number | null; archived: boolean; missing: boolean; movedTo: string }
+
+/**
+ * 一行体检结论的人话标签。顺序有讲究：先说"仓没了/归档了"这类硬事实，再说超阈值。
+ * 阈值必须跟着体检那次走：不然把阈值调成 200 天时，一条 250 天没动的仓会被服务端判成
+ * 该剔、面板却显示"正常在更"——勾着红叉的行自己说没事，管理员就没法信这张表了。
+ * `daysSince === null` 说的是"GitHub 没给可读的时间"，不是"这个仓新"。
+ */
+export function freshnessBadges(row: FreshnessRow, maxAgeDays: number): string[] {
+  const out: string[] = []
+  if (row.missing) out.push('已消失(404)')
+  if (row.archived) out.push('已归档')
+  if (row.daysSince != null) {
+    if (row.daysSince > maxAgeDays) {
+      out.push(row.daysSince > STALE_REPO_DAYS ? `停更 ${Math.floor(row.daysSince / 365)} 年+` : `超阈值 ${row.daysSince} 天（阈值 ${maxAgeDays}）`)
+    }
+  } else {
+    out.push('读不到推送时间')
+  }
+  if (row.movedTo) out.push(`改名 → ${row.movedTo}`)
+  return out
+}
+
+/**
  * 搜索结果里的"最近推送"给管理员一句人话：清单一次就 27 个仓，引进来一个停更两年的仓
  * 等于给每轮白加一次树调用（我们上一次清理就是按满一年剔的 11 个仓）。
  */
@@ -201,6 +236,13 @@ export function SourceDiscoveryPanel() {
   const [addingRepos, setAddingRepos] = useState(false)
   const [scanOnlyAdded, setScanOnlyAdded] = useState(true)
   const [searchNote, setSearchNote] = useState<string | null>(null)
+  const [freshnessDays, setFreshnessDays] = useState('365')
+  const [freshnessReport, setFreshnessReport] = useState<RepoFreshnessReport | null>(null)
+  const [freshnessPicked, setFreshnessPicked] = useState<string[]>([])
+  const [checkingFresh, setCheckingFresh] = useState(false)
+  const [removingFresh, setRemovingFresh] = useState(false)
+  const [pruneAfterRemove, setPruneAfterRemove] = useState(true)
+  const [freshNote, setFreshNote] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [starting, setStarting] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -404,6 +446,66 @@ export function SourceDiscoveryPanel() {
       alert(e instanceof Error ? e.message : '加入清单失败')
     } finally {
       setAddingRepos(false)
+    }
+  }
+
+  const handleFreshness = async () => {
+    const parsed = Number.parseInt(freshnessDays, 10)
+    if (!Number.isFinite(parsed) || parsed < 30 || parsed > 3650) {
+      alert('停更阈值要填 30~3650 的天数（默认 365，就是我们上次剔仓用的那把尺子）')
+      return
+    }
+    setCheckingFresh(true)
+    try {
+      const report = await auditRepoFreshness(parsed)
+      // 判停更/失效的排前面：一屏看得见要处理的那几行，不用在 28 行里找
+      const sorted = [...report.items].sort((a, b) => Number(b.stale) - Number(a.stale))
+      setFreshnessReport({ ...report, items: sorted })
+      setFreshnessPicked(report.items.filter(item => item.stale).map(item => item.repo))
+      setFreshNote(null)
+    } catch (e) {
+      setFreshnessReport(null)
+      alert(e instanceof Error ? e.message : '体检失败')
+    } finally {
+      setCheckingFresh(false)
+    }
+  }
+
+  /**
+   * 把勾选的仓移出扫描清单。剔完还能顺手清掉它们留下的候选行（就是那个「清理已移除仓的候选」），
+   * 这两步本来是同一件事：仓不扫了，留在表里的候选就再也不会被刷新。
+   */
+  const handleRemoveStale = async () => {
+    const removing = (freshnessReport?.items ?? []).filter(item => freshnessPicked.includes(item.repo))
+    if (!removing.length) {
+      alert('先勾选要移出的仓库')
+      return
+    }
+    const next = reposAfterRemoval(settings?.repos ?? [], removing.map(item => item.repo))
+    if (!next.length) {
+      alert('清单不能剔空：那样「清理已移除仓的候选」会把整张候选表都当成失效仓删掉。至少留一个仓。')
+      return
+    }
+    if (!confirm(`把 ${removing.length} 个仓移出扫描清单？\n${removing.map(item => item.repo).join('\n')}`)) return
+
+    setRemovingFresh(true)
+    try {
+      const result = await savePatch({ repos: next })
+      if (!result) return
+      let note = `已移出 ${removing.length} 个仓，清单剩 ${result.settings.repos.length} 个`
+      if (pruneAfterRemove) {
+        const pruned = await pruneOrphanCandidates()
+        note += `；顺手清掉 ${pruned.removed} 行候选`
+        if (pruned.keptImported.length) note += `（保留 ${pruned.keptImported.length} 行已导入的）`
+      }
+      setFreshNote(note)
+      setFreshnessReport(null)
+      setFreshnessPicked([])
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '移出失败')
+    } finally {
+      setRemovingFresh(false)
     }
   }
 
@@ -802,6 +904,124 @@ export function SourceDiscoveryPanel() {
                 {searchNote ? (
                   <div className="mt-2 rounded border border-green-600/40 bg-green-600/10 px-3 py-1.5 text-xs text-green-800">
                     {searchNote}
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+
+          <div className="mb-6 rounded-lg border border-border p-4">
+            <div className="mb-1 flex items-center gap-2 text-sm font-medium">
+              <CalendarClock className="h-4 w-4 text-primary" />
+              停更仓体检
+            </div>
+            <p className="mb-3 text-xs text-muted-foreground">
+              逐个读清单里仓库的 <code className="font-mono">pushed_at</code>（GitHub 仓库接口，一次一个仓，
+              吃的是爬树那档 core 额度，起手的配额预检不够会直接告诉你差多少）。
+              这一步只读：勾完点「移出扫描清单」才会写进库。查不动的仓（超时/5xx）只列进「这次没查到」，
+              不会被判成停更。
+            </p>
+
+            <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
+              <label className="uppercase text-muted-foreground" htmlFor="discovery-stale-days">停更阈值（天）</label>
+              <input
+                id="discovery-stale-days"
+                type="number"
+                min={30}
+                max={3650}
+                value={freshnessDays}
+                onChange={e => setFreshnessDays(e.target.value)}
+                disabled={checkingFresh || removingFresh}
+                className="w-24 rounded border border-border bg-background px-2 py-1.5 font-mono"
+              />
+              <button
+                onClick={() => { void handleFreshness() }}
+                disabled={checkingFresh || removingFresh}
+                className="flex items-center gap-1 rounded bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+              >
+                {checkingFresh ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CalendarClock className="h-3.5 w-3.5" />}
+                体检停更仓
+              </button>
+              <span className="text-muted-foreground">365 天 = 上次手工剔 11 个仓用的那把尺子</span>
+            </div>
+
+            {freshnessReport ? (
+              <>
+                <div className="mb-2 text-xs text-muted-foreground">
+                  体检 {freshnessReport.checked} 个仓｜阈值 {freshnessReport.maxAgeDays} 天｜
+                  判停更/失效 {freshnessReport.items.filter(item => item.stale).length} 个
+                  {freshnessReport.quota ? `｜GitHub 余量 ${freshnessReport.quota.remaining}/${freshnessReport.quota.limit}` : ''}
+                  {freshnessReport.failed.length ? `｜没查到 ${freshnessReport.failed.length} 个` : ''}
+                </div>
+                {freshnessReport.failed.length ? (
+                  <div className="mb-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-700">
+                    这些仓这次没查到，所以没被判成停更（等额度恢复或网络稳了再体检一次）：{freshnessReport.failed.join('；')}
+                  </div>
+                ) : null}
+                <div className="overflow-hidden rounded border border-border">
+                  <table className="w-full text-xs">
+                    <thead className="bg-accent/40 text-left uppercase text-muted-foreground">
+                      <tr>
+                        <th className="w-8 px-2 py-2"></th>
+                        <th className="px-2 py-2 font-medium">仓库</th>
+                        <th className="px-2 py-2 font-medium">★</th>
+                        <th className="px-2 py-2 font-medium">最近推送</th>
+                        <th className="px-2 py-2 font-medium">候选行</th>
+                        <th className="px-2 py-2 font-medium">结论</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {freshnessReport.items.map(item => (
+                        <tr key={item.repo} className="border-t border-border">
+                          <td className="px-2 py-2">
+                            <input
+                              type="checkbox"
+                              checked={freshnessPicked.includes(item.repo)}
+                              onChange={() => setFreshnessPicked(prev => prev.includes(item.repo)
+                                ? prev.filter(repo => repo !== item.repo)
+                                : [...prev, item.repo])}
+                            />
+                          </td>
+                          <td className="px-2 py-2 font-mono">{item.repo}</td>
+                          <td className="px-2 py-2">{item.stars}</td>
+                          <td className="px-2 py-2 text-muted-foreground">
+                            {item.daysSince == null ? '—' : `${item.daysSince} 天前`}
+                          </td>
+                          <td className="px-2 py-2 text-muted-foreground">{item.candidates}</td>
+                          <td className={`px-2 py-2 ${item.stale ? 'text-amber-600' : 'text-muted-foreground'}`}>
+                            {freshnessBadges(item, freshnessReport.maxAgeDays).join('｜') || '正常在更'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <label
+                    className="flex items-center gap-1"
+                    title="仓不扫了，留在候选表里的行就再也不会被刷新 —— 这两步本来就是同一件事"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={pruneAfterRemove}
+                      onChange={e => setPruneAfterRemove(e.target.checked)}
+                    />
+                    顺手清掉它们留下的候选（已导入成音源的保留）
+                  </label>
+                  <button
+                    onClick={() => { void handleRemoveStale() }}
+                    disabled={removingFresh || checkingFresh || freshnessPicked.length === 0}
+                    className="flex items-center gap-1 rounded bg-destructive/15 px-3 py-1.5 font-medium text-destructive hover:bg-destructive/25 disabled:opacity-50"
+                  >
+                    {removingFresh ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Eraser className="h-3.5 w-3.5" />}
+                    把勾选的 {freshnessPicked.length} 个仓移出扫描清单
+                  </button>
+                </div>
+
+                {freshNote ? (
+                  <div className="mt-2 rounded border border-green-600/40 bg-green-600/10 px-3 py-1.5 text-xs text-green-800">
+                    {freshNote}
                   </div>
                 ) : null}
               </>

@@ -57,6 +57,7 @@ vi.mock('./source-probe', () => probeDeps)
 const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
   searchGitHubRepos, sanitizeRepoQuery, repoSearchItemFromApi,
+  auditRepoFreshness, daysSincePush,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
@@ -138,7 +139,19 @@ beforeEach(() => {
     }
     return typeof args?.take === 'number' ? out.slice(0, args.take) : out
   })
-  prismaMock.sourceCandidate.groupBy = vi.fn(async () => [])
+  // groupBy 要真的按 by 聚合：体检"每个仓还剩多少候选行"靠的就是这份数，装样子就测不出它
+  prismaMock.sourceCandidate.groupBy = vi.fn(async ({ by }: { by: string[] }) => {
+    const SEP = String.fromCharCode(1)
+    const keyOf = (row: Row) => by.map(field => String(row[field] ?? '')).join(SEP)
+    const grouped = new Map<string, number>()
+    for (const row of rows) grouped.set(keyOf(row), (grouped.get(keyOf(row)) ?? 0) + 1)
+    return [...grouped.entries()].map(([key, n]) => {
+      const parts = key.split(SEP)
+      const out: Record<string, unknown> = { _count: { id: n } }
+      by.forEach((field, i) => { out[field] = parts[i] })
+      return out
+    })
+  })
   prismaMock.sourceCandidate.count = vi.fn(async () => rows.filter(r => r.verdict === 'pending').length)
   // deleteMany 要真的把行从数组里摘掉，否则"清掉了"这句就只是断言一个返回数
   prismaMock.sourceCandidate.deleteMany = vi.fn(async ({ where }: { where: { id: { in: number[] } } }) => {
@@ -1076,6 +1089,142 @@ describe('runDiscoveryCrawl 的仓子集', () => {
     vi.stubGlobal('fetch', fetch)
     // 这一档是同步抛的：请求形状就不对，没必要先起一个后台任务再失败
     expect(() => runDiscoveryCrawl({ onlyRepos: ['https://evil.test/a/b', '../etc'] })).toThrow(/写法都不合法/)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+})
+
+// ————— 停更仓体检 —————
+describe('daysSincePush', () => {
+  const now = Date.parse('2026-10-05T12:00:00.000Z')
+  it('读不出时间就是 null、时钟偏前按 0 天：这两种都不该被判成停更', () => {
+    expect(daysSincePush('', now)).toBeNull()
+    expect(daysSincePush(undefined, now)).toBeNull()
+    expect(daysSincePush('乱码', now)).toBeNull()
+    expect(daysSincePush('2026-10-06T00:00:00.000Z', now)).toBe(0)
+    expect(daysSincePush('2026-09-05T12:00:00.000Z', now)).toBe(30)
+  })
+})
+
+describe('auditRepoFreshness（停更仓体检）', () => {
+  const repoPayload = (over: Record<string, unknown> = {}) => ({
+    full_name: 'a/b', pushed_at: '2026-10-01T12:00:00.000Z', stargazers_count: 5, archived: false, ...over,
+  })
+  const rate = () => jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+
+  it('每个仓打一次仓库接口，pushed_at 超阈值才判 stale', async () => {
+    await enable(['a/b', 'c/d'])
+    const fetch = vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return rate()
+      if (url.endsWith('/repos/a/b')) return jsonResponse(repoPayload({ pushed_at: '2024-01-01T00:00:00.000Z' }))
+      if (url.endsWith('/repos/c/d')) return jsonResponse(repoPayload({ full_name: 'c/d' }))
+      throw new Error(`不该打: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetch)
+
+    const report = await auditRepoFreshness(365)
+    expect(report.checked).toBe(2)
+    expect(report.items.find(i => i.repo === 'a/b')?.stale).toBe(true)
+    expect(report.items.find(i => i.repo === 'c/d')?.stale).toBe(false)
+    expect(fetch.mock.calls.filter(([u]) => String(u).includes('/repos/')).length).toBe(2)
+  })
+
+  it('404 判"已消失"、archived 判停更，两者都进 stale', async () => {
+    await enable(['a/b', 'c/d', 'e/f'])
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return rate()
+      if (url.endsWith('/repos/a/b')) return new Response('{"message":"Not Found"}', { status: 404 })
+      if (url.endsWith('/repos/c/d')) return jsonResponse(repoPayload({ full_name: 'c/d', archived: true }))
+      return jsonResponse(repoPayload({ full_name: 'e/f' }))
+    }))
+
+    const report = await auditRepoFreshness(365)
+    const gone = report.items.find(i => i.repo === 'a/b')
+    expect(gone?.missing).toBe(true)
+    expect(gone?.stale).toBe(true)
+    const archived = report.items.find(i => i.repo === 'c/d')
+    expect(archived?.archived).toBe(true)
+    expect(archived?.stale).toBe(true)
+    expect(report.failed).toEqual([])
+  })
+
+  it('超时与 5xx 只进 failed，绝不判成停更 —— 没查到不等于不动了', async () => {
+    await enable(['a/b', 'c/d'])
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return rate()
+      if (url.endsWith('/repos/a/b')) throw new Error('socket hang up')
+      return new Response('bad gateway', { status: 502 })
+    }))
+
+    const report = await auditRepoFreshness(365)
+    expect(report.items).toEqual([])
+    expect(report.failed.length).toBe(2)
+    expect(report.failed.join(' ')).toContain('socket hang up')
+    expect(report.failed.join(' ')).toContain('HTTP 502')
+  })
+
+  it('跟完重定向后名字变了要说"改名到"，但不算停更（GitHub 的重定向一直有效）；只差大小写不算搬家', async () => {
+    await enable(['a/b'])
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return rate()
+      return jsonResponse(repoPayload({ full_name: 'new/owner-name' }))
+    }))
+    const moved = await auditRepoFreshness(365)
+    expect(moved.items[0].movedTo).toBe('new/owner-name')
+    expect(moved.items[0].stale).toBe(false)
+
+    await enable(['A/B'])
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return rate()
+      return jsonResponse(repoPayload({ full_name: 'a/b' }))
+    }))
+    const cased = await auditRepoFreshness(365)
+    expect(cased.items[0].movedTo).toBe('')
+  })
+
+  it('每个仓在候选表里还剩多少行要一起报回来（剔仓的人得知道会连带清掉多少）', async () => {
+    await enable(['a/b', 'c/d'])
+    seedSuspect({ repo: 'a/b' })
+    seedSuspect({ repo: 'a/b' })
+    seedSuspect({ repo: 'c/d' })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return rate()
+      return jsonResponse(repoPayload({ full_name: url.endsWith('/repos/c/d') ? 'c/d' : 'a/b' }))
+    }))
+
+    const report = await auditRepoFreshness(365)
+    expect(report.items.find(i => i.repo === 'a/b')?.candidates).toBe(2)
+    expect(report.items.find(i => i.repo === 'c/d')?.candidates).toBe(1)
+  })
+
+  it('配额不够就报差额，一个仓库接口都不打（体检是 N 次调用，不是免费的）', async () => {
+    await enable(['a/b', 'c/d', 'e/f'])
+    const fetch = vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 2, limit: 60, reset: 0 } } })
+      throw new Error(`不该再打了: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetch)
+
+    await expect(auditRepoFreshness(365)).rejects.toThrow(/余量 2，体检 3 个仓/)
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('阈值钳在 30~3650 天：填 1 天不会把清单剔空', async () => {
+    await enable(['a/b'])
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return rate()
+      return jsonResponse(repoPayload({ pushed_at: new Date(Date.now() - 10 * 86_400_000).toISOString() }))
+    }))
+
+    const report = await auditRepoFreshness(1)
+    expect(report.maxAgeDays).toBe(30)
+    expect(report.items[0].stale).toBe(false)
+  })
+
+  it('清单是空的就没得体检，也不打网络', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: [] })
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    await expect(auditRepoFreshness()).rejects.toThrow(/空的/)
     expect(fetch).not.toHaveBeenCalled()
   })
 })

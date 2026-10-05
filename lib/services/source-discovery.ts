@@ -379,6 +379,132 @@ export async function searchGitHubRepos(
   }
 }
 
+/** 体检出来的一个仓：面板按这些字段决定默认勾不勾 */
+export interface FreshnessItem {
+  repo: string
+  lastPushAt: string
+  /** 距今多少天；null = GitHub 没给可读的时间（此时不判停更，让人自己看） */
+  daysSince: number | null
+  stars: number
+  archived: boolean
+  /** 404/451：仓真没了 */
+  missing: boolean
+  /** GitHub 跟完重定向后的规范名（改名/转移 owner）；与 repo 相同表示没挪 */
+  movedTo: string
+  /** 这仓在候选表里还留了多少行 */
+  candidates: number
+  /** 体检结论：超过阈值、或已归档、或已消失 */
+  stale: boolean
+}
+
+export interface FreshnessReport {
+  checked: number
+  maxAgeDays: number
+  quota: RateLimitInfo | null
+  items: FreshnessItem[]
+  /**
+   * **查不动的仓**（超时、5xx、DNS 失败）。这些绝不进 `stale`：
+   * 一次网络抖动不能被判成"这个仓停更了"，否则体检会把好仓剔掉。
+   */
+  failed: string[]
+}
+
+const FRESHNESS_DEFAULT_DAYS = 365
+/** 并发 4：28 个仓约 3 秒出结果，同步回给面板（NAS 上是 I/O 等待，不吃 CPU） */
+const FRESHNESS_CONCURRENCY = 4
+
+/**
+ * 距今多少天。时间读不出来返回 null，时钟偏前（未来时间）按 0 天算 ——
+ * 都不能因此被判成停更。
+ */
+export function daysSincePush(lastPushAt: unknown, nowMs: number): number | null {
+  if (typeof lastPushAt !== 'string' || !lastPushAt) return null
+  const pushed = Date.parse(lastPushAt)
+  if (!Number.isFinite(pushed)) return null
+  if (pushed > nowMs) return 0
+  return Math.floor((nowMs - pushed) / 86_400_000)
+}
+
+async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length)
+  let cursor = 0
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (cursor < items.length) {
+      const index = cursor++
+      out[index] = await fn(items[index])
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+/**
+ * 停更仓体检：逐个读 GitHub 的 `pushed_at`（我们上次手工剔 11 个仓用的就是这把尺子），
+ * 把"该不该从扫描清单里剔掉"的判断材料摆到面板上。
+ *
+ * 这一步**只读不写**：剔不剔由面板那一次显式保存决定。消失与归档一起进 `stale`，
+ * 但查不动的（超时/5xx）只进 `failed` —— 否定式结论要有正证。
+ */
+export async function auditRepoFreshness(rawMaxAgeDays: unknown = FRESHNESS_DEFAULT_DAYS): Promise<FreshnessReport> {
+  const settings = await getDiscoverySettings()
+  if (!settings.repos.length) throw new SourceDiscoveryError('扫描仓库清单是空的，没什么可体检的')
+  const maxAgeDays = clampInt(rawMaxAgeDays, FRESHNESS_DEFAULT_DAYS, 30, 3650)
+
+  const quota = await readRateLimit(settings.githubToken)
+  if (quota && quota.remaining < settings.repos.length) {
+    throw new SourceDiscoveryError(
+      `GitHub API 余量 ${quota.remaining}，体检 ${settings.repos.length} 个仓需要这么多次调用。`
+      + `配一个只读 token 或等额度恢复再来（体检不吃搜索那档额度）`,
+      429,
+    )
+  }
+
+  const counts = new Map<string, number>()
+  for (const row of await prisma.sourceCandidate.groupBy({ by: ['repo'], _count: { id: true } })) {
+    counts.set(row.repo, row._count.id)
+  }
+
+  const nowMs = Date.now()
+  const failed: string[] = []
+  const items = (await mapWithLimit(settings.repos, FRESHNESS_CONCURRENCY, async (repo): Promise<FreshnessItem | null> => {
+    const base = {
+      repo, lastPushAt: '', daysSince: null as number | null, stars: 0, archived: false,
+      missing: false, movedTo: '', candidates: counts.get(repo) ?? 0, stale: false,
+    }
+    let response: Response
+    try {
+      response = await githubFetch(buildRepoUrl(repo), settings.githubToken)
+    } catch (err) {
+      failed.push(`${repo}：${err instanceof Error ? err.message : String(err)}`.slice(0, 120))
+      return null
+    }
+    if (response.status === 404 || response.status === 451) {
+      return { ...base, missing: true, stale: true }
+    }
+    if (!response.ok) {
+      failed.push(`${repo}：HTTP ${response.status}`)
+      return null
+    }
+    const payload = await response.json() as Record<string, unknown>
+    const lastPushAt = typeof payload.pushed_at === 'string' ? payload.pushed_at : ''
+    const daysSince = daysSincePush(lastPushAt, nowMs)
+    const archived = payload.archived === true
+    // 跟完重定向后 GitHub 回的是规范名，与请求的那个不一致就是改名/转移了 owner。
+    // 比大小写不敏感的版本：清单里的手写名字与 GitHub 规范名常常只差大小写，那不算搬家。
+    const canonical = normalizeRepo(typeof payload.full_name === 'string' ? payload.full_name : '')
+    const movedTo = canonical && canonical.toLowerCase() !== repo.toLowerCase() ? canonical : ''
+    return {
+      repo, lastPushAt, daysSince,
+      stars: Number(payload.stargazers_count) || 0,
+      archived, missing: false, movedTo,
+      candidates: counts.get(repo) ?? counts.get(canonical || '') ?? 0,
+      stale: archived || (daysSince != null && daysSince > maxAgeDays),
+    }
+  })).filter((item): item is FreshnessItem => item !== null)
+
+  return { checked: settings.repos.length, maxAgeDays, quota, items, failed }
+}
+
 export interface CrawlSummary {
   reposScanned: number
   reposSkipped: string[]
@@ -527,6 +653,11 @@ function clampIntRaw(value: number, low: number, high: number): number {
 function buildTreeUrl(repo: string): string {
   const [owner, name] = repo.split('/')
   return `${API_HOST}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/git/trees/HEAD?recursive=1`
+}
+
+function buildRepoUrl(repo: string): string {
+  const [owner, name] = repo.split('/')
+  return `${API_HOST}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
 }
 
 function buildRawUrl(repo: string, path: string): string {

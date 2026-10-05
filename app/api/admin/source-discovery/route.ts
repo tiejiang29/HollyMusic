@@ -5,6 +5,7 @@
  * POST /api/admin/source-discovery  { action: 'crawl', repos? } 起一轮发现（repos 给了就只扫这些仓）；
  *                                   { action:'drain' } 连轮清完待判定；
  *                                   { action:'search', query, page?, sort? } 按关键词搜 GitHub 仓库（只返回元数据，不入清单）；
+ *                                   { action:'freshness', maxAgeDays? } 体检扫描清单里的仓多久没动（只读，剔不剔由 PUT 决定）；
  *                                   { action:'probe', id } 起一次判级；{ action:'probe-batch' } 批量判级（一批≤50）；
  *                                   { action:'stop' } 请求停止；
  *                                   { action:'prune' } 清理已移除仓的候选；
@@ -20,6 +21,7 @@ import { requireAdmin, AuthError, ForbiddenError } from '@/lib/services/user-con
 import { maskSecret } from '@/lib/services/app-setting'
 import {
   SourceDiscoveryError,
+  auditRepoFreshness,
   clearDiscoveryToken,
   countCandidates,
   discoveryStatus,
@@ -147,6 +149,12 @@ export async function POST(request: NextRequest) {
       // 同步返回：一次搜索就一个接口调用（约 1 秒），而且搜完就得看到结果
       const result = await searchGitHubRepos(body?.query, body?.page, body?.sort, body?.pageSize)
       return createSuccessResponse(result)
+    }
+
+    if (action === 'freshness') {
+      // 只读：逐个查 pushed_at，把"该不该剔"的材料摆给面板；剔除是面板另一次显式保存
+      const report = await auditRepoFreshness(body?.maxAgeDays)
+      return createSuccessResponse(report)
     }
 
     if (action === 'crawl') {

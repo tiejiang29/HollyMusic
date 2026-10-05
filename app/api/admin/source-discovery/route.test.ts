@@ -29,7 +29,7 @@ vi.mock('@/lib/services/user-context', () => ({
   ForbiddenError: MockForbiddenError,
 }))
 
-const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, pruneMock, searchMock } = vi.hoisted(() => ({
+const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, pruneMock, searchMock, freshnessMock } = vi.hoisted(() => ({
   db: { setting: new Map<string, string>(), candidates: [] as Array<Record<string, unknown>> },
   runCrawl: vi.fn(async () => ({})),
   importCandidateMock: vi.fn(),
@@ -41,6 +41,13 @@ const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, 
     total: 2, page: 1, pageSize: 30, sort: 'updated', incomplete: false,
     quota: { remaining: 27, limit: 30, resetAt: 0 },
     items: [{ repo: 'new/guy', description: '洛雪音源', stars: 3, lastPushAt: '2026-10-01T00:00:00Z', language: 'JavaScript', fork: false, archived: false, alreadyListed: false }],
+  })),
+  freshnessMock: vi.fn(async () => ({
+    checked: 2, maxAgeDays: 365, quota: { remaining: 4990, limit: 5000, resetAt: 0 }, failed: [],
+    items: [
+      { repo: 'old/guy', lastPushAt: '2024-01-01T00:00:00Z', daysSince: 1000, stars: 0, archived: false, missing: false, movedTo: '', candidates: 6, stale: true },
+      { repo: 'a/b', lastPushAt: '2026-10-01T00:00:00Z', daysSince: 4, stars: 9, archived: false, missing: false, movedTo: '', candidates: 3, stale: false },
+    ],
   })),
 }))
 
@@ -71,6 +78,7 @@ vi.mock('@/lib/services/source-discovery', async importOriginal => {
     ...actual,
     runDiscoveryCrawl: runCrawl,
     searchGitHubRepos: searchMock,
+    auditRepoFreshness: freshnessMock,
     runDiscoveryDrain: drainMock,
     requestDiscoveryStop: stopMock,
     importCandidate: importCandidateMock,
@@ -100,6 +108,7 @@ beforeEach(async () => {
   probeBatchMock.mockClear()
   pruneMock.mockClear()
   searchMock.mockClear()
+  freshnessMock.mockClear()
   await saveDiscoverySettings({ enabled: true, repos: ['a/b'], githubToken: 'ghp_supersecret1234' })
 })
 
@@ -232,6 +241,28 @@ describe('动作校验', () => {
     const response = await POST(request('POST', { action: 'search', query: 'lxmusic source' }))
     expect(response.status).toBe(429)
     expect((await response.json()).error.message).toContain('配额用尽')
+  })
+
+  it('freshness（停更仓体检）把阈值交给服务层，报告原样透出', async () => {
+    const response = await POST(request('POST', { action: 'freshness', maxAgeDays: 200 }))
+    expect(response.status).toBe(200)
+    expect(freshnessMock).toHaveBeenCalledWith(200)
+    const payload = await response.json()
+    expect(payload.data.items.map((i: { repo: string }) => i.repo)).toEqual(['old/guy', 'a/b'])
+    expect(payload.data.items[0].candidates).toBe(6)
+  })
+
+  it('体检的配额不足也按 429 透出（它是 N 次仓库接口调用，不是免费的）', async () => {
+    const { SourceDiscoveryError } = await import('@/lib/services/source-discovery')
+    freshnessMock.mockRejectedValueOnce(new SourceDiscoveryError('GitHub API 余量 2，体检 3 个仓需要 3 次调用', 429))
+    const response = await POST(request('POST', { action: 'freshness' }))
+    expect(response.status).toBe(429)
+  })
+
+  it('非管理员不能触发体检（那是一轮真打 GitHub 的读操作）', async () => {
+    authMode = 'user'
+    expect((await POST(request('POST', { action: 'freshness' }))).status).toBe(403)
+    expect(freshnessMock).not.toHaveBeenCalled()
   })
 
   it('drain（连轮清完）也是 202，不让人挂着请求等几十分钟', async () => {

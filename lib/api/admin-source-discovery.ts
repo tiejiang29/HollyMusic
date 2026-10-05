@@ -163,6 +163,35 @@ export function searchDiscoveryRepos(
   return apiPost<RepoSearchResultView>('admin/source-discovery', { action: 'search', query, ...opts })
 }
 
+/** 体检结果里的一行：一个仓多久没动、归档了没、还在不在 */
+export interface RepoFreshnessItem {
+  repo: string
+  lastPushAt: string
+  /** null = GitHub 没给可读的时间，此时不判停更 */
+  daysSince: number | null
+  stars: number
+  archived: boolean
+  missing: boolean
+  /** 改名/转移 owner 后的规范名；空串 = 没挪 */
+  movedTo: string
+  candidates: number
+  stale: boolean
+}
+
+export interface RepoFreshnessReport {
+  checked: number
+  maxAgeDays: number
+  quota: { remaining: number; limit: number; resetAt: number } | null
+  items: RepoFreshnessItem[]
+  /** 查不动的仓（超时/5xx）：它们**不**被判成停更 */
+  failed: string[]
+}
+
+/** 体检扫描清单里的仓库多久没更新（只读；剔不剔由随后那次保存清单决定） */
+export function auditRepoFreshness(maxAgeDays?: number): Promise<RepoFreshnessReport> {
+  return apiPost<RepoFreshnessReport>('admin/source-discovery', { action: 'freshness', maxAgeDays })
+}
+
 /** 连轮清完待判定（一轮吃满下载额度就自动接下一轮） */
 export function startDiscoveryDrain(): Promise<{ started: boolean; reason?: string }> {
   return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'drain' })
