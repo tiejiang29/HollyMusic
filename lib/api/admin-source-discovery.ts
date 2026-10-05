@@ -159,6 +159,11 @@ export function importDiscoveryCandidate(id: number, force = false): Promise<{ i
   return apiPost<{ imported: { id: number; path: string; name: string } }>('admin/source-discovery', { action: 'import', id, force })
 }
 
+/** 清掉已从扫描列表里移除的仓留下的候选行（已导入成音源的保留） */
+export function pruneOrphanCandidates(): Promise<{ removed: number; keptImported: string[] }> {
+  return apiPost<{ removed: number; keptImported: string[] }>('admin/source-discovery', { action: 'prune' })
+}
+
 export function saveDiscoverySettings(payload: {
   enabled?: boolean
   repos?: string[]

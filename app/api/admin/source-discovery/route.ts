@@ -5,6 +5,7 @@
  * POST /api/admin/source-discovery  { action: 'crawl' } 起一轮发现；{ action:'drain' } 连轮清完待判定；
  *                                   { action:'probe', id } 起一次判级；{ action:'probe-batch' } 批量判级（一批≤50）；
  *                                   { action:'stop' } 请求停止；
+ *                                   { action:'prune' } 清理已移除仓的候选；
  *                                   { action:'dismiss'|'import', id, force? } 剔除 / 导入成音源
  * PUT  /api/admin/source-discovery  改配置：{ enabled, repos, maxCandidatesPerRepo, maxDownloadsPerRound, githubToken?, clearToken? }
  *
@@ -24,6 +25,7 @@ import {
   getDiscoverySettings,
   importCandidate,
   listCandidates,
+  pruneOrphanCandidates,
   requestDiscoveryStop,
   runDiscoveryCrawl,
   runDiscoveryDrain,
@@ -91,6 +93,11 @@ export async function POST(request: NextRequest) {
       if (!Number.isFinite(id) || id <= 0) return createErrorResponse('INVALID_PARAMS', '缺少合法的候选 id', 400)
       await dismissCandidate(id)
       return createSuccessResponse({ dismissed: id })
+    }
+
+    if (action === 'prune') {
+      // 清掉"已从扫描列表里移除的仓"留下的候选行（已导入的保留），删多少由服务层算
+      return createSuccessResponse(await pruneOrphanCandidates())
     }
 
     if (action === 'probe') {

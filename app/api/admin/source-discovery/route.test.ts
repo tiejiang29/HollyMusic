@@ -29,13 +29,14 @@ vi.mock('@/lib/services/user-context', () => ({
   ForbiddenError: MockForbiddenError,
 }))
 
-const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock } = vi.hoisted(() => ({
+const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, pruneMock } = vi.hoisted(() => ({
   db: { setting: new Map<string, string>(), candidates: [] as Array<Record<string, unknown>> },
   runCrawl: vi.fn(async () => ({})),
   importCandidateMock: vi.fn(),
   drainMock: vi.fn(async () => ({ rounds: 1, downloaded: 0, suspect: 0, notSource: 0, stale: 0, pendingLeft: 0, stopped: false, note: null })),
   stopMock: vi.fn(() => ({ stopping: true })),
   probeBatchMock: vi.fn(() => ({ started: true })),
+  pruneMock: vi.fn(async () => ({ removed: 3, keptImported: [] })),
 }))
 
 interface KeyWhere { where: { key: string } }
@@ -68,6 +69,7 @@ vi.mock('@/lib/services/source-discovery', async importOriginal => {
     requestDiscoveryStop: stopMock,
     importCandidate: importCandidateMock,
     startCandidateProbeBatch: probeBatchMock,
+    pruneOrphanCandidates: pruneMock,
   }
 })
 
@@ -90,6 +92,7 @@ beforeEach(async () => {
   drainMock.mockClear()
   stopMock.mockClear()
   probeBatchMock.mockClear()
+  pruneMock.mockClear()
   await saveDiscoverySettings({ enabled: true, repos: ['a/b'], githubToken: 'ghp_supersecret1234' })
 })
 
@@ -209,6 +212,13 @@ describe('动作校验', () => {
     const busy = await POST(request('POST', { action: 'probe-batch' }))
     expect(busy.status).toBe(200)
     expect((await busy.json()).data.started).toBe(false)
+  })
+
+  it('prune 把删掉的行数原样报回（管理员要知道清了多少，别只回一句成功）', async () => {
+    const response = await POST(request('POST', { action: 'prune' }))
+    expect(response.status).toBe(200)
+    expect((await response.json()).data).toEqual({ removed: 3, keptImported: [] })
+    expect(pruneMock).toHaveBeenCalledTimes(1)
   })
 
   it('stop 原样回服务层的判定（没在跑就是 stopping:false）', async () => {

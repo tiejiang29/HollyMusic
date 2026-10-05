@@ -59,7 +59,7 @@ const {
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
-  startCandidateProbe, startCandidateProbeBatch, _setProbeGapForTest, _setRunnerForTest,
+  startCandidateProbe, startCandidateProbeBatch, pruneOrphanCandidates, _setProbeGapForTest, _setRunnerForTest,
 } = await import('./source-discovery')
 const { gitBlobSha } = await import('@/lib/server/git-blob-sha')
 
@@ -139,6 +139,13 @@ beforeEach(() => {
   })
   prismaMock.sourceCandidate.groupBy = vi.fn(async () => [])
   prismaMock.sourceCandidate.count = vi.fn(async () => rows.filter(r => r.verdict === 'pending').length)
+  // deleteMany 要真的把行从数组里摘掉，否则"清掉了"这句就只是断言一个返回数
+  prismaMock.sourceCandidate.deleteMany = vi.fn(async ({ where }: { where: { id: { in: number[] } } }) => {
+    const gone = new Set(where.id.in)
+    const before = rows.length
+    rows = rows.filter(r => !gone.has(r.id))
+    return { count: before - rows.length }
+  })
 })
 
 /** 我们自己的特征骨架：够过阈值，又不是任何真实脚本 */
@@ -853,5 +860,39 @@ describe('startCandidateProbeBatch（批量判级）', () => {
     expect(startCandidateProbeBatch()).toEqual({ started: false, reason: '已有一批判级在跑' })
     expect(startCandidateProbe(1)).toEqual({ started: false, reason: '有一批判级正在跑' })
     await waitProbeBatch()
+  })
+})
+
+describe('pruneOrphanCandidates（清理已移除仓留下的候选）', () => {
+  it('只删不在清单里的仓，清单里的行一行都不动', async () => {
+    await enable(['a/b'])
+    const kept = seedSuspect({})
+    const orphanA = seedSuspect({ repo: 'old/c', path: 'x.js' })
+    const orphanB = seedSuspect({ repo: 'old/d', path: 'y.js' })
+
+    const result = await pruneOrphanCandidates()
+    expect(result.removed).toBe(2)
+    expect(rows.map(r => r.id)).toEqual([kept])
+    expect(rows.some(r => r.id === orphanA || r.id === orphanB)).toBe(false)
+  })
+
+  it('已导入成音源的行保留 —— 它是配置里那条源的溯源，删了就答不出"这脚本哪来的"', async () => {
+    await enable(['a/b'])
+    const imported = seedSuspect({ repo: 'old/c', state: 'imported', importedPath: 'custom-sources/老源.js' })
+    seedSuspect({ repo: 'old/d' })
+
+    const result = await pruneOrphanCandidates()
+    expect(result.removed).toBe(1)
+    expect(result.keptImported).toEqual(['old/c → custom-sources/老源.js'])
+    expect(rows.map(r => r.id)).toEqual([imported])
+  })
+
+  it('清单被清空时拒绝执行：那等于"所有候选都不在清单里"，一键清表不该这么容易', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'] })
+    seedSuspect({ repo: 'a/b' })
+    await saveDiscoverySettings({ repos: [] })
+
+    await expect(pruneOrphanCandidates()).rejects.toThrow(/先加回至少一个仓/)
+    expect(rows.length).toBe(1)
   })
 })

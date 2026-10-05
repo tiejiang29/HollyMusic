@@ -1135,6 +1135,33 @@ async function runProbeBatch(limit: number): Promise<void> {
   logger.info('[discovery] 批量判级结束', { 总数: batch.total, 判了: batch.done, 出货: batch.withAddress, 失败: batch.failed, 停止: batch.stopped })
 }
 
+/**
+ * 清掉"扫描列表里已经没有的仓"留下的候选行（比如把停更仓从列表里删掉之后剩下的尾巴）。
+ *
+ * 为什么是**删行**而不是标 `stale`：这些仓以后不会再被扫，把行留着只是让"已被顶掉"越堆越厚；
+ * 而哪天真要把仓加回列表，当新候选重采一遍才是我们要的状态（重新走下载与打分）。
+ * 两个不动：列表里的仓一行不碰；`state=imported` 的行**保留** —— 它是配置里那条音源的溯源，
+ * 删了就没法回答"这个脚本是从哪个仓来的"。
+ */
+export async function pruneOrphanCandidates(): Promise<{ removed: number; keptImported: string[] }> {
+  const settings = await getDiscoverySettings()
+  // 清单空着时"不在清单里"= 全部，一键就把候选表清空了 —— 这几乎肯定是误操作，先拦住
+  if (!settings.repos.length) {
+    throw new SourceDiscoveryError('扫描仓库清单是空的，这样会把所有候选都当成失效仓清掉；先加回至少一个仓再清理')
+  }
+  const listed = new Set(settings.repos)
+  const rows = await prisma.sourceCandidate.findMany({
+    where: { NOT: { repo: { in: [...listed] } } },
+    select: { id: true, repo: true, state: true, importedPath: true },
+  })
+  const orphans = rows.filter(row => !listed.has(row.repo))
+  const keptImported = orphans.filter(row => row.state === 'imported').map(row => `${row.repo} → ${row.importedPath || '(无路径)'}`)
+  const doomed = orphans.filter(row => row.state !== 'imported')
+  if (doomed.length) await prisma.sourceCandidate.deleteMany({ where: { id: { in: doomed.map(row => row.id) } } })
+  logger.info('[discovery] 清理失效仓的候选', { 删除: doomed.length, 保留已导入: keptImported.length })
+  return { removed: doomed.length, keptImported }
+}
+
 /** 面板渲染用：读回已存的判级结果，没判过或内容坏都返回 null */
 export function parseProbeReport(probeJson: string): CandidateProbeReport | null {
   if (!probeJson) return null

@@ -13,6 +13,7 @@ import {
   dismissDiscoveryCandidate,
   getDiscovery,
   importDiscoveryCandidate,
+  pruneOrphanCandidates,
   saveDiscoverySettings,
   startCandidateProbe,
   startCandidateProbeBatch,
@@ -153,6 +154,7 @@ export function SourceDiscoveryPanel() {
   // 判级没出货的候选要点两下：第一下只把按钮变成「确认强制导入」。
   // force 是"管理员对着红灯坚持要装"那一档，不该一次点击就能触发。
   const [forceConfirmId, setForceConfirmId] = useState<number | null>(null)
+  const [pruning, setPruning] = useState(false)
   const [importNote, setImportNote] = useState<string | null>(null)
   // 面板跑在明文 HTTP 上（NAS 局域网），非安全上下文里 navigator.clipboard 直接不存在，
   // 所以必须能降级成"手动选中"，否则这个按钮在真实环境是死的
@@ -251,6 +253,21 @@ export function SourceDiscoveryPanel() {
       return
     }
     await handleSave({ maxDownloadsPerRound: parsed })
+  }
+
+  const handlePrune = async () => {
+    if (!confirm('清掉「已不在扫描列表里的仓」留下的候选行？已导入成音源的会保留。这一步不可撤销（重新把仓加回列表会当新候选重采）。')) return
+    setPruning(true)
+    try {
+      const result = await pruneOrphanCandidates()
+      setImportNote(`清理完成：删掉 ${result.removed} 行候选`
+        + (result.keptImported.length ? `；保留 ${result.keptImported.length} 行已导入的（${result.keptImported.join('；')}）` : ''))
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '清理失败')
+    } finally {
+      setPruning(false)
+    }
   }
 
   const handleCopy = async (rawUrl: string, id: number) => {
@@ -412,6 +429,15 @@ export function SourceDiscoveryPanel() {
                 spellCheck={false}
                 className="w-full rounded border border-border bg-background p-2 font-mono text-xs"
               />
+              <button
+                onClick={handlePrune}
+                disabled={pruning}
+                title="把「已从这个列表里移除的仓」留下的候选行清掉。已导入成音源的行会保留；重新把某个仓加回来会当新候选重采一遍。"
+                className="mt-1 flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+              >
+                {pruning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
+                清理已移除仓的候选
+              </button>
             </div>
 
             <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
