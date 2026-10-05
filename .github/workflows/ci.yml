@@ -1,11 +1,20 @@
 name: CI
 
-# PR 与 main 直推时的代码质量门禁：lint / 类型检查 / 测试 / 构建
-# main 分支保护将本 job 设为 required check，全部通过才允许合并
+# 代码质量门禁 + Docker Hub 镜像发布，**合在一条 workflow 里，用 needs 串起来**。
+#
+# 为什么合：原来 CI 与 Build & Push 是两条并列的 workflow，各自被 push 触发、互不引用
+# —— 于是测试红了镜像照样发。2026-10-05 实测坐实：`CI #57` failure，同一 commit 的
+# `#70` success 并把 latest 推上了 Docker Hub。别指望"给 build 加 needs: check"能解决：
+# **`needs` 只能引用同一文件内的 job，跨 workflow 无效**。所以把发布 job 搬进来。
+# （分支保护里的 required check 只拦 PR 合并，我们直推 main，那条保护从来拦不住发布。）
+#
+# ghcr.io 那条（docker-publish.yml，tag → 镜像 → GitHub Release）不在这条链上，没动它。
 on:
   pull_request:
   push:
     branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
 
 jobs:
   check:
@@ -56,3 +65,53 @@ jobs:
         run: |
           pnpm build
           pnpm -C frontend build
+
+  # Docker Hub 发布（NAS 拉的就是这个镜像）。steps 原样搬自旧的 docker-build.yml，
+  # 包括各 action 的版本号 —— 这次只加"先过 check"这一道，不顺手升依赖。
+  build-and-push:
+    # PR 不发布；只有 main 直推、tag、手动触发才走这一段
+    if: github.event_name != 'pull_request'
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      REGISTRY: docker.io
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/hollymusic
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
