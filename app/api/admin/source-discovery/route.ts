@@ -2,7 +2,8 @@
  * 音源发现 API（仅管理员）
  *
  * GET  /api/admin/source-discovery  配置视图（token 只回脱敏尾巴）+ 候选列表 + 本轮进度
- * POST /api/admin/source-discovery  { action: 'crawl' } 起一轮发现；{ action:'probe', id } 起一次判级；
+ * POST /api/admin/source-discovery  { action: 'crawl' } 起一轮发现；{ action:'drain' } 连轮清完待判定；
+ *                                   { action:'stop' } 请求停止；{ action:'probe', id } 起一次判级；
  *                                   { action:'dismiss'|'import', id, force? } 剔除 / 导入成音源
  * PUT  /api/admin/source-discovery  改配置：{ enabled, repos, maxCandidatesPerRepo, maxDownloadsPerRound, githubToken?, clearToken? }
  *
@@ -22,7 +23,9 @@ import {
   getDiscoverySettings,
   importCandidate,
   listCandidates,
+  requestDiscoveryStop,
   runDiscoveryCrawl,
+  runDiscoveryDrain,
   saveDiscoverySettings,
   startCandidateProbe,
   type DiscoverySettings,
@@ -104,6 +107,20 @@ export async function POST(request: NextRequest) {
       // 导入要重下载 + 一次性进程校验，最坏十几秒，但必须等它出结果才知道源名，所以同步返回
       const source = await importCandidate(id, { force: body?.force === true })
       return createSuccessResponse({ imported: { id, path: source.path, name: source.name ?? source.path } })
+    }
+
+    if (action === 'drain') {
+      const status = discoveryStatus()
+      if (status.running || status.draining) return createSuccessResponse({ started: false, reason: '已有任务在跑' })
+      // 连轮可能跑几十分钟，一样只回 202，进度靠 GET 轮询
+      void runDiscoveryDrain().catch(err => {
+        logger.warn('[discovery] 连轮失败:', err instanceof Error ? err.message : err)
+      })
+      return createSuccessResponse({ started: true }, 202)
+    }
+
+    if (action === 'stop') {
+      return createSuccessResponse(requestDiscoveryStop())
     }
 
     if (action === 'crawl') {

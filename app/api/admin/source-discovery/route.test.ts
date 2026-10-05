@@ -29,10 +29,12 @@ vi.mock('@/lib/services/user-context', () => ({
   ForbiddenError: MockForbiddenError,
 }))
 
-const { db, runCrawl, importCandidateMock } = vi.hoisted(() => ({
+const { db, runCrawl, importCandidateMock, drainMock, stopMock } = vi.hoisted(() => ({
   db: { setting: new Map<string, string>(), candidates: [] as Array<Record<string, unknown>> },
   runCrawl: vi.fn(async () => ({})),
   importCandidateMock: vi.fn(),
+  drainMock: vi.fn(async () => ({ rounds: 1, downloaded: 0, suspect: 0, notSource: 0, stale: 0, pendingLeft: 0, stopped: false, note: null })),
+  stopMock: vi.fn(() => ({ stopping: true })),
 }))
 
 interface KeyWhere { where: { key: string } }
@@ -55,10 +57,10 @@ vi.mock('@/lib/db', () => ({
   },
 }))
 
-// 部分 mock：只换掉"真会打 GitHub / 真会写生产配置"的那两个，其余保持实现原样
+// 部分 mock：只换掉"真会打 GitHub / 真会写生产配置"的那几个，其余保持实现原样
 vi.mock('@/lib/services/source-discovery', async importOriginal => {
   const actual = await importOriginal<Record<string, unknown>>()
-  return { ...actual, runDiscoveryCrawl: runCrawl, importCandidate: importCandidateMock }
+  return { ...actual, runDiscoveryCrawl: runCrawl, runDiscoveryDrain: drainMock, requestDiscoveryStop: stopMock, importCandidate: importCandidateMock }
 })
 
 const { GET, POST, PUT } = await import('./route')
@@ -76,6 +78,9 @@ beforeEach(async () => {
   db.setting.clear()
   db.candidates = []
   importCandidateMock.mockReset()
+  // 这两个带默认实现（route 会 void 它们的返回值），只清调用记录、别把实现清没
+  drainMock.mockClear()
+  stopMock.mockClear()
   await saveDiscoverySettings({ enabled: true, repos: ['a/b'], githubToken: 'ghp_supersecret1234' })
 })
 
@@ -177,5 +182,29 @@ describe('动作校验', () => {
     expect(response.status).toBe(202)
     expect((await response.json()).data.started).toBe(true)
     expect(runCrawl).toHaveBeenCalledTimes(1)
+  })
+
+  it('drain（连轮清完）也是 202，不让人挂着请求等几十分钟', async () => {
+    const response = await POST(request('POST', { action: 'drain' }))
+    expect(response.status).toBe(202)
+    expect((await response.json()).data.started).toBe(true)
+    expect(drainMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('stop 原样回服务层的判定（没在跑就是 stopping:false）', async () => {
+    stopMock.mockReturnValueOnce({ stopping: false })
+    const response = await POST(request('POST', { action: 'stop' }))
+    expect(response.status).toBe(200)
+    expect((await response.json()).data).toEqual({ stopping: false })
+  })
+})
+
+describe('每轮抓正文上限', () => {
+  it('可以调到 2000（清几千条存量时用），再大就夹住', async () => {
+    const up = await (await PUT(request('PUT', { maxDownloadsPerRound: 2000 }))).json()
+    expect(up.data.settings.maxDownloadsPerRound).toBe(2000)
+
+    const over = await (await PUT(request('PUT', { maxDownloadsPerRound: 99999 }))).json()
+    expect(over.data.settings.maxDownloadsPerRound).toBe(2000)
   })
 })

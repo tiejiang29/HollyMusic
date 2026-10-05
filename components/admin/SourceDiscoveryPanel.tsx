@@ -16,6 +16,8 @@ import {
   saveDiscoverySettings,
   startCandidateProbe,
   startDiscoveryCrawl,
+  startDiscoveryDrain,
+  stopDiscovery,
   type DiscoveryCandidate,
   type DiscoverySettingsView,
   type DiscoveryStatus,
@@ -23,7 +25,7 @@ import {
 } from '@/lib/api/admin-source-discovery'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download } from 'lucide-react'
+import { Radar, RefreshCw, Loader2, Ban, KeyRound, Trash2, Link2, CheckCircle2, Download, Layers, Square } from 'lucide-react'
 import { copyAddress } from '@/lib/utils/clipboard'
 
 const FILTERS = [
@@ -133,6 +135,7 @@ export function SourceDiscoveryPanel() {
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>(FILTERS[0])
   const [reposText, setReposText] = useState('')
+  const [budgetText, setBudgetText] = useState('')
   const [tokenInput, setTokenInput] = useState('')
   const [saving, setSaving] = useState(false)
   const [starting, setStarting] = useState(false)
@@ -155,6 +158,7 @@ export function SourceDiscoveryPanel() {
       setCandidates(view.candidates)
       setCounts(view.counts)
       setReposText(prev => (prev === '' && !view.status.running ? view.settings.repos.join('\n') : prev))
+      setBudgetText(prev => (prev === '' && !view.status.running ? String(view.settings.maxDownloadsPerRound) : prev))
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载失败')
@@ -169,16 +173,16 @@ export function SourceDiscoveryPanel() {
     void reload()
   }, [reload])
 
-  // 有一轮发现或有一次判级在跑就轮进度，都停下来自动收（不留着空转）
+  // 有一轮发现、一次连轮或一次判级在跑就轮进度，都停下来自动收（不留着空转）
   useEffect(() => {
-    if (!status?.running && status?.probingId == null) {
+    if (!status?.running && !status?.draining && status?.probingId == null) {
       if (pollRef.current) clearInterval(pollRef.current)
       pollRef.current = null
       return
     }
     pollRef.current = setInterval(() => { void reload() }, 3000)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [status?.running, status?.probingId, reload])
+  }, [status?.running, status?.draining, status?.probingId, reload])
 
   const handleSave = async (extra: Record<string, unknown> = {}) => {
     setSaving(true)
@@ -207,6 +211,38 @@ export function SourceDiscoveryPanel() {
     } finally {
       setStarting(false)
     }
+  }
+
+  const handleDrain = async () => {
+    setStarting(true)
+    try {
+      const result = await startDiscoveryDrain()
+      if (!result.started) alert(result.reason ?? '已有任务在跑')
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '起不来连轮')
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const handleStop = async () => {
+    try {
+      const result = await stopDiscovery()
+      if (!result.stopping) alert('现在没有在跑的任务')
+      await reload()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '停止请求没送出去')
+    }
+  }
+
+  const handleBudgetSave = async () => {
+    const parsed = Number.parseInt(budgetText, 10)
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 2000) {
+      alert('每轮抓正文上限要填 0~2000 的整数')
+      return
+    }
+    await handleSave({ maxDownloadsPerRound: parsed })
   }
 
   const handleCopy = async (rawUrl: string, id: number) => {
@@ -297,6 +333,26 @@ export function SourceDiscoveryPanel() {
             {status?.running || starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Radar className="h-4 w-4" />}
             {status?.running ? '本轮进行中' : '开始发现'}
           </button>
+          <button
+            onClick={handleDrain}
+            disabled={starting || saving || !settings?.enabled || status?.running || status?.draining}
+            title="一轮把「每轮抓正文上限」吃满就自动接下一轮，直到没有待判定 —— 存量几千条时不用人守着点"
+            className="flex items-center gap-1 rounded-full border border-border px-4 py-2 text-sm font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {status?.draining ? <Loader2 className="h-4 w-4 animate-spin" /> : <Layers className="h-4 w-4" />}
+            {status?.draining ? `连轮中 第 ${status.round} 轮` : '连轮清完'}
+          </button>
+          {status?.running || status?.draining ? (
+            <button
+              onClick={handleStop}
+              disabled={Boolean(status?.stopRequested)}
+              title="已经在抓的那一条会抓完，之后的都停下；连轮不再起下一轮"
+              className="flex items-center gap-1 rounded-full border border-destructive/40 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Square className="h-4 w-4" />
+              {status?.stopRequested ? '停止中…' : '停止'}
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -329,6 +385,30 @@ export function SourceDiscoveryPanel() {
                 spellCheck={false}
                 className="w-full rounded border border-border bg-background p-2 font-mono text-xs"
               />
+            </div>
+
+            <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
+              <label className="uppercase text-muted-foreground" htmlFor="discovery-budget">每轮抓正文上限</label>
+              <input
+                id="discovery-budget"
+                type="number"
+                min={0}
+                max={2000}
+                value={budgetText}
+                onChange={e => setBudgetText(e.target.value)}
+                disabled={saving}
+                className="w-24 rounded border border-border bg-background px-2 py-1 font-mono"
+              />
+              <button
+                onClick={handleBudgetSave}
+                disabled={saving}
+                className="rounded bg-accent px-3 py-1.5 font-medium hover:bg-accent/70 disabled:opacity-50"
+              >
+                保存
+              </button>
+              <span className="text-muted-foreground">
+                待判定条数 ÷ 这个数 = 要跑几轮；点「连轮清完」就不用一轮一轮手点。填 0 表示这轮只登记文件、不抓正文。
+              </span>
             </div>
 
             <div className="mb-3 flex flex-wrap items-center gap-3">
@@ -367,7 +447,16 @@ export function SourceDiscoveryPanel() {
 
           {status?.running ? (
             <div className="mb-4 rounded-lg border border-border bg-accent/20 px-4 py-3 text-sm">
+              {status.draining ? `连轮第 ${status.round} 轮 · ` : ''}
               {status.phase}：{status.reposDone}/{status.reposTotal} 个仓库，已抓正文 {status.downloaded} 个
+              {status.stopRequested ? ' · 已请求停止，抓完手头这条就收' : ''}
+            </div>
+          ) : null}
+          {status?.drainLast && !status.running && !status.draining ? (
+            <div className="mb-4 text-xs text-muted-foreground">
+              上次连轮：跑了 {status.drainLast.rounds} 轮，抓正文 {status.drainLast.downloaded}，
+              疑似 {status.drainLast.suspect}，剩余待判定 {status.drainLast.pendingLeft}
+              {status.drainLast.note ? `｜${status.drainLast.note}` : ''}
             </div>
           ) : null}
           {status?.lastError ? (

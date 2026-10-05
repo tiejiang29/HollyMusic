@@ -254,6 +254,23 @@ export interface CrawlSummary {
   stale: number
   quota: RateLimitInfo | null
   note: string | null
+  /** 这一轮是被手动停止中断的（连轮据此决定是否继续） */
+  stopped: boolean
+}
+
+/** 一次连轮（清存量）的总账 */
+export interface DrainSummary {
+  /** 实际跑了几轮 */
+  rounds: number
+  downloaded: number
+  suspect: number
+  notSource: number
+  stale: number
+  /** 结束时还剩多少条没抓正文 —— 0 就是真清完了 */
+  pendingLeft: number
+  stopped: boolean
+  /** 为什么停：清完 / 被停止 / 整轮没进展 / 配额不够 / 保险丝 */
+  note: string | null
 }
 
 interface ProgressState {
@@ -268,9 +285,19 @@ interface ProgressState {
   startedAt: string | null
   last: CrawlSummary | null
   lastError: string | null
+  /** 连轮（清存量）里的第几轮；单轮恒为 1 */
+  round: number
+  /** true = 连轮在跑。面板要靠它决定继续轮询还是收掉，也用来显示"停止" */
+  draining: boolean
+  /** 按过停止：单轮在下一个仓之间生效，连轮在下一轮之前生效 */
+  stopRequested: boolean
+  /** 上一次连轮的汇总（中断/清完/没进展都会留一句原因） */
+  drainLast: DrainSummary | null
 }
 
 let runningTask: Promise<CrawlSummary> | null = null
+let drainTask: Promise<DrainSummary> | null = null
+
 const progress: ProgressState = {
   running: false,
   phase: 'idle',
@@ -282,6 +309,10 @@ const progress: ProgressState = {
   startedAt: null,
   last: null,
   lastError: null,
+  round: 1,
+  draining: false,
+  stopRequested: false,
+  drainLast: null,
 }
 
 export function discoveryStatus(): ProgressState {
@@ -310,7 +341,8 @@ export async function saveDiscoverySettings(patch: Partial<DiscoverySettings>): 
     enabled: typeof patch.enabled === 'boolean' ? patch.enabled : current.enabled,
     repos,
     maxCandidatesPerRepo: clampInt(patch.maxCandidatesPerRepo, current.maxCandidatesPerRepo, 1, 300),
-    maxDownloadsPerRound: clampInt(patch.maxDownloadsPerRound, current.maxDownloadsPerRound, 0, 500),
+    // 上限 2000 是给"清一次几千条存量"留的口子；默认仍是 80（NAS 上一轮别吃掉十几分钟）
+    maxDownloadsPerRound: clampInt(patch.maxDownloadsPerRound, current.maxDownloadsPerRound, 0, 2000),
     // 空串视为"不改动"，清空要走显式的 clearToken，避免面板回显时把 token 抹掉
     githubToken: typeof patch.githubToken === 'string' && patch.githubToken.trim() ? patch.githubToken.trim() : current.githubToken,
   }
@@ -348,10 +380,97 @@ function buildRawUrl(repo: string, path: string): string {
   return `${RAW_HOST}/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/HEAD/${encoded}`
 }
 
-export function runDiscoveryCrawl(): Promise<CrawlSummary> {
+/**
+ * 起一轮发现。`fromDrain` 只给连轮内部用：那时连轮自己已经占住单飞位（drainTask），
+ * 不加这个参数的话，每一轮都会被"已有连轮在跑"拒掉。
+ */
+export function runDiscoveryCrawl(fromDrain = false): Promise<CrawlSummary> {
+  if (!fromDrain && drainTask) throw new SourceDiscoveryError('有一轮连轮正在跑，先按停止或等它结束', 409)
   if (runningTask) return runningTask
+  // 单轮起手要清掉上一次"停止"的痕迹，否则它会立刻把自己停掉
+  if (!progress.draining) progress.stopRequested = false
   runningTask = doCrawl().finally(() => { runningTask = null })
   return runningTask
+}
+
+/**
+ * 连轮清存量：一轮把「每轮抓正文上限」吃满就自动接着下一轮，直到
+ * 待判定清零 / 被手动停止 / 一整轮没能减少任何一条 / 撞上保险丝轮数。
+ *
+ * 为什么要有"没进展就停"这一条：下载失败会**保留 pending**（临时故障不该固化成结论），
+ * 所以没有这条判据，一个一直失败的地址能让它永远转下去。
+ */
+export function runDiscoveryDrain(): Promise<DrainSummary> {
+  if (drainTask) return drainTask
+  if (runningTask) throw new SourceDiscoveryError('已有一轮发现正在跑', 409)
+  drainTask = doDrain().finally(() => { drainTask = null })
+  return drainTask
+}
+
+/** 请求停止：正在抓的那一条抓完就收（仓内逐条检查），连轮则不再起下一轮 */
+export function requestDiscoveryStop(): { stopping: boolean } {
+  if (!(progress.running || progress.draining)) return { stopping: false }
+  progress.stopRequested = true
+  return { stopping: true }
+}
+
+async function countPending(): Promise<number> {
+  return prisma.sourceCandidate.count({ where: { verdict: 'pending' } })
+}
+
+const MAX_DRAIN_ROUNDS = 40
+
+async function doDrain(): Promise<DrainSummary> {
+  const totals: DrainSummary = {
+    rounds: 0, downloaded: 0, suspect: 0, notSource: 0, stale: 0, pendingLeft: 0, stopped: false, note: null,
+  }
+  progress.draining = true
+  progress.stopRequested = false
+  try {
+    while (totals.rounds < MAX_DRAIN_ROUNDS) {
+      // 第一轮无条件跑：全新库里 pending 还是 0，先查就等于什么都不做
+      const before = totals.rounds === 0 ? null : await countPending()
+      if (before === 0) {
+        totals.pendingLeft = 0
+        totals.note = '待判定已清零'
+        break
+      }
+      totals.rounds++
+      progress.round = totals.rounds
+      let summary: CrawlSummary
+      try {
+        summary = await runDiscoveryCrawl(true)
+      } catch (err) {
+        // 配额见底这类中断不该让连轮在后台 reject 掉，把原因留在总账里正常结束
+        totals.note = `第 ${totals.rounds} 轮起不来：${err instanceof Error ? err.message : String(err)}`
+        break
+      }
+      totals.downloaded += summary.downloaded
+      totals.suspect += summary.suspect
+      totals.notSource += summary.notSource
+      totals.stale += summary.stale
+      totals.pendingLeft = await countPending()
+      if (summary.stopped) {
+        totals.stopped = true
+        totals.note = '被手动停止'
+        break
+      }
+      if (before !== null && totals.pendingLeft >= before) {
+        totals.note = `第 ${totals.rounds} 轮没能减少待判定（仍 ${totals.pendingLeft} 条），连轮停在这里 —— 看下这轮跳过的仓与配额`
+        break
+      }
+    }
+    if (!totals.note && totals.rounds >= MAX_DRAIN_ROUNDS) totals.note = `已到 ${MAX_DRAIN_ROUNDS} 轮保险丝`
+    logger.info('[discovery] 连轮结束', {
+      轮数: totals.rounds, 抓正文: totals.downloaded, 疑似: totals.suspect, 剩余待判定: totals.pendingLeft, 原因: totals.note,
+    })
+    return totals
+  } finally {
+    progress.drainLast = totals
+    progress.draining = false
+    progress.round = 1
+    progress.stopRequested = false
+  }
 }
 
 async function doCrawl(): Promise<CrawlSummary> {
@@ -361,7 +480,7 @@ async function doCrawl(): Promise<CrawlSummary> {
 
   const summary: CrawlSummary = {
     reposScanned: 0, reposSkipped: [], truncatedRepos: [], seen: 0, created: 0, refreshed: 0,
-    downloaded: 0, suspect: 0, notSource: 0, stale: 0, quota: null, note: null,
+    downloaded: 0, suspect: 0, notSource: 0, stale: 0, quota: null, note: null, stopped: false,
   }
   progress.running = true
   progress.phase = '配额预检'
@@ -384,6 +503,12 @@ async function doCrawl(): Promise<CrawlSummary> {
 
     let downloadBudget = settings.maxDownloadsPerRound
     for (const repo of settings.repos) {
+      // 停止在仓与仓之间也生效（仓内是逐条检查）：中断点之后剩下的仓这轮不扫，下轮再说
+      if (progress.stopRequested) {
+        summary.stopped = true
+        summary.reposSkipped.push(`（已停止，剩下 ${settings.repos.length - progress.reposDone} 个仓没扫）`)
+        break
+      }
       progress.phase = `扫描 ${repo}`
       try {
         const counted = await crawlRepo(repo, settings, summary, downloadBudget)
@@ -400,9 +525,11 @@ async function doCrawl(): Promise<CrawlSummary> {
     progress.phase = '去重择优'
     summary.stale = await dedupeCandidates()
 
-    summary.note = downloadBudget <= 0
-      ? `本轮下载额度（${settings.maxDownloadsPerRound}）用尽，剩下的候选留在 pending，下轮继续`
-      : null
+    summary.note = summary.stopped
+      ? '已按停止中断（这一轮扫过的仓已入库，去重照常做完）'
+      : downloadBudget <= 0
+        ? `本轮下载额度（${settings.maxDownloadsPerRound}）用尽，剩下的候选留在 pending，下轮继续`
+        : null
     progress.last = summary
     logger.info('[discovery] 一轮发现完成', {
       仓库: summary.reposScanned, 候选: summary.seen, 新采: summary.created, 疑似: summary.suspect,
@@ -444,6 +571,11 @@ async function crawlRepo(
   }
 
   for (const entry of paths) {
+    // 逐条之间也看停止：一个大仓能一口气吃满整轮额度，只仓间检查的话"停止"要等十几分钟才生效
+    if (progress.stopRequested) {
+      summary.stopped = true
+      break
+    }
     const rawUrl = buildRawUrl(repo, entry.path)
     const existing = await prisma.sourceCandidate.findUnique({
       where: { repo_path: { repo, path: entry.path } },

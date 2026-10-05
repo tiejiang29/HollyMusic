@@ -57,7 +57,8 @@ vi.mock('./source-probe', () => probeDeps)
 const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
-  probeCandidate, importCandidate, dismissCandidate, listCandidates, _setRunnerForTest,
+  probeCandidate, importCandidate, dismissCandidate, listCandidates,
+  runDiscoveryDrain, requestDiscoveryStop, discoveryStatus, _setRunnerForTest,
 } = await import('./source-discovery')
 const { gitBlobSha } = await import('@/lib/server/git-blob-sha')
 
@@ -116,6 +117,7 @@ beforeEach(() => {
   })
   prismaMock.sourceCandidate.findMany = vi.fn(async () => rows)
   prismaMock.sourceCandidate.groupBy = vi.fn(async () => [])
+  prismaMock.sourceCandidate.count = vi.fn(async () => rows.filter(r => r.verdict === 'pending').length)
 })
 
 /** 我们自己的特征骨架：够过阈值，又不是任何真实脚本 */
@@ -617,5 +619,80 @@ describe('导入前先跟已经装着的源比一次', () => {
     seedSuspect({ contentHash: SAME_HASH, nameKey: '', scriptName: '合成测试音源 v1.2.0' })
     const [view] = await listCandidates()
     expect(view.duplicateOf).toEqual({ kind: 'content', path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' })
+  })
+})
+
+// ————— 连轮清存量 —————
+/** 一棵只含指定文件的仓库树；正文默认返回骨架脚本，failRaw 时 500（演"下载一直失败"） */
+function stubRepoTree(files: Array<{ path: string; sha: string }>, options: { failRaw?: boolean } = {}) {
+  return vi.fn(async (url: string) => {
+    if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 5000, limit: 5000, reset: 0 } } })
+    if (url.includes('/git/trees/')) {
+      return jsonResponse({ tree: files.map(f => ({ path: f.path, type: 'blob', sha: f.sha, size: 100 })) })
+    }
+    if (options.failRaw) return new Response('nope', { status: 500 })
+    return new Response(FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain', 'last-modified': 'Wed, 01 Oct 2026 00:00:00 GMT' } })
+  })
+}
+
+describe('runDiscoveryDrain（连轮清完待判定）', () => {
+  it('一轮吃满下载额度就自动接下一轮，pending 清零即停', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], maxDownloadsPerRound: 1 })
+    vi.stubGlobal('fetch', stubRepoTree([
+      { path: 'lx-a.js', sha: 'aaa' }, { path: 'lx-b.js', sha: 'bbb' }, { path: 'lx-c.js', sha: 'ccc' },
+    ]))
+
+    const totals = await runDiscoveryDrain()
+    // 三个文件、每轮只许下 1 个 ⇒ 要 3 轮；剩余数是**从假库里数 pending 行**得来的，不是我手喂的
+    expect(totals.rounds).toBe(3)
+    expect(totals.downloaded).toBe(3)
+    expect(totals.pendingLeft).toBe(0)
+    expect(totals.note).toContain('清零')
+    expect(discoveryStatus().draining).toBe(false)
+    expect(discoveryStatus().drainLast?.rounds).toBe(3)
+  })
+
+  it('全新库也得先跑一轮：pending 还是 0 不等于没活干（树里可能一堆没登记过的文件）', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], maxDownloadsPerRound: 5 })
+    vi.stubGlobal('fetch', stubRepoTree([{ path: 'lx-a.js', sha: 'aaa' }]))
+
+    const totals = await runDiscoveryDrain()
+    expect(totals.rounds).toBe(1)
+    expect(totals.downloaded).toBe(1)
+    expect(totals.pendingLeft).toBe(0)
+  })
+
+  it('一整轮没能减少待判定 ⇒ 停下并报原因（下载全失败会一直留 pending，没这条判据就永远空转）', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], maxDownloadsPerRound: 5 })
+    vi.stubGlobal('fetch', stubRepoTree([{ path: 'lx-a.js', sha: 'aaa' }], { failRaw: true }))
+
+    const totals = await runDiscoveryDrain()
+    expect(totals.pendingLeft).toBe(1)
+    expect(totals.note).toMatch(/没能减少待判定/)
+  })
+
+  it('停止：当前轮在仓与仓之间中断，连轮随即收尾', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], maxDownloadsPerRound: 5 })
+    vi.stubGlobal('fetch', stubRepoTree([{ path: 'lx-a.js', sha: 'aaa' }]))
+
+    const task = runDiscoveryDrain()
+    // 抢在第一轮扫到任何仓之前按下去
+    expect(requestDiscoveryStop()).toEqual({ stopping: true })
+    const totals = await task
+    expect(totals.stopped).toBe(true)
+    expect(totals.note).toContain('手动停止')
+    expect(discoveryStatus().stopRequested).toBe(false)
+  })
+
+  it('没在跑的时候按停止是句空话：回 stopping:false，别让人以为按坏了', () => {
+    expect(requestDiscoveryStop()).toEqual({ stopping: false })
+  })
+
+  it('连轮期间再点"开始发现"不会被塞成第二个任务', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], maxDownloadsPerRound: 5 })
+    vi.stubGlobal('fetch', stubRepoTree([{ path: 'lx-a.js', sha: 'aaa' }]))
+    const task = runDiscoveryDrain()
+    expect(() => runDiscoveryCrawl()).toThrow(/连轮/)
+    await task
   })
 })

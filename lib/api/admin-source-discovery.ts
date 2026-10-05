@@ -24,6 +24,23 @@ export interface DiscoveryStatus {
   reposTotal: number
   downloaded: number
   startedAt: string | null
+  /** 连轮里的第几轮；单轮恒为 1 */
+  round: number
+  /** 连轮（清完待判定）在跑 */
+  draining: boolean
+  /** 按过停止，等它在下一个仓/下一轮生效 */
+  stopRequested: boolean
+  /** 上一次连轮的总账 */
+  drainLast: {
+    rounds: number
+    downloaded: number
+    suspect: number
+    notSource: number
+    stale: number
+    pendingLeft: number
+    stopped: boolean
+    note: string | null
+  } | null
   last: {
     reposScanned: number
     seen: number
@@ -34,6 +51,8 @@ export interface DiscoveryStatus {
     notSource: number
     stale: number
     note: string | null
+    /** 被手动停止中断的这一轮（连轮据此不再接着跑） */
+    stopped: boolean
     /** 树被 GitHub 截断的仓库：这仓的结果是不完整的，不能当"就这些" */
     truncatedRepos: string[]
     /** 本轮跳过的仓库及原因（404 / 配额 / HTTP 错误…） */
@@ -95,6 +114,16 @@ export function getDiscovery(filter: { verdict?: string; state?: string } = {}):
 
 export function startDiscoveryCrawl(): Promise<{ started: boolean; reason?: string }> {
   return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'crawl' })
+}
+
+/** 连轮清完待判定（一轮吃满下载额度就自动接下一轮） */
+export function startDiscoveryDrain(): Promise<{ started: boolean; reason?: string }> {
+  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'drain' })
+}
+
+/** 请求停止：当前这一轮扫完手上的仓就收，连轮不再起下一轮 */
+export function stopDiscovery(): Promise<{ stopping: boolean }> {
+  return apiPost<{ stopping: boolean }>('admin/source-discovery', { action: 'stop' })
 }
 
 /** 起一次判级（服务端异步执行，结果靠 getDiscovery 轮询） */
