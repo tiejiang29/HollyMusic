@@ -18,6 +18,8 @@
  */
 
 import { createHash } from 'node:crypto'
+import path from 'node:path'
+import fsp from 'node:fs/promises'
 import { logger } from '@/lib/logger'
 import { pickProbeSamples, verifyHead, type ProbeCellOutcome } from '@/lib/services/source-probe'
 import { isContentMiss } from '@/lib/server/source-health'
@@ -25,7 +27,7 @@ import { prisma } from '@/lib/db'
 import { readSetting, writeSetting } from '@/lib/services/app-setting'
 import { safePublicFetch } from '@/lib/server/url-guard'
 import { gitBlobSha } from '@/lib/server/git-blob-sha'
-import { parseScriptMeta, importSubscription, readConfig, SourceSubscriptionError } from '@/lib/services/source-manager-service'
+import { parseScriptMeta, importSubscription, readConfig, SOURCE_MANAGER_CONSTANTS, SourceSubscriptionError } from '@/lib/services/source-manager-service'
 import type { SourceConfig } from '@/lib/types/music'
 
 export const DISCOVERY_SETTING_KEY = 'sourceDiscovery'
@@ -607,6 +609,8 @@ export interface CandidateView {
   probedAt: string | null
   /** P0-c：已导入时它在 custom-sources 下的路径；空串 = 没导入过 */
   importedPath: string
+  /** P0-c：与**已装源**撞车的对象（content=字节相同 / name=同名不同内容）；null = 没撞 */
+  duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
 }
 
 export async function listCandidates(filter: { verdict?: string; state?: string; take?: number } = {}): Promise<CandidateView[]> {
@@ -618,22 +622,28 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
     orderBy: [{ score: 'desc' }, { updatedAt: 'desc' }],
     take: filter.take ?? 200,
   })
-  return rows.map(row => ({
-    id: row.id,
-    repo: row.repo,
-    path: row.path,
-    rawUrl: row.rawUrl,
-    scriptName: row.scriptName,
-    score: row.score,
-    verdict: row.verdict,
-    state: row.state,
-    reason: row.reason,
-    sizeBytes: row.sizeBytes,
-    checkedAt: row.checkedAt ? row.checkedAt.toISOString() : null,
-    probe: parseProbeReport(row.probeJson),
-    probedAt: row.probedAt ? row.probedAt.toISOString() : null,
-    importedPath: row.importedPath,
-  }))
+  // 空列表时不去读盘上那十几份脚本
+  const index = rows.length ? await installedTwinIndex() : { byHash: new Map<string, InstalledTwin>(), byName: new Map<string, InstalledTwin>() }
+  return rows.map(row => {
+    const twin = findInstalledTwin(index, row)
+    return {
+      id: row.id,
+      repo: row.repo,
+      path: row.path,
+      rawUrl: row.rawUrl,
+      scriptName: row.scriptName,
+      score: row.score,
+      verdict: row.verdict,
+      state: row.state,
+      reason: row.reason,
+      sizeBytes: row.sizeBytes,
+      checkedAt: row.checkedAt ? row.checkedAt.toISOString() : null,
+      probe: parseProbeReport(row.probeJson),
+      probedAt: row.probedAt ? row.probedAt.toISOString() : null,
+      importedPath: row.importedPath,
+      duplicateOf: twin ? { kind: twin.kind, path: twin.twin.path, name: twin.twin.name } : null,
+    }
+  })
 }
 
 export async function countCandidates(): Promise<Record<string, number>> {
@@ -884,6 +894,55 @@ function okCellCount(report: CandidateProbeReport | null): number {
   return Object.values(report.cells).filter(cell => cell.outcome === 'ok').length
 }
 
+/** 已装源里与某条候选"是同一个东西"的那一条 */
+export interface InstalledTwin {
+  path: string
+  name: string
+}
+
+/**
+ * 把"已经装进音源列表的源"索引成 内容哈希 → 谁、`@name` 归一键 → 谁。
+ *
+ * 补的是候选去重缺的**另一半**：候选之间早就按内容/同名去重了，但候选 vs 在册源没比过 ——
+ * `addSource` 只校验路径唯一，于是不同仓库流传的同一份脚本能装成两条源。同名不是难看问题而是
+ * 记账问题：健康账本的键就是音源名（`instance.config.name = name || path`，取址成败都按它记），
+ * 两条同名源共用一格，冷却与坏证据互相污染，面板上也分不清谁是谁。
+ *
+ * 内容哈希直接读盘上的文件，不拿配置里的旧值：订阅更新会原地换内容，只有读文件才知道现在装的是啥。
+ */
+async function installedTwinIndex(): Promise<{ byHash: Map<string, InstalledTwin>; byName: Map<string, InstalledTwin> }> {
+  const config = await readConfig()
+  const byHash = new Map<string, InstalledTwin>()
+  const byName = new Map<string, InstalledTwin>()
+  for (const source of config.sources) {
+    const twin: InstalledTwin = { path: source.path, name: source.name || '' }
+    const nameKey = toNameKey(source.name || '')
+    if (nameKey && !byName.has(nameKey)) byName.set(nameKey, twin)
+    // 配置里的 path 由 addSource 校验过，但那是写入时的事；读之前再过一道，别拿配置去拼任意路径
+    const abs = path.resolve(process.cwd(), source.path)
+    const insideScriptsDir = !path.relative(SOURCE_MANAGER_CONSTANTS.SCRIPTS_DIR, abs).startsWith('..')
+      && !path.isAbsolute(path.relative(SOURCE_MANAGER_CONSTANTS.SCRIPTS_DIR, abs))
+    if (!insideScriptsDir) continue
+    try {
+      const hash = createHash('sha256').update(await fsp.readFile(abs, 'utf-8'), 'utf8').digest('hex')
+      if (!byHash.has(hash)) byHash.set(hash, twin)
+    } catch {
+      // 配置里有、盘上没有：那是条坏源，不该让它把别的候选一起挡掉
+    }
+  }
+  return { byHash, byName }
+}
+
+/** 先比内容再比同名：内容一样意味着"再装一遍毫无意义"，同名只是"要不要并排装" */
+function findInstalledTwin(
+  index: { byHash: Map<string, InstalledTwin>; byName: Map<string, InstalledTwin> },
+  row: { contentHash: string; nameKey: string },
+): { kind: 'content' | 'name'; twin: InstalledTwin } | null {
+  if (row.contentHash && index.byHash.has(row.contentHash)) return { kind: 'content', twin: index.byHash.get(row.contentHash)! }
+  if (row.nameKey && index.byName.has(row.nameKey)) return { kind: 'name', twin: index.byName.get(row.nameKey)! }
+  return null
+}
+
 /**
  * 候选行写着"已导入"，不代表它还在服役 —— 音源管理里删掉那条源时，候选表这行不会跟着变。
  * 判据取配置文件（它才是驱动取址瀑布的东西），不取状态：源被删了就该能重新导入，
@@ -903,7 +962,10 @@ async function isStillInstalled(importedPath: string): Promise<boolean> {
  * saveScript → addSource → 立即重建实例）。顺序不能反：sha 对不上说明下下来的不是
  * 打分/判级时那份东西，那种情况下连执行都不该发生。
  *
- * 两道闸门，只有一道能越：
+ * 三道闸门，按"证据成本"从低到高排：
+ * - 库里已装着**内容完全相同**的一份 ⇒ 直接拒，`force` 也不给越（同下面那条重复导入的理由）；
+ *   只是**同名**不同内容 ⇒ 也拒，但 `force` 能越（"我就要两条并排做对照"是他自己的决定，
+ *   代价是两条源共用健康账本那一格）；
  * - 判级至少一个平台真出货，`force` 可以越过 —— 管理员对着红绿灯坚持要装，是他的决定；
  * - 已经导入且**那条源还在配置里**的不给重复导入，**这条不给 force 越** —— 点两下就在
  *   custom-sources 多一个 `-1.js`，那不属于"坚持"，属于垃圾。源已经在「音源管理」里删掉的，
@@ -915,6 +977,22 @@ export async function importCandidate(id: number, opts: { force?: boolean } = {}
   if (row.verdict !== 'suspect') throw new SourceDiscoveryError('只导入判定为「疑似音源」的候选')
   if (row.state === 'imported' && await isStillInstalled(row.importedPath)) {
     throw new SourceDiscoveryError(`这条候选已经导入为 ${row.importedPath}，请到「音源管理」里管理它`, 409)
+  }
+  // 撞车检查排在判级之前：它不需要任何新证据（库里就摆着那份），而"还没判级"是可以下一步补的
+  const twin = findInstalledTwin(await installedTwinIndex(), row)
+  if (twin?.kind === 'content') {
+    // 不给 force 越：字节相同意味着"这已经是第二条一模一样的源"，管理员再坚持也变不出新东西
+    throw new SourceDiscoveryError(
+      `库里已经装着内容完全相同的一份（${twin.twin.name || twin.twin.path}），不需要再装第二遍`,
+      409,
+    )
+  }
+  if (twin?.kind === 'name' && !opts.force) {
+    throw new SourceDiscoveryError(
+      `库里已有同名源「${twin.twin.name}」—— 健康账本按音源名记账，两条同名会互相污染冷却与坏证据。`
+      + '确实要并排装请再点一次「确认强制导入」',
+      409,
+    )
   }
   if (!opts.force && okCellCount(parseProbeReport(row.probeJson)) === 0) {
     throw new SourceDiscoveryError(

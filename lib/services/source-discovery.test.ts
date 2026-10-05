@@ -6,12 +6,18 @@
  * - 假脚本正文全部是本文件自己写的特征骨架，不引入任何真实音源脚本内容。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
 
-const { prismaMock, importSubscriptionMock, readConfigMock } = vi.hoisted(() => ({
+const { prismaMock, importSubscriptionMock, readConfigMock, fsReadFileMock } = vi.hoisted(() => ({
   prismaMock: { appSetting: {}, sourceCandidate: {} } as Record<string, Record<string, unknown>>,
   importSubscriptionMock: vi.fn(),
-  readConfigMock: vi.fn(async () => ({ sources: [] as Array<{ path: string }> })),
+  readConfigMock: vi.fn(async () => ({ sources: [] as Array<{ path: string; name?: string }> })),
+  fsReadFileMock: vi.fn(async () => '' as string),
 }))
+
+// 已装源的内容哈希要读盘，这里隔掉：脚本正文由测试自己给
+vi.mock('node:fs/promises', () => ({ default: { readFile: fsReadFileMock } }))
 
 vi.mock('@/lib/db', () => ({ prisma: prismaMock }))
 vi.mock('@/lib/server/url-guard', () => ({
@@ -26,6 +32,7 @@ vi.mock('@/lib/services/source-manager-service', () => ({
   importSubscription: importSubscriptionMock,
   // "已导入"的判据看配置文件，不是候选状态 —— 用它来演"源被删了"的两种局面
   readConfig: readConfigMock,
+  SOURCE_MANAGER_CONSTANTS: { SCRIPTS_DIR: path.resolve(process.cwd(), 'custom-sources') },
   SourceSubscriptionError: class SourceSubscriptionError extends Error {
     readonly status: number
     constructor(message: string, status = 422) {
@@ -50,7 +57,7 @@ vi.mock('./source-probe', () => probeDeps)
 const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
-  probeCandidate, importCandidate, dismissCandidate, _setRunnerForTest,
+  probeCandidate, importCandidate, dismissCandidate, listCandidates, _setRunnerForTest,
 } = await import('./source-discovery')
 const { gitBlobSha } = await import('@/lib/server/git-blob-sha')
 
@@ -76,6 +83,8 @@ beforeEach(() => {
   importSubscriptionMock.mockReset()
   readConfigMock.mockReset()
   readConfigMock.mockResolvedValue({ sources: [] })
+  fsReadFileMock.mockReset()
+  fsReadFileMock.mockResolvedValue('')
   prismaMock.appSetting.findUnique = vi.fn(async ({ where }: KeyWhere) =>
     settingRows.has(where.key) ? { value: settingRows.get(where.key) } : null)
   prismaMock.appSetting.upsert = vi.fn(async ({ where, create, update }: SettingUpsert) => {
@@ -558,5 +567,55 @@ describe('importCandidate', () => {
     const id = seedSuspect({ state: 'imported', importedPath: 'custom-sources/x.js' })
     await dismissCandidate(id)
     expect(rows.find(r => r.id === id)?.state).toBe('stale')
+  })
+})
+
+// ————— P0-c 补：候选 vs 已装源 —————
+describe('导入前先跟已经装着的源比一次', () => {
+  const INSTALLED_PATH = 'custom-sources/已装的源.js'
+  const SAME_HASH = createHash('sha256').update(FAKE_SOURCE_SCRIPT, 'utf8').digest('hex')
+  const OTHER_HASH = 'd'.repeat(64)
+
+  beforeEach(() => {
+    fsReadFileMock.mockResolvedValue(FAKE_SOURCE_SCRIPT)
+    readConfigMock.mockResolvedValue({ sources: [{ path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' }] })
+  })
+
+  it('字节完全相同 ⇒ 拒，force 也不给越，并且一次都不下载', async () => {
+    const id = seedSuspect({ contentHash: SAME_HASH, nameKey: '', probeJson: probeReportOf({ tx: 'ok' }) })
+    await expect(importCandidate(id, { force: true })).rejects.toThrow(/内容完全相同/)
+    expect(importSubscriptionMock).not.toHaveBeenCalled()
+  })
+
+  it('同名但内容不同 ⇒ 拒；force 能越 —— "我就要两条并排对照"是管理员的决定', async () => {
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    await expect(importCandidate(id)).rejects.toThrow(/同名源/)
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/别的.js', name: 'X' })
+    await importCandidate(id, { force: true })
+    expect(importSubscriptionMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('撞车先于判级报：库里就有那份，这条比"你还没判过"更有决定性', async () => {
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: '' })
+    await expect(importCandidate(id)).rejects.toThrow(/同名源/)
+  })
+
+  it('同名是**归一后**比：括号注记与版本号不一样也认得出同一个源', async () => {
+    readConfigMock.mockResolvedValue({ sources: [{ path: INSTALLED_PATH, name: '合成测试音源（二改修复版） 1.2.0' }] })
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    await expect(importCandidate(id)).rejects.toThrow(/同名源/)
+  })
+
+  it('配置里有、盘上读不到时，不该把别的导入一起挡死', async () => {
+    fsReadFileMock.mockRejectedValue(new Error('ENOENT'))
+    const id = seedSuspect({ contentHash: '', nameKey: '', probeJson: probeReportOf({ tx: 'ok' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/新.js', name: 'X' })
+    await expect(importCandidate(id)).resolves.toBeTruthy()
+  })
+
+  it('列表里就把撞车对象标出来（面板据此提前提示，不必等管理员点了才知道）', async () => {
+    seedSuspect({ contentHash: SAME_HASH, nameKey: '', scriptName: '合成测试音源 v1.2.0' })
+    const [view] = await listCandidates()
+    expect(view.duplicateOf).toEqual({ kind: 'content', path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' })
   })
 })

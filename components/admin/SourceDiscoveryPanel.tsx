@@ -95,6 +95,16 @@ export function okPlatformCount(cells: Record<string, ProbeCellView> | undefined
   return Object.values(cells).filter(cell => cell.outcome === 'ok').length
 }
 
+/**
+ * 一次点击能不能直接导？判级有平台出货**且**没撞上库里已有的同名源，才算"直接"。
+ *
+ * 导出是为了能直测：服务端 `importCandidate` 有同一套判据（至少一格 ok；同名要 force），
+ * 两边算得不一样时，按钮会说"可以装"而接口回你 409，管理员看到的就是自相矛盾。
+ */
+export function needsForceConfirm(row: Pick<DiscoveryCandidate, 'probe' | 'duplicateOf'>): boolean {
+  return okPlatformCount(row.probe?.cells) === 0 || row.duplicateOf?.kind === 'name'
+}
+
 const OUTCOME_LABEL: Record<string, string> = {
   ok: '真出货',
   'no-address': '没给地址',
@@ -230,15 +240,15 @@ export function SourceDiscoveryPanel() {
   }
 
   const handleImport = async (row: DiscoveryCandidate) => {
-    const hasOk = okPlatformCount(row.probe?.cells) > 0
-    if (!hasOk && forceConfirmId !== row.id) {
+    const forced = needsForceConfirm(row)
+    if (forced && forceConfirmId !== row.id) {
       setForceConfirmId(row.id)
       return
     }
     setForceConfirmId(null)
     setImportingId(row.id)
     try {
-      const result = await importDiscoveryCandidate(row.id, !hasOk)
+      const result = await importDiscoveryCandidate(row.id, forced)
       setImportNote(`已导入为「${result.imported.name}」（${result.imported.path}），到「音源管理」可调优先级或直接停用`)
       await reload()
     } catch (e) {
@@ -432,7 +442,16 @@ export function SourceDiscoveryPanel() {
                           onCopy={() => { void handleCopy(row.rawUrl, row.id) }}
                         />
                       </td>
-                      <td className="px-4 py-3 text-xs">{row.scriptName || '—'}</td>
+                      <td className="px-4 py-3 text-xs">
+                        <div>{row.scriptName || '—'}</div>
+                        {row.duplicateOf ? (
+                          <div className={row.duplicateOf.kind === 'content' ? 'text-destructive' : 'text-amber-600'}>
+                            {row.duplicateOf.kind === 'content'
+                              ? `库里已装着同一份 → ${row.duplicateOf.name || row.duplicateOf.path}`
+                              : `库里已有同名源 → ${row.duplicateOf.name}`}
+                          </div>
+                        ) : null}
+                      </td>
                       <td className="px-4 py-3 text-xs font-medium">{row.score}</td>
                       <td className="px-4 py-3 text-xs text-muted-foreground">
                         {row.sizeBytes ? `${Math.round(row.sizeBytes / 1024)}KB` : '—'}
@@ -456,13 +475,15 @@ export function SourceDiscoveryPanel() {
                               : <Radar className="h-3.5 w-3.5" />}
                             判级
                           </button>
-                          {row.state === 'imported' ? null : (
+                          {row.state === 'imported' || row.duplicateOf?.kind === 'content' ? null : (
                             <button
                               onClick={() => { void handleImport(row) }}
                               disabled={row.verdict !== 'suspect' || importingId !== null}
-                              title={okPlatformCount(row.probe?.cells) > 0
+                              title={!needsForceConfirm(row)
                                 ? '按记录里的地址重新下载、复验 blob sha，通过后才装入音源列表'
-                                : '判级里没有平台真出货 —— 再点一次表示坚持导入'}
+                                : row.duplicateOf?.kind === 'name'
+                                  ? '库里已经有同名源 —— 两条同名会共用健康账本那一格，再点一次表示坚持并排装'
+                                  : '判级里没有平台真出货 —— 再点一次表示坚持导入'}
                               className={`flex items-center gap-1 rounded px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40 ${
                                 forceConfirmId === row.id
                                   ? 'bg-destructive/15 text-destructive hover:bg-destructive/25'

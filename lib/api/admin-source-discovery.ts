@@ -74,6 +74,8 @@ export interface DiscoveryCandidate {
   probedAt: string | null
   /** P0-c：已导入时它在 custom-sources 下的路径；空串 = 没导入过 */
   importedPath: string
+  /** P0-c：撞上了**已经装着的源**（content=字节相同 / name=同名不同内容）；null = 没撞 */
+  duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
 }
 
 export interface DiscoveryView {
