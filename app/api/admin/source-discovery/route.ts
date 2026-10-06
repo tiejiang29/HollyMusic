@@ -6,7 +6,7 @@
  *                                   { action:'drain' } 连轮清完待判定；
  *                                   { action:'search', query, page?, sort? } 按关键词搜 GitHub 仓库（只返回元数据，不入清单）；
  *                                   { action:'freshness', maxAgeDays? } 体检扫描清单里的仓多久没动（只读，剔不剔由 PUT 决定）；
- *                                   { action:'probe', id } 起一次判级；{ action:'probe-batch' } 批量判级（一批≤50）；
+ *                                   { action:'probe', id, force? } 起一次判级（force=「仍然判级」，只放过静态分不够但像载荷的）；{ action:'probe-batch' } 批量判级（一批≤50）；
  *                                   { action:'stop' } 请求停止；
  *                                   { action:'prune' } 清理已移除仓的候选；
  *                                   { action:'dismiss'|'import', id, force? } 剔除 / 导入成音源
@@ -109,7 +109,8 @@ export async function POST(request: NextRequest) {
     if (action === 'probe') {
       const id = Number(body?.id)
       if (!Number.isFinite(id) || id <= 0) return createErrorResponse('INVALID_PARAMS', '缺少合法的候选 id', 400)
-      const result = startCandidateProbe(id)
+      // force = 「仍然判级」：静态分不够但像载荷的混淆脚本，由服务层按同一条判据把关
+      const result = startCandidateProbe(id, { force: body?.force === true })
       // 判级会真执行脚本（数秒到数十秒），所以只回 202，结果靠 GET 轮询
       return result.started
         ? createSuccessResponse(result, 202)

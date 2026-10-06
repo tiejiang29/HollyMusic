@@ -29,12 +29,13 @@ vi.mock('@/lib/services/user-context', () => ({
   ForbiddenError: MockForbiddenError,
 }))
 
-const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeBatchMock, pruneMock, searchMock, freshnessMock } = vi.hoisted(() => ({
+const { db, runCrawl, importCandidateMock, drainMock, stopMock, probeMock, probeBatchMock, pruneMock, searchMock, freshnessMock } = vi.hoisted(() => ({
   db: { setting: new Map<string, string>(), candidates: [] as Array<Record<string, unknown>> },
   runCrawl: vi.fn(async () => ({})),
   importCandidateMock: vi.fn(),
   drainMock: vi.fn(async () => ({ rounds: 1, downloaded: 0, suspect: 0, notSource: 0, stale: 0, pendingLeft: 0, stopped: false, note: null })),
   stopMock: vi.fn(() => ({ stopping: true })),
+  probeMock: vi.fn(() => ({ started: true })),
   probeBatchMock: vi.fn(() => ({ started: true })),
   pruneMock: vi.fn(async () => ({ removed: 3, keptImported: [] })),
   searchMock: vi.fn(async () => ({
@@ -82,6 +83,7 @@ vi.mock('@/lib/services/source-discovery', async importOriginal => {
     runDiscoveryDrain: drainMock,
     requestDiscoveryStop: stopMock,
     importCandidate: importCandidateMock,
+    startCandidateProbe: probeMock,
     startCandidateProbeBatch: probeBatchMock,
     pruneOrphanCandidates: pruneMock,
   }
@@ -106,6 +108,7 @@ beforeEach(async () => {
   drainMock.mockClear()
   stopMock.mockClear()
   probeBatchMock.mockClear()
+  probeMock.mockClear()
   pruneMock.mockClear()
   searchMock.mockClear()
   freshnessMock.mockClear()
@@ -270,6 +273,21 @@ describe('动作校验', () => {
     expect(response.status).toBe(202)
     expect((await response.json()).data.started).toBe(true)
     expect(drainMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('probe 起来了回 202；force 原样透传给服务层（「仍然判级」的判据在服务端，不在这里）', async () => {
+    const response = await POST(request('POST', { action: 'probe', id: 7 }))
+    expect(response.status).toBe(202)
+    expect(probeMock).toHaveBeenCalledWith(7, { force: false })
+
+    const forced = await POST(request('POST', { action: 'probe', id: 7, force: true }))
+    expect(forced.status).toBe(202)
+    expect(probeMock).toHaveBeenLastCalledWith(7, { force: true })
+
+    probeMock.mockReturnValueOnce({ started: false, reason: '候选 3 正在判级中' })
+    const busy = await POST(request('POST', { action: 'probe', id: 8 }))
+    expect(busy.status).toBe(200)
+    expect((await busy.json()).data.started).toBe(false)
   })
 
   it('probe-batch（批量判级）也是 202，一批在跑时回 started:false', async () => {

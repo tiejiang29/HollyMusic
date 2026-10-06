@@ -220,9 +220,9 @@ export function stopDiscovery(): Promise<{ stopping: boolean }> {
   return apiPost<{ stopping: boolean }>('admin/source-discovery', { action: 'stop' })
 }
 
-/** 起一次判级（服务端异步执行，结果靠 getDiscovery 轮询） */
-export function startCandidateProbe(id: number): Promise<{ started: boolean; reason?: string }> {
-  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe', id })
+/** 起一次判级（服务端异步执行，结果靠 getDiscovery 轮询）。force = 「仍然判级」那一档 */
+export function startCandidateProbe(id: number, force = false): Promise<{ started: boolean; reason?: string }> {
+  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe', id, force })
 }
 
 /** 批量判级：把"在册且没判过"的候选排队逐条判，一批最多 50 条（服务端定死，不在 UI 里另抄） */

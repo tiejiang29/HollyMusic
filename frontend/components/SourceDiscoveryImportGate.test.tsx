@@ -8,9 +8,9 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import type { ProbeCellView } from '@/lib/api/admin-source-discovery'
+import type { DiscoveryCandidate, ProbeCellView } from '@/lib/api/admin-source-discovery'
 
-const { okPlatformCount, needsForceConfirm } = await import('@/components/admin/SourceDiscoveryPanel')
+const { okPlatformCount, needsForceConfirm, canForceProbe } = await import('@/components/admin/SourceDiscoveryPanel')
 
 const cell = (outcome: string): ProbeCellView => ({ outcome, latencyMs: 120, container: null, reason: null })
 
@@ -51,5 +51,28 @@ describe('needsForceConfirm（要不要二次确认才导）', () => {
 
   it('内容完全相同 ⇒ 不在这一档（按钮根本不渲染，服务端也不给 force 越），这里保持"不需要确认"以免误判成可点', () => {
     expect(needsForceConfirm({ probe: probeWith({ tx: cell('ok') }), duplicateOf: dup('content') })).toBe(false)
+  })
+})
+
+describe('canForceProbe（「仍然判级」的按钮口径）', () => {
+  const row = (over: Partial<Pick<DiscoveryCandidate, 'verdict' | 'scriptName' | 'sizeBytes'>> = {}) =>
+    ({ verdict: 'not-source', scriptName: '聚合API', sizeBytes: 60 * 1024, ...over })
+
+  it('像载荷的 not-source 才点亮：@name 非空 + 正文 20KB~1MB（闭区间）', () => {
+    expect(canForceProbe(row())).toBe(true)
+    expect(canForceProbe(row({ sizeBytes: 20 * 1024 }))).toBe(true)
+    expect(canForceProbe(row({ sizeBytes: 1024 * 1024 }))).toBe(true)
+  })
+
+  it('碎屑和大块都不给点 —— 跑它们只是白打第三方取址接口', () => {
+    expect(canForceProbe(row({ sizeBytes: 20 * 1024 - 1 }))).toBe(false)
+    expect(canForceProbe(row({ sizeBytes: 1024 * 1024 + 1 }))).toBe(false)
+    expect(canForceProbe(row({ sizeBytes: 0 }))).toBe(false)
+  })
+
+  it('没有 @name 不算载荷；这一档只管 not-source，pending/suspect 走原来的口', () => {
+    expect(canForceProbe(row({ scriptName: '   ' }))).toBe(false)
+    expect(canForceProbe(row({ verdict: 'pending' }))).toBe(false)
+    expect(canForceProbe(row({ verdict: 'suspect' }))).toBe(false)
   })
 })

@@ -1732,6 +1732,32 @@ async function saveReport(id: number, report: CandidateProbeReport): Promise<voi
 }
 
 /**
+ * 「仍然判级」放行的体积窗口：比这小的多半是 README 片段或占位脚本，比这大的多半是打包了
+ * 二进制数据的杂物 —— 这两种跑起来也判不出音源，只是白给第三方取址接口加一次请求。
+ */
+const FORCE_PROBE_MIN_BYTES = 20 * 1024
+const FORCE_PROBE_MAX_BYTES = 1024 * 1024
+
+/**
+ * 静态特征读不懂、但**长得像一份真载荷**的候选。
+ *
+ * 为什么要有这一档：混淆过的脚本（字符串表、base64 大块、没有 `musicSearch` 字面量）拿静态
+ * 打分必然不过线，可它照样可能是能出货的源 —— 静态分不够不等于跑不起来。而"跑一下"是唯一
+ * 能证明这件事的手段，所以给这一档留一个人工入口。
+ *
+ * 判据必须窄：`@name` 非空说明作者确实把它当洛雪音源发布，体积窗口说明不是碎屑；两条同时成立
+ * 才放行。否则管理员拿它当万能口子，把 4 分的那种垃圾 js 也一条条送去真打第三方接口。
+ */
+export function looksLikeObfuscatedSource(
+  row: { verdict: string; scriptName: string; sizeBytes: number },
+): boolean {
+  return row.verdict === 'not-source'
+    && row.scriptName.trim().length > 0
+    && row.sizeBytes >= FORCE_PROBE_MIN_BYTES
+    && row.sizeBytes <= FORCE_PROBE_MAX_BYTES
+}
+
+/**
  * 判级一条候选：下载 → 复验 blob sha → 一次性子进程里"加载 + 真取一次址" →
  * 拿到地址后在父进程走与周测同一套首块魔数判据。
  *
@@ -1741,11 +1767,18 @@ async function saveReport(id: number, report: CandidateProbeReport): Promise<voi
  * - 执行只发生在**一次性子进程**：来路不明的代码崩掉也只崩那个进程（详见 OneShotRunner）；
  * - 全程不碰 `sourceHealth`：判级不经取址瀑布，结构上写不进账本
  *   （探测抖动不能变成用户侧的坏证据，这条约束与周测同源）。
+ *
+ * `force` 只放宽入口那一条（原判不是 suspect 的，得同时满足 `looksLikeObfuscatedSource`），
+ * 上面四点一个都不动。
  */
-export async function probeCandidate(id: number): Promise<CandidateProbeReport> {
+export async function probeCandidate(id: number, opts: { force?: boolean } = {}): Promise<CandidateProbeReport> {
   const row = await prisma.sourceCandidate.findUnique({ where: { id } })
   if (!row) throw new SourceDiscoveryError('候选不存在', 404)
-  if (row.verdict !== 'suspect') throw new SourceDiscoveryError('只给"疑似音源"的候选做判级')
+  if (row.verdict !== 'suspect' && !(opts.force && looksLikeObfuscatedSource(row))) {
+    throw new SourceDiscoveryError(
+      '只给"疑似音源"的候选做判级；不像音源的，只有带 @name 且正文 20KB~1MB 才允许「仍然判级」',
+    )
+  }
 
   const settings = await getDiscoverySettings()
   // 取正文这一步就把"内容是不是我们记录的那一份"判掉：zip 条目要先复验整包 sha256 才解，
@@ -1839,6 +1872,18 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
   report.note = `${okCount}/${cells.length} 个平台真出货`
     + (harnessCount ? `｜${harnessCount} 格是我们通道没判成，可重判` : '')
   await saveReport(id, report)
+  // 原判不是 suspect 的（走「仍然判级」进来的）：真出货就把等级提上来。
+  // 静态分读不懂混淆载荷，而"跑起来真能取到地址"就是它缺的那份证据 —— 提升之后导入闸门
+  // （要 suspect 且至少一格 ok）不用改就能用；0 出货则留在 not-source，只把红绿灯留在行上。
+  if (row.verdict !== 'suspect' && okCount > 0) {
+    await prisma.sourceCandidate.update({
+      where: { id },
+      data: {
+        verdict: 'suspect',
+        reason: `原判 ${row.score} 分（静态特征读不懂）；仍然判级后 ${okCount}/${cells.length} 个平台真出货 ⇒ 提升为疑似可用`,
+      },
+    })
+  }
   return report
 }
 
@@ -1846,14 +1891,17 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
  * 起一次判级：立刻返回，结果靠 GET 轮询。
  * 判级会真执行第三方脚本（数秒到数十秒），不能把这个时间挂在 HTTP 请求上；
  * 一次只允许一个，避免多个 slot 同时跑把低配 NAS 压住。
+ *
+ * `force` 是给「仍然判级」留的那一档：静态分读不懂的混淆载荷，判据见
+ * `looksLikeObfuscatedSource` —— 只放宽入口，不放宽隔离与完整性复验。
  */
-export function startCandidateProbe(id: number): { started: boolean; reason?: string } {
+export function startCandidateProbe(id: number, opts: { force?: boolean } = {}): { started: boolean; reason?: string } {
   if (progress.probingId !== null) return { started: false, reason: `候选 ${progress.probingId} 正在判级中` }
   if (progress.probeBatch?.running) return { started: false, reason: '有一批判级正在跑' }
   if (progress.running) return { started: false, reason: '有一轮发现正在跑' }
   progress.probingId = id
   progress.lastProbeNote = null
-  void probeCandidate(id)
+  void probeCandidate(id, opts)
     .then(report => { progress.lastProbeNote = report.note ?? '判级完成' })
     .catch(err => {
       progress.lastProbeNote = `判级失败：${err instanceof Error ? err.message : String(err)}`

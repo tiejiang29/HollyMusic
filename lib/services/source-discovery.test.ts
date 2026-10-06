@@ -62,6 +62,7 @@ const {
   pickReleaseAssets, fetchCandidateContent,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
+  looksLikeObfuscatedSource,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
   startCandidateProbe, startCandidateProbeBatch, pruneOrphanCandidates, _setProbeGapForTest, _setRunnerForTest,
 } = await import('./source-discovery')
@@ -600,6 +601,77 @@ describe('probeCandidate', () => {
   it('只给"疑似音源"判级：pending 直接拒', async () => {
     const id = seedSuspect({ verdict: 'pending' })
     await expect(probeCandidate(id)).rejects.toThrow(/疑似音源/)
+  })
+
+  it('「仍然判级」：像载荷的 not-source 允许 force 跑，真出货就提升为疑似可用并把来源写进依据', async () => {
+    const id = seedSuspect({
+      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT),
+    })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner())
+
+    const report = await probeCandidate(id, { force: true })
+    expect(report.cells.tx?.outcome).toBe('ok')
+    const row = rows.find(r => r.id === id)!
+    expect(row.verdict).toBe('suspect')
+    expect(String(row.reason)).toContain('仍然判级')
+    expect(String(row.reason)).toContain('1/1 个平台真出货')
+  })
+
+  it('仍然判级 0 出货 ⇒ 等级不动（留在 not-source），但红绿灯留在行上供人看', async () => {
+    const id = seedSuspect({
+      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT),
+    })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner({ probeImpl: async () => ({ ok: true, sourceInfo: {}, callError: '无版权，无法播放' }) }))
+
+    const report = await probeCandidate(id, { force: true })
+    expect(report.cells.tx?.outcome).toBe('no-address')
+    const row = rows.find(r => r.id === id)!
+    expect(row.verdict).toBe('not-source')
+    expect(String(row.probeJson)).toContain('no-address')
+  })
+
+  it('仍然判级不放水完整性：sha 对不上照旧一次都不执行', async () => {
+    const id = seedSuspect({
+      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: '0'.repeat(40),
+    })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    const runner = fakeRunner()
+    _setRunnerForTest(runner)
+
+    const report = await probeCandidate(id, { force: true })
+    expect(report.shaVerified).toBe(false)
+    expect(runner.validateScript).not.toHaveBeenCalled()
+    expect(rows.find(r => r.id === id)?.verdict).toBe('not-source')
+  })
+
+  it('不像载荷的不给仍然判级：没 @name、体积在窗口外、pending 都拒（防它变成万能口子）', async () => {
+    const sha = gitBlobSha(FAKE_SOURCE_SCRIPT)
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner())
+
+    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', scriptName: '', sizeBytes: 60 * 1024, blobSha: sha }), { force: true }))
+      .rejects.toThrow(/仍然判级/)
+    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', sizeBytes: 5 * 1024, blobSha: sha }), { force: true }))
+      .rejects.toThrow(/仍然判级/)
+    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', sizeBytes: 5 * 1024 * 1024, blobSha: sha }), { force: true }))
+      .rejects.toThrow(/仍然判级/)
+    await expect(probeCandidate(seedSuspect({ verdict: 'pending', sizeBytes: 60 * 1024, blobSha: sha }), { force: true }))
+      .rejects.toThrow(/仍然判级/)
+    // 不带 force 时老口子一个字没变
+    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', sizeBytes: 60 * 1024, blobSha: sha })))
+      .rejects.toThrow(/疑似音源/)
+  })
+
+  it('looksLikeObfuscatedSource 的窗口是闭区间，且只认 not-source', () => {
+    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 20 * 1024 })).toBe(true)
+    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 1024 * 1024 })).toBe(true)
+    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 20 * 1024 - 1 })).toBe(false)
+    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 1024 * 1024 + 1 })).toBe(false)
+    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: '   ', sizeBytes: 60 * 1024 })).toBe(false)
+    expect(looksLikeObfuscatedSource({ verdict: 'suspect', scriptName: 'X', sizeBytes: 60 * 1024 })).toBe(false)
+    expect(looksLikeObfuscatedSource({ verdict: 'pending', scriptName: 'X', sizeBytes: 60 * 1024 })).toBe(false)
   })
 
   it('一次性进程崩了 ⇒ 记 harness（我们通道没判成），不记成"源不行"', async () => {

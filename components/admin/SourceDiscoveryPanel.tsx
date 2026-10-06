@@ -121,6 +121,21 @@ export function needsForceConfirm(row: Pick<DiscoveryCandidate, 'probe' | 'dupli
 }
 
 /**
+ * 「仍然判级」——静态分读不懂、但长得像一份真载荷的候选，允许人工送去真跑一次。
+ *
+ * 混淆过的音源脚本没有 `musicSearch` 这类字面量，静态打分必然不过线，可它照样能出货；
+ * 而"跑一次"是唯一能证明这件事的手段。判据与服务端 `looksLikeObfuscatedSource` 同一条
+ * （@name 非空 + 正文 20KB~1MB），两边不一致的话按钮会点亮而判级失败信息只在进度里闪一下。
+ * 体积窗口不是装饰：小于 20KB 多半是碎屑，大于 1MB 多半打包了二进制，白打第三方取址接口。
+ */
+export function canForceProbe(row: Pick<DiscoveryCandidate, 'verdict' | 'scriptName' | 'sizeBytes'>): boolean {
+  return row.verdict === 'not-source'
+    && row.scriptName.trim().length > 0
+    && row.sizeBytes >= 20 * 1024
+    && row.sizeBytes <= 1024 * 1024
+}
+
+/**
  * 搜索结果的一行，附"多久之前推送"那句话。
  * 时间差在**拿到结果的那一刻**算好，不在 render 里算：一来 React 要求 render 纯净
  * （每次重渲染调 Date.now() 会让同一份结果显示着变来变去），二来"上次搜索时它是多久前的仓"
@@ -535,9 +550,9 @@ export function SourceDiscoveryPanel() {
     }
   }
 
-  const handleProbe = async (id: number) => {
+  const handleProbe = async (id: number, force = false) => {
     try {
-      const result = await startCandidateProbe(id)
+      const result = await startCandidateProbe(id, force)
       if (!result.started) alert(result.reason ?? '已有判级在跑')
       await reload()
     } catch (e) {
@@ -1189,7 +1204,14 @@ export function SourceDiscoveryPanel() {
                       <td className="px-4 py-3 text-xs text-muted-foreground">
                         {row.sizeBytes ? `${Math.round(row.sizeBytes / 1024)}KB` : '—'}
                       </td>
-                      <td className="max-w-[22rem] px-4 py-3 text-xs text-muted-foreground">{row.reason || '还没抓正文'}</td>
+                      <td className="max-w-[22rem] px-4 py-3 text-xs text-muted-foreground">
+                        {row.reason || '还没抓正文'}
+                        {canForceProbe(row) ? (
+                          <div className="text-amber-600" title="静态特征读不懂（多半是混淆过的），但它带 @name 且正文体积像一份真载荷 —— 可以点「仍然判级」真跑一次；跑出平台出货会自动提升为疑似可用">
+                            静态特征读不懂（疑似混淆载荷，可「仍然判级」）
+                          </div>
+                        ) : null}
+                      </td>
                       <td className="px-4 py-3 text-xs">
                         {row.probe
                           ? <ProbeLights cells={row.probe.cells} />
@@ -1198,15 +1220,19 @@ export function SourceDiscoveryPanel() {
                       <td className="px-4 py-3">
                         <div className="flex justify-end gap-1">
                           <button
-                            onClick={() => { void handleProbe(row.id) }}
-                            disabled={status?.probingId !== null || Boolean(status?.probeBatch?.running) || row.verdict !== 'suspect'}
-                            title="下载它、复验 blob sha、在一次性沙箱里真取一次址"
+                            onClick={() => { void handleProbe(row.id, row.verdict !== 'suspect') }}
+                            disabled={status?.probingId !== null || Boolean(status?.probeBatch?.running) || (row.verdict !== 'suspect' && !canForceProbe(row))}
+                            title={row.verdict === 'suspect'
+                              ? '下载它、复验 blob sha、在一次性沙箱里真取一次址'
+                              : canForceProbe(row)
+                                ? '仍然判级：静态分不够但像载荷，真跑一次试试；跑出平台出货会把它提升为疑似可用'
+                                : '不像音源（没有 @name 或体积不在 20KB~1MB），不给判级'}
                             className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             {status?.probingId === row.id
                               ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
                               : <Radar className="h-3.5 w-3.5" />}
-                            判级
+                            {row.verdict === 'suspect' ? '判级' : '仍然判级'}
                           </button>
                           {row.state === 'imported' || row.duplicateOf?.kind === 'content' ? null : (
                             <button
