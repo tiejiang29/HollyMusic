@@ -27,6 +27,7 @@ import { prisma } from '@/lib/db'
 import { readSetting, writeSetting } from '@/lib/services/app-setting'
 import { safePublicFetch } from '@/lib/server/url-guard'
 import { gitBlobSha } from '@/lib/server/git-blob-sha'
+import { listZipEntries, extractZipEntry, type ZipLimits } from '@/lib/server/zip-read'
 import { parseScriptMeta, importSubscription, readConfig, SOURCE_MANAGER_CONSTANTS, SourceSubscriptionError } from '@/lib/services/source-manager-service'
 import type { SourceConfig } from '@/lib/types/music'
 
@@ -131,6 +132,17 @@ const MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 /** 打分阈值：只靠"文件名像"不够，必须有脚本自身特征才能进 suspect */
 const SUSPECT_THRESHOLD = 5
 const GAP_BETWEEN_REPOS_MS = 400
+/** 找"最近的一个 zip"时列多少条发布（一次调用，够跨过形态变化） */
+const RELEASE_LIST_PER_PAGE = 15
+/** 一个 zip 最多展开多少条 .js（你定的 50；真包实测一批 22~23 条，落在里面） */
+const MAX_ZIP_MEMBERS = 50
+/** 压缩包的上限：整包字节、解压后合计、条目数。超任何一条就拒这个包，不硬撑 */
+const ZIP_LIMITS: ZipLimits = {
+  maxEntryBytes: MAX_SCRIPT_BYTES,
+  maxTotalBytes: 60 * 1024 * 1024,
+  maxEntries: 2000,
+}
+const ZIP_MAX_ASSET_BYTES = 25 * 1024 * 1024
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
@@ -551,6 +563,8 @@ export interface CrawlSummary {
   releaseRepos: string[]
   /** 查了 release 但回落到 tree 的仓与原因（404=从没发过、5xx=没查到、资产不是 .js） */
   releaseFallbacks: string[]
+  /** zip 包的处置说明：为什么没收、跳过了哪些条目、每包上限没登记多少条 */
+  zipNotes: string[]
   /** 因为改走 release 采集而被标成"已被顶掉"的 tree 历史行数量 */
   releaseSuperseded: number
   seen: number
@@ -834,7 +848,7 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
   }
 
   const summary: CrawlSummary = {
-    reposScanned: 0, reposSkipped: [], truncatedRepos: [], releaseRepos: [], releaseFallbacks: [], releaseSuperseded: 0,
+    reposScanned: 0, reposSkipped: [], truncatedRepos: [], releaseRepos: [], releaseFallbacks: [], zipNotes: [], releaseSuperseded: 0,
     seen: 0, created: 0, refreshed: 0,
     downloaded: 0, suspect: 0, notSource: 0, stale: 0, quota: null, note: null, stopped: false,
   }
@@ -909,21 +923,30 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
  * 同样的登记、同样的下载额度、同样的打分。
  */
 interface CandidateEntry {
-  /** tree 里是仓库内路径；release 里是资产文件名（它与 repo 组成唯一键，形状一致） */
+  /** tree 里是仓库内路径；release 里是资产文件名；zip 条目是 `包名!包内路径`（三者与 repo 组成唯一键） */
   path: string
   rawUrl: string
   size: number
   blobSha: string
-  /** release 资产的 `sha256:…`；tree 采集时为空 */
+  /** release 资产的 `sha256:…`；tree 采集时为空。zip 条目记的是**整包**的 sha256 */
   assetDigest: string
   releaseTag: string
+  /** 非空 = 正文在 `rawUrl` 那个 zip 里，条目名是这个 */
+  zipMember: string
+  /** 本轮已经从整包里取出的正文（zip 条目专用：整包只下一次次性的，不再按条目重下） */
+  content?: string
   /** release 的 published_at —— tree 那边拿不到（raw 的 HEAD 路径不回 Last-Modified） */
   upstreamAt: string
 }
 
-function buildReleaseUrl(repo: string): string {
+/**
+ * 发布列表接口，一次调用同时拿到"最新一次的散 .js"和"从新往旧数的第一个 zip"。
+ * 不用 `/releases/latest` 是因为它对"没发过"回 404、而列表回 200 空数组，
+ * 且它看不到更早的 zip。
+ */
+function buildReleasesUrl(repo: string): string {
   const [owner, name] = repo.split('/')
-  return `${API_HOST}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest`
+  return `${API_HOST}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=${RELEASE_LIST_PER_PAGE}`
 }
 
 /**
@@ -944,7 +967,7 @@ function entriesFromTree(repo: string, tree: TreeEntry[], maxCandidates: number)
     out.push({
       path: entry.path, rawUrl: buildRawUrl(repo, entry.path),
       size: Number(entry.size) || 0, blobSha: typeof entry.sha === 'string' ? entry.sha : '',
-      assetDigest: '', releaseTag: '', upstreamAt: '',
+      assetDigest: '', releaseTag: '', zipMember: '', upstreamAt: '',
     })
   }
   return out
@@ -966,8 +989,10 @@ export function assetDigestHex(digest: unknown): string {
  * - tree 的 blob sha（`git hash-object` 那套 `blob <len>\0` 算法）。
  * 返回 null = 这条记录本来没有可对锚点（**无从校验**），不等于"校验通过"。
  *
- * content 是已按 UTF-8 解码的文本：.js 资产是文本，重新编码回字节等价，所以可比。
- * 真要碰二进制资产（本期不解压别人的压缩包）就不能走这条。
+ * 只用于**整文件**候选。zip 包内条目的锚点是整包的 sha256，对不上条目正文，
+ * 所以那条路在 `fetchCandidateContent` 里"复验整包 → 再取条目"，不走这里。
+ *
+ * content 是已按 UTF-8 解码的文本：.js 是文本，重新编码回字节等价，所以可比。
  */
 export function verifyContentAnchor(content: string, blobSha: string, assetDigest: string): boolean | null {
   const digestHex = assetDigestHex(assetDigest)
@@ -977,54 +1002,301 @@ export function verifyContentAnchor(content: string, blobSha: string, assetDiges
   return null
 }
 
+export interface ReleaseAssetLike { name?: unknown; size?: unknown; digest?: unknown }
+export interface ReleaseLike { tag_name?: unknown; published_at?: unknown; prerelease?: unknown; assets?: unknown }
+
+function assetsOf(release: ReleaseLike): ReleaseAssetLike[] {
+  return Array.isArray(release.assets) ? release.assets as ReleaseAssetLike[] : []
+}
+function tagOf(release: ReleaseLike): string {
+  return typeof release.tag_name === 'string' ? release.tag_name : ''
+}
+function publishedOf(release: ReleaseLike): string {
+  return typeof release.published_at === 'string' ? release.published_at : ''
+}
+
+export interface ReleasePicked {
+  /** 最新一次发布里的散 .js 资产 */
+  loose: Array<{ tag: string; publishedAt: string; asset: ReleaseAssetLike }>
+  /** 从新往旧数到的第一个 zip 资产（可能在更早的发布里） */
+  zip: { tag: string; publishedAt: string; asset: ReleaseAssetLike } | null
+}
+
 /**
- * 有 release 的仓只取**最新那一个 release 的 .js 资产**。
- * 理由不是好看：实测 `Macrohard0001/lx-ikun-music-sources` 的 tree 里有 969 个像脚本的 .js
- * （全是历史版本堆，一家占候选表 39% 的行），而它最新一次发布只有 1 个 .js 资产。
+ * 采集形状的纯函数：**最新一次发布的散 .js ＋ 这个仓最近的一个 zip**。
+ * 分开出来是为了能直测"包在更早的发布里"这一档 —— 真数据就是这个形状：
+ * `Macrohard0001/lx-ikun-music-sources` 最新两次（8-31、9-08）各发 1 个散 js，
+ * 而装一大堆源的 zip 在 8-17 那次；只看最新一次就正好把最肥的部分切掉。
  *
- * 回落 tree 的三种情况要分清：
- * - **404 = 这个仓从没发过 release**（该接口的语义，是正证不是猜）；
- * - 最新 release 里没有 .js 资产 —— 实测 `guoyue2010/lxmusic-` 发的是 `V261003.zip`，
- *   本期不解压别人的压缩包（那是新的一整面风险，且这仓 tree 里本来就有散文件）；
- * - 超时/5xx 只是**这次没查到**，同样回落，但要在结论里留一句，别让它看起来像"这仓没 release"。
+ * pre-release 算数（这类仓常把汇总包发成 pre-release），排序自己按 `published_at` 兜一层，
+ * 不依赖接口的返回顺序。
  */
-async function collectLatestRelease(repo: string, settings: DiscoverySettings, summary: CrawlSummary): Promise<CandidateEntry[] | null> {
+export function pickReleaseAssets(releases: ReleaseLike[]): ReleasePicked {
+  const sorted = [...releases].sort((a, b) => {
+    const at = Date.parse(publishedOf(a))
+    const bt = Date.parse(publishedOf(b))
+    return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
+  })
+  const loose: ReleasePicked['loose'] = []
+  const newest = sorted[0]
+  if (newest && tagOf(newest)) {
+    for (const asset of assetsOf(newest)) {
+      if (typeof asset.name === 'string' && isPlausibleScriptPath(asset.name)) {
+        loose.push({ tag: tagOf(newest), publishedAt: publishedOf(newest), asset })
+      }
+    }
+  }
+  let zip: ReleasePicked['zip'] = null
+  for (const release of sorted) {
+    const tag = tagOf(release)
+    if (!tag) continue
+    const found = assetsOf(release).find(asset => typeof asset.name === 'string' && /\.zip$/i.test(asset.name))
+    if (found) { zip = { tag, publishedAt: publishedOf(release), asset: found }; break }
+  }
+  return { loose, zip }
+}
+
+/**
+ * 按上限流式下载一个包/文件。声明的 Content-Length 只是一道预筛，
+ * 真正的边界是逐块累加 —— 撒谎的服务端不能把内存撑爆。
+ */
+async function downloadBoundedBytes(url: string, token: string, maxBytes: number): Promise<Buffer> {
+  const response = await githubFetch(url, token, { headers: { Accept: 'application/octet-stream' } }, DOWNLOAD_TIMEOUT_MS)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const declared = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`声明大小 ${Math.round(declared / 1024 / 1024)}MB 超过上限`)
+  if (!response.body) return Buffer.alloc(0)
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    total += chunk.byteLength
+    if (total > maxBytes) throw new Error(`下载体超过 ${Math.round(maxBytes / 1024 / 1024)}MB 上限，中止`)
+    chunks.push(Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks, total)
+}
+
+function zipNote(summary: CrawlSummary, text: string): void {
+  summary.zipNotes.push(text)
+}
+
+/**
+ * 库里已经有"同一个 tag + 同一个整包 sha256"的条目登记 ⇒ 直接复用它们的定位信息，不重下整包。
+ * 返回的条目没有 `content`，但锚点与库里一致，`registerEntries` 会在复验相同后跳过取正文。
+ */
+async function findUnchangedZipMembers(repo: string, tag: string, digest: string): Promise<CandidateEntry[]> {
+  const rows = await prisma.sourceCandidate.findMany({
+    where: { repo, releaseTag: tag, assetDigest: digest, state: 'new' },
+    select: { path: true, rawUrl: true, sizeBytes: true, assetDigest: true, releaseTag: true, zipMember: true, upstreamAt: true, verdict: true },
+  })
+  // 一行都还没判过（全是 pending）时不省事：那时本来就要下包取正文
+  return rows.filter(row => row.zipMember && row.verdict !== 'pending').map(row => ({
+    path: row.path,
+    rawUrl: row.rawUrl,
+    size: row.sizeBytes,
+    blobSha: '',
+    assetDigest: row.assetDigest,
+    releaseTag: row.releaseTag,
+    zipMember: row.zipMember,
+    upstreamAt: row.upstreamAt,
+  }))
+}
+
+/**
+ * 展开一个 zip 资产：下整包 → 复验整包 sha256 → 取出 .js 条目（正文顺手带在内存里，
+ * 一轮里 50 个条目不会重下 50 次同一个包）。
+ *
+ * 任何一步不成都判整仓失败：记一句为什么没收这个包，散 js 照收，tree 该回落还回落。
+ */
+async function collectZipMembers(repo: string, picked: ReleasePicked['zip'], settings: DiscoverySettings, summary: CrawlSummary): Promise<CandidateEntry[]> {
+  if (!picked) return []
+  const assetName = typeof picked.asset.name === 'string' ? picked.asset.name : ''
+  const assetUrl = buildReleaseAssetUrl(repo, picked.tag, assetName)
+  const digest = assetDigestHex(picked.asset.digest)
+  const size = Number(picked.asset.size) || 0
+
+  if (!assetName) return []
+  if (size > ZIP_MAX_ASSET_BYTES) {
+    zipNote(summary, `${repo}：包 ${assetName} ${(size / 1024 / 1024).toFixed(1)}MB 超过 ${Math.round(ZIP_MAX_ASSET_BYTES / 1024 / 1024)}MB 上限，没收这个包`)
+    return []
+  }
+
+  // 包没换就不重下：这一档不是省流量好看，是少一个失败面 —— 实测本机到 github.com 的下载时好时坏，
+  // 重下一次就多一次"这轮没收到这个包"的机会。
+  const cached = digest ? await findUnchangedZipMembers(repo, picked.tag, `sha256:${digest}`) : []
+  if (cached.length) {
+    zipNote(summary, `${repo}：包 ${assetName} 的 sha256 与库里一致，跳过下载，复用 ${cached.length} 条登记`)
+    return cached
+  }
+
+  let buffer: Buffer
+  try {
+    buffer = await downloadBoundedBytes(assetUrl, settings.githubToken, ZIP_MAX_ASSET_BYTES)
+  } catch (err) {
+    zipNote(summary, `${repo}：包 ${assetName} 下载失败（${(err instanceof Error ? err.message : String(err)).slice(0, 60)}）`)
+    return []
+  }
+  // 先复验整包再解：解包器读到的必须就是发布记录里那个字节
+  if (digest && createHash('sha256').update(buffer).digest('hex') !== digest) {
+    zipNote(summary, `${repo}：包 ${assetName} 的 sha256 与发布记录不一致，没收`)
+    return []
+  }
+
+  let listing
+  try {
+    listing = listZipEntries(buffer, ZIP_LIMITS)
+  } catch (err) {
+    zipNote(summary, `${repo}：包 ${assetName} 读不了（${(err instanceof Error ? err.message : String(err)).slice(0, 70)}）`)
+    return []
+  }
+  if (listing.rejected.length) {
+    zipNote(summary, `${repo}：包 ${assetName} 跳过的条目：${listing.rejected.map(item => `${item.reason}×${item.count}`).join('，')}`)
+  }
+  const js = listing.entries.filter(entry => isPlausibleScriptPath(entry.name))
+  const taken = js.slice(0, MAX_ZIP_MEMBERS)
+  if (js.length > taken.length) {
+    zipNote(summary, `${repo}：包 ${assetName} 里还有 ${js.length - taken.length} 个 .js 没登记（每包上限 ${MAX_ZIP_MEMBERS}）`)
+  }
+
+  const out: CandidateEntry[] = []
+  for (const member of taken) {
+    let bytes: Buffer
+    try {
+      bytes = extractZipEntry(buffer, member, ZIP_LIMITS.maxEntryBytes)
+    } catch (err) {
+      zipNote(summary, `${repo}：包 ${assetName} 里的 ${member.name} 取不出（${(err instanceof Error ? err.message : String(err)).slice(0, 60)}）`)
+      continue
+    }
+    out.push({
+      path: `${assetName}!${member.name}`,
+      rawUrl: assetUrl,
+      size: member.uncompressedSize,
+      blobSha: '',
+      // 锚点是整包的 sha256：判级/导入要"复验整包 → 再取这个条目"，不能拿包摘要去比对条目正文
+      assetDigest: digest ? `sha256:${digest}` : '',
+      releaseTag: picked.tag,
+      zipMember: member.name,
+      content: bytes.toString('utf8'),
+      upstreamAt: picked.publishedAt,
+    })
+  }
+  return out
+}
+
+/**
+ * release 采集：**最新一次发布的散 .js ＋ 这个仓最近的一个 zip 里的 .js**。
+ * 动因是实测：`Macrohard0001/lx-ikun-music-sources` 的 tree 里堆着 969 个历史版本 .js
+ * （一家占候选表 39% 的行），而它 8 月中旬改成了"一个汇总 zip"、8 月底又改成"一个散 js"。
+ *
+ * 回落 tree 的情况要分清，**每一种都在结论里说清**：
+ * - 从没发过 release（`/releases` 回 200 空数组，或 `/releases/latest` 那种 404）⇒ 静默回落；
+ * - 有发布但既没有散 js、zip 里也没收进东西 ⇒ 回落并说明；
+ * - 超时 / 5xx / 响应不是 JSON ⇒ 只是**这次没查到**，回落并写一句，别让它读起来像"这仓没发布"。
+ */
+/** 一条候选怎么找到自己的正文：整文件，还是先下整包再取那一个条目 */
+export interface CandidateLocator {
+  rawUrl: string
+  blobSha: string
+  assetDigest: string
+  zipMember: string
+}
+
+export interface CandidateContent {
+  content: string
+  /** true=复验过了；false=对不上或取不出；null=没有可对的锚点（无从校验，不等于通过） */
+  anchor: boolean | null
+  reason: string | null
+}
+
+/**
+ * 按候选行取正文，并把"内容复验"这件事一次说清。
+ *
+ * zip 条目那条路是 **先复验整包的 sha256，再取那一个条目** —— 条目的摘要不在我们的记录里，
+ * 整包摘要才是同源锚点；整包对不上就一票否决，解出来的东西不配进沙箱、更不配进配置。
+ */
+export async function fetchCandidateContent(locator: CandidateLocator, token: string): Promise<CandidateContent> {
+  if (!locator.zipMember) {
+    const content = await fetchScriptText(locator.rawUrl, token)
+    const anchor = verifyContentAnchor(content, locator.blobSha, locator.assetDigest)
+    // 对不上时说的是"哪一种锚点"，管理员才知道是"上游刚改过 tree"还是"发布被重发过"
+    const reason = anchor === false
+      ? (assetDigestHex(locator.assetDigest) ? '内容与发布资产记录的 sha256 不一致' : 'blob sha 与仓库 tree 不一致')
+      : null
+    return { content, anchor, reason }
+  }
+
+  const digest = assetDigestHex(locator.assetDigest)
+  let buffer: Buffer
+  try {
+    buffer = await downloadBoundedBytes(locator.rawUrl, token, ZIP_MAX_ASSET_BYTES)
+  } catch (err) {
+    return { content: '', anchor: false, reason: `下载整包失败：${(err instanceof Error ? err.message : String(err)).slice(0, 80)}` }
+  }
+  if (digest && createHash('sha256').update(buffer).digest('hex') !== digest) {
+    return { content: '', anchor: false, reason: '整包的 sha256 与发布记录不一致' }
+  }
+  let listing
+  try {
+    listing = listZipEntries(buffer, ZIP_LIMITS)
+  } catch (err) {
+    return { content: '', anchor: false, reason: `包读不了：${(err instanceof Error ? err.message : String(err)).slice(0, 80)}` }
+  }
+  const member = listing.entries.find(entry => entry.name === locator.zipMember)
+  if (!member) return { content: '', anchor: false, reason: '包里没有记录的那个条目（上游可能已重发包）' }
+  try {
+    const bytes = extractZipEntry(buffer, member, ZIP_LIMITS.maxEntryBytes)
+    return { content: bytes.toString('utf8'), anchor: digest ? true : null, reason: null }
+  } catch (err) {
+    return { content: '', anchor: false, reason: `条目取不出：${(err instanceof Error ? err.message : String(err)).slice(0, 80)}` }
+  }
+}
+
+async function collectReleaseEntries(repo: string, settings: DiscoverySettings, summary: CrawlSummary): Promise<CandidateEntry[] | null> {
   const fallback = (reason: string) => {
     summary.releaseFallbacks.push(`${repo}：${reason}，本轮按 tree 扫`)
     return null
   }
-  let release: { tag_name?: unknown; published_at?: unknown; assets?: unknown }
+
+  let releases: ReleaseLike[]
   try {
-    const response = await githubFetch(buildReleaseUrl(repo), settings.githubToken)
-    // 404 = 这个仓从没发过 release（该接口的语义），是正证；它不写进回落说明，免得每轮都刷一句
+    const response = await githubFetch(buildReleasesUrl(repo), settings.githubToken)
     if (response.status === 404) return null
     if (!response.ok) return fallback(`release 返回 HTTP ${response.status}`)
-    // 读体也在同一段 try 里：非 JSON 的响应（截断、代理塞了网页）不该把整个仓判成失败
-    release = await response.json() as typeof release
+    const payload = await response.json() as unknown
+    releases = Array.isArray(payload) ? payload as ReleaseLike[] : []
   } catch (err) {
     const reason = (err instanceof Error ? err.message : String(err)).slice(0, 60)
     return fallback(`release 没查到（${reason}）`)
   }
-  const tag = typeof release.tag_name === 'string' ? release.tag_name : ''
-  const publishedAt = typeof release.published_at === 'string' ? release.published_at : ''
-  const assets = Array.isArray(release.assets) ? release.assets as Array<Record<string, unknown>> : []
-  const jsAssets = assets.filter(asset => typeof asset.name === 'string' && isPlausibleScriptPath(asset.name))
-  if (!tag || !jsAssets.length) {
-    const names = assets.slice(0, 3).map(asset => String(asset.name ?? '')).filter(Boolean)
-    summary.releaseFallbacks.push(`${repo}：最新 release${tag ? ` ${tag}` : ''} 里没有 .js 资产${names.length ? `（是 ${names.join('、')}）` : ''}，本轮按 tree 扫`)
-    return null
+  // 这个接口对"从没发过"回的是 200 + 空数组（不是 404），所以这里也要当"没有"
+  if (!releases.length) return null
+
+  const picked = pickReleaseAssets(releases)
+  const loose = picked.loose.slice(0, settings.maxCandidatesPerRepo).map(item => ({
+    path: String(item.asset.name),
+    rawUrl: buildReleaseAssetUrl(repo, item.tag, String(item.asset.name)),
+    size: Number(item.asset.size) || 0,
+    blobSha: '',
+    assetDigest: typeof item.asset.digest === 'string' ? item.asset.digest : '',
+    releaseTag: item.tag,
+    zipMember: '',
+    upstreamAt: item.publishedAt,
+  }))
+  const fromZip = await collectZipMembers(repo, picked.zip, settings, summary)
+  const entries = [...loose, ...fromZip]
+  if (!entries.length) {
+    const names = assetsOf(releases[0] ?? {}).slice(0, 3).map(asset => String(asset.name ?? '')).filter(Boolean).join('、')
+    // 回落原因不能张冠李戴：有包但没收进来（下不动/对不上/读不了）时，原因是那一条，
+    // 不是"这仓没有 .js 资产" —— 实测本机网络到 github.com 不通时就会走到这里
+    const why = picked.zip
+      ? `，而最近的包 ${String(picked.zip.asset.name ?? '')} 没收进来（原因见「压缩包」那行）`
+      : '，也没找到 zip'
+    return fallback(`最新 release${tagOf(releases[0] ?? {}) ? ` ${tagOf(releases[0] ?? {})}` : ''} 里没有 .js 资产${names ? `（是 ${names}）` : ''}${why}`)
   }
 
-  summary.releaseRepos.push(`${repo}（${tag}，${jsAssets.length} 个 .js 资产）`)
-  return jsAssets.slice(0, settings.maxCandidatesPerRepo).map(asset => ({
-    path: String(asset.name),
-    rawUrl: buildReleaseAssetUrl(repo, tag, String(asset.name)),
-    size: Number(asset.size) || 0,
-    blobSha: '',
-    assetDigest: typeof asset.digest === 'string' ? asset.digest : '',
-    releaseTag: tag,
-    upstreamAt: publishedAt,
-  }))
+  const zipTag = picked.zip && fromZip.length ? `＋包 ${String(picked.zip.asset.name ?? '')} 展开 ${fromZip.length} 条` : ''
+  summary.releaseRepos.push(`${repo}（散 js ${loose.length} 条${zipTag}）`)
+  return entries
 }
 
 /** 改走 release 采集后，tree 里那些不再刷新的历史行标成"已被顶掉"（标行不删行，与去重同一口径） */
@@ -1052,7 +1324,7 @@ async function crawlRepo(
   let entries: CandidateEntry[] | null = null
   let fromRelease = false
   if (settings.preferLatestRelease) {
-    entries = await collectLatestRelease(repo, settings, summary)
+    entries = await collectReleaseEntries(repo, settings, summary)
     fromRelease = entries !== null
   }
   if (!entries) entries = await collectTree(repo, settings, summary)
@@ -1102,7 +1374,7 @@ async function registerEntries(
         where: { id: existing.id },
         data: {
           rawUrl: entry.rawUrl, blobSha: entry.blobSha, assetDigest: entry.assetDigest,
-          releaseTag: entry.releaseTag, sizeBytes: entry.size,
+          releaseTag: entry.releaseTag, zipMember: entry.zipMember, sizeBytes: entry.size,
         },
       })
       summary.refreshed++
@@ -1113,7 +1385,7 @@ async function registerEntries(
       await prisma.sourceCandidate.create({
         data: {
           repo, path: entry.path, rawUrl: entry.rawUrl, blobSha: entry.blobSha,
-          assetDigest: entry.assetDigest, releaseTag: entry.releaseTag, sizeBytes: entry.size,
+          assetDigest: entry.assetDigest, releaseTag: entry.releaseTag, zipMember: entry.zipMember, sizeBytes: entry.size,
         },
       })
       summary.created++
@@ -1144,17 +1416,22 @@ async function downloadAndScore(
 ): Promise<void> {
   let content: string
   let lastModified = ''
-  try {
-    const response = await githubFetch(entry.rawUrl, token, { headers: { Accept: 'text/plain' } }, DOWNLOAD_TIMEOUT_MS)
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const contentType = response.headers.get('content-type') || ''
-    if (/text\/html/i.test(contentType)) throw new Error('返回的是网页不是文件')
-    lastModified = response.headers.get('last-modified') || ''
-    content = await response.text()
-  } catch (err) {
-    // 下载失败保留 pending：这是临时故障，不该把结论固化成"非音源"
-    logger.info('[discovery] 正文抓取失败，留待下轮', { repo, path: entry.path, reason: err instanceof Error ? err.message : String(err) })
-    return
+  if (entry.content !== undefined) {
+    // zip 条目的正文在本轮解包时已经取出，不必（也不该）为每个条目重下一次整包
+    content = entry.content
+  } else {
+    try {
+      const response = await githubFetch(entry.rawUrl, token, { headers: { Accept: 'text/plain' } }, DOWNLOAD_TIMEOUT_MS)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const contentType = response.headers.get('content-type') || ''
+      if (/text\/html/i.test(contentType)) throw new Error('返回的是网页不是文件')
+      lastModified = response.headers.get('last-modified') || ''
+      content = await response.text()
+    } catch (err) {
+      // 下载失败保留 pending：这是临时故障，不该把结论固化成"非音源"
+      logger.info('[discovery] 正文抓取失败，留待下轮', { repo, path: entry.path, reason: err instanceof Error ? err.message : String(err) })
+      return
+    }
   }
 
   if (Buffer.byteLength(content, 'utf8') > MAX_SCRIPT_BYTES) {
@@ -1273,6 +1550,8 @@ export interface CandidateView {
   duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
   /** 非空 = 这条来自某个 release 的资产（面板据此说"来自发布 vX"，并说明为什么不是仓库路径） */
   releaseTag: string
+  /** 非空 = 正文在 rawUrl 那个 zip 里，这是条目名（整包的 sha256 记在 assetDigest） */
+  zipMember: string
   /** 资产记录的 sha256（`sha256:<hex>`）；空 = tree 采集或 GitHub 没给 */
   assetDigest: string
   /** 上游时间：release 采集拿到的是发布时间，tree 采集通常拿不到（raw HEAD 不回 Last-Modified） */
@@ -1309,6 +1588,7 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
       importedPath: row.importedPath,
       duplicateOf: twin ? { kind: twin.kind, path: twin.twin.path, name: twin.twin.name } : null,
       releaseTag: row.releaseTag,
+      zipMember: row.zipMember,
       assetDigest: row.assetDigest,
       upstreamAt: row.upstreamAt,
     }
@@ -1468,19 +1748,17 @@ export async function probeCandidate(id: number): Promise<CandidateProbeReport> 
   if (row.verdict !== 'suspect') throw new SourceDiscoveryError('只给"疑似音源"的候选做判级')
 
   const settings = await getDiscoverySettings()
-  const content = await fetchScriptText(row.rawUrl, settings.githubToken)
+  // 取正文这一步就把"内容是不是我们记录的那一份"判掉：zip 条目要先复验整包 sha256 才解，
+  // 普通候选对 blob sha / 资产 digest。对不上 = 拒绝执行，一步都不往下走
+  const fetched = await fetchCandidateContent(row, settings.githubToken)
+  const report: CandidateProbeReport = { cells: {}, shaVerified: fetched.anchor, note: null }
 
-  // 锚点两种：release 资产看 digest，tree 文件看 blob sha（两个都没有 = 无从校验，不写成通过）
-  const anchor = verifyContentAnchor(content, row.blobSha, row.assetDigest)
-  const report: CandidateProbeReport = { cells: {}, shaVerified: anchor, note: null }
-
-  if (anchor === false) {
-    report.note = row.assetDigest
-      ? '内容与发布资产记录的 sha256 不一致，拒绝执行'
-      : 'blob sha 与仓库 tree 不一致，拒绝执行'
+  if (fetched.anchor === false || !fetched.content) {
+    report.note = `${fetched.reason ?? '内容与记录里的锚点不一致'}，拒绝执行`
     await saveReport(id, report)
     return report
   }
+  const content = fetched.content
 
   const runner = getOneShotRunner()
   if (runner.mode === 'inline') {
@@ -1811,11 +2089,27 @@ export async function importCandidate(id: number, opts: { force?: boolean } = {}
 
   let source: SourceConfig
   try {
-    // 复验锚点按来源分：release 资产不是 git blob，只能对 GitHub 记录的 sha256；
-    // tree 文件仍对 blob sha。两个都没有就交给下游校验（面板会显示"无从校验"）
-    source = await importSubscription(row.rawUrl, assetDigestHex(row.assetDigest)
-      ? { expectedSha256: assetDigestHex(row.assetDigest) }
-      : { expectedBlobSha: row.blobSha })
+    const settings = await getDiscoverySettings()
+    if (row.zipMember) {
+      // 包内条目：服务端按记录**重下整包 → 先复验整包 sha256 → 再取那一个条目**。
+      // 这种源不登记订阅 —— 订阅更新按 URL 重取"整份脚本"，而它的正文在包里的一条目，
+      // 让「音源管理」去更新它只会取错东西；要拿上游新版本请回到发现面板再采一次。
+      const fetched = await fetchCandidateContent(row, settings.githubToken)
+      if (fetched.anchor === false || !fetched.content) {
+        throw new SourceDiscoveryError(`导入失败：${fetched.reason ?? '取不到正文'}`, 409)
+      }
+      source = await importSubscription(row.rawUrl, {
+        content: fetched.content,
+        filename: (row.zipMember.split('/').pop() || row.zipMember),
+        subscribe: false,
+      })
+    } else {
+      // 复验锚点按来源分：release 资产不是 git blob，只能对 GitHub 记录的 sha256；
+      // tree 文件仍对 blob sha。两个都没有就交给下游校验（面板会显示"无从校验"）
+      source = await importSubscription(row.rawUrl, assetDigestHex(row.assetDigest)
+        ? { expectedSha256: assetDigestHex(row.assetDigest) }
+        : { expectedBlobSha: row.blobSha })
+    }
   } catch (err) {
     if (err instanceof SourceDiscoveryError) throw err
     const status = err instanceof SourceSubscriptionError ? err.status : 422

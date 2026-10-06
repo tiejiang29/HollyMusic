@@ -74,6 +74,8 @@ export interface DiscoveryStatus {
     releaseRepos: string[]
     /** 查了 release 但回落 tree 的仓与原因（没发过 / 不是 .js 资产 / 这次没查到） */
     releaseFallbacks: string[]
+    /** zip 包的处置：为什么没收、跳过的条目、每包上限没登记多少条、包没换跳过重下 */
+    zipNotes: string[]
     /** 因为改走 release 采集而被标成"已被顶掉"的 tree 历史行数 */
     releaseSuperseded: number
     quota: { remaining: number; limit: number; resetAt: number } | null
@@ -116,6 +118,8 @@ export interface DiscoveryCandidate {
   duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
   /** 非空 = 这条来自某个 release 的资产（此时 path 是资产文件名，不是仓库内路径） */
   releaseTag: string
+  /** 非空 = 正文在 rawUrl 那个 zip 里，这是包内条目名 */
+  zipMember: string
   /** GitHub 记录的资产 sha256（`sha256:<hex>`）；空 = tree 采集或它没给 */
   assetDigest: string
   /** 上游时间：release 采集是发布时间；tree 采集通常为空（raw 的 HEAD 路径不回 Last-Modified） */

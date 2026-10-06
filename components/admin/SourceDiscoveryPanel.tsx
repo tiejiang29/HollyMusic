@@ -1102,6 +1102,9 @@ export function SourceDiscoveryPanel() {
               {status.last.releaseFallbacks?.length ? (
                 <div className="mt-1 text-muted-foreground">回落扫 tree：{status.last.releaseFallbacks.join('；')}</div>
               ) : null}
+              {status.last.zipNotes?.length ? (
+                <div className="mt-1 text-muted-foreground">压缩包：{status.last.zipNotes.join('；')}</div>
+              ) : null}
               {status.last.reposSkipped?.length ? (
                 <div className="mt-1">跳过：{status.last.reposSkipped.join('；')}</div>
               ) : null}
@@ -1151,12 +1154,18 @@ export function SourceDiscoveryPanel() {
                         {row.releaseTag ? (
                           <div
                             className="text-primary"
-                            title={row.assetDigest ? `发布资产的 sha256：${row.assetDigest}（导入前会按它复验）` : '这个发布资产 GitHub 没给 digest，导入时无从复验'}
+                            title={row.assetDigest
+                              ? (row.zipMember
+                                ? `整包的 sha256：${row.assetDigest}（取条目之前先复验整包）`
+                                : `发布资产的 sha256：${row.assetDigest}（导入前会按它复验）`)
+                              : '这个发布资产 GitHub 没给 digest，导入时无从复验'}
                           >
                             来自发布 {row.releaseTag}{row.upstreamAt ? `（${row.upstreamAt.slice(0, 10)}）` : ''}
                           </div>
                         ) : null}
-                        <div className="text-muted-foreground">{row.releaseTag ? '资产文件：' : ''}{row.path}</div>
+                        <div className="text-muted-foreground">
+                          {row.zipMember ? '包内条目：' : row.releaseTag ? '资产文件：' : ''}{row.zipMember || row.path}
+                        </div>
                         {row.importedPath ? (
                           <div className="text-green-700">已导入 → {row.importedPath}</div>
                         ) : null}

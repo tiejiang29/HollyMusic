@@ -369,6 +369,8 @@ model SourceCandidate {
   assetDigest String    @default("")
   /// 走 Release 采集时的 tag_name；空 = tree 采集。面板据此说明"这条来自某个发布"
   releaseTag  String    @default("")
+  /// 非空 = 正文在 rawUrl 那个 zip 里的这个条目（整包的 sha256 记在 assetDigest）
+  zipMember   String    @default("")
   /// 从脚本头注释解析的 @name
   scriptName  String    @default("")
   /// @name 剥掉尾部版本号并归一后的键，用于同名择优

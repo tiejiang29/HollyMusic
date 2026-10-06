@@ -460,6 +460,15 @@ export async function addSource(opts: {
   return newSource
 }
 
+/** 调用方已经给了正文时，名字只用于落盘：地址解析不出来就退回一个通用名，不该为此打断导入 */
+function filenameFromUrlOrFallback(value: string): string {
+  try {
+    return getSubscriptionFilename(new URL(value))
+  } catch {
+    return 'lx-source.js'
+  }
+}
+
 /**
  * 从在线链接导入洛雪脚本，校验通过后自动注册为可更新订阅。
  *
@@ -468,13 +477,20 @@ export async function addSource(opts: {
  * - `expectedBlobSha`：候选来自仓库 tree 时，树接口给的 blob sha（`git hash-object` 那套算法）；
  * - `expectedSha256`：候选来自 release 资产时，GitHub 记录的文件 sha256 —— 资产不是 git blob，
  *   没有 blob sha 可对，这条才是它的同源锚点。
+ *
+ * `content` 是给"正文在 zip 包里"那种候选用的：调用方已经下过整包、复验过整包 sha256、
+ * 取出那一个条目，这里就别再按 URL 重下一遍（那只会拿到整包）。此时 `subscribe: false`
+ * 不登记订阅 —— 订阅更新是"按 URL 重取整份脚本"，对包内条目没有意义，让它可点会取错东西。
  */
 export async function importSubscription(
   subscriptionUrl: string,
-  options: { expectedBlobSha?: string; expectedSha256?: string } = {},
+  options: { expectedBlobSha?: string; expectedSha256?: string; content?: string; filename?: string; subscribe?: boolean } = {},
 ): Promise<SourceConfig> {
   const normalizedUrl = subscriptionUrl.trim()
-  const { content, filename } = await fetchSubscriptionScript(normalizedUrl)
+  const fetched = options.content === undefined
+    ? await fetchSubscriptionScript(normalizedUrl)
+    : { content: options.content, filename: options.filename || filenameFromUrlOrFallback(normalizedUrl) }
+  const { content, filename } = fetched
 
   const expectedDigest = (options.expectedSha256 || '').trim().toLowerCase()
   if (expectedDigest) {
@@ -517,7 +533,7 @@ export async function importSubscription(
       description: sourceInfo?.description,
       enabled: true,
       pt: extractPlatforms(validation.sourceInfo),
-      subscription: { url: normalizedUrl, updatedAt: new Date().toISOString() },
+      subscription: options.subscribe === false ? undefined : { url: normalizedUrl, updatedAt: new Date().toISOString() },
     })
     logger.info(`[source-manager-service] 已导入订阅脚本: ${normalizedUrl} → ${relativePath}`)
     return source

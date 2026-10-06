@@ -7,6 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import zlib from 'node:zlib'
 import path from 'node:path'
 
 const { prismaMock, importSubscriptionMock, readConfigMock, fsReadFileMock } = vi.hoisted(() => ({
@@ -58,6 +59,7 @@ const {
   normalizeRepo, isPlausibleScriptPath, scoreCandidate, toNameKey, betterKeeper, toIsoTime,
   searchGitHubRepos, sanitizeRepoQuery, repoSearchItemFromApi,
   auditRepoFreshness, daysSincePush, verifyContentAnchor, assetDigestHex,
+  pickReleaseAssets, fetchCandidateContent,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
@@ -111,7 +113,7 @@ beforeEach(() => {
     // 补齐 schema 里带 @default 的列：真库由 Prisma 填，假库要自己填，否则测不出真实形状
     const row = {
       blobSha: '', scriptName: '', nameKey: '', contentHash: '', upstreamAt: '', sizeBytes: 0, score: 0,
-      assetDigest: '', releaseTag: '',
+      assetDigest: '', releaseTag: '', zipMember: '',
       verdict: 'pending', state: 'new', reason: null, checkedAt: null, probeJson: '', importedPath: '',
       id: nextId++, ...data,
     } as Row
@@ -130,8 +132,21 @@ beforeEach(() => {
     where?: Record<string, unknown> & { OR?: Array<Record<string, unknown>> }
     take?: number
   }) => {
-    const where = (args?.where ?? {}) as { verdict?: string; state?: string; probeJson?: string; OR?: Array<Record<string, unknown>> }
+    const where = (args?.where ?? {}) as {
+      verdict?: string; state?: string; probeJson?: string; OR?: Array<Record<string, unknown>>
+      repo?: string; releaseTag?: string; assetDigest?: string; zipMember?: string
+      NOT?: { repo?: { in?: string[] } }
+    }
     let out = rows
+    // 字符串列一律真按等值筛（"包没换就跳过下载"那条判据靠 repo+tag+digest 三者同时命中）
+    for (const key of ['repo', 'releaseTag', 'assetDigest', 'zipMember'] as const) {
+      const value = where[key]
+      if (typeof value === 'string') out = out.filter(r => String(r[key] ?? '') === value)
+    }
+    if (where.NOT?.repo?.in) {
+      const listed = new Set(where.NOT.repo.in)
+      out = out.filter(r => !listed.has(r.repo))
+    }
     if (where.verdict) out = out.filter(r => r.verdict === where.verdict)
     if (where.state) out = out.filter(r => r.state === where.state)
     if (where.probeJson !== undefined) out = out.filter(r => r.probeJson === where.probeJson)
@@ -430,8 +445,8 @@ describe('runDiscoveryCrawl', () => {
     await enable(['a/b'], 'ghp_testtoken')
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
-      if (url.includes('/releases/latest')) {
-        return jsonResponse({ tag_name: 'v1', published_at: '2026-10-01T00:00:00Z', assets: [{ name: 's.js', size: 40, digest: `sha256:${'a'.repeat(64)}` }] })
+      if (url.includes('/releases?per_page=')) {
+        return jsonResponse([{ tag_name: 'v1', published_at: '2026-10-01T00:00:00Z', prerelease: false, assets: [{ name: 's.js', size: 40, digest: `sha256:${'a'.repeat(64)}` }] }])
       }
       return new Response(FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
     }))
@@ -463,7 +478,7 @@ const RAW_URL = 'https://raw.githubusercontent.com/a/b/HEAD/lx-source.js'
 function seedSuspect(over: Partial<Row> = {}): number {
   const row = {
     id: nextId++, repo: 'a/b', path: 'lx-source.js', rawUrl: RAW_URL, blobSha: '',
-    assetDigest: '', releaseTag: '',
+    assetDigest: '', releaseTag: '', zipMember: '',
     scriptName: '合成测试音源 v1.2.0', nameKey: '合成测试音源', contentHash: '', upstreamAt: '',
     sizeBytes: 400, score: 8, verdict: 'suspect', state: 'new', reason: null,
     probeJson: '', probedAt: null, checkedAt: null, importedPath: '', ...over,
@@ -1292,154 +1307,6 @@ describe('auditRepoFreshness（停更仓体检）', () => {
 })
 
 // ————— 有 release 的仓只取最新那一次发布 —————
-describe('最新 release 采集', () => {
-  const HEX_A = 'a'.repeat(64)
-  const HEX_B = 'b'.repeat(64)
-  const releasePayload = (over: Record<string, unknown> = {}) => ({
-    tag_name: 'v260908',
-    published_at: '2026-09-08T11:23:47Z',
-    assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000, digest: `sha256:${HEX_A}`, browser_download_url: 'https://objects.githubusercontent.com/不该用这个' }],
-    ...over,
-  })
-  const treeOnce = (path = 'lx-music-source.js') => jsonResponse({ tree: [{ path, type: 'blob', sha: 'aaa', size: 500 }], truncated: false })
-
-  /** 一个仓：release 有 .js 资产 ⇒ 不打 tree；正文返回合成脚本 */
-  const releaseStub = (payload: Record<string, unknown>, opts: { releases?: unknown; scriptText?: string } = {}) => {
-    const urls: string[] = []
-    let scriptReads = 0
-    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
-      urls.push(url)
-      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
-      if (url.includes('/releases/latest')) {
-        return opts.releases !== undefined ? opts.releases as Response : jsonResponse(payload)
-      }
-      if (url.includes('/git/trees/')) return treeOnce()
-      scriptReads++
-      return new Response(opts.scriptText ?? FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
-    }))
-    return { urls, reads: () => scriptReads }
-  }
-
-  it('有 .js 资产就只用它当候选，一次都不打仓库树', async () => {
-    await enable(['a/b'])
-    const { urls } = releaseStub(releasePayload())
-    const summary = await runDiscoveryCrawl()
-
-    expect(summary.releaseRepos).toHaveLength(1)
-    expect(urls.some(u => u.includes('/git/trees/'))).toBe(false)
-    expect(summary.suspect).toBe(1)
-  })
-
-  it('地址与元数据都按 release 记：路径是资产名、url 我们自己拼、上游时间是发布时间、digest 留着复验', async () => {
-    await enable(['a/b'])
-    releaseStub(releasePayload())
-    await runDiscoveryCrawl()
-
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toMatchObject({
-      repo: 'a/b',
-      path: 'HYWmusic_v1.0.3.js',
-      // 不取 API 给的 browser_download_url —— 那是第二个自由文本入口
-      rawUrl: 'https://github.com/a/b/releases/download/v260908/HYWmusic_v1.0.3.js',
-      releaseTag: 'v260908',
-      assetDigest: `sha256:${HEX_A}`,
-      blobSha: '',
-      // 归一成 ISO 后存（原始来源是 published_at；下载头里没有 Last-Modified）
-      upstreamAt: '2026-09-08T11:23:47.000Z',
-    })
-  })
-
-  it('从没发过 release（404）就照常扫 tree，而且不在结论里每轮刷一句废话', async () => {
-    await enable(['a/b'])
-    const { urls } = releaseStub(releasePayload(), { releases: new Response('{"message":"Not Found"}', { status: 404 }) })
-    const summary = await runDiscoveryCrawl()
-
-    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
-    expect(summary.releaseFallbacks).toEqual([])
-    expect(rows[0]).toMatchObject({ path: 'lx-music-source.js', releaseTag: '', assetDigest: '' })
-  })
-
-  it('最新 release 发的是压缩包 ⇒ 回落扫 tree，并把"没有 .js 资产"连同文件名说清', async () => {
-    await enable(['a/b'])
-    const { urls } = releaseStub(releasePayload({
-      tag_name: 'V261003',
-      assets: [{ name: 'V261003.zip', size: 282_000, digest: `sha256:${HEX_B}` }],
-    }))
-    const summary = await runDiscoveryCrawl()
-
-    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
-    expect(summary.releaseFallbacks.join(' ')).toContain('没有 .js 资产')
-    expect(summary.releaseFallbacks.join(' ')).toContain('V261003.zip')
-  })
-
-  it('release 接口 502 也只是"这次没查到"：回落扫 tree，不把它写成"这仓没发布"', async () => {
-    await enable(['a/b'])
-    const { urls } = releaseStub(releasePayload(), { releases: new Response('bad gateway', { status: 502 }) })
-    const summary = await runDiscoveryCrawl()
-
-    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
-    expect(summary.releaseFallbacks.join(' ')).toContain('HTTP 502')
-  })
-
-  it('release 接口回的不是 JSON 也不该把整个仓判失败：回落扫 tree', async () => {
-    await enable(['a/b'])
-    const { urls } = releaseStub(releasePayload(), { releases: new Response('<html>代理塞进来的网页</html>', { status: 200, headers: { 'content-type': 'text/html' } }) })
-    const summary = await runDiscoveryCrawl()
-
-    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
-    expect(summary.reposSkipped).toEqual([])
-  })
-
-  it('改走 release 之后，tree 里那些不再刷新的历史行标成"已被顶掉"，行留着', async () => {
-    await enable(['a/b'])
-    const old = seedSuspect({ repo: 'a/b', path: '历史版本/v1.0.0.js' })
-    releaseStub(releasePayload())
-
-    const summary = await runDiscoveryCrawl()
-    expect(summary.releaseSuperseded).toBe(1)
-    expect(rows.find(r => r.id === old)?.state).toBe('stale')
-    expect(rows.find(r => r.id === old)?.reason).toContain('改走')
-    expect(rows).toHaveLength(2)
-  })
-
-  it('同一资产换了内容（digest 变了）要重下；digest 没变就不重下', async () => {
-    await enable(['a/b'])
-    const first = releaseStub(releasePayload())
-    await runDiscoveryCrawl()
-    expect(first.reads()).toBe(1)
-
-    const second = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000, digest: `sha256:${HEX_A}` }] }))
-    await runDiscoveryCrawl()
-    expect(second.reads()).toBe(0)
-
-    const changed = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_500, digest: `sha256:${HEX_B}` }] }))
-    await runDiscoveryCrawl()
-    expect(changed.reads()).toBe(1)
-  })
-
-  it('GitHub 没给 digest 时不能拿"两边都是空串"当内容没变 —— 那会把更新固化掉', async () => {
-    await enable(['a/b'])
-    const noDigest = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000 }] }))
-    await runDiscoveryCrawl()
-    expect(noDigest.reads()).toBe(1)
-
-    const again = releaseStub(releasePayload({ assets: [{ name: 'HYWmusic_v1.0.3.js', size: 11_000 }] }))
-    await runDiscoveryCrawl()
-    expect(again.reads()).toBe(1)
-  })
-
-  it('关掉开关就回到"只扫 tree"：一次 release 接口都不打', async () => {
-    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], preferLatestRelease: false })
-    const { urls } = releaseStub(releasePayload())
-    const summary = await runDiscoveryCrawl()
-
-    expect(urls.some(u => u.includes('/releases/latest'))).toBe(false)
-    expect(urls.some(u => u.includes('/git/trees/'))).toBe(true)
-    expect(summary.releaseRepos).toEqual([])
-  })
-})
-
-// ————— 完整性锚点 —————
 describe('完整性锚点', () => {
   it('assetDigestHex 只认 64 位 hex：取不出就当没有锚点，不能拿解析错的串拒掉好源', () => {
     expect(assetDigestHex(`sha256:${'a'.repeat(64)}`)).toBe('a'.repeat(64))
@@ -1489,5 +1356,458 @@ describe('完整性锚点', () => {
 
     await importCandidate(id)
     expect(importSubscriptionMock).toHaveBeenCalledWith(downloadUrl, { expectedSha256: hex })
+  })
+})
+
+describe('最新 release 采集（散 js ＋ 最近的一个 zip）', () => {
+  const HEX_A = 'a'.repeat(64)
+  const HEX_B = 'b'.repeat(64)
+  const rate = () => jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+
+  const jsAsset = (name: string, over: Record<string, unknown> = {}) => ({ name, size: 11_000, digest: `sha256:${HEX_A}`, ...over })
+  const zipAsset = (name: string, digest: string) => ({ name, size: 282_000, digest: `sha256:${digest}` })
+  const release = (tag: string, publishedAt: string, assets: Array<Record<string, unknown>>) => ({
+    tag_name: tag, published_at: publishedAt, prerelease: false, assets,
+  })
+
+  /** 自造的 zip 夹具：形状照真包（deflate + 中央目录存大小） */
+  function makeZip(files: Array<{ name: string; body: string }>): Buffer {
+    const parts: Buffer[] = []
+    const central: Buffer[] = []
+    let offset = 0
+    for (const file of files) {
+      const nameBuf = Buffer.from(file.name, 'utf8')
+      const body = Buffer.from(file.body, 'utf8')
+      const data = zlib.deflateRawSync(body)
+      const local = Buffer.alloc(30)
+      local.writeUInt32LE(0x04034b50, 0)
+      local.writeUInt16LE(20, 4)
+      local.writeUInt16LE(0x808, 6)
+      local.writeUInt16LE(8, 8)
+      local.writeUInt32LE(data.length, 18)
+      local.writeUInt32LE(body.length, 22)
+      local.writeUInt16LE(nameBuf.length, 26)
+      parts.push(local, nameBuf, data)
+      const record = Buffer.alloc(46)
+      record.writeUInt32LE(0x02014b50, 0)
+      record.writeUInt16LE(20, 4)
+      record.writeUInt16LE(20, 6)
+      record.writeUInt16LE(0x808, 8)
+      record.writeUInt16LE(8, 10)
+      record.writeUInt32LE(data.length, 20)
+      record.writeUInt32LE(body.length, 24)
+      record.writeUInt16LE(nameBuf.length, 28)
+      record.writeUInt32LE(offset, 42)
+      central.push(record, nameBuf)
+      offset += local.length + nameBuf.length + data.length
+    }
+    const cd = Buffer.concat(central)
+    const eocd = Buffer.alloc(22)
+    eocd.writeUInt32LE(0x06054b50, 0)
+    eocd.writeUInt16LE(files.length, 8)
+    eocd.writeUInt16LE(files.length, 10)
+    eocd.writeUInt32LE(cd.length, 12)
+    eocd.writeUInt32LE(offset, 16)
+    return Buffer.concat([...parts, cd, eocd])
+  }
+
+  const sha = (buffer: Buffer) => createHash('sha256').update(buffer).digest('hex')
+
+  interface StubOptions {
+    releases?: unknown
+    /** zip 资产的响应：Buffer 当包体、Response 当异常响应、null 表示"下载会失败" */
+    zipBody?: Buffer | Response | null
+    scriptText?: string
+  }
+
+  /**
+   * 一个仓的假通道：/releases?per_page=… 给发布列表，release 下载地址给 zip 包体或脚本文本。
+   * 返回 urls（都打过哪些地址）与各计数，断言"有没有打仓库树/重下包"靠它。
+   */
+  function releaseStub(list: unknown[], opts: StubOptions = {}) {
+    const urls: string[] = []
+    const counts = { zipFetches: 0, scriptFetches: 0 }
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      if (url.endsWith('/rate_limit')) return rate()
+      if (url.includes('/releases?per_page=')) {
+        return opts.releases !== undefined ? opts.releases as Response : jsonResponse(list)
+      }
+      if (url.includes('/git/trees/')) {
+        return jsonResponse({ tree: [{ path: 'lx-music-source.js', type: 'blob', sha: 'tree1', size: 500 }], truncated: false })
+      }
+      if (url.includes('/releases/download/')) {
+        // 同一个前缀下有两种东西：`.zip` 结尾给包体，其余是散 js 的正文 —— 不分开的话
+        // 散 js 会拿到一包字节，digest 必然对不上，测出来的就是假失败
+        if (/\.zip$/i.test(url)) {
+          if (opts.zipBody instanceof Response) return opts.zipBody
+          if (opts.zipBody) { counts.zipFetches++; return new Response(new Uint8Array(opts.zipBody)) }
+          if (opts.zipBody === null) throw new Error('socket hang up')
+        }
+        counts.scriptFetches++
+        return new Response(opts.scriptText ?? FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
+      }
+      counts.scriptFetches++
+      return new Response(opts.scriptText ?? FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain' } })
+    }))
+    return { urls, counts, treeCalls: () => urls.filter(u => u.includes('/git/trees/')).length }
+  }
+
+  it('最新一次的散 js ＋ 更早一次发布里的 zip，两种一起收，且不扫仓库树', async () => {
+    await enable(['a/b'])
+    const zip = makeZip([{ name: 'V260817/其他/念心音源 v1.0.2.js', body: FAKE_SOURCE_SCRIPT }])
+    const stub = releaseStub([
+      release('v260908', '2026-09-08T11:23:47Z', [jsAsset('HYWmusic_._v1.0.3.js')]),
+      release('2026.08.17', '2026-08-17T03:42:24Z', [zipAsset('V260817.zip', sha(zip))]),
+    ], { zipBody: zip })
+
+    const summary = await runDiscoveryCrawl()
+    expect(stub.treeCalls()).toBe(0)
+    expect(summary.seen).toBe(2)
+    expect(summary.releaseRepos.join(' ')).toContain('散 js 1 条')
+    expect(summary.releaseRepos.join(' ')).toContain('展开 1 条')
+    const paths = rows.map(r => r.path)
+    expect(paths).toContain('HYWmusic_._v1.0.3.js')
+    // 包内条目的唯一键是 `包名!条目名`，同名的两个包不会互相覆盖
+    expect(paths).toContain('V260817.zip!V260817/其他/念心音源 v1.0.2.js')
+    const member = rows.find(r => r.path.includes('!'))!
+    expect(member.zipMember).toBe('V260817/其他/念心音源 v1.0.2.js')
+    expect(member.assetDigest).toBe(`sha256:${sha(zip)}`)
+    expect(member.verdict).toBe('suspect')
+    expect(stub.counts.scriptFetches).toBe(1)
+    // 整包只下一次，两个条目不会各下一遍
+    expect(stub.counts.zipFetches).toBe(1)
+  })
+
+  it('只有 zip 没有散 js 的仓（guoyue 那个形状）也走 release，不再白扫一遍 tree', async () => {
+    await enable(['a/b'])
+    const zip = makeZip([
+      { name: 'V261003/gdstudio音乐源.js', body: FAKE_SOURCE_SCRIPT },
+      { name: 'V261003/HelloWorld音源.js', body: FAKE_SOURCE_SCRIPT },
+    ])
+    const stub = releaseStub([release('V261003', '2026-10-03T02:31:44Z', [zipAsset('V261003.zip', sha(zip))])], { zipBody: zip })
+
+    const summary = await runDiscoveryCrawl()
+    expect(stub.treeCalls()).toBe(0)
+    expect(summary.created).toBe(2)
+    expect(summary.releaseFallbacks).toEqual([])
+  })
+
+  it('从没发过 release（200 空数组，这个接口不回 404）就静默回落扫 tree', async () => {
+    await enable(['a/b'])
+    const stub = releaseStub([])
+    const summary = await runDiscoveryCrawl()
+    expect(stub.treeCalls()).toBe(1)
+    expect(summary.releaseFallbacks).toEqual([])
+    expect(rows[0].path).toBe('lx-music-source.js')
+  })
+
+  it('有发布但既没散 js 也没 zip ⇒ 回落扫 tree，并把原因说清', async () => {
+    await enable(['a/b'])
+    const stub = releaseStub([release('v1', '2026-01-01T00:00:00Z', [{ name: 'bundle.txt', size: 10 }])])
+    const summary = await runDiscoveryCrawl()
+    expect(stub.treeCalls()).toBe(1)
+    expect(summary.releaseFallbacks.join(' ')).toContain('没有 .js 资产')
+    expect(summary.releaseFallbacks.join(' ')).toContain('没找到 zip')
+  })
+
+  it('release 接口 502 只是"这次没查到"：回落扫 tree，不写成"这仓没发布"', async () => {
+    await enable(['a/b'])
+    const stub = releaseStub([], { releases: new Response('bad gateway', { status: 502 }) })
+    const summary = await runDiscoveryCrawl()
+    expect(stub.treeCalls()).toBe(1)
+    expect(summary.releaseFallbacks.join(' ')).toContain('HTTP 502')
+  })
+
+  it('散 js 收到了、包却下不动 ⇒ 不散 js 白丢，只记一句包的事', async () => {
+    await enable(['a/b'])
+    const stub = releaseStub([
+      release('v2', '2026-09-08T00:00:00Z', [jsAsset('a.js')]),
+      release('v1', '2026-08-08T00:00:00Z', [zipAsset('V1.zip', HEX_B)]),
+    ], { zipBody: null })
+
+    const summary = await runDiscoveryCrawl()
+    expect(stub.treeCalls()).toBe(0)
+    expect(summary.created).toBe(1)
+    expect(summary.zipNotes.join(' ')).toContain('下载失败')
+  })
+
+  it('整包的 sha256 与发布记录不一致 ⇒ 这个包不收货，本轮退回扫 tree（解出来的东西不配进沙箱）', async () => {
+    await enable(['a/b'])
+    const zip = makeZip([{ name: 'V1/x.js', body: FAKE_SOURCE_SCRIPT }])
+    const stub = releaseStub([release('v1', '2026-08-08T00:00:00Z', [zipAsset('V1.zip', HEX_B)])], { zipBody: zip })
+
+    const summary = await runDiscoveryCrawl()
+    expect(summary.zipNotes.join(' ')).toContain('sha256 与发布记录不一致')
+    // 没收这个包，但也没让这一轮空手：退回 tree，且没有一条 zip 条目混进来
+    expect(stub.treeCalls()).toBe(1)
+    expect(rows.filter(r => r.zipMember)).toHaveLength(0)
+    expect(rows[0].path).toBe('lx-music-source.js')
+  })
+
+  it('只有包、包又下不动 ⇒ 回落原因写"包没收进来"，不能张冠李戴成"这仓没有 .js 资产"', async () => {
+    await enable(['a/b'])
+    const stub = releaseStub(
+      [release('V261003', '2026-10-03T02:31:44Z', [zipAsset('V261003.zip', HEX_A)])],
+      { zipBody: null },
+    )
+
+    const summary = await runDiscoveryCrawl()
+    expect(stub.treeCalls()).toBe(1)
+    const note = summary.releaseFallbacks.join(' ')
+    expect(note).toContain('V261003.zip 没收进来')
+    expect(summary.zipNotes.join(' ')).toContain('下载失败')
+  })
+
+  it('一个包最多展开 50 条，剩下的写在结论里而不是静默丢', async () => {
+    await enable(['a/b'])
+    const many = Array.from({ length: 60 }, (_unused, index) => ({ name: `V1/f${index}.js`, body: 'x'.repeat(20) }))
+    const zip = makeZip(many)
+    releaseStub([release('v1', '2026-08-08T00:00:00Z', [zipAsset('V1.zip', sha(zip))])], { zipBody: zip })
+
+    const summary = await runDiscoveryCrawl()
+    expect(rows).toHaveLength(50)
+    expect(summary.zipNotes.join(' ')).toContain('还有 10 个 .js 没登记')
+    expect(summary.zipNotes.join(' ')).toContain('每包上限 50')
+  })
+
+  it('包没换（库里已记着同一个 sha256）就不再重下整包', async () => {
+    await enable(['a/b'])
+    const zip = makeZip([
+      { name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT },
+      // 两条正文必须不同：同内容会被去重合成一条，那就测不出"复用 2 条"了
+      { name: 'V1/二.js', body: FAKE_SOURCE_SCRIPT.replace('合成测试音源', '合成测试音源二号') },
+    ])
+    const list = [release('v1', '2026-08-08T00:00:00Z', [zipAsset('V1.zip', sha(zip))])]
+
+    const first = releaseStub(list, { zipBody: zip })
+    await runDiscoveryCrawl()
+    expect(first.counts.zipFetches).toBe(1)
+
+    const second = releaseStub(list, { zipBody: zip })
+    const summary = await runDiscoveryCrawl()
+    expect(second.counts.zipFetches).toBe(0)
+    expect(second.treeCalls()).toBe(0)
+    expect(summary.refreshed).toBe(2)
+    expect(summary.zipNotes.join(' ')).toContain('跳过下载，复用 2 条')
+  })
+
+  it('改走 release 之后，tree 里那些不再刷新的历史行标成"已被顶掉"，行留着', async () => {
+    await enable(['a/b'])
+    const old = seedSuspect({ repo: 'a/b', path: '历史版本/v1.0.0.js' })
+    const zip = makeZip([{ name: 'V1/新.js', body: FAKE_SOURCE_SCRIPT }])
+    releaseStub([release('v1', '2026-08-08T00:00:00Z', [zipAsset('V1.zip', sha(zip))])], { zipBody: zip })
+
+    const summary = await runDiscoveryCrawl()
+    expect(summary.releaseSuperseded).toBe(1)
+    expect(rows.find(r => r.id === old)?.state).toBe('stale')
+    expect(rows).toHaveLength(2)
+  })
+
+  it('同一个资产换了内容（digest 变了）要重下；没变就不重下', async () => {
+    await enable(['a/b'])
+    releaseStub([release('v1', '2026-09-08T00:00:00Z', [jsAsset('a.js', { digest: `sha256:${HEX_A}` })])])
+    await runDiscoveryCrawl()
+    expect(rows[0].verdict).toBe('suspect')
+
+    const unchanged = releaseStub([release('v1', '2026-09-08T00:00:00Z', [jsAsset('a.js', { digest: `sha256:${HEX_A}` })])])
+    await runDiscoveryCrawl()
+    expect(unchanged.counts.scriptFetches).toBe(0)
+
+    const changed = releaseStub([release('v1', '2026-09-08T00:00:00Z', [jsAsset('a.js', { digest: `sha256:${HEX_B}` })])])
+    await runDiscoveryCrawl()
+    expect(changed.counts.scriptFetches).toBe(1)
+  })
+
+  it('GitHub 没给 digest 时不能拿"两边都是空串"当内容没变 —— 那会把更新固化掉', async () => {
+    await enable(['a/b'])
+    const list = [release('v1', '2026-09-08T00:00:00Z', [{ name: 'a.js', size: 500 }])]
+    const first = releaseStub(list)
+    await runDiscoveryCrawl()
+    expect(first.counts.scriptFetches).toBe(1)
+
+    const again = releaseStub(list)
+    await runDiscoveryCrawl()
+    expect(again.counts.scriptFetches).toBe(1)
+  })
+
+  it('关掉开关就回到"只扫 tree"：release 接口一次都不打', async () => {
+    await saveDiscoverySettings({ enabled: true, repos: ['a/b'], preferLatestRelease: false })
+    const stub = releaseStub([release('v1', '2026-09-08T00:00:00Z', [jsAsset('a.js')])])
+    await runDiscoveryCrawl()
+    expect(stub.urls.some(u => u.includes('/releases?per_page='))).toBe(false)
+    expect(stub.treeCalls()).toBe(1)
+  })
+
+  it('pickReleaseAssets：按 published_at 排，不靠接口返回顺序；zip 是从新往旧数的第一个', () => {
+    const picked = pickReleaseAssets([
+      release('旧', '2026-01-01T00:00:00Z', [zipAsset('old.zip', HEX_A)]),
+      release('最新散js', '2026-09-08T00:00:00Z', [jsAsset('new.js'), { name: 'notes.md', size: 10 }]),
+      release('中间', '2026-05-05T00:00:00Z', [zipAsset('mid.zip', HEX_B)]),
+    ])
+    expect(picked.loose.map(item => item.asset.name)).toEqual(['new.js'])
+    // 最近的一个 zip 是 5-05 那次，不是 1-01 那次
+    expect(picked.zip?.asset.name).toBe('mid.zip')
+    expect(picked.zip?.tag).toBe('中间')
+  })
+
+  it('pre-release 也算（这类仓常把汇总包发成 pre-release）', () => {
+    const picked = pickReleaseAssets([
+      { tag_name: 'v2', published_at: '2026-09-08T00:00:00Z', prerelease: true, assets: [jsAsset('beta.js')] },
+    ])
+    expect(picked.loose.map(item => item.asset.name)).toEqual(['beta.js'])
+  })
+})
+
+describe('包内条目的复验与导入', () => {
+  const zipOf = (files: Array<{ name: string; body: string }>) => {
+    // 复用上一个套件里的构造思路（每个 describe 自己带一份，避免跨 describe 共享夹具带来的顺序依赖）
+    const parts: Buffer[] = []
+    const central: Buffer[] = []
+    let offset = 0
+    for (const file of files) {
+      const nameBuf = Buffer.from(file.name, 'utf8')
+      const body = Buffer.from(file.body, 'utf8')
+      const data = zlib.deflateRawSync(body)
+      const local = Buffer.alloc(30)
+      local.writeUInt32LE(0x04034b50, 0)
+      local.writeUInt16LE(20, 4)
+      local.writeUInt16LE(0x808, 6)
+      local.writeUInt16LE(8, 8)
+      local.writeUInt32LE(data.length, 18)
+      local.writeUInt32LE(body.length, 22)
+      local.writeUInt16LE(nameBuf.length, 26)
+      parts.push(local, nameBuf, data)
+      const record = Buffer.alloc(46)
+      record.writeUInt32LE(0x02014b50, 0)
+      record.writeUInt16LE(20, 4)
+      record.writeUInt16LE(20, 6)
+      record.writeUInt16LE(0x808, 8)
+      record.writeUInt16LE(8, 10)
+      record.writeUInt32LE(data.length, 20)
+      record.writeUInt32LE(body.length, 24)
+      record.writeUInt16LE(nameBuf.length, 28)
+      record.writeUInt32LE(offset, 42)
+      central.push(record, nameBuf)
+      offset += local.length + nameBuf.length + data.length
+    }
+    const cd = Buffer.concat(central)
+    const eocd = Buffer.alloc(22)
+    eocd.writeUInt32LE(0x06054b50, 0)
+    eocd.writeUInt16LE(files.length, 8)
+    eocd.writeUInt16LE(files.length, 10)
+    eocd.writeUInt32LE(cd.length, 12)
+    eocd.writeUInt32LE(offset, 16)
+    return Buffer.concat([...parts, cd, eocd])
+  }
+  const ZIP_URL = 'https://github.com/a/b/releases/download/v1/V1.zip'
+  const locator = (digest: string, member = 'V1/一.js') => ({ rawUrl: ZIP_URL, blobSha: '', assetDigest: `sha256:${digest}`, zipMember: member })
+
+  it('取包内条目：先复验整包 sha256，对上了才解，anchor=true', async () => {
+    const zip = zipOf([{ name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT }])
+    const digest = createHash('sha256').update(zip).digest('hex')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(zip))))
+
+    const fetched = await fetchCandidateContent(locator(digest), 'tok')
+    expect(fetched.anchor).toBe(true)
+    expect(fetched.content).toBe(FAKE_SOURCE_SCRIPT)
+  })
+
+  it('整包 sha256 对不上 ⇒ anchor=false，一个字节都不给下游', async () => {
+    const zip = zipOf([{ name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT }])
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(zip))))
+
+    const fetched = await fetchCandidateContent(locator('f'.repeat(64)), 'tok')
+    expect(fetched.anchor).toBe(false)
+    expect(fetched.content).toBe('')
+    expect(fetched.reason).toContain('sha256 与发布记录不一致')
+  })
+
+  it('包里找不到记录的那个条目（上游重发过包）也判 false，不拿别的条目顶上去', async () => {
+    const zip = zipOf([{ name: 'V1/别的.js', body: FAKE_SOURCE_SCRIPT }])
+    const digest = createHash('sha256').update(zip).digest('hex')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(zip))))
+
+    const fetched = await fetchCandidateContent(locator(digest), 'tok')
+    expect(fetched.anchor).toBe(false)
+    expect(fetched.reason).toContain('没有记录的那个条目')
+  })
+
+  it('GitHub 没给 digest 的包：照取，但 anchor=null（无从校验，不等于通过）', async () => {
+    const zip = zipOf([{ name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT }])
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(zip))))
+    const fetched = await fetchCandidateContent({ rawUrl: ZIP_URL, blobSha: '', assetDigest: '', zipMember: 'V1/一.js' }, 'tok')
+    expect(fetched.anchor).toBeNull()
+    expect(fetched.content).toBe(FAKE_SOURCE_SCRIPT)
+  })
+
+  it('判级一条包内候选：复验整包通过后解出条目再进一次性进程', async () => {
+    await enable(['a/b'])
+    const zip = zipOf([{ name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT }])
+    const digest = createHash('sha256').update(zip).digest('hex')
+    const id = seedSuspect({
+      path: 'V1.zip!V1/一.js', rawUrl: ZIP_URL, blobSha: '', assetDigest: `sha256:${digest}`,
+      releaseTag: 'v1', zipMember: 'V1/一.js',
+    })
+    const runner = fakeRunner()
+    _setRunnerForTest(runner)
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+      return new Response(new Uint8Array(zip))
+    }))
+
+    const report = await probeCandidate(id)
+    expect(report.shaVerified).toBe(true)
+    expect(runner.validateScript.mock.calls[0][0]).toBe(FAKE_SOURCE_SCRIPT)
+  })
+
+  it('判级时整包对不上 ⇒ 拒绝执行，一次性进程一次都不起', async () => {
+    await enable(['a/b'])
+    const zip = zipOf([{ name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT }])
+    const id = seedSuspect({
+      path: 'V1.zip!V1/一.js', rawUrl: ZIP_URL, assetDigest: `sha256:${'f'.repeat(64)}`,
+      releaseTag: 'v1', zipMember: 'V1/一.js',
+    })
+    const runner = fakeRunner()
+    _setRunnerForTest(runner)
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 100, limit: 100, reset: 0 } } })
+      return new Response(new Uint8Array(zip))
+    }))
+
+    const report = await probeCandidate(id)
+    expect(report.shaVerified).toBe(false)
+    expect(report.note).toContain('拒绝执行')
+    expect(runner.validateScript).not.toHaveBeenCalled()
+  })
+
+  it('导入一条包内候选：正文是解出来的条目，且**不登记订阅**（订阅更新对包内条目没意义）', async () => {
+    await enable(['a/b'])
+    const zip = zipOf([{ name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT }])
+    const digest = createHash('sha256').update(zip).digest('hex')
+    const id = seedSuspect({
+      path: 'V1.zip!V1/一.js', rawUrl: ZIP_URL, assetDigest: `sha256:${digest}`,
+      releaseTag: 'v1', zipMember: 'V1/一.js', probeJson: probeReportOf({ tx: 'ok' }),
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(zip))))
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/一.js', name: '一' })
+
+    await importCandidate(id)
+    expect(importSubscriptionMock).toHaveBeenCalledWith(ZIP_URL, {
+      content: FAKE_SOURCE_SCRIPT, filename: '一.js', subscribe: false,
+    })
+  })
+
+  it('导入时整包对不上就拒，导入通道一次都不碰', async () => {
+    await enable(['a/b'])
+    const zip = zipOf([{ name: 'V1/一.js', body: FAKE_SOURCE_SCRIPT }])
+    const id = seedSuspect({
+      path: 'V1.zip!V1/一.js', rawUrl: ZIP_URL, assetDigest: `sha256:${'e'.repeat(64)}`,
+      releaseTag: 'v1', zipMember: 'V1/一.js', probeJson: probeReportOf({ tx: 'ok' }),
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(zip))))
+
+    await expect(importCandidate(id)).rejects.toThrow(/sha256 与发布记录不一致/)
+    expect(importSubscriptionMock).not.toHaveBeenCalled()
   })
 })
