@@ -62,6 +62,7 @@ const {
   pickReleaseAssets, fetchCandidateContent,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
+  shipmentOf,
   looksLikeObfuscatedSource,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
   startCandidateProbe, startCandidateProbeBatch, pruneOrphanCandidates, _setProbeGapForTest, _setRunnerForTest,
@@ -899,6 +900,34 @@ describe('导入前先跟已经装着的源比一次', () => {
     seedSuspect({ contentHash: SAME_HASH, nameKey: '', scriptName: '合成测试音源 v1.2.0' })
     const [view] = await listCandidates()
     expect(view.duplicateOf).toEqual({ kind: 'content', path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' })
+  })
+})
+
+// ————— 候选列表排序 —————
+
+describe('候选列表排序（判级真出货优先，静态分只给没判过的排队）', () => {
+  it('判过但零出货的，仍排在没判过的高分前面；没判过的之间按分高在前', async () => {
+    seedSuspect({ scriptName: '甲 v1', score: 11, probeJson: probeReportOf({ tx: 'error', wy: 'no-address' }) })
+    seedSuspect({ scriptName: '乙 v1', score: 4, probeJson: probeReportOf({ tx: 'ok', wy: 'ok', kw: 'ok', kg: 'timeout' }) })
+    seedSuspect({ scriptName: '丙 v1', score: 20 })
+    seedSuspect({ scriptName: '丁 v1', score: 6 })
+    const views = await listCandidates()
+    expect(views.map(v => v.scriptName)).toEqual(['乙 v1', '甲 v1', '丙 v1', '丁 v1'])
+  })
+
+  it('出货数相同按判级时间新的在前；take 是排完才切（切的是最该看的，不是插入序）', async () => {
+    const at = (dayOfMonth: number) => new Date(Date.UTC(2026, 9, dayOfMonth))
+    seedSuspect({ scriptName: '旧 v1', score: 9, probedAt: at(1), probeJson: probeReportOf({ tx: 'ok' }) })
+    seedSuspect({ scriptName: '新 v1', score: 3, probedAt: at(5), probeJson: probeReportOf({ tx: 'ok' }) })
+    seedSuspect({ scriptName: '没判 v1', score: 30 })
+    expect((await listCandidates()).map(v => v.scriptName)).toEqual(['新 v1', '旧 v1', '没判 v1'])
+    expect((await listCandidates({ take: 1 })).map(v => v.scriptName)).toEqual(['新 v1'])
+  })
+
+  it('shipmentOf：从没判过与"判过但零出货"是两回事（排序分档与面板都靠这个）', () => {
+    expect(shipmentOf('')).toEqual({ judged: false, ok: 0 })
+    expect(shipmentOf('不是 JSON')).toEqual({ judged: true, ok: 0 })
+    expect(shipmentOf(probeReportOf({ tx: 'ok', kg: 'harness' }))).toEqual({ judged: true, ok: 1 })
   })
 })
 

@@ -622,7 +622,7 @@ export function SourceDiscoveryPanel() {
           </h2>
           <p className="text-sm text-muted-foreground">
             从 GitHub 仓库树里挑出疑似洛雪音源脚本，静态打分去重后进候选表；「判级」在一次性沙箱里真取一次址，
-            点过「导入」才会把它装进音源列表。
+            点过「导入」才会把它装进音源列表。列表按**判级真出货的格数**从多到少排，没判过的按静态分排在后面等判。
           </p>
         </div>
         <div className="flex shrink-0 gap-2">

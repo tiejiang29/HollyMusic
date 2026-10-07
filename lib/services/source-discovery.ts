@@ -1606,18 +1606,65 @@ export interface CandidateView {
   upstreamAt: string
 }
 
+/** 判级里真出货的格数；`judged=false` = 从没判过（`probeJson` 空） */
+export function shipmentOf(probeJson: string): { judged: boolean; ok: number } {
+  if (!probeJson) return { judged: false, ok: 0 }
+  const report = parseProbeReport(probeJson)
+  return { judged: true, ok: report ? Object.values(report.cells).filter(cell => cell.outcome === 'ok').length : 0 }
+}
+
+/** 列表排序用到的那几个键 */
+interface CandidateListRank {
+  judged: boolean
+  ok: number
+  score: number
+  probedAtMs: number
+  updatedAtMs: number
+}
+
+/**
+ * 排序口径：**判过级的整体排在前面，按真出货格数从多到少**（同数按判级时间新）；
+ * 从没判过的排在后面，按静态分排队等判。
+ *
+ * 为什么静态分不能再当第一键（本机 33 条已判级在册候选实测，2026-10-07）：`score≤5` 那十条
+ * 平均出货 **1.00** 格，`score≥10` 那十五条平均 **0.67** 格 —— 过了阈值之后静态分基本没有
+ * 信息量，混淆载荷那一批还是反的（4 分却 5/5 出货）。它的本职是"执行之前把噪音压下去"，
+ * 拿它排第一就成了"能出货的排在后面"。
+ */
+function compareCandidatesForList(a: CandidateListRank, b: CandidateListRank): number {
+  if (a.judged !== b.judged) return a.judged ? -1 : 1
+  if (a.ok !== b.ok) return b.ok - a.ok
+  if (a.probedAtMs !== b.probedAtMs) return b.probedAtMs - a.probedAtMs
+  if (a.score !== b.score) return b.score - a.score
+  return b.updatedAtMs - a.updatedAtMs
+}
+
+/** 假库里这些时间列可能是 undefined（真 Prisma 不会），按 0 算就好，别让排序把测试炸掉 */
+const epochOf = (value: Date | null | undefined): number => (value instanceof Date ? value.getTime() : 0)
+
 export async function listCandidates(filter: { verdict?: string; state?: string; take?: number } = {}): Promise<CandidateView[]> {
   const rows = await prisma.sourceCandidate.findMany({
     where: {
       ...(filter.verdict ? { verdict: filter.verdict } : {}),
       ...(filter.state ? { state: filter.state } : {}),
     },
-    orderBy: [{ score: 'desc' }, { updatedAt: 'desc' }],
-    take: filter.take ?? 200,
   })
+  // 排序要看判级结果，而判级结果是一段 JSON ⇒ 先每行解析一次算出排序键，排完切页，
+  // **只给这一页**建视图（含与已装源的撞车检查）。反过来先建全表视图等于白算一千多行。
+  const ranked = rows.map(row => ({
+    row,
+    rank: {
+      ...shipmentOf(row.probeJson),
+      score: row.score,
+      probedAtMs: epochOf(row.probedAt),
+      updatedAtMs: epochOf(row.updatedAt),
+    } satisfies CandidateListRank,
+  }))
+  ranked.sort((a, b) => compareCandidatesForList(a.rank, b.rank))
+  const page = ranked.slice(0, filter.take ?? 200)
   // 空列表时不去读盘上那十几份脚本
-  const index = rows.length ? await installedTwinIndex() : { byHash: new Map<string, InstalledTwin>(), byName: new Map<string, InstalledTwin>() }
-  return rows.map(row => {
+  const index = page.length ? await installedTwinIndex() : { byHash: new Map<string, InstalledTwin>(), byName: new Map<string, InstalledTwin>() }
+  return page.map(({ row }) => {
     const twin = findInstalledTwin(index, row)
     return {
       id: row.id,
