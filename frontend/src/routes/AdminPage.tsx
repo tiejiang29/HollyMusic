@@ -9,7 +9,8 @@ import { RecommendPanel } from '@/components/admin/RecommendPanel'
 import { RecommendTaskPanel } from '@/components/admin/RecommendTaskPanel'
 import { LoginLocksPanel } from '@/components/admin/LoginLocksPanel'
 import { SourceDiscoveryPanel } from '@/components/admin/SourceDiscoveryPanel'
-import { Users, Music, Database, Sparkles, ListTodo, ShieldOff, Radar } from 'lucide-react'
+import { SpeakerPanel } from '@/components/admin/SpeakerPanel'
+import { Users, Music, Database, Sparkles, ListTodo, ShieldOff, Radar, Speaker } from 'lucide-react'
 
 const TABS = [
   { key: 'users', label: '用户管理', icon: Users },
@@ -19,6 +20,7 @@ const TABS = [
   { key: 'recommend', label: '推荐管理', icon: Sparkles },
   { key: 'recommend-tasks', label: '推荐任务', icon: ListTodo },
   { key: 'cache', label: '缓存管理', icon: Database },
+  { key: 'speaker', label: '小爱音箱', icon: Speaker },
 ] as const
 
 type TabKey = (typeof TABS)[number]['key']
@@ -91,6 +93,7 @@ export function AdminPage() {
         {tab === 'recommend' && <RecommendPanel />}
         {tab === 'recommend-tasks' && <RecommendTaskPanel />}
         {tab === 'cache' && <CachePanel />}
+        {tab === 'speaker' && <SpeakerPanel />}
       </div>
     </div>
   )

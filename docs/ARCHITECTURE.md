@@ -259,6 +259,19 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 - **封面回填**（cover-backfill）：进程内定时器（启动 15s 后首跑，之后每 6h），补齐历史歌曲的封面，幂等。
 - **推荐任务**（RecommendTask）：管理端创建 AI 推荐任务（建歌单/筛歌），进程内 worker 串行消费，进度写 `progressJson`，前端 2.5s 轮询；服务重启时把僵尸态任务标记 `interrupted`。API Key 只在创建请求里透传，不落库。
 
+### 4.7 小爱音箱网关（`lib/services/xiaomi/*`，分期推进中）
+
+服务端自建的小米网关，不挂任何旁路容器。**G0 只到"扫码登录 + 设备列表"**，推歌（G1）、转码（G1.5）、语音接管（G2）尚未落地。
+
+- **登录是两步，少第二步什么也干不了**：二维码的 `sid` 是 `mijia`（米家），它只发 `passToken`；小爱音箱走的 MiNA 要的是 `sid=micoapi` 的 serviceToken，必须再换一次票。换票要**跟完重定向并收集每一跳的 Set-Cookie**（票就在其中一跳的头里），所以这一段用不了 `safePublicFetch`（它跟跳时会 cancel 中间响应体、也不回传中间跳的头），改成每跳先过 `assertPublicHttpUrl` 再手动 `redirect:'manual'`。
+- **两个必须照抄的取数细节**：响应体带 `&&&START&&&` 前缀；`nonce` 是 18~19 位大整数，**只能从原始字符串里抠**（`JSON.parse` 会把尾数改掉，签名于是算错，表现是"换票莫名失败"）。
+- **二维码要用平台渲染的那张**（返回体里的 `qr` 字段是图片地址）；自己拿 `loginUrl` 编一张 App 认不出来，只回"二维码已过期"。
+- **凭据与设备表落 `AppSetting` 单键 `speaker`（JSON）**，与 `sourceDiscovery` 同构：管理员要调的都在面板上，不写配置文件也不走环境变量。`serviceToken` 约 12h 有效，剩 3h 主动用 `passToken` 静默续（不需要重扫）；设备侧回 401 时当场续一次再试一遍。续期失败**不清凭据** —— passToken 大概率还在，清了就等于把人逼去重扫。
+- **脱敏是硬线**：`GET /api/admin/speaker` 只回 `accountTail` / `tokenTail`（尾四位），凭据原值没有任何一条路径从服务端走到浏览器；日志同样只打尾巴（`0b33df9` 那次 wire 日志泄露会话 cookie 的同类教训）。
+- **小米侧的 401 不许发成本站的 401**：`lib/api/client` 一见到 401 就作废管理员在本站的会话（`hooks/useAuth` 注册的处置），否则"小爱的票过期"会把人从后台踢下线。路由统一降级成 502，靠 `error.code` 区分 `XIAOMI_UNAUTHORIZED`（要重扫）与 `XIAOMI_UPSTREAM_ERROR`（上游抽了）。
+- **扫码的长轮询不在路由里等满 30 秒**：单次 lp 只等 8 秒就返回 `waiting`（把 Next 的请求槽挂住会拖垮同时进行的音频请求），前端隔 3 秒再来一次；过期由服务端会话时间戳判（5 分钟），不靠前端计数。轮询要同时带 `sessionId` 与一次性 `loginToken`（后者只在出二维码那一次响应里出现过），对不上就一律回同一句话，不给可用来试探哪些 id 有效的差异。
+- **设备表必须存 `hardware`**：G1 判"这台走 `player_play_music` 还是 `player_play_url`"只看它，G0 不存 G1 就得改结构。刷新列表时按 `deviceID` 保住管理员手工标的 `managed`。
+
 ---
 
 ## 5. API 路由参考
@@ -358,6 +371,7 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 | GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
 | GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`（撞同名时 `mode`：`replace` 换掉库里那条 / `parallel` 并排装）、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
+| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`logout`） |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |
 | POST | `/api/admin/sources/subscriptions` | 在线音源订阅 |
 | POST | `/api/admin/sources/upload` | 上传音源脚本（预校验 + 自动注册） |
@@ -421,7 +435,7 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 ### 6.4 组件地图
 
 - `components/player/`（19 个文件）：PlayerBar 全局底栏（唯一 Audio 元素）、QueuePanel、LyricsPanel、音质/模式弹层、频谱可视化。
-- `components/admin/`：6 个 Panel 对应管理端 6 个 Tab（Users/LoginLocks/Sources/Recommend/RecommendTask/Cache）。
+- `components/admin/`：8 个 Panel 对应管理端 8 个 Tab（Users/LoginLocks/Sources/SourceDiscovery/Recommend/RecommendTask/Cache/Speaker），Tab 清单集中在 `frontend/src/routes/AdminPage.tsx` 的 `TABS` 数组里，有效 tab 值由它派生（加页签只改一处）。
 - `frontend/src/components/`：AI 建歌单向导（双壳自适应）、歌单弹窗组、听音识曲。
 - `components/shared/`：SongList/SongRow、SongContextMenu（全局右键/长按）、封面组件（两级降级）、Toast。
 - `lib/api/`（23 个模块）：统一走 `client.ts` 的 `apiGet/apiPost/...`，统一解析 `{success, data}` 信封。
