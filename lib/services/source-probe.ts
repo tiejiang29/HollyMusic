@@ -61,7 +61,10 @@ export interface ProbeCellResult {
 export interface ProbeSummary {
   runId: number
   total: number
+  /** 真打了上游的格数。`unsupported`（脚本没这平台 / 被 pt 摘掉）不计入：它 0ms、没出网 */
   probed: number
+  /** 不适用（压根没测的格）：与 probed 一起凑成 total */
+  skipped: number
   okCount: number
   badCount: number
   startedAt: Date
@@ -244,15 +247,47 @@ export async function verifyHead(url: string): Promise<{ outcome: ProbeCellOutco
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
-/** 一批要探的格子：pt 白名单外的平台压根不列进来，与瀑布口径一致 */
+/**
+ * 一档源实际要探哪些平台 —— **以脚本自报的范围为准**。
+ *
+ * 原来这里读的是 `pt`（面板「编辑源」里勾的支持平台），没勾就铺满全平台。两个毛病：
+ * 勾少了 → 脚本其实有的平台每周都不测，管理员永远看不到"它后来修好了"；勾着但脚本压根
+ * 没这个平台 → 那格测出来的 `error` 说的不是"这源不行"，只是"我们测了一件不存在的事"。
+ *
+ * 所以口径改成：脚本声明了哪些平台（且有 `musicUrl` 操作）就测哪些 —— 这才是"这源现在
+ * 到底能不能用"的事实。`pt` 不裁这一刀：它是**取址瀑布**的开关（把已知失效的平台手动
+ * 摘掉），拿它当测量范围等于用结论去定义题目，那个平台一旦被勾掉就再没有翻身的数据。
+ * 只有脚本没加载起来、声明拿不到时，才退回 `pt`，两者都空再退回全平台 —— 宁可测出 error，
+ * 也不能让一档源从矩阵里静默消失。
+ */
+export function scopePlatformsForSource(s: {
+  pt?: string[]
+  supportedSources?: string[]
+  supportedActions?: Record<string, string[]>
+}): string[] {
+  const declared = s.supportedSources ?? []
+  if (declared.length) {
+    const usable = PLATFORMS.filter(p => declared.includes(p) && (s.supportedActions?.[p] ?? []).includes('musicUrl'))
+    // 声明了却一个都取不了址：按声明测（那本身就是"这源不行"的数据，不该静默）
+    return usable.length ? usable : [...PLATFORMS.filter(p => declared.includes(p))]
+  }
+  const whitelist = s.pt?.length ? PLATFORMS.filter(p => s.pt!.includes(p)) : []
+  return whitelist.length ? [...whitelist] : [...PLATFORMS]
+}
+
+/** 一批要探的格子：每档源的范围按 `scopePlatformsForSource` 定，每平台 × 每首基准曲各一格 */
 export function planCells(
-  sources: { name: string; pt?: string[] }[],
+  sources: {
+    name: string
+    pt?: string[]
+    supportedSources?: string[]
+    supportedActions?: Record<string, string[]>
+  }[],
   samples: Record<string, MusicInfo[]>
 ): { source: string; platform: string; musicInfo: MusicInfo }[] {
   const cells: { source: string; platform: string; musicInfo: MusicInfo }[] = []
   for (const s of sources) {
-    const scoped = s.pt && s.pt.length ? PLATFORMS.filter(p => s.pt!.includes(p)) : [...PLATFORMS]
-    for (const platform of scoped) {
+    for (const platform of scopePlatformsForSource(s)) {
       for (const musicInfo of samples[platform] || []) {
         cells.push({ source: s.name, platform, musicInfo })
       }
@@ -290,11 +325,21 @@ export function isProbeRunning(): boolean {
 async function doRun(trigger: 'manual' | 'schedule'): Promise<ProbeSummary> {
   const startedAt = new Date()
   const run = await prisma.sourceProbeRun.create({ data: { startedAt, trigger, samples: '{}' } })
-  const summary: ProbeSummary = { runId: run.id, total: 0, probed: 0, okCount: 0, badCount: 0, startedAt }
+  const summary: ProbeSummary = { runId: run.id, total: 0, probed: 0, skipped: 0, okCount: 0, badCount: 0, startedAt }
   try {
     await musicSourceManager.ensureFresh()
     const [sources, samples] = await Promise.all([listSourcesWithStatus(), pickProbeSamples()])
-    const enabled = sources.filter(s => s.enabled).map(s => ({ ...s, name: s.name || s.path }))
+    // 脚本自报的平台与每平台的操作来自已加载的实例（键 = config.name || path，与 probeSourceUrl 同一个）
+    const statuses = new Map(musicSourceManager.getHealthStatus().map(s => [s.name, s]))
+    const enabled = sources.filter(s => s.enabled).map(s => {
+      const name = s.name || s.path
+      const status = statuses.get(name)
+      return {
+        ...s, name,
+        supportedSources: status?.supportedSources ?? [],
+        supportedActions: status?.supportedActions ?? {},
+      }
+    })
     const cells = planCells(enabled, samples)
     summary.total = cells.length
 
@@ -310,7 +355,10 @@ async function doRun(trigger: 'manual' | 'schedule'): Promise<ProbeSummary> {
     const perSourceBudget = readUrlBudgets().perSourceMs
     for (const cell of cells) {
       const result = await probeOne(cell, perSourceBudget)
-      summary.probed++
+      // 「不适用」那一格不进口径：它没出网、也没花时间。算进分母会让"出货 x/y"
+      // 因为管理员摘了某平台而看着变差 —— 那是决定，不是坏消息
+      if (result.outcome === 'unsupported') summary.skipped++
+      else summary.probed++
       if (result.outcome === 'ok') summary.okCount++
       if (BAD_OUTCOMES.has(result.outcome)) summary.badCount++
       await prisma.sourceProbeResult.create({
@@ -330,7 +378,7 @@ async function doRun(trigger: 'manual' | 'schedule'): Promise<ProbeSummary> {
       where: { id: run.id },
       data: { finishedAt: new Date(), status: 'done', probed: summary.probed, okCount: summary.okCount, badCount: summary.badCount },
     })
-    logger.info(`[source-probe] 周测完成（${trigger}）：出货 ${summary.okCount}/${summary.probed}，坏 ${summary.badCount}，计划 ${summary.total} 格`)
+    logger.info(`[source-probe] 周测完成（${trigger}）：出货 ${summary.okCount}/${summary.probed}，坏 ${summary.badCount}，不适用 ${summary.skipped}，计划 ${summary.total} 格`)
     return summary
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)

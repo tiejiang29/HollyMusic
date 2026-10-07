@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   probeSourceUrl: vi.fn(),
+  getHealthStatus: vi.fn(() => []),
   safePublicFetch: vi.fn(),
   prisma: {
     $queryRaw: vi.fn(),
@@ -26,7 +27,12 @@ vi.mock('@/lib/db', () => ({ prisma: mocks.prisma }))
 vi.mock('@/lib/services/source-manager-service', () => ({ listSourcesWithStatus: vi.fn() }))
 vi.mock('@/lib/server/url-guard', () => ({ safePublicFetch: mocks.safePublicFetch }))
 vi.mock('@/lib/music-source-manager', () => ({
-  musicSourceManager: { ensureFresh: vi.fn(async () => {}), probeSourceUrl: mocks.probeSourceUrl },
+  musicSourceManager: {
+    ensureFresh: vi.fn(async () => {}),
+    probeSourceUrl: mocks.probeSourceUrl,
+    // 周测的范围要按脚本自报的平台定，这份声明就从这里来
+    getHealthStatus: vi.fn(() => mocks.getHealthStatus()),
+  },
   readUrlBudgets: () => ({ urlMs: 15_000, perSourceMs: 8_000, totalMs: 18_000 }),
 }))
 
@@ -90,11 +96,39 @@ afterEach(() => {
 })
 
 describe('planCells', () => {
-  it('pt 白名单外的平台不列进批次（与瀑布同口径：不该测的格不测）', () => {
-    const samples = { kw: [{ songmid: 'k1' }], tx: [{ songmid: 't1' }], wy: [{ songmid: 'w1' }] } as never
-    const cells = planCells([{ name: '只支持酷我的源', pt: ['kw'] }, { name: '未声明 pt 的源' }], samples)
-    expect(cells.filter(c => c.source === '只支持酷我的源').map(c => c.platform)).toEqual(['kw'])
-    expect(cells.filter(c => c.source === '未声明 pt 的源').length).toBe(3)
+  const samples = { kw: [{ songmid: 'k1' }], tx: [{ songmid: 't1' }], wy: [{ songmid: 'w1' }] } as never
+  const acts = (...platforms: string[]) => Object.fromEntries(platforms.map(x => [x, ['musicUrl']]))
+
+  it('范围按脚本自报：pt 只勾了酷我，但脚本声明了两个，就测两个（pt 是瀑布的开关，不是题目的范围）', () => {
+    const cells = planCells([{ name: '勾得比声明窄的源', pt: ['kw'], supportedSources: ['kw', 'tx'], supportedActions: acts('kw', 'tx') }], samples)
+    expect(cells.map(c => c.platform).sort()).toEqual(['kw', 'tx'])
+  })
+
+  it('声明里没有的平台不测：勾了脚本压根没有的网易，那格不再每周被测成 error', () => {
+    const cells = planCells([{ name: '多勾了一格的源', pt: ['kw', 'wy'], supportedSources: ['kw', 'tx'], supportedActions: acts('kw', 'tx') }], samples)
+    expect(cells.map(c => c.platform).sort()).toEqual(['kw', 'tx'])
+  })
+
+  it('声明里夹着平台清单之外的键（脚本乱声明）时按平台白名单滤掉，不凭空多测一格', () => {
+    const cells = planCells([{ name: '乱声明的源', pt: [], supportedSources: ['kw', 'ximalaya'], supportedActions: acts('kw') }], samples)
+    expect(cells.map(c => c.platform)).toEqual(['kw'])
+  })
+
+  it('声明了但没有 musicUrl 操作的平台不测（瀑布也绝不会派给它活）', () => {
+    const cells = planCells([{ name: '腾讯声明了却取不了址', pt: [], supportedSources: ['kw', 'tx'], supportedActions: { kw: ['musicUrl'], tx: ['search'] } }], samples)
+    expect(cells.map(c => c.platform)).toEqual(['kw'])
+  })
+
+  it('声明了一个都取不了址 ⇒ 仍按声明测：这源"不行"要有数据，不能从矩阵里静默消失', () => {
+    const cells = planCells([{ name: '只会搜索的源', pt: ['kw'], supportedSources: ['kw', 'tx'], supportedActions: { kw: ['search'], tx: ['search'] } }], samples)
+    expect(cells.map(c => c.platform).sort()).toEqual(['kw', 'tx'])
+  })
+
+  it('脚本没加载起来（声明为空）时退回 pt，pt 也没有才铺满全平台', () => {
+    const byPt = planCells([{ name: '没加载但勾了 pt', pt: ['kw'], supportedSources: [], supportedActions: {} }], samples)
+    expect(byPt.map(c => c.platform)).toEqual(['kw'])
+    const all = planCells([{ name: '啥都不知道', pt: [], supportedSources: [] }], samples)
+    expect(all.map(c => c.platform).sort()).toEqual(['kw', 'tx', 'wy'])
   })
 })
 
@@ -103,7 +137,15 @@ describe('runSourceProbe', () => {
     vi.mocked(listSourcesWithStatus).mockResolvedValue([
       { name: '好源', path: 'a.js', enabled: true, pt: ['kw', 'tx'] },
       { name: '假地址源', path: 'b.js', enabled: true, pt: ['kw'] },
+      { name: '只自报酷我的源', path: 'd.js', enabled: true },
       { name: '停用的源', path: 'c.js', enabled: false, pt: ['kw'] },
+    ] as never)
+    // 脚本自报的平台来自已加载的实例（键 = config.name || path），没 pt 的源就按它定范围
+    mocks.getHealthStatus.mockReturnValue([
+      { name: '好源', supportedSources: ['kw', 'tx', 'wy'], supportedActions: { kw: ['musicUrl'], tx: ['musicUrl'], wy: ['musicUrl'] } },
+      { name: '假地址源', supportedSources: ['kw', 'tx'], supportedActions: { kw: ['musicUrl'], tx: ['musicUrl'] } },
+      { name: '只自报酷我的源', supportedSources: ['kw'], supportedActions: { kw: ['musicUrl'] } },
+      { name: '停用的源', supportedSources: ['kw'], supportedActions: { kw: ['musicUrl'] } },
     ] as never)
     mocks.probeSourceUrl.mockImplementation(async (name: string, musicInfo: { source: string }) =>
       name === '假地址源'
@@ -113,11 +155,16 @@ describe('runSourceProbe', () => {
 
     const summary = await runSourceProbe('manual')
 
-    // 好源 2 平台 × 2 首 = 4 格；假地址源 1 平台 × 2 首 = 2 格
-    expect(summary.probed).toBe(6)
-    expect(summary.okCount).toBe(4)
-    expect(summary.badCount).toBe(2)
+    // 按自报定范围：好源 3 平台 × 2 首 = 6 格；假地址源 2 平台 = 4 格；只自报酷我的源 2 格
+    expect(summary.probed).toBe(12)
+    expect(summary.okCount).toBe(8)
+    expect(summary.badCount).toBe(4)
     const written = mocks.prisma.sourceProbeResult.create.mock.calls.map(c => c[0].data)
+    const platformsOf = (name: string) => written.filter(r => r.source === name).map(r => r.platform)
+    // 没勾 pt 的那档：只测脚本自己声明的酷我，腾讯/网易/酷狗/咪咕压根没进批次
+    expect(platformsOf('只自报酷我的源')).toEqual(['kw', 'kw'])
+    // pt 只勾了 kw/tx，但脚本声明了 wy —— 那一格照样要测
+    expect(platformsOf('好源').sort()).toEqual(['kw', 'kw', 'tx', 'tx', 'wy', 'wy'])
     expect(written.find(r => r.source === '假地址源')).toMatchObject({ platform: 'kw', outcome: 'fake' })
     expect(written.every(r => r.quality === '320k')).toBe(true)
     expect(written.some(r => r.source === '停用的源')).toBe(false)
@@ -126,6 +173,28 @@ describe('runSourceProbe', () => {
     expect(mocks.prisma.sourceProbeRun.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: 'done' }) })
     )
+  })
+
+  it('「不适用」不进出口径：pt 摘掉的平台测出来是 unsupported，分母不该被它撑大', async () => {
+    vi.mocked(listSourcesWithStatus).mockResolvedValue([{ name: '摘了咪咕的源', path: 'e.js', enabled: true, pt: ['kw'] }] as never)
+    // 脚本自己声明了五个平台（周测按声明定范围），但瀑布那侧 pt 只放了酷我
+    mocks.getHealthStatus.mockReturnValue([{
+      name: '摘了咪咕的源',
+      supportedSources: ['kw', 'tx', 'wy', 'kg', 'mg'],
+      supportedActions: Object.fromEntries(['kw', 'tx', 'wy', 'kg', 'mg'].map(p => [p, ['musicUrl']])),
+    }] as never)
+    mocks.probeSourceUrl.mockImplementation(async (name: string, musicInfo: { source: string }) =>
+      musicInfo.source === 'kw'
+        ? { ok: true, url: 'https://up.example/a.flac', latencyMs: 100 }
+        : { ok: false, outcome: 'unsupported', reason: `pt 白名单未包含 ${musicInfo.source}`, latencyMs: 0 })
+    mocks.safePublicFetch.mockResolvedValue(audioResponse())
+
+    const summary = await runSourceProbe('manual')
+    expect(summary.total).toBe(10)
+    expect(summary.skipped).toBe(8)
+    expect(summary.probed).toBe(2)
+    expect(summary.okCount).toBe(2)
+    expect(summary.badCount).toBe(0)
   })
 
   it('同一时刻只跑一批：并发调用复用同一个 promise', async () => {

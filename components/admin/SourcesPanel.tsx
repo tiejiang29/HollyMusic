@@ -335,6 +335,8 @@ export function SourcesPanel() {
             <p className="mt-1 text-xs text-muted-foreground">
               上次周测：{formatAgo(new Date(probe.last.startedAt).getTime())} ·
               出货 {probe.last.okCount}/{probe.last.probed} · 坏 {probe.last.badCount}
+              {/* 分母只算真出过网的格：脚本没声明或被 pt 摘掉的平台是"不适用"，不是"这源不行" */}
+              {probe.last.total > probe.last.probed ? ` · 不适用 ${probe.last.total - probe.last.probed}` : ''}
               {probe.last.status === 'failed' && ` · 本批失败：${probe.last.detail || '未知原因'}`}
             </p>
           )}
