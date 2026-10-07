@@ -190,9 +190,10 @@ export function SpeakerPanel() {
         <div className="flex shrink-0 gap-2">
           <button
             onClick={reload}
+            title="只重新读一遍面板状态（不出网、不会续票）；要拉音箱列表或触发续期请点下面设备区右上角的「刷新设备列表」"
             className="flex items-center gap-1 rounded-full px-4 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
           >
-            <RefreshCw className="h-4 w-4" /> 刷新
+            <RefreshCw className="h-4 w-4" /> 重新读取状态
           </button>
           {view?.loggedIn ? (
             <button
@@ -264,7 +265,9 @@ export function SpeakerPanel() {
                 <div>设备列表更新时间：<span className="text-foreground">{clockText(view.lastSyncAt)}</span></div>
                 {view.needsRefresh ? (
                   <div className="sm:col-span-2 lg:col-span-3">
-                    有效期快到了：下一次操作会自动用 passToken 静默续期，不需要重新扫码
+                    {view.msToExpiry !== null && view.msToExpiry <= 0
+                      ? '票已过期：点下面设备区的「刷新设备列表」会用库里的 passToken 自动续一张，不需要重新扫码'
+                      : '有效期快到了：点下面设备区的「刷新设备列表」会自动用 passToken 静默续期，不需要重新扫码（右上角「重新读取状态」只读，不出网）'}
                   </div>
                 ) : null}
               </div>
