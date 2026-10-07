@@ -2191,6 +2191,45 @@ async function isStillInstalled(importedPath: string): Promise<boolean> {
 }
 
 /**
+ * 源被删掉之后，把引用它的那些候选行写回"可再导入"。
+ *
+ * 为什么需要这一步：行上的 `state='imported'` 是**导入那一刻的历史**，而"这条源还在不在"
+ * 是配置文件里的事实。导入闸门和剔除闸门早就只看配置（见 `isStillInstalled`），但面板的
+ * 页签、页签计数和「导入」按钮读的是 `state` —— 不写回，删过源的候选就永远挂着「已导入」：
+ * 出现在「已导入」页签里、行上写着"已导入 → 某个不存在的路径"，还不给「导入」按钮，
+ * 而它实际上是能导的。
+ *
+ * 由删除音源的那条路由调用（面板上那把删除键是唯一入口）。手改 `music-sources.json` 或
+ * 整体替换配置的路径够不着 —— 那种情况下导入与剔除照样会重新开放（判据在配置那边），
+ * 只是行上的标记要等下一次导入才纠正。
+ */
+export async function reopenCandidatesForRemovedSource(sourcePath: string): Promise<number> {
+  if (!sourcePath) return 0
+  const rows = await prisma.sourceCandidate.findMany({
+    where: { importedPath: sourcePath },
+    select: { id: true, reason: true },
+  })
+  for (const row of rows) {
+    // 同一条路径只记一次：导入→删除→再导入→再删除是常规操作，句子叠两遍就成了噪音
+    const note = `曾导入为 ${sourcePath}，源已删除 ⇒ 重新开放导入`
+    const reason = row.reason
+      ? (row.reason.includes(`曾导入为 ${sourcePath}`) ? row.reason : `${row.reason}；${note}`)
+      : note
+    await prisma.sourceCandidate.update({
+      where: { id: row.id },
+      data: {
+        state: 'new',
+        // importedPath 要清掉：留着它，行上就继续显示"已导入 → 那条已经不存在的路径"。
+        // 这段历史改写在依据里，看得见但不参与任何判据。
+        importedPath: '',
+        reason,
+      },
+    })
+  }
+  return rows.length
+}
+
+/**
  * 把一条候选导入成正式音源。接口只收 id —— **地址与 blob sha 都取自库里那行记录**，
  * 客户端传进来的 URL / 正文一律不认，否则"发现出来的东西"就能被换成任何地址。
  *

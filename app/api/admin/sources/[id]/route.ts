@@ -20,6 +20,7 @@ import {
   updateSource,
   updateSubscribedSource,
 } from '@/lib/services/source-manager-service'
+import { reopenCandidatesForRemovedSource } from '@/lib/services/source-discovery'
 import { logger } from '@/lib/logger'
 
 function guard(err: unknown) {
@@ -96,7 +97,15 @@ export async function DELETE(
     const sourcePath = await parsePath(props)
 
     await removeSource(sourcePath)
-    return createSuccessResponse({ ok: true })
+    // 引用这条源的候选行写回"可再导入"。这一步失败不该把已经删成的源报成"删除失败"——
+    // 那是行上的标记，不是用户的意图；报错了管理员反而会再点一次删除。
+    let reopened = 0
+    try {
+      reopened = await reopenCandidatesForRemovedSource(sourcePath)
+    } catch (err) {
+      logger.info('[api/admin/sources/[id] DELETE] 候选行写回失败（源已删除，不影响结果）:', err)
+    }
+    return createSuccessResponse({ ok: true, reopened })
   } catch (err) {
     const g = guard(err)
     if (g) return g

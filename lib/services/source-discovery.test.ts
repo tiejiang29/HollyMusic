@@ -62,7 +62,7 @@ const {
   pickReleaseAssets, fetchCandidateContent,
   runDiscoveryCrawl, saveDiscoverySettings, DEFAULT_DISCOVERY_SETTINGS,
   probeCandidate, importCandidate, dismissCandidate, listCandidates,
-  shipmentOf,
+  shipmentOf, reopenCandidatesForRemovedSource,
   looksLikeObfuscatedSource,
   runDiscoveryDrain, requestDiscoveryStop, discoveryStatus,
   startCandidateProbe, startCandidateProbeBatch, pruneOrphanCandidates, _setProbeGapForTest, _setRunnerForTest,
@@ -136,12 +136,13 @@ beforeEach(() => {
   }) => {
     const where = (args?.where ?? {}) as {
       verdict?: string; state?: string; probeJson?: string; OR?: Array<Record<string, unknown>>
-      repo?: string; releaseTag?: string; assetDigest?: string; zipMember?: string
+      repo?: string; releaseTag?: string; assetDigest?: string; zipMember?: string; importedPath?: string
       NOT?: { repo?: { in?: string[] } }
     }
     let out = rows
-    // 字符串列一律真按等值筛（"包没换就跳过下载"那条判据靠 repo+tag+digest 三者同时命中）
-    for (const key of ['repo', 'releaseTag', 'assetDigest', 'zipMember'] as const) {
+    // 字符串列一律真按等值筛（"包没换就跳过下载"那条判据靠 repo+tag+digest 三者同时命中；
+    //  「源删了写回候选行」那条靠 importedPath 命中，漏了它就会变成"动了全表"）
+    for (const key of ['repo', 'releaseTag', 'assetDigest', 'zipMember', 'importedPath'] as const) {
       const value = where[key]
       if (typeof value === 'string') out = out.filter(r => String(r[key] ?? '') === value)
     }
@@ -900,6 +901,51 @@ describe('导入前先跟已经装着的源比一次', () => {
     seedSuspect({ contentHash: SAME_HASH, nameKey: '', scriptName: '合成测试音源 v1.2.0' })
     const [view] = await listCandidates()
     expect(view.duplicateOf).toEqual({ kind: 'content', path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' })
+  })
+})
+
+// ————— 删掉音源 ⇒ 引用它的候选行写回 —————
+
+describe('源删除后把候选行写回可再导入', () => {
+  it('按 importedPath 找行：状态回 new、importedPath 清空、这段历史留在依据里', async () => {
+    const id = seedSuspect({ state: 'imported', importedPath: 'custom-sources/聚合.js', reason: '4/5 个平台真出货' })
+    const untouched = seedSuspect({ repo: 'x/y', path: 'other.js', importedPath: 'custom-sources/别的.js' })
+    expect(await reopenCandidatesForRemovedSource('custom-sources/聚合.js')).toBe(1)
+    const row = rows.find(r => r.id === id)!
+    expect(row.state).toBe('new')
+    expect(row.importedPath).toBe('')
+    expect(String(row.reason)).toContain('4/5 个平台真出货')
+    expect(String(row.reason)).toContain('曾导入为 custom-sources/聚合.js，源已删除 ⇒ 重新开放导入')
+    expect(rows.find(r => r.id === untouched)!.importedPath).toBe('custom-sources/别的.js')
+  })
+
+  it('落盘路径重名时会有两条指向同一条源，两条都得写回；原本没有依据的行也给一句人话', async () => {
+    const a = seedSuspect({ state: 'imported', importedPath: 'custom-sources/同名.js' })
+    const b = seedSuspect({ repo: 'p/q', path: 'b.js', state: 'imported', importedPath: 'custom-sources/同名.js', reason: null })
+    expect(await reopenCandidatesForRemovedSource('custom-sources/同名.js')).toBe(2)
+    expect(rows.filter(r => r.importedPath === 'custom-sources/同名.js')).toEqual([])
+    expect(String(rows.find(r => r.id === b)!.reason)).toBe('曾导入为 custom-sources/同名.js，源已删除 ⇒ 重新开放导入')
+    expect(rows.find(r => r.id === a)!.state).toBe('new')
+  })
+
+  it('导入→删除→再导入→再删除 是常规操作：同一句历史不叠两遍', async () => {
+    const id = seedSuspect({ state: 'imported', importedPath: 'custom-sources/某.js', reason: '3/5 个平台真出货' })
+    expect(await reopenCandidatesForRemovedSource('custom-sources/某.js')).toBe(1)
+    const once = String(rows.find(r => r.id === id)!.reason)
+    // 第二次导入+删除：行重新挂上 importedPath，再写回一次
+    const row = rows.find(r => r.id === id)!
+    row.state = 'imported'
+    row.importedPath = 'custom-sources/某.js'
+    expect(await reopenCandidatesForRemovedSource('custom-sources/某.js')).toBe(1)
+    const twice = String(rows.find(r => r.id === id)!.reason)
+    expect(twice).toBe(once)
+    expect((twice.match(/曾导入为/g) ?? []).length).toBe(1)
+  })
+
+  it('空路径直接不查库：配置里不存在"路径为空"的源，写回全表是灾难', async () => {
+    seedSuspect({ state: 'imported', importedPath: 'custom-sources/某.js' })
+    expect(await reopenCandidatesForRemovedSource('')).toBe(0)
+    expect(rows.filter(r => r.state === 'imported').length).toBe(1)
   })
 })
 
