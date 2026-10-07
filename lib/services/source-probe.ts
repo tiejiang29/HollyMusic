@@ -204,7 +204,10 @@ function toProbeMusicInfo(row: MusicInfoRow): MusicInfo {
   return {
     ...base,
     source: row.source,
-    songmid: base.songmid ?? row.songmid,
+    // 必须收成字符串：库里 kg 的 `data.songmid` 有的是**数字**（`327803`），而它下面要写进
+    // `SourceProbeResult.songmid`（String 列）—— 生产实测过一次整批 88 格在 Prisma 校验上炸掉。
+    // 传进脚本的对象形状本身不受影响（脚本自己拿到的 kg songmid 也是数字）。
+    songmid: base.songmid !== undefined ? String(base.songmid) : row.songmid,
     name: base.name ?? row.name ?? '',
     singer: base.singer ?? row.singer ?? '',
     types: Array.isArray(base.types) ? base.types : [],

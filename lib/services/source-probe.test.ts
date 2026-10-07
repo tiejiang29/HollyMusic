@@ -167,6 +167,8 @@ describe('runSourceProbe', () => {
     expect(platformsOf('好源').sort()).toEqual(['kw', 'kw', 'tx', 'tx', 'wy', 'wy'])
     expect(written.find(r => r.source === '假地址源')).toMatchObject({ platform: 'kw', outcome: 'fake' })
     expect(written.every(r => r.quality === '320k')).toBe(true)
+    // 写入列的类型：songmid 是 String 列，数字会在 Prisma 校验上整批炸（生产踩过）
+    expect(written.every(r => typeof r.songmid === 'string')).toBe(true)
     expect(written.some(r => r.source === '停用的源')).toBe(false)
     // 关键隔离：探测证据不进真实流量账本，否则 3c 会把它当用户遇到的坏去熔断
     expect(sourceHealth.snapshot()).toEqual([])
@@ -243,6 +245,18 @@ describe('pickProbeSamples', () => {
       return rows.filter(r => ids.includes(r.id))
     })
   }
+
+  it('data 列里的 songmid 是数字时也要收成字符串 —— 生产整批 88 格就是这么崩的', async () => {
+    // NAS 实测：库里 kg 的 data.songmid 有的是 `327803` 这种数字，它覆盖了 DB 那一列（String），
+    // 一路带到 sourceProbeResult.create 被 Prisma 判 "Expected String, provided Int" ⇒ 整批中断。
+    mocks.prisma.$queryRaw.mockResolvedValue([{ id: 21 }])
+    mockRows([{ ...rowOf(21, 'kg'), data: JSON.stringify({ name: '一路向北', singer: '周杰伦', songmid: 327803, hash: 'h21' }) }])
+    mocks.prisma.sourceProbeRun.findFirst.mockResolvedValue(null as never)
+
+    const samples = await pickProbeSamples(1)
+    expect(typeof samples.kg[0].songmid).toBe('string')
+    expect(samples.kg[0].songmid).toBe('327803')
+  })
 
   it('优先用「上一批有源真出货过」的歌做基准样本', async () => {
     // 选样候选与"上一批哪个歌被解出过"是两回事：冷门歌让 7 个源里 6 个报"无数据"，
