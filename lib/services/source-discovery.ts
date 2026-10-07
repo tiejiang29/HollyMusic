@@ -1477,16 +1477,70 @@ async function markNotSource(repo: string, path: string, reason: string): Promis
 async function dedupeCandidates(): Promise<number> {
   const rows = await prisma.sourceCandidate.findMany({
     where: { verdict: 'suspect', state: 'new' },
-    select: {
-      id: true, repo: true, path: true, contentHash: true, nameKey: true, scriptName: true,
-      score: true, upstreamAt: true,
-    },
+    select: DEDUPE_FIELDS,
   })
+  return applyDedupeLosers(rows)
+}
+
+const DEDUPE_FIELDS = {
+  id: true, repo: true, path: true, contentHash: true, nameKey: true, scriptName: true,
+  score: true, upstreamAt: true,
+}
+
+/** 选输家再逐条落 stale（整表去重只要数量） */
+async function applyDedupeLosers(rows: DedupeRow[]): Promise<number> {
+  const losers = pickDedupeLosers(rows)
+  for (const id of losers) await prisma.sourceCandidate.update({ where: { id }, data: { state: 'stale' } })
+  return losers.size
+}
+
+interface DedupeRow {
+  id: number
+  repo: string
+  path: string
+  contentHash: string
+  nameKey: string
+  scriptName: string
+  score: number
+  upstreamAt: string
+}
+
+/**
+ * 一条刚提升为疑似可用的候选，与**在册的**同内容/同名候选并一次组。
+ *
+ * 为什么要有这一步：整表去重只在一轮采集结束时跑，而「仍然判级」是往 suspect 池里新塞一个
+ * 成员 —— 不补这一下就会出现两条同名源并排站在「疑似可用」里，他各点一次导入就是两条同名源
+ * 共用健康账本那一格（冷却与坏证据互相污染，与 P0-c 那条撞车检查同一个理由）。
+ *
+ * `verdict` 不能放在顶层：这条自己的等级此刻还没写下去（还是 not-source），顶层过滤会把它本人
+ * 排除在比较之外，于是"该被顶掉的是它"那种情形算不出来。所以把 verdict 挪进各分支，
+ * 自己那一支只按 id 收进来。
+ */
+async function dedupeAroundPromotedCandidate(self: DedupeRow): Promise<{ others: number; selfLost: boolean }> {
+  const branches: Array<Record<string, unknown>> = [{ id: self.id }]
+  if (self.contentHash) branches.push({ verdict: 'suspect', contentHash: self.contentHash })
+  if (self.nameKey) branches.push({ verdict: 'suspect', nameKey: self.nameKey })
+  const peers = await prisma.sourceCandidate.findMany({
+    where: { state: 'new', OR: branches },
+    select: DEDUPE_FIELDS,
+  })
+  if (peers.length < 2) return { others: 0, selfLost: false }
+  const losers = pickDedupeLosers(peers)
+  let others = 0
+  for (const id of losers) {
+    await prisma.sourceCandidate.update({ where: { id }, data: { state: 'stale' } })
+    if (id !== self.id) others++
+  }
+  return { others, selfLost: losers.has(self.id) }
+}
+
+/** 分桶选输家：hash 与 nameKey 各成一桶，一个桶只留 `betterKeeper` 那个，其余落 stale */
+function pickDedupeLosers(rows: DedupeRow[]): Set<number> {
   const versionOf = new Map<number, string>()
   for (const row of rows) versionOf.set(row.id, parseVersionFromPath(row.path, row.scriptName))
 
   const losers = new Set<number>()
-  const groups = new Map<string, typeof rows>()
+  const groups = new Map<string, DedupeRow[]>()
   const groupKey = (prefix: string, value: string) => value ? `${prefix}:${value}` : ''
 
   for (const row of rows) {
@@ -1505,13 +1559,7 @@ async function dedupeCandidates(): Promise<number> {
     }, bucket[0])
     for (const item of bucket) if (item.id !== keeper.id) losers.add(item.id)
   }
-
-  let changed = 0
-  for (const id of losers) {
-    await prisma.sourceCandidate.update({ where: { id }, data: { state: 'stale' } })
-    changed++
-  }
-  return changed
+  return losers
 }
 
 function rankOf(row: { upstreamAt: string; score: number; id: number }, versionOf: Map<number, string>) {
@@ -1876,11 +1924,18 @@ export async function probeCandidate(id: number, opts: { force?: boolean } = {})
   // 静态分读不懂混淆载荷，而"跑起来真能取到地址"就是它缺的那份证据 —— 提升之后导入闸门
   // （要 suspect 且至少一格 ok）不用改就能用；0 出货则留在 not-source，只把红绿灯留在行上。
   if (row.verdict !== 'suspect' && okCount > 0) {
+    // 先按"它已经是疑似可用"去跟在册的同名/同内容并一次组，再把等级写下去 ——
+    // 整表去重只在采集轮末跑，这一档是点判级时才往池子里塞新成员，不补就会出现
+    // 两条同名源并排站在「疑似可用」里，各点一次导入 = 两条源共用健康账本那一格。
+    const superseded = await dedupeAroundPromotedCandidate(row)
     await prisma.sourceCandidate.update({
       where: { id },
       data: {
         verdict: 'suspect',
-        reason: `原判 ${row.score} 分（静态特征读不懂）；仍然判级后 ${okCount}/${cells.length} 个平台真出货 ⇒ 提升为疑似可用`,
+        reason: `原判 ${row.score} 分（静态特征读不懂）；仍然判级后 ${okCount}/${cells.length} 个平台真出货 ⇒ 提升为疑似可用`
+          // 输的可能是它自己（同名另一条的上游时间更新）——那句话说的是"这条别装"，不是"顶掉了别人"
+          + (superseded.selfLost ? '；同名的另一条上游更新，这条记为已被顶掉'
+            : superseded.others ? `；顺带顶掉 ${superseded.others} 条同名/同内容的旧候选` : ''),
       },
     })
   }

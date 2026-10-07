@@ -152,12 +152,17 @@ beforeEach(() => {
     if (where.state) out = out.filter(r => r.state === where.state)
     if (where.probeJson !== undefined) out = out.filter(r => r.probeJson === where.probeJson)
     if (where.OR) {
-      const match = (row: Row, branch: Record<string, unknown>) => {
-        const want = row.probeJson as string
-        if (typeof branch.probeJson === 'string') return want === branch.probeJson
-        const contains = (branch.probeJson as { contains?: string } | undefined)?.contains
-        return contains ? want.includes(contains) : true
-      }
+      // 分支内是 AND、分支间是 OR：按真 Prisma 的语义逐字段比，别只认 probeJson
+      // （批量判级用 `probeJson` 挑该判的，「仍然判级」补跑去重用 `{id}` + `{verdict, contentHash/nameKey}`，
+      //  只写 probeJson 的话新那条会匹配到全表，等于测了个假库）
+      const match = (row: Row, branch: Record<string, unknown>) => Object.entries(branch).every(([field, want]) => {
+        const got = String(row[field] ?? '')
+        if (want && typeof want === 'object') {
+          const contains = (want as { contains?: string }).contains
+          return contains ? got.includes(contains) : true
+        }
+        return got === String(want)
+      })
       out = out.filter(row => where.OR!.some(branch => match(row, branch)))
     }
     return typeof args?.take === 'number' ? out.slice(0, args.take) : out
@@ -616,6 +621,50 @@ describe('probeCandidate', () => {
     expect(row.verdict).toBe('suspect')
     expect(String(row.reason)).toContain('仍然判级')
     expect(String(row.reason)).toContain('1/1 个平台真出货')
+  })
+
+  it('提升等级时顺带并组：赢家（上游时间新的那条）留在册，输家标 stale 并把数量写进依据', async () => {
+    const sha = gitBlobSha(FAKE_SOURCE_SCRIPT)
+    // 在册的另一条同名候选，上游时间更新 ⇒ 按 betterKeeper 第一档它就是赢家
+    const keeper = seedSuspect({
+      nameKey: '玉宁熙pro', scriptName: 'lx-玉宁熙-Pro v1.2.5', contentHash: 'hash-125',
+      upstreamAt: '2026-10-03T00:00:00Z', path: 'V261003.zip!V261003/lx-玉宁熙1.2.5.js',
+    })
+    const id = seedSuspect({
+      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: sha,
+      nameKey: '玉宁熙pro', scriptName: 'lx-玉宁熙-Pro v1.2.2', contentHash: 'hash-122', upstreamAt: '',
+    })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner())
+
+    await probeCandidate(id, { force: true })
+    const promoted = rows.find(r => r.id === id)!
+    expect(promoted.verdict).toBe('suspect')
+    // 它是输家：等级照样提上来，但状态是被顶掉，「疑似可用」里只剩那一条更新的同名源
+    expect(promoted.state).toBe('stale')
+    expect(String(promoted.reason)).toContain('同名的另一条上游更新')
+    expect(String(promoted.reason)).not.toContain('顺带顶掉')
+    expect(rows.find(r => r.id === keeper)!.state).toBe('new')
+    expect(String(rows.find(r => r.id === keeper)!.reason)).not.toContain('仍然判级')
+  })
+
+  it('并组时同内容（sha256）也算，即使名字不一样；not-source 的同行不进池子（判据没写宽）', async () => {
+    const sha = gitBlobSha(FAKE_SOURCE_SCRIPT)
+    const twin = seedSuspect({ nameKey: '别的源', scriptName: '另一个名字 v9', contentHash: 'same-hash' })
+    // 同字节但还没判成疑似的一行：不该被卷进这次比较
+    const notSuspect = seedSuspect({ verdict: 'not-source', nameKey: '玉宁熙pro', contentHash: 'same-hash' })
+    const id = seedSuspect({
+      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: sha,
+      nameKey: '玉宁熙pro', contentHash: 'same-hash', upstreamAt: '2026-10-05T00:00:00Z',
+    })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+    _setRunnerForTest(fakeRunner())
+
+    await probeCandidate(id, { force: true })
+    expect(rows.find(r => r.id === id)!.state).toBe('new')        // 上游时间最新 ⇒ 它留
+    expect(String(rows.find(r => r.id === id)!.reason)).toContain('顺带顶掉 1 条')
+    expect(rows.find(r => r.id === twin)!.state).toBe('stale')    // 同内容的在册疑似被顶掉
+    expect(rows.find(r => r.id === notSuspect)!.state).toBe('new')
   })
 
   it('仍然判级 0 出货 ⇒ 等级不动（留在 not-source），但红绿灯留在行上供人看', async () => {
