@@ -47,6 +47,105 @@ export const STATUS_LABEL: Record<number, string> = {
   2: '已暂停',
 }
 
+/**
+ * 拖动音量条时的最小发送间隔（毫秒）。
+ * 音量指令走小米云端一次 HTTP + 一次 ubus，一次拖动会产生几十个中间值；
+ * 全发既慢又容易撞上小米的限流（70022），所以按间隔发、松手那下必发。
+ */
+export const VOLUME_SEND_INTERVAL_MS = 250
+
+/** 读不到当前音量时，音量条的起始档 */
+const DEFAULT_VOLUME = 50
+
+/** 距上次发出还要等多久（null = 现在就发）。导出给测试：节流口径只在这一处算。 */
+export function volumeSendDelayMs(
+  now: number, lastSentAt: number, interval: number = VOLUME_SEND_INTERVAL_MS,
+): number | null {
+  const left = interval - (now - lastSentAt)
+  return left > 0 ? left : null
+}
+
+/**
+ * 点开「音量」后弹出的竖向滚动条：拖动即调整，不需要再点提交。
+ *
+ * 为什么不做成浮层：设备表的外层是 `overflow-hidden`（圆角裁表头），浮层会被裁掉；
+ * 放在格子里随行展开，视觉上同样是"点开才出来"，且窄屏不会飘出表格外。
+ */
+function VolumeSlider({ initial, onSend }: { initial: number; onSend: (v: number) => Promise<void> }) {
+  const [value, setValue] = useState(initial)
+  const [sending, setSending] = useState(false)
+  /** 每次渲染换一份回调也没关系：真正的发送走最新那份 */
+  const sendRef = useRef(onSend)
+  sendRef.current = onSend
+  const lastSentAt = useRef(-Infinity)
+  const timer = useRef<number | null>(null)
+  /** 最后一次已经发出去的值：松手时只有它和当前值不一致才补发，避免同一值发两遍 */
+  const sentValue = useRef(initial)
+
+  const push = useCallback((v: number) => {
+    sentValue.current = v
+    lastSentAt.current = Date.now()
+    setSending(true)
+    void sendRef.current(v).finally(() => setSending(false))
+  }, [])
+
+  const handleChange = (v: number) => {
+    setValue(v)
+    if (timer.current !== null) {
+      clearTimeout(timer.current)
+      timer.current = null
+    }
+    const delay = volumeSendDelayMs(Date.now(), lastSentAt.current)
+    if (delay === null) {
+      push(v)
+      return
+    }
+    timer.current = window.setTimeout(() => {
+      timer.current = null
+      push(v)
+    }, delay)
+  }
+
+  /** 松手/键盘改完就把落点补发出去：中间被间隔吃掉的那些值无所谓，停在哪一档必须生效 */
+  const commit = () => {
+    if (timer.current !== null) {
+      clearTimeout(timer.current)
+      timer.current = null
+    }
+    if (value !== sentValue.current) push(value)
+  }
+
+  useEffect(() => () => {
+    if (timer.current !== null) clearTimeout(timer.current)
+  }, [])
+
+  return (
+    <div className="mt-2 flex items-end gap-2 rounded-md border border-border bg-accent/30 px-2 py-2">
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={value}
+        onChange={e => handleChange(Number(e.target.value))}
+        onPointerUp={commit}
+        onKeyUp={commit}
+        aria-label="音箱音量"
+        className="h-28 w-5 accent-primary"
+        // 竖向且小端在下：新浏览器靠 writing-mode + rtl，旧 WebKit 认 appearance
+        style={{ writingMode: 'vertical-lr', direction: 'rtl', WebkitAppearance: 'slider-vertical' }}
+      />
+      <div className="text-xs text-muted-foreground">
+        <div className="font-mono text-base text-foreground">{value}</div>
+        <div className="mt-1 flex items-center gap-1">
+          {sending ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+          {sending ? '发送中…' : '已发到音箱'}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function SpeakerPanel() {
   const [view, setView] = useState<SpeakerView | null>(null)
   const [loading, setLoading] = useState(true)
@@ -61,8 +160,8 @@ export function SpeakerPanel() {
   const [busySetting, setBusySetting] = useState(false)
   /** 每台最近一次读到的播放状态（只在这台设备上，不写库、不进日志） */
   const [statusByDevice, setStatusByDevice] = useState<Record<string, SpeakerStreamStatus>>({})
-  /** 音量输入框的 DOM 引用：按设备存，点「设音量」时读当前值 */
-  const volInputs = useRef<Record<string, HTMLInputElement | null>>({})
+  /** 打开的音量条：null = 没开。initial 来自点开时那一次状态回读，known=false 表示没读到、按默认档起调 */
+  const [volPanel, setVolPanel] = useState<{ deviceID: string; initial: number; known: boolean } | null>(null)
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -228,12 +327,34 @@ export function SpeakerPanel() {
     }
   }
 
+  /** 音量条拖动中的发送：不占 busyDeviceId，否则一次拖动会把那台的按钮闪disable几十次 */
   const runVolume = async (volume: number, deviceID: string) => {
-    setBusyDeviceId(deviceID)
     try {
       await setSpeakerVolumeFromAdmin(volume, deviceID)
     } catch (e) {
       setError(e instanceof Error ? e.message : '音量设置失败')
+    }
+  }
+
+  /**
+   * 点开音量条：先读一次状态，把条上的起始值摆成音箱**现在**的音量。
+   * 起始值乱猜是有代价的——音箱在 30，条子画在 50，人往下拖一格就跳到 45，听起来是"越调越响"。
+   * 读不到（离线/不报）也照样开，只是标明这一档是默认值。
+   */
+  const openVolume = async (deviceID: string) => {
+    if (volPanel?.deviceID === deviceID) {
+      setVolPanel(null)
+      return
+    }
+    setBusyDeviceId(deviceID)
+    setError(null)
+    try {
+      const r = await readSpeakerStatusFromAdmin(deviceID)
+      setStatusByDevice(prev => ({ ...prev, [deviceID]: r.status }))
+      setVolPanel({ deviceID, initial: Math.max(0, r.status.volume), known: r.status.volume >= 0 })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '读状态失败')
+      setVolPanel({ deviceID, initial: DEFAULT_VOLUME, known: false })
     } finally {
       setBusyDeviceId(null)
     }
@@ -534,36 +655,28 @@ export function SpeakerPanel() {
                               停止
                             </button>
                             <span className="ml-auto flex items-center gap-1">
-                              <input
-                                type="number"
-                                min={0}
-                                max={100}
-                                defaultValue={statusByDevice[d.deviceID]?.volume >= 0 ? statusByDevice[d.deviceID].volume : ''}
-                                placeholder="0-100"
-                                aria-label="音量"
-                                ref={el => {
-                                  // 读到的当前音量回填进输入框：省得管理员盲猜现在是多少
-                                  if (el && statusByDevice[d.deviceID]?.volume >= 0 && el.value === '') {
-                                    el.value = String(statusByDevice[d.deviceID].volume)
-                                  }
-                                  volInputs.current[d.deviceID] = el
-                                }}
-                                disabled={!d.managed}
-                                className="w-20 rounded border border-border bg-background px-2 py-1 text-xs disabled:opacity-50"
-                              />
                               <button
-                                onClick={() => {
-                                  const el = volInputs.current[d.deviceID]
-                                  runVolume(Number(el?.value), d.deviceID)
-                                }}
+                                onClick={() => void openVolume(d.deviceID)}
                                 disabled={!d.managed || busyDeviceId === d.deviceID}
-                                title="设音量：投过去没声音时先排掉「音箱被静音了」这一种"
+                                title="音量：点开后拖动竖向滚动条即调，不用提交（打开时会先读一次音箱当前的音量）"
                                 className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                               >
-                                设音量
+                                {volPanel?.deviceID === d.deviceID ? '收起音量' : '音量'}
                               </button>
                             </span>
                           </div>
+                          {volPanel?.deviceID === d.deviceID ? (
+                            <VolumeSlider
+                              key={d.deviceID}
+                              initial={volPanel.initial}
+                              onSend={v => runVolume(v, d.deviceID)}
+                            />
+                          ) : null}
+                          {volPanel?.deviceID === d.deviceID && !volPanel.known ? (
+                            <p className="mt-1 text-[11px] text-muted-foreground">
+                              没读到这台现在的音量，条子从 {DEFAULT_VOLUME} 起；先拖一格就会发过去
+                            </p>
+                          ) : null}
                           {statusByDevice[d.deviceID] ? (
                             <div className="mt-1 font-mono text-[11px] text-muted-foreground">
                               {STATUS_LABEL[statusByDevice[d.deviceID].status] ?? `状态码 ${statusByDevice[d.deviceID].status}`}
