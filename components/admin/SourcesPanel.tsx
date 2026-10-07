@@ -21,7 +21,14 @@ import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import type { SourceHealthView } from '@/lib/server/source-health'
 import type { SourceProbeVerdict } from '@/lib/services/source-manager-service'
-import { Plus, Pencil, Trash2, Music, X, Loader2, Upload, AlertCircle, CheckCircle2, FileWarning, RefreshCw, Rss, Radar } from 'lucide-react'
+import { Plus, Pencil, Trash2, Music, X, Loader2, Upload, AlertCircle, CheckCircle2, FileWarning, RefreshCw, Rss, Radar, Lightbulb, Undo2 } from 'lucide-react'
+import {
+  applySourceAdvice,
+  getSourceAdvice,
+  undoSourceAdvice,
+  type SourceAdvice,
+  type SourceAdviceView,
+} from '@/lib/api/admin-sources'
 
 const PLATFORMS = ['tx', 'wy', 'kw', 'kg', 'mg'] as const
 const PLATFORM_LABELS: Record<string, string> = {
@@ -180,6 +187,22 @@ type DialogMode =
   | { kind: 'edit'; source: AdminSource }
   | null
 
+/** 建议类型的短标签（面板徽标与确认框都用它，别在多处再抄一份中文） */
+const ADVICE_KIND_LABEL: Record<SourceAdvice['kind'], string> = {
+  'add-pt': '放回平台',
+  'drop-pt': '摘掉平台',
+  priority: '调整顺位',
+}
+
+export function adviceKindLabel(kind: SourceAdvice['kind']): string {
+  return ADVICE_KIND_LABEL[kind] ?? kind
+}
+
+/** 卡片里那一行的文本（导出来是为了能直测；确认框也复用它拼摘要） */
+export function adviceRowText(item: Pick<SourceAdvice, 'source' | 'action' | 'evidence'>): string {
+  return `${item.source} · ${item.action}｜${item.evidence}`
+}
+
 export function SourcesPanel() {
   const [sources, setSources] = useState<AdminSource[]>([])
   const [loading, setLoading] = useState(true)
@@ -192,6 +215,9 @@ export function SourcesPanel() {
   const [uploadMsg, setUploadMsg] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
   const [probe, setProbe] = useState<ProbeStatus | null>(null)
   const [startingProbe, setStartingProbe] = useState(false)
+  const [advice, setAdvice] = useState<SourceAdviceView | null>(null)
+  const [advicePicked, setAdvicePicked] = useState<string[]>([])
+  const [applyingAdvice, setApplyingAdvice] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const reload = useCallback(async (opts: { quiet?: boolean } = {}) => {
@@ -201,9 +227,18 @@ export function SourcesPanel() {
       setError(null)
     }
     try {
-      const { list, probe: probeStatus } = await listSources()
+      // 建议读失败不该把整张音源表一起拖没，单独兜一下
+      const [{ list, probe: probeStatus }, adviceView] = await Promise.all([
+        listSources(),
+        getSourceAdvice().catch(() => null),
+      ])
       setSources(list)
       if (probeStatus) setProbe(probeStatus)
+      if (adviceView) {
+        setAdvice(adviceView)
+        // 建议变了就丢掉勾选：留着会让"固化"去写一条已经不成立的建议
+        setAdvicePicked(prev => prev.filter(id => adviceView.suggestions.some(item => item.id === id)))
+      }
     } catch (e) {
       if (!opts.quiet) setError(e instanceof Error ? e.message : '加载失败')
     } finally {
@@ -222,6 +257,47 @@ export function SourcesPanel() {
     const timer = setInterval(() => { void reload({ quiet: true }) }, 5_000)
     return () => clearInterval(timer)
   }, [probeRunning, reload])
+
+  const toggleAdvice = (id: string) => {
+    setAdvicePicked(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]))
+  }
+
+  const handleApplyAdvice = async () => {
+    const picked = advicePicked.slice()
+    if (!picked.length) return
+    // 固化会真改 music-sources.json（pt 与 priority），所以要管理员看一眼摘要再点头
+    const list = (advice?.suggestions ?? []).filter(item => picked.includes(item.id))
+    // 换行显式拼出来：这段文本要跨行，直接写在模板串里容易被工具重排成真的换行
+    const lineBreak = String.fromCharCode(10)
+    const summary = list.map(item => `· ${item.source}｜${adviceKindLabel(item.kind)}：${item.action}`).join(lineBreak)
+    const detail = `将改写 ${new Set(list.map(item => item.path)).size} 条源的配置（共 ${list.length} 条建议）：${lineBreak}${summary}`
+      + `${lineBreak}${lineBreak}改完可以点「撤销上次固化」还原。确定吗？`
+    if (!confirm(detail)) return
+    setApplyingAdvice(true)
+    try {
+      const result = await applySourceAdvice(picked)
+      setUploadMsg({ kind: 'success', text: `已固化 ${result.applied} 条建议（改动 ${result.changed} 条源）。发现或搜索的平台范围会跟着变，可用「撤销上次固化」还原` })
+      await reload({ quiet: true })
+    } catch (e) {
+      setUploadMsg({ kind: 'error', text: e instanceof Error ? e.message : '固化失败' })
+    } finally {
+      setApplyingAdvice(false)
+    }
+  }
+
+  const handleUndoAdvice = async () => {
+    if (!confirm('撤销上次固化：把 music-sources.json 还原成固化前的那份，确定吗？')) return
+    setApplyingAdvice(true)
+    try {
+      const result = await undoSourceAdvice()
+      setUploadMsg({ kind: 'success', text: result.restored ? '已还原到上次固化之前的配置' : (result.reason ?? '没有可撤销的记录') })
+      await reload({ quiet: true })
+    } catch (e) {
+      setUploadMsg({ kind: 'error', text: e instanceof Error ? e.message : '撤销失败' })
+    } finally {
+      setApplyingAdvice(false)
+    }
+  }
 
   const handleProbe = async () => {
     setStartingProbe(true)
@@ -405,6 +481,59 @@ export function SourcesPanel() {
           <button onClick={() => setUploadMsg(null)} className="text-current/70 hover:text-current">
             <X className="h-4 w-4" />
           </button>
+        </div>
+      )}
+
+      {advice && (advice.suggestions.length > 0 || advice.canUndo) && (
+        <div className="mb-6 rounded-lg border border-border p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Lightbulb className="h-4 w-4 text-primary" />
+              <span className="text-sm font-medium">周测建议</span>
+              <span className="text-xs text-muted-foreground">
+                按最近 {advice.batchesUsed} 批周测算，<span className="font-medium">连续两批同向才提</span>；
+                没有实测数据的源不会被挪位置
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {advice.canUndo && (
+                <button
+                  onClick={handleUndoAdvice}
+                  disabled={applyingAdvice}
+                  title="把 music-sources.json 还原成上次固化之前那份原文"
+                  className="flex items-center gap-1 rounded-full border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
+                >
+                  <Undo2 className="h-3.5 w-3.5" /> 撤销上次固化
+                </button>
+              )}
+              <button
+                onClick={handleApplyAdvice}
+                disabled={applyingAdvice || advicePicked.length === 0}
+                title="按勾选的建议改配置（一次原子写入）。这一步不会自动发生，只有点这里才写"
+                className="flex items-center gap-1 rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {applyingAdvice ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                固化所选{advicePicked.length ? `（${advicePicked.length}）` : ''}
+              </button>
+            </div>
+          </div>
+          <div className="mt-3 space-y-1">
+            {advice.suggestions.map(item => (
+              <label key={item.id} className="flex cursor-pointer items-start gap-2 rounded px-2 py-1.5 text-xs hover:bg-accent/40">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={advicePicked.includes(item.id)}
+                  onChange={() => toggleAdvice(item.id)}
+                />
+                <span className="shrink-0 rounded bg-accent px-1.5 py-0.5 font-medium">{adviceKindLabel(item.kind)}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="font-medium">{item.source}</span> · {item.action}
+                  <span className="block break-all text-muted-foreground">{item.evidence}</span>
+                </span>
+              </label>
+            ))}
+          </div>
         </div>
       )}
 

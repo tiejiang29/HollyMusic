@@ -606,6 +606,56 @@ export async function updateSource(
   return updated
 }
 
+/**
+ * 一次读、一次写地应用多条源的补丁（固化周测建议要同时改好几条源的 `pt`/`priority`）。
+ *
+ * 为什么不用循环调 `updateSource`：那是一条补丁一次写盘 + 一次重建实例，
+ * 中途任何一条失败就留下"改了一半"的配置，而这份文件只应该有**一个原子写入者**。
+ * `priority` 的顺序由 `writeConfig` 统一负责（它按 priority 升序落盘），这里不自己排。
+ */
+export async function updateSourcesBatch(
+  patches: Array<{ path: string; pt?: string[]; priority?: number }>
+): Promise<number> {
+  const config = await readConfig()
+  let changed = 0
+  for (const patch of patches) {
+    const idx = config.sources.findIndex(s => s.path === patch.path)
+    if (idx < 0) continue
+    const updated = { ...config.sources[idx] }
+    if (patch.pt !== undefined) updated.pt = patch.pt.filter(p => (VALID_PLATFORMS as readonly string[]).includes(p))
+    if (patch.priority !== undefined) updated.priority = patch.priority
+    if (JSON.stringify(updated) !== JSON.stringify(config.sources[idx])) {
+      config.sources[idx] = updated
+      changed++
+    }
+  }
+  if (!changed) return 0
+  await writeConfig(config)
+  await notifyReload()
+  logger.info(`[source-manager-service] 批量固化 ${changed} 条源的配置`)
+  return changed
+}
+
+/** 配置文件的原文（固化前拍快照）：撤销要按字节还原，不能重新序列化一遍 */
+export async function readConfigText(): Promise<string> {
+  return fsp.readFile(CONFIG_PATH, 'utf-8')
+}
+
+/**
+ * 按原文写回配置（只给"撤销上次固化"用）。
+ * 先解析并逐条校验脚本路径，坏内容一律拒 —— 这是能整体覆盖配置文件唯一的入口。
+ */
+export async function writeConfigText(text: string): Promise<void> {
+  const parsed = JSON.parse(text) as MusicSourcesConfig
+  if (!parsed || !Array.isArray(parsed.sources)) throw new SourceSubscriptionError('快照内容不是一份音源配置', 400)
+  for (const s of parsed.sources) assertScriptPath(s.path)
+  const tmp = CONFIG_PATH + '.tmp'
+  await fsp.writeFile(tmp, text, 'utf-8')
+  await fsp.rename(tmp, CONFIG_PATH)
+  await notifyReload()
+  logger.info(`[source-manager-service] 已还原音源配置（撤销固化，${parsed.sources.length} 条源）`)
+}
+
 /** 删除一条源配置 + 关联脚本文件 */
 export async function removeSource(sourcePath: string): Promise<void> {
   const config = await readConfig()

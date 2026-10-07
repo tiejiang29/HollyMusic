@@ -25,7 +25,7 @@ import type { SourceProbeVerdict, SourceWithStatus } from '@/lib/services/source
 import type { MusicInfo, QualityType } from '@/lib/types/music'
 
 /** 全平台清单（与音源脚本声明的平台口径一致） */
-const PLATFORMS = ['kw', 'tx', 'wy', 'kg', 'mg'] as const
+export const PLATFORMS = ['kw', 'tx', 'wy', 'kg', 'mg'] as const
 /** 每平台几首基准曲。2 首是摸底用的量：单首会把"源里没这首歌"当成坏 */
 const SAMPLES_PER_PLATFORM = 2
 /** 固定探测音质。摸底结论：坏的主流形态与音质档无关，多档只会成倍放大成本 */
@@ -389,6 +389,61 @@ async function doRun(trigger: 'manual' | 'schedule'): Promise<ProbeSummary> {
     logger.warn('[source-probe] 周测失败:', err)
     throw new Error(`周测失败：${message}`)
   }
+}
+
+/** 一格在一批里的汇总：几首基准曲合成一格（有一首出货就算这格可用） */
+export interface ProbeBatchCell {
+  samples: number
+  okCount: number
+  /** 判坏的行数（超时/报错/假地址/HTTP 错）——与 no-address、unsupported 分得开 */
+  badCount: number
+  /** 出货那几行的取址耗时，给建议当依据用 */
+  latencies: number[]
+  /** 第一句坏因，面板直接展示（"为什么建议摘掉它"没有这句就说不清） */
+  badReason: string | null
+}
+
+/** 一批周测（一个 runAt 一批），按时间新→旧排 */
+export interface ProbeBatch {
+  runAt: Date
+  cells: Map<string, ProbeBatchCell>
+}
+
+export const probeCellKey = (source: string, platform: string): string => `${source}\u0000${platform}`
+
+/**
+ * 最近几批周测，**按批分开**留着。
+ *
+ * 为什么不用下面的 `latestProbeCells()`：那个已经把历史压成"每格最新一次"，而建议要的是
+ * "连续两批同向"——只看最新一批会因为一首冷门歌没版权、或某次网络抖动就误摘一个平台。
+ */
+export async function recentProbeBatches(limit = 4): Promise<ProbeBatch[]> {
+  const runs = await prisma.sourceProbeRun.findMany({
+    where: { status: 'done' }, orderBy: { startedAt: 'desc' }, take: limit, select: { startedAt: true },
+  })
+  if (!runs.length) return []
+  const rows = await prisma.sourceProbeResult.findMany({
+    where: { runAt: { in: runs.map(r => r.startedAt) } },
+    select: { runAt: true, source: true, platform: true, outcome: true, latencyMs: true, reason: true },
+  })
+  const byRun = new Map<number, Map<string, ProbeBatchCell>>()
+  for (const r of rows) {
+    const at = r.runAt.getTime()
+    const cells = byRun.get(at) ?? new Map<string, ProbeBatchCell>()
+    byRun.set(at, cells)
+    const key = probeCellKey(r.source, r.platform)
+    const cell = cells.get(key) ?? { samples: 0, okCount: 0, badCount: 0, latencies: [], badReason: null }
+    cell.samples++
+    if (r.outcome === 'ok') {
+      cell.okCount++
+      if (typeof r.latencyMs === 'number') cell.latencies.push(r.latencyMs)
+    } else if (BAD_OUTCOMES.has(r.outcome)) {
+      cell.badCount++
+      cell.badReason = cell.badReason ?? (r.reason ?? r.outcome)
+    }
+    cells.set(key, cell)
+  }
+  return runs.map(r => ({ runAt: r.startedAt, cells: byRun.get(r.startedAt.getTime()) ?? new Map<string, ProbeBatchCell>() }))
 }
 
 /**
