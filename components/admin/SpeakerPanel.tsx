@@ -10,7 +10,7 @@
  *    会话 5 分钟后自己作废。所以这里**不调 logout**（那会把已登录的状态一起清掉）。
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   getSpeaker, startSpeakerQr, pollSpeakerQr, refreshSpeakerDevices,
   setSpeakerManaged, setSpeakerEnabled, speakerLogout,
@@ -61,6 +61,8 @@ export function SpeakerPanel() {
   const [busySetting, setBusySetting] = useState(false)
   /** 每台最近一次读到的播放状态（只在这台设备上，不写库、不进日志） */
   const [statusByDevice, setStatusByDevice] = useState<Record<string, SpeakerStreamStatus>>({})
+  /** 音量输入框的 DOM 引用：按设备存，点「设音量」时读当前值 */
+  const volInputs = useRef<Record<string, HTMLInputElement | null>>({})
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -517,25 +519,55 @@ export function SpeakerPanel() {
                               暂停
                             </button>
                             <button
+                              onClick={() => runControl('play', d.deviceID)}
+                              disabled={!d.managed || busyDeviceId === d.deviceID}
+                              title="继续：暂停之后从这里恢复（推的是我们那条流地址，音箱不记得上次播到哪）"
+                              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              继续
+                            </button>
+                            <button
                               onClick={() => runControl('stop', d.deviceID)}
                               disabled={!d.managed || busyDeviceId === d.deviceID}
                               className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               停止
                             </button>
-                            <button
-                              onClick={() => runVolume(30, d.deviceID)}
-                              disabled={!d.managed || busyDeviceId === d.deviceID}
-                              title="把音量设成 30：推过去没声音时，先排掉「音箱被静音了」这一种"
-                              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                              音量 30
-                            </button>
+                            <span className="ml-auto flex items-center gap-1">
+                              <input
+                                type="number"
+                                min={0}
+                                max={100}
+                                defaultValue={statusByDevice[d.deviceID]?.volume >= 0 ? statusByDevice[d.deviceID].volume : ''}
+                                placeholder="0-100"
+                                aria-label="音量"
+                                ref={el => {
+                                  // 读到的当前音量回填进输入框：省得管理员盲猜现在是多少
+                                  if (el && statusByDevice[d.deviceID]?.volume >= 0 && el.value === '') {
+                                    el.value = String(statusByDevice[d.deviceID].volume)
+                                  }
+                                  volInputs.current[d.deviceID] = el
+                                }}
+                                disabled={!d.managed}
+                                className="w-20 rounded border border-border bg-background px-2 py-1 text-xs disabled:opacity-50"
+                              />
+                              <button
+                                onClick={() => {
+                                  const el = volInputs.current[d.deviceID]
+                                  runVolume(Number(el?.value), d.deviceID)
+                                }}
+                                disabled={!d.managed || busyDeviceId === d.deviceID}
+                                title="设音量：投过去没声音时先排掉「音箱被静音了」这一种"
+                                className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                设音量
+                              </button>
+                            </span>
                           </div>
                           {statusByDevice[d.deviceID] ? (
                             <div className="mt-1 font-mono text-[11px] text-muted-foreground">
                               {STATUS_LABEL[statusByDevice[d.deviceID].status] ?? `状态码 ${statusByDevice[d.deviceID].status}`}
-                              {' · '}位置 {Math.round(statusByDevice[d.deviceID].position / 1000)}s
+                              {' · '}位置 {statusByDevice[d.deviceID].position >= 0 ? `${Math.round(statusByDevice[d.deviceID].position / 1000)}s` : '没报'}
                               {' · '}时长 {statusByDevice[d.deviceID].duration > 0 ? `${Math.round(statusByDevice[d.deviceID].duration / 1000)}s` : '不报'}
                               {statusByDevice[d.deviceID].volume >= 0 ? ` · 音量 ${statusByDevice[d.deviceID].volume}` : ''}
                             </div>

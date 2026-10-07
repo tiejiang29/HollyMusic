@@ -291,6 +291,19 @@ describe('ubus 播控（G1）', () => {
     expect(await getPlayStatus(creds, '1')).toMatchObject({ status: -1, duration: -1 })
   })
 
+  it('真机形状（L05B 实测回包）：顶层没有 position，位置只在 play_song_detail 里', async () => {
+    // 这就是"位置一直显示 0s"的成因：只读顶层会静默兜成 0，看着像设备没报
+    const info = JSON.stringify({
+      status: 2, volume: 30, loop_type: 1, media_type: 3,
+      play_song_detail: { audio_id: '1732418460076477549', position: 177266, duration: 248869 },
+      track_list: ['1732418460076477549'],
+    })
+    ubusReply([{ code: 0, message: 'Msg has been successfully proxy…', data: { code: 0, info } }])
+    expect(await getPlayStatus(creds, '1')).toEqual({
+      status: 2, position: 177266, duration: 248869, volume: 30, title: '',
+    })
+  })
+
   it('日志里不许出现推给音箱的 URL（它带着能放歌的令牌），但要留得下长度', async () => {
     // 走"云端非 0 且不是鉴权"这条会打日志的分支
     ubusReply([{ code: 5005, message: 'internal' }])

@@ -334,11 +334,19 @@ export async function getPlayStatus(creds: XiaomiCredentials, deviceId: string):
     }
     const detail = (info.play_song_detail ?? {}) as Record<string, unknown>
     const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : -1)
+    // 位置/时长在 `play_song_detail` 里（真机实测：顶层只有 status/volume/loop_type/media_type）。
+    // 两处都取、取先拿到的那个：不同固件放过顶层，硬只读一处就会一直显示 0s。
+    const pick = (key: 'position' | 'duration'): number => {
+      const top = num(info[key])
+      const nested = num(detail[key])
+      return Math.max(top, nested)
+    }
     return {
       status: num(info.status) < 0 ? -1 : num(info.status),
-      position: Math.max(0, num(info.position)),
-      // 时长在两个位置都见过，取先拿到的那个（0/缺失都会如实变成 -1，不猜）
-      duration: Math.max(num(info.duration), num(detail.duration)),
+      // 不兜成 0：0 是"刚开始"，-1 才是"这台不报" —— 兜起来就让面板分不清两件事了
+      position: pick('position'),
+      // 0/缺失都会如实变成 -1：这台不报时长时，上层不能拿它做时长判据
+      duration: pick('duration'),
       volume: num(info.volume),
       title: typeof info.title === 'string' ? info.title : '',
     }
