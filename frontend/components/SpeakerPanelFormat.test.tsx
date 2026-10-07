@@ -9,10 +9,23 @@
 
 import { describe, expect, it } from 'vitest'
 
-const { humanRemaining, clockText } = await import('@/components/admin/SpeakerPanel')
+const { humanRemaining, clockText, STATUS_LABEL } = await import('@/components/admin/SpeakerPanel')
 
 const MIN = 60 * 1000
 const HOUR = 60 * MIN
+
+describe('STATUS_LABEL：读不到与停了是两件事', () => {
+  it('-1 说"读不到状态"，0 才说"已停止"', () => {
+    expect(STATUS_LABEL[-1]).toBe('读不到状态')
+    expect(STATUS_LABEL[0]).toBe('已停止')
+    expect(STATUS_LABEL[1]).toBe('正在播')
+    expect(STATUS_LABEL[2]).toBe('已暂停')
+  })
+
+  it('没见过的状态码不在表里（面板会退回显示原始码，不会编一个说法）', () => {
+    expect(STATUS_LABEL[7]).toBeUndefined()
+  })
+})
 
 describe('humanRemaining', () => {
   it('整小时只报时；跨过一小时才带上分', () => {
