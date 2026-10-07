@@ -127,7 +127,8 @@ export async function POST(request: NextRequest) {
 
     if (action === 'probe-batch') {
       // 一批最多 50 条、串行逐条判（真打第三方取址），进度与停止都靠 GET 轮询
-      const result = startCandidateProbeBatch()
+      // includeObfuscated：把「混淆载荷」那一档也排进这批（默认不带，那批大多是死脚本，白等超时档）
+      const result = startCandidateProbeBatch({ includeObfuscated: body?.includeObfuscated === true })
       return result.started
         ? createSuccessResponse(result, 202)
         : createSuccessResponse(result)

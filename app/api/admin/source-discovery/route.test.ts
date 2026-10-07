@@ -294,6 +294,12 @@ describe('动作校验', () => {
     const response = await POST(request('POST', { action: 'probe-batch' }))
     expect(response.status).toBe(202)
     expect(probeBatchMock).toHaveBeenCalledTimes(1)
+    // 默认不带混淆载荷；body 里勾了才透传过去（选哪几档进这批由面板决定，参数在这条路上不能丢）
+    expect(probeBatchMock).toHaveBeenLastCalledWith({ includeObfuscated: false })
+
+    const withObf = await POST(request('POST', { action: 'probe-batch', includeObfuscated: true }))
+    expect(withObf.status).toBe(202)
+    expect(probeBatchMock).toHaveBeenLastCalledWith({ includeObfuscated: true })
 
     probeBatchMock.mockReturnValueOnce({ started: false, reason: '已有一批判级在跑' })
     const busy = await POST(request('POST', { action: 'probe-batch' }))

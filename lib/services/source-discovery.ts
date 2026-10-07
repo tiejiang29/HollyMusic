@@ -573,6 +573,8 @@ export interface CrawlSummary {
   downloaded: number
   suspect: number
   notSource: number
+  /** 静态读不懂但像一份真载荷的（带 @name、正文 20KB~1MB），单列一档等人工/批量去判 */
+  obfuscated: number
   stale: number
   quota: RateLimitInfo | null
   note: string | null
@@ -587,6 +589,8 @@ export interface DrainSummary {
   downloaded: number
   suspect: number
   notSource: number
+  /** 静态读不懂但像一份真载荷的（带 @name、正文 20KB~1MB），单列一档等人工/批量去判 */
+  obfuscated: number
   stale: number
   /** 结束时还剩多少条没抓正文 —— 0 就是真清完了 */
   pendingLeft: number
@@ -777,7 +781,7 @@ const MAX_DRAIN_ROUNDS = 40
 
 async function doDrain(): Promise<DrainSummary> {
   const totals: DrainSummary = {
-    rounds: 0, downloaded: 0, suspect: 0, notSource: 0, stale: 0, pendingLeft: 0, stopped: false, note: null,
+    rounds: 0, downloaded: 0, suspect: 0, notSource: 0, obfuscated: 0, stale: 0, pendingLeft: 0, stopped: false, note: null,
   }
   progress.draining = true
   progress.stopRequested = false
@@ -803,6 +807,7 @@ async function doDrain(): Promise<DrainSummary> {
       totals.downloaded += summary.downloaded
       totals.suspect += summary.suspect
       totals.notSource += summary.notSource
+      totals.obfuscated += summary.obfuscated
       totals.stale += summary.stale
       totals.pendingLeft = await countPending()
       if (summary.stopped) {
@@ -850,7 +855,7 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
   const summary: CrawlSummary = {
     reposScanned: 0, reposSkipped: [], truncatedRepos: [], releaseRepos: [], releaseFallbacks: [], zipNotes: [], releaseSuperseded: 0,
     seen: 0, created: 0, refreshed: 0,
-    downloaded: 0, suspect: 0, notSource: 0, stale: 0, quota: null, note: null, stopped: false,
+    downloaded: 0, suspect: 0, notSource: 0, obfuscated: 0, stale: 0, quota: null, note: null, stopped: false,
   }
   progress.running = true
   progress.phase = '配额预检'
@@ -906,7 +911,7 @@ async function doCrawl(onlyRepos: string[] = []): Promise<CrawlSummary> {
     progress.last = summary
     logger.info('[discovery] 一轮发现完成', {
       仓库: summary.reposScanned, 候选: summary.seen, 新采: summary.created, 疑似: summary.suspect,
-      非音源: summary.notSource, 顶掉: summary.stale, 配额: summary.quota?.remaining ?? '未知',
+      非音源: summary.notSource, 混淆载荷: summary.obfuscated, 顶掉: summary.stale, 配额: summary.quota?.remaining ?? '未知',
     })
     return summary
   } catch (err) {
@@ -1443,12 +1448,16 @@ async function downloadAndScore(
   const { score, hits } = scoreCandidate(entry.path, content)
   const meta = parseScriptMeta(content)
   const suspect = score >= SUSPECT_THRESHOLD
+  // 过不了阈值但"长得像一份真载荷"的，单列一档：它不是"不像音源"，是"静态读不懂"
+  const obfuscated = !suspect && looksLikeObfuscatedSource({ scriptName: meta.name || '', sizeBytes: entry.size })
   await prisma.sourceCandidate.update({
     where: { repo_path: { repo, path: entry.path } },
     data: {
       score,
-      verdict: suspect ? 'suspect' : 'not-source',
-      reason: suspect ? hits.join('、') : `特征分 ${score} 未达 ${SUSPECT_THRESHOLD}（命中：${hits.join('、') || '无'}）`,
+      verdict: suspect ? 'suspect' : obfuscated ? 'obfuscated' : 'not-source',
+      reason: suspect ? hits.join('、')
+        : `特征分 ${score} 未达 ${SUSPECT_THRESHOLD}（命中：${hits.join('、') || '无'}）`
+        + (obfuscated ? `；带 @name、正文 ${Math.round(entry.size / 1024)}KB —— 静态特征读不懂，按混淆载荷收着` : ''),
       contentHash: createHash('sha256').update(content, 'utf8').digest('hex'),
       scriptName: meta.name || '',
       // 只按归一后的 @name 分组：同名不同内容也要顶掉旧的（被顶的行不删，面板还能看见）
@@ -1460,6 +1469,7 @@ async function downloadAndScore(
     },
   })
   if (suspect) summary.suspect++
+  else if (obfuscated) summary.obfuscated++
   else summary.notSource++
 }
 
@@ -1471,12 +1481,19 @@ async function markNotSource(repo: string, path: string, reason: string): Promis
 }
 
 /**
+ * 去重池收这两档：疑似可用 + 混淆载荷。
+ * 同名的混淆载荷被疑似那条顶掉是对的 —— 库里只该有"玉宁熙"这一条，谁更值得装由证据（上游时间/
+ * 版本号/出货）决定，不是由"静态分够不够"决定。真要看并排对照，被顶掉的行不删、页签还能翻出来。
+ */
+const DEDUPE_POOL_VERDICTS = ['suspect', 'obfuscated']
+
+/**
  * 两轮去重：同内容（sha256）与同名（@name 归一）各留一个"更优者"，其余标 stale 不删行
  * ——留着才看得清"为什么这条不见了"，也避免下轮重新建一遍。
  */
 async function dedupeCandidates(): Promise<number> {
   const rows = await prisma.sourceCandidate.findMany({
-    where: { verdict: 'suspect', state: 'new' },
+    where: { verdict: { in: DEDUPE_POOL_VERDICTS }, state: 'new' },
     select: DEDUPE_FIELDS,
   })
   return applyDedupeLosers(rows)
@@ -1518,8 +1535,8 @@ interface DedupeRow {
  */
 async function dedupeAroundPromotedCandidate(self: DedupeRow): Promise<{ others: number; selfLost: boolean }> {
   const branches: Array<Record<string, unknown>> = [{ id: self.id }]
-  if (self.contentHash) branches.push({ verdict: 'suspect', contentHash: self.contentHash })
-  if (self.nameKey) branches.push({ verdict: 'suspect', nameKey: self.nameKey })
+  if (self.contentHash) branches.push({ verdict: { in: DEDUPE_POOL_VERDICTS }, contentHash: self.contentHash })
+  if (self.nameKey) branches.push({ verdict: { in: DEDUPE_POOL_VERDICTS }, nameKey: self.nameKey })
   const peers = await prisma.sourceCandidate.findMany({
     where: { state: 'new', OR: branches },
     select: DEDUPE_FIELDS,
@@ -1842,20 +1859,17 @@ const FORCE_PROBE_MIN_BYTES = 20 * 1024
 const FORCE_PROBE_MAX_BYTES = 1024 * 1024
 
 /**
- * 静态特征读不懂、但**长得像一份真载荷**的候选。
+ * 静态特征读不懂、但**长得像一份真载荷**的候选 —— 判"要不要单列成一档"用。
  *
  * 为什么要有这一档：混淆过的脚本（字符串表、base64 大块、没有 `musicSearch` 字面量）拿静态
- * 打分必然不过线，可它照样可能是能出货的源 —— 静态分不够不等于跑不起来。而"跑一下"是唯一
- * 能证明这件事的手段，所以给这一档留一个人工入口。
+ * 打分必然不过线，可它照样可能是能出货的源 —— 静态分不够不等于跑不起来。所以它不是"不像音源"，
+ * 是"静态判不动、需要真跑一次"，面板上单独一个页签，批量判级也能带上它。
  *
  * 判据必须窄：`@name` 非空说明作者确实把它当洛雪音源发布，体积窗口说明不是碎屑；两条同时成立
- * 才放行。否则管理员拿它当万能口子，把 4 分的那种垃圾 js 也一条条送去真打第三方接口。
+ * 才进这一档。否则一堆 README 附带的 js 也涌进来，管理员拿它当"疑似可用"的备胎池。
  */
-export function looksLikeObfuscatedSource(
-  row: { verdict: string; scriptName: string; sizeBytes: number },
-): boolean {
-  return row.verdict === 'not-source'
-    && row.scriptName.trim().length > 0
+export function looksLikeObfuscatedSource(row: { scriptName: string; sizeBytes: number }): boolean {
+  return row.scriptName.trim().length > 0
     && row.sizeBytes >= FORCE_PROBE_MIN_BYTES
     && row.sizeBytes <= FORCE_PROBE_MAX_BYTES
 }
@@ -1871,16 +1885,14 @@ export function looksLikeObfuscatedSource(
  * - 全程不碰 `sourceHealth`：判级不经取址瀑布，结构上写不进账本
  *   （探测抖动不能变成用户侧的坏证据，这条约束与周测同源）。
  *
- * `force` 只放宽入口那一条（原判不是 suspect 的，得同时满足 `looksLikeObfuscatedSource`），
- * 上面四点一个都不动。
+ * `force` 是给「混淆载荷」那一档留的口子：静态读不懂的东西只有真跑一次才知道行不行。
+ * 上面四点一个都不动 —— 放宽的只是入口，不是隔离与完整性复验。
  */
 export async function probeCandidate(id: number, opts: { force?: boolean } = {}): Promise<CandidateProbeReport> {
   const row = await prisma.sourceCandidate.findUnique({ where: { id } })
   if (!row) throw new SourceDiscoveryError('候选不存在', 404)
-  if (row.verdict !== 'suspect' && !(opts.force && looksLikeObfuscatedSource(row))) {
-    throw new SourceDiscoveryError(
-      '只给"疑似音源"的候选做判级；不像音源的，只有带 @name 且正文 20KB~1MB 才允许「仍然判级」',
-    )
+  if (row.verdict !== 'suspect' && !(opts.force && row.verdict === 'obfuscated')) {
+    throw new SourceDiscoveryError('只给「疑似可用」和「混淆载荷」的候选做判级')
   }
 
   const settings = await getDiscoverySettings()
@@ -1975,19 +1987,19 @@ export async function probeCandidate(id: number, opts: { force?: boolean } = {})
   report.note = `${okCount}/${cells.length} 个平台真出货`
     + (harnessCount ? `｜${harnessCount} 格是我们通道没判成，可重判` : '')
   await saveReport(id, report)
-  // 原判不是 suspect 的（走「仍然判级」进来的）：真出货就把等级提上来。
-  // 静态分读不懂混淆载荷，而"跑起来真能取到地址"就是它缺的那份证据 —— 提升之后导入闸门
-  // （要 suspect 且至少一格 ok）不用改就能用；0 出货则留在 not-source，只把红绿灯留在行上。
+  // 混淆载荷那一档（走 force 进来的）：真出货就把等级提到疑似可用。
+  // 静态分读不懂它，而"跑起来真能取到地址"就是它缺的那份证据 —— 提升之后导入闸门
+  // （要 suspect 且至少一格 ok）不用改就能用；0 出货则留在混淆载荷档，只把红绿灯留在行上。
   if (row.verdict !== 'suspect' && okCount > 0) {
     // 先按"它已经是疑似可用"去跟在册的同名/同内容并一次组，再把等级写下去 ——
-    // 整表去重只在采集轮末跑，这一档是点判级时才往池子里塞新成员，不补就会出现
+    // 整表去重只在采集轮末跑，这一档是判级时才往池子里塞新成员，不补就会出现
     // 两条同名源并排站在「疑似可用」里，各点一次导入 = 两条源共用健康账本那一格。
     const superseded = await dedupeAroundPromotedCandidate(row)
     await prisma.sourceCandidate.update({
       where: { id },
       data: {
         verdict: 'suspect',
-        reason: `原判 ${row.score} 分（静态特征读不懂）；仍然判级后 ${okCount}/${cells.length} 个平台真出货 ⇒ 提升为疑似可用`
+        reason: `原判 ${row.score} 分（静态特征读不懂，收在混淆载荷档）；判级 ${okCount}/${cells.length} 个平台真出货 ⇒ 提升为疑似可用`
           // 输的可能是它自己（同名另一条的上游时间更新）——那句话说的是"这条别装"，不是"顶掉了别人"
           + (superseded.selfLost ? '；同名的另一条上游更新，这条记为已被顶掉'
             : superseded.others ? `；顺带顶掉 ${superseded.others} 条同名/同内容的旧候选` : ''),
@@ -2030,13 +2042,17 @@ export function startCandidateProbe(id: number, opts: { force?: boolean } = {}):
  * 12 秒），所以一批 50 条约 8 分钟。
  * 为什么设 50：判级是**真打第三方平台**的取址接口，一批就是上百次请求；一口气把全部候选
  * 打一遍有触发上游风控的风险（源可用性那期的聚合 API 就是这么吃到 CF 429 的）。
+ *
+ * `includeObfuscated` 决定要不要把「混淆载荷」那一档也排进来。默认不带：那批大多是没接卡的
+ * 死脚本，一批 50 条里有几个判不动就要各等满超时档，把额度花在"确认它不行"上；单条人工
+ * 「仍然判级」才是它该被验的路。勾选就是管理员明确要一次扫一批。
  */
-export function startCandidateProbeBatch(): { started: boolean; reason?: string } {
+export function startCandidateProbeBatch(opts: { includeObfuscated?: boolean } = {}): { started: boolean; reason?: string } {
   if (progress.probeBatch?.running) return { started: false, reason: '已有一批判级在跑' }
   if (progress.probingId !== null) return { started: false, reason: `候选 ${progress.probingId} 正在判级中` }
   if (progress.running || progress.draining) return { started: false, reason: '有发现在跑，先等它结束' }
   progress.probeBatch = { total: 0, done: 0, withAddress: 0, failed: 0, stopped: false, note: null, running: true, limit: PROBE_BATCH_LIMIT }
-  void runProbeBatch(PROBE_BATCH_LIMIT)
+  void runProbeBatch(PROBE_BATCH_LIMIT, opts.includeObfuscated === true)
     .catch(err => {
       if (progress.probeBatch) progress.probeBatch.note = `这批崩了：${err instanceof Error ? err.message : String(err)}`
       logger.warn('[discovery] 批量判级异常:', err)
@@ -2049,17 +2065,17 @@ export function startCandidateProbeBatch(): { started: boolean; reason?: string 
   return { started: true }
 }
 
-async function runProbeBatch(limit: number): Promise<void> {
+async function runProbeBatch(limit: number, includeObfuscated: boolean): Promise<void> {
   const rows = await prisma.sourceCandidate.findMany({
     where: {
-      verdict: 'suspect',
+      verdict: includeObfuscated ? { in: DEDUPE_POOL_VERDICTS } : 'suspect',
       state: 'new',
       // 没判过的，加上"通道没判成"的（重判就是它们需要的）；判成功或判成"源真不行"的不再重复消耗上游
       OR: [{ probeJson: '' }, { probeJson: { contains: '"harness"' } }],
     },
     orderBy: [{ score: 'desc' }, { updatedAt: 'desc' }],
     take: limit,
-    select: { id: true },
+    select: { id: true, verdict: true },
   })
   const batch = progress.probeBatch!
   batch.total = rows.length
@@ -2076,7 +2092,8 @@ async function runProbeBatch(limit: number): Promise<void> {
     progress.probingId = row.id
     batch.done++
     try {
-      const report = await probeCandidate(row.id)
+      // 混淆载荷那一档要靠 force 才进得了门（静态分不够不等于跑不起来，但入口仍要显式放宽）
+      const report = await probeCandidate(row.id, { force: row.verdict !== 'suspect' })
       if (okCellCount(report) > 0) batch.withAddress++
       progress.lastProbeNote = report.note ?? '判级完成'
     } catch (err) {

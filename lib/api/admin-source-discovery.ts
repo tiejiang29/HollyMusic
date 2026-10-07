@@ -38,6 +38,7 @@ export interface DiscoveryStatus {
     downloaded: number
     suspect: number
     notSource: number
+    obfuscated: number
     stale: number
     pendingLeft: number
     stopped: boolean
@@ -62,6 +63,7 @@ export interface DiscoveryStatus {
     downloaded: number
     suspect: number
     notSource: number
+    obfuscated: number
     stale: number
     note: string | null
     /** 被手动停止中断的这一轮（连轮据此不再接着跑） */
@@ -104,7 +106,7 @@ export interface DiscoveryCandidate {
   rawUrl: string
   scriptName: string
   score: number
-  verdict: 'pending' | 'suspect' | 'not-source' | string
+  verdict: 'pending' | 'suspect' | 'obfuscated' | 'not-source' | string
   state: 'new' | 'stale' | 'imported' | string
   reason: string | null
   sizeBytes: number
@@ -227,9 +229,12 @@ export function startCandidateProbe(id: number, force = false): Promise<{ starte
   return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe', id, force })
 }
 
-/** 批量判级：把"在册且没判过"的候选排队逐条判，一批最多 50 条（服务端定死，不在 UI 里另抄） */
-export function startCandidateProbeBatch(): Promise<{ started: boolean; reason?: string }> {
-  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe-batch' })
+/**
+ * 批量判级：把"在册且没判过"的候选排队逐条判，一批最多 50 条（服务端定死，不在 UI 里另抄）。
+ * `includeObfuscated` 勾上才把「混淆载荷」那一档一起排进这批 —— 默认不带，见服务层那条理由。
+ */
+export function startCandidateProbeBatch(includeObfuscated = false): Promise<{ started: boolean; reason?: string }> {
+  return apiPost<{ started: boolean; reason?: string }>('admin/source-discovery', { action: 'probe-batch', includeObfuscated })
 }
 
 export function dismissDiscoveryCandidate(id: number): Promise<{ dismissed: number }> {

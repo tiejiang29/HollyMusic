@@ -55,25 +55,13 @@ describe('needsForceConfirm（要不要二次确认才导）', () => {
 })
 
 describe('canForceProbe（「仍然判级」的按钮口径）', () => {
-  const row = (over: Partial<Pick<DiscoveryCandidate, 'verdict' | 'scriptName' | 'sizeBytes'>> = {}) =>
-    ({ verdict: 'not-source', scriptName: '聚合API', sizeBytes: 60 * 1024, ...over })
+  const row = (over: Partial<Pick<DiscoveryCandidate, 'verdict'>> = {}) => ({ verdict: 'obfuscated', ...over })
 
-  it('像载荷的 not-source 才点亮：@name 非空 + 正文 20KB~1MB（闭区间）', () => {
+  it('只有「混淆载荷」那一档给点：档位是服务端分的，面板不再重算 @name 与体积', () => {
     expect(canForceProbe(row())).toBe(true)
-    expect(canForceProbe(row({ sizeBytes: 20 * 1024 }))).toBe(true)
-    expect(canForceProbe(row({ sizeBytes: 1024 * 1024 }))).toBe(true)
-  })
-
-  it('碎屑和大块都不给点 —— 跑它们只是白打第三方取址接口', () => {
-    expect(canForceProbe(row({ sizeBytes: 20 * 1024 - 1 }))).toBe(false)
-    expect(canForceProbe(row({ sizeBytes: 1024 * 1024 + 1 }))).toBe(false)
-    expect(canForceProbe(row({ sizeBytes: 0 }))).toBe(false)
-  })
-
-  it('没有 @name 不算载荷；这一档只管 not-source，pending/suspect 走原来的口', () => {
-    expect(canForceProbe(row({ scriptName: '   ' }))).toBe(false)
-    expect(canForceProbe(row({ verdict: 'pending' }))).toBe(false)
     expect(canForceProbe(row({ verdict: 'suspect' }))).toBe(false)
+    expect(canForceProbe(row({ verdict: 'not-source' }))).toBe(false)
+    expect(canForceProbe(row({ verdict: 'pending' }))).toBe(false)
   })
 })
 

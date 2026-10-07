@@ -135,7 +135,7 @@ beforeEach(() => {
     take?: number
   }) => {
     const where = (args?.where ?? {}) as {
-      verdict?: string; state?: string; probeJson?: string; OR?: Array<Record<string, unknown>>
+      verdict?: string | { in?: string[] }; state?: string; probeJson?: string; OR?: Array<Record<string, unknown>>
       repo?: string; releaseTag?: string; assetDigest?: string; zipMember?: string; importedPath?: string
       NOT?: { repo?: { in?: string[] } }
     }
@@ -150,7 +150,9 @@ beforeEach(() => {
       const listed = new Set(where.NOT.repo.in)
       out = out.filter(r => !listed.has(r.repo))
     }
-    if (where.verdict) out = out.filter(r => r.verdict === where.verdict)
+    // 去重池与批量判级现在按 `verdict: { in: [...] }` 取两档，等值比较会把它们全筛掉
+    if (typeof where.verdict === 'string') out = out.filter(r => r.verdict === where.verdict)
+    else if (where.verdict?.in) out = out.filter(r => where.verdict!.in!.includes(String(r.verdict)))
     if (where.state) out = out.filter(r => r.state === where.state)
     if (where.probeJson !== undefined) out = out.filter(r => r.probeJson === where.probeJson)
     if (where.OR) {
@@ -160,8 +162,9 @@ beforeEach(() => {
       const match = (row: Row, branch: Record<string, unknown>) => Object.entries(branch).every(([field, want]) => {
         const got = String(row[field] ?? '')
         if (want && typeof want === 'object') {
-          const contains = (want as { contains?: string }).contains
-          return contains ? got.includes(contains) : true
+          const spec = want as { contains?: string; in?: string[] }
+          if (spec.in) return spec.in.includes(got)
+          return spec.contains ? got.includes(spec.contains) : true
         }
         return got === String(want)
       })
@@ -605,14 +608,14 @@ describe('probeCandidate', () => {
     expect(rows.find(r => r.id === id)?.probeJson).toBe('')
   })
 
-  it('只给"疑似音源"判级：pending 直接拒', async () => {
+  it('只给「疑似可用」和「混淆载荷」判级：pending 直接拒', async () => {
     const id = seedSuspect({ verdict: 'pending' })
-    await expect(probeCandidate(id)).rejects.toThrow(/疑似音源/)
+    await expect(probeCandidate(id)).rejects.toThrow(/混淆载荷/)
   })
 
-  it('「仍然判级」：像载荷的 not-source 允许 force 跑，真出货就提升为疑似可用并把来源写进依据', async () => {
+  it('混淆载荷档允许 force 跑：真出货就提升为疑似可用，并把来历与并组结果写进依据', async () => {
     const id = seedSuspect({
-      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT),
+      verdict: 'obfuscated', score: 2, sizeBytes: 60 * 1024, blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT),
     })
     vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
     _setRunnerForTest(fakeRunner())
@@ -621,8 +624,8 @@ describe('probeCandidate', () => {
     expect(report.cells.tx?.outcome).toBe('ok')
     const row = rows.find(r => r.id === id)!
     expect(row.verdict).toBe('suspect')
-    expect(String(row.reason)).toContain('仍然判级')
-    expect(String(row.reason)).toContain('1/1 个平台真出货')
+    expect(String(row.reason)).toContain('收在混淆载荷档')
+    expect(String(row.reason)).toContain('判级 1/1 个平台真出货')
   })
 
   it('提升等级时顺带并组：赢家（上游时间新的那条）留在册，输家标 stale 并把数量写进依据', async () => {
@@ -633,7 +636,7 @@ describe('probeCandidate', () => {
       upstreamAt: '2026-10-03T00:00:00Z', path: 'V261003.zip!V261003/lx-玉宁熙1.2.5.js',
     })
     const id = seedSuspect({
-      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: sha,
+      verdict: 'obfuscated', score: 2, sizeBytes: 60 * 1024, blobSha: sha,
       nameKey: '玉宁熙pro', scriptName: 'lx-玉宁熙-Pro v1.2.2', contentHash: 'hash-122', upstreamAt: '',
     })
     vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
@@ -647,16 +650,16 @@ describe('probeCandidate', () => {
     expect(String(promoted.reason)).toContain('同名的另一条上游更新')
     expect(String(promoted.reason)).not.toContain('顺带顶掉')
     expect(rows.find(r => r.id === keeper)!.state).toBe('new')
-    expect(String(rows.find(r => r.id === keeper)!.reason)).not.toContain('仍然判级')
+    expect(String(rows.find(r => r.id === keeper)!.reason)).not.toContain('混淆载荷')
   })
 
-  it('并组时同内容（sha256）也算，即使名字不一样；not-source 的同行不进池子（判据没写宽）', async () => {
+  it('并组时同内容（sha256）也算，即使名字不一样；没进池子的档（不像音源）不参与', async () => {
     const sha = gitBlobSha(FAKE_SOURCE_SCRIPT)
     const twin = seedSuspect({ nameKey: '别的源', scriptName: '另一个名字 v9', contentHash: 'same-hash' })
-    // 同字节但还没判成疑似的一行：不该被卷进这次比较
+    // 同字节但归在"不像音源"的一行：不在去重池里，不该被卷进这次比较
     const notSuspect = seedSuspect({ verdict: 'not-source', nameKey: '玉宁熙pro', contentHash: 'same-hash' })
     const id = seedSuspect({
-      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: sha,
+      verdict: 'obfuscated', score: 2, sizeBytes: 60 * 1024, blobSha: sha,
       nameKey: '玉宁熙pro', contentHash: 'same-hash', upstreamAt: '2026-10-05T00:00:00Z',
     })
     vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
@@ -665,13 +668,13 @@ describe('probeCandidate', () => {
     await probeCandidate(id, { force: true })
     expect(rows.find(r => r.id === id)!.state).toBe('new')        // 上游时间最新 ⇒ 它留
     expect(String(rows.find(r => r.id === id)!.reason)).toContain('顺带顶掉 1 条')
-    expect(rows.find(r => r.id === twin)!.state).toBe('stale')    // 同内容的在册疑似被顶掉
+    expect(rows.find(r => r.id === twin)!.state).toBe('stale')    // 同内容的在册候选被顶掉
     expect(rows.find(r => r.id === notSuspect)!.state).toBe('new')
   })
 
-  it('仍然判级 0 出货 ⇒ 等级不动（留在 not-source），但红绿灯留在行上供人看', async () => {
+  it('混淆载荷判出 0 出货 ⇒ 等级不动（还留在这一档等人工看），但红绿灯留在行上', async () => {
     const id = seedSuspect({
-      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT),
+      verdict: 'obfuscated', score: 2, sizeBytes: 60 * 1024, blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT),
     })
     vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
     _setRunnerForTest(fakeRunner({ probeImpl: async () => ({ ok: true, sourceInfo: {}, callError: '无版权，无法播放' }) }))
@@ -679,13 +682,13 @@ describe('probeCandidate', () => {
     const report = await probeCandidate(id, { force: true })
     expect(report.cells.tx?.outcome).toBe('no-address')
     const row = rows.find(r => r.id === id)!
-    expect(row.verdict).toBe('not-source')
+    expect(row.verdict).toBe('obfuscated')
     expect(String(row.probeJson)).toContain('no-address')
   })
 
-  it('仍然判级不放水完整性：sha 对不上照旧一次都不执行', async () => {
+  it('判级不放水完整性：sha 对不上照旧一次都不执行', async () => {
     const id = seedSuspect({
-      verdict: 'not-source', score: 2, sizeBytes: 60 * 1024, blobSha: '0'.repeat(40),
+      verdict: 'obfuscated', score: 2, sizeBytes: 60 * 1024, blobSha: '0'.repeat(40),
     })
     vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
     const runner = fakeRunner()
@@ -694,35 +697,30 @@ describe('probeCandidate', () => {
     const report = await probeCandidate(id, { force: true })
     expect(report.shaVerified).toBe(false)
     expect(runner.validateScript).not.toHaveBeenCalled()
-    expect(rows.find(r => r.id === id)?.verdict).toBe('not-source')
+    expect(rows.find(r => r.id === id)?.verdict).toBe('obfuscated')
   })
 
-  it('不像载荷的不给仍然判级：没 @name、体积在窗口外、pending 都拒（防它变成万能口子）', async () => {
+  it('force 只对着「混淆载荷」这一档：不像音源、待判定都拒（口子没被撑大）', async () => {
     const sha = gitBlobSha(FAKE_SOURCE_SCRIPT)
     vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
     _setRunnerForTest(fakeRunner())
 
-    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', scriptName: '', sizeBytes: 60 * 1024, blobSha: sha }), { force: true }))
-      .rejects.toThrow(/仍然判级/)
-    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', sizeBytes: 5 * 1024, blobSha: sha }), { force: true }))
-      .rejects.toThrow(/仍然判级/)
-    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', sizeBytes: 5 * 1024 * 1024, blobSha: sha }), { force: true }))
-      .rejects.toThrow(/仍然判级/)
+    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', sizeBytes: 60 * 1024, blobSha: sha }), { force: true }))
+      .rejects.toThrow(/混淆载荷/)
     await expect(probeCandidate(seedSuspect({ verdict: 'pending', sizeBytes: 60 * 1024, blobSha: sha }), { force: true }))
-      .rejects.toThrow(/仍然判级/)
+      .rejects.toThrow(/混淆载荷/)
     // 不带 force 时老口子一个字没变
-    await expect(probeCandidate(seedSuspect({ verdict: 'not-source', sizeBytes: 60 * 1024, blobSha: sha })))
-      .rejects.toThrow(/疑似音源/)
+    await expect(probeCandidate(seedSuspect({ verdict: 'obfuscated', sizeBytes: 60 * 1024, blobSha: sha })))
+      .rejects.toThrow(/混淆载荷/)
   })
 
-  it('looksLikeObfuscatedSource 的窗口是闭区间，且只认 not-source', () => {
-    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 20 * 1024 })).toBe(true)
-    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 1024 * 1024 })).toBe(true)
-    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 20 * 1024 - 1 })).toBe(false)
-    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: 'X', sizeBytes: 1024 * 1024 + 1 })).toBe(false)
-    expect(looksLikeObfuscatedSource({ verdict: 'not-source', scriptName: '   ', sizeBytes: 60 * 1024 })).toBe(false)
-    expect(looksLikeObfuscatedSource({ verdict: 'suspect', scriptName: 'X', sizeBytes: 60 * 1024 })).toBe(false)
-    expect(looksLikeObfuscatedSource({ verdict: 'pending', scriptName: 'X', sizeBytes: 60 * 1024 })).toBe(false)
+  it('looksLikeObfuscatedSource 只管"像不像一份载荷"，档位由分档那步决定', () => {
+    expect(looksLikeObfuscatedSource({ scriptName: 'X', sizeBytes: 20 * 1024 })).toBe(true)
+    expect(looksLikeObfuscatedSource({ scriptName: 'X', sizeBytes: 1024 * 1024 })).toBe(true)
+    expect(looksLikeObfuscatedSource({ scriptName: 'X', sizeBytes: 20 * 1024 - 1 })).toBe(false)
+    expect(looksLikeObfuscatedSource({ scriptName: 'X', sizeBytes: 1024 * 1024 + 1 })).toBe(false)
+    expect(looksLikeObfuscatedSource({ scriptName: '   ', sizeBytes: 60 * 1024 })).toBe(false)
+    expect(looksLikeObfuscatedSource({ scriptName: 'X', sizeBytes: 0 })).toBe(false)
   })
 
   it('一次性进程崩了 ⇒ 记 harness（我们通道没判成），不记成"源不行"', async () => {
@@ -1001,14 +999,17 @@ describe('候选列表排序（判级真出货优先，静态分只给没判过�
 
 // ————— 连轮清存量 —————
 /** 一棵只含指定文件的仓库树；正文默认返回骨架脚本，failRaw 时 500（演"下载一直失败"） */
-function stubRepoTree(files: Array<{ path: string; sha: string }>, options: { failRaw?: boolean } = {}) {
+/** 只带 @name、没有任何运行期特征的脚本：静态判不动，靠体积窗口归进「混淆载荷」 */
+const OBFUSCATED_SCRIPT = ['// @name 混淆测试音源 v1.0.0', 'a'.repeat(30 * 1024)].join('\n')
+
+function stubRepoTree(files: Array<{ path: string; sha: string; size?: number }>, options: { failRaw?: boolean; content?: string } = {}) {
   return vi.fn(async (url: string) => {
     if (url.endsWith('/rate_limit')) return jsonResponse({ resources: { core: { remaining: 5000, limit: 5000, reset: 0 } } })
     if (url.includes('/git/trees/')) {
-      return jsonResponse({ tree: files.map(f => ({ path: f.path, type: 'blob', sha: f.sha, size: 100 })) })
+      return jsonResponse({ tree: files.map(f => ({ path: f.path, type: 'blob', sha: f.sha, size: f.size ?? 100 })) })
     }
     if (options.failRaw) return new Response('nope', { status: 500 })
-    return new Response(FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain', 'last-modified': 'Wed, 01 Oct 2026 00:00:00 GMT' } })
+    return new Response(options.content ?? FAKE_SOURCE_SCRIPT, { headers: { 'content-type': 'text/plain', 'last-modified': 'Wed, 01 Oct 2026 00:00:00 GMT' } })
   })
 }
 
@@ -1085,6 +1086,37 @@ async function waitProbeBatch(timeoutMs = 5_000) {
   throw new Error('批量判级没在预期时间内收口')
 }
 
+  it('静态读不懂但像一份载荷的（带 @name、正文在窗口内）单列成「混淆载荷」档，不塞进"不像音源"', async () => {
+    await enable(['a/b'])
+    vi.stubGlobal('fetch', stubRepoTree([
+      { path: 'lx-obf.js', sha: 'o1'.repeat(20), size: 60 * 1024 },
+      { path: 'lx-small.js', sha: 'o2'.repeat(20), size: 5 * 1024 },
+    ], { content: OBFUSCATED_SCRIPT }))
+
+    const summary = await runDiscoveryCrawl()
+    const obf = rows.find(r => r.path === 'lx-obf.js')!
+    expect(obf.verdict).toBe('obfuscated')
+    expect(String(obf.reason)).toContain('按混淆载荷收着')
+    expect(summary.obfuscated).toBe(1)
+    // 同一份内容、体积不在窗口内的仍算"不像音源"：这一档不是"分数低就收进来"
+    expect(rows.find(r => r.path === 'lx-small.js')!.verdict).toBe('not-source')
+    expect(summary.notSource).toBe(1)
+  })
+
+  it('整表去重的池子也含「混淆载荷」：同名两条里，静态读不懂那条会被疑似可用顶掉', async () => {
+    await enable(['a/b'])
+    const keeper = seedSuspect({ nameKey: '玉宁熙pro', scriptName: 'lx-玉宁熙-Pro v1.2.5', upstreamAt: '2026-10-03T00:00:00Z', contentHash: 'hash-125' })
+    const obf = seedSuspect({ verdict: 'obfuscated', nameKey: '玉宁熙pro', scriptName: 'lx-玉宁熙-Pro', upstreamAt: '', contentHash: 'hash-122' })
+    vi.stubGlobal('fetch', stubRepoTree([]))
+
+    const summary = await runDiscoveryCrawl()
+    expect(summary.stale).toBe(1)
+    expect(rows.find(r => r.id === obf)!.state).toBe('stale')
+    expect(rows.find(r => r.id === keeper)!.state).toBe('new')
+    // 被顶掉不等于消失：它还在混淆载荷那一档里翻得出来
+    expect(rows.find(r => r.id === obf)!.verdict).toBe('obfuscated')
+  })
+
 describe('startCandidateProbeBatch（批量判级）', () => {
   beforeEach(() => {
     _setProbeGapForTest(0)
@@ -1093,6 +1125,25 @@ describe('startCandidateProbeBatch（批量判级）', () => {
   afterEach(() => {
     _setProbeGapForTest(null)
     _setRunnerForTest(null)
+  })
+
+  it('默认不把「混淆载荷」排进这批；勾上才带，且带去的是 force 判级、出货就提档', async () => {
+    await enable(['a/b'])
+    const obf = seedSuspect({ verdict: 'obfuscated', sizeBytes: 60 * 1024, blobSha: gitBlobSha(FAKE_SOURCE_SCRIPT) })
+    vi.stubGlobal('fetch', stubRawFetch(FAKE_SOURCE_SCRIPT))
+
+    expect(startCandidateProbeBatch().started).toBe(true)
+    let batch = await waitProbeBatch()
+    expect(batch?.total).toBe(0)
+    expect(rows.find(r => r.id === obf)!.probeJson).toBe('')
+
+    expect(startCandidateProbeBatch({ includeObfuscated: true }).started).toBe(true)
+    batch = await waitProbeBatch()
+    expect(batch?.total).toBe(1)
+    expect(batch?.withAddress).toBe(1)
+    const row = rows.find(r => r.id === obf)!
+    expect(row.verdict).toBe('suspect')
+    expect(String(row.reason)).toContain('收在混淆载荷档')
   })
 
   it('一批最多 50 条，只挑在册且没判过的，判完把结果写回行上', async () => {

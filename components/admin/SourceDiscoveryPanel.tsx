@@ -37,6 +37,7 @@ import { copyAddress } from '@/lib/utils/clipboard'
 
 const FILTERS = [
   { key: 'suspect', label: '疑似可用', verdict: 'suspect', state: 'new' },
+  { key: 'obfuscated', label: '混淆载荷', verdict: 'obfuscated', state: 'new' },
   { key: 'pending', label: '待判定', verdict: 'pending', state: 'new' },
   { key: 'not-source', label: '不像音源', verdict: 'not-source', state: 'new' },
   { key: 'imported', label: '已导入', verdict: '', state: 'imported' },
@@ -121,18 +122,14 @@ export function needsForceConfirm(row: Pick<DiscoveryCandidate, 'probe' | 'dupli
 }
 
 /**
- * 「仍然判级」——静态分读不懂、但长得像一份真载荷的候选，允许人工送去真跑一次。
+ * 「仍然判级」按钮亮不亮 —— 只有「混淆载荷」这一档可以。
  *
- * 混淆过的音源脚本没有 `musicSearch` 这类字面量，静态打分必然不过线，可它照样能出货；
- * 而"跑一次"是唯一能证明这件事的手段。判据与服务端 `looksLikeObfuscatedSource` 同一条
- * （@name 非空 + 正文 20KB~1MB），两边不一致的话按钮会点亮而判级失败信息只在进度里闪一下。
- * 体积窗口不是装饰：小于 20KB 多半是碎屑，大于 1MB 多半打包了二进制，白打第三方取址接口。
+ * 为什么不再在面板里重算 @name 与体积窗口：那两条判据现在由服务端在**打分那一刻**决定档位
+ * （`looksLikeObfuscatedSource` → `verdict='obfuscated'`），面板再算一遍就是第二份尺子，
+ * 两边不一致时按钮会点亮而接口回你一句"只给疑似可用和混淆载荷判级"。
  */
-export function canForceProbe(row: Pick<DiscoveryCandidate, 'verdict' | 'scriptName' | 'sizeBytes'>): boolean {
-  return row.verdict === 'not-source'
-    && row.scriptName.trim().length > 0
-    && row.sizeBytes >= 20 * 1024
-    && row.sizeBytes <= 1024 * 1024
+export function canForceProbe(row: Pick<DiscoveryCandidate, 'verdict'>): boolean {
+  return row.verdict === 'obfuscated'
 }
 
 /**
@@ -273,6 +270,8 @@ export function SourceDiscoveryPanel() {
   const [freshNote, setFreshNote] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [starting, setStarting] = useState(false)
+  // 批量判级默认只碰「疑似可用」；勾上才把「混淆载荷」一起排进这批（代价见按钮 title）
+  const [batchWithObfuscated, setBatchWithObfuscated] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [copiedId, setCopiedId] = useState<number | null>(null)
   const [importingId, setImportingId] = useState<number | null>(null)
@@ -575,7 +574,7 @@ export function SourceDiscoveryPanel() {
 
   const handleProbeBatch = async () => {
     try {
-      const result = await startCandidateProbeBatch()
+      const result = await startCandidateProbeBatch(batchWithObfuscated)
       if (!result.started) alert(result.reason ?? '已有一批判级在跑')
       await reload()
     } catch (e) {
@@ -665,12 +664,25 @@ export function SourceDiscoveryPanel() {
           <button
             onClick={handleProbeBatch}
             disabled={starting || saving || !settings?.enabled || status?.running || status?.draining || Boolean(status?.probeBatch?.running)}
-            title="把「疑似可用」页签里没判过的候选排队逐条判（一批最多 50 条，串行）。实测一条几秒到一分多钟 —— 判不动的平台要等超时档，所以一批约 8 分钟；判级是真打第三方取址接口，所以分批"
+            title="把「疑似可用」页签里没判过的候选排队逐条判（一批最多 50 条，串行）。实测一条几秒到一分多钟 —— 判不动的平台要等超时档，所以一批约 8 分钟；判级是真打第三方取址接口，所以分批。旁边的勾选才会带上「混淆载荷」"
             className="flex items-center gap-1 rounded-full border border-border px-4 py-2 text-sm font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           >
             {status?.probeBatch?.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <ListChecks className="h-4 w-4" />}
             {status?.probeBatch?.running ? `判级中 ${status.probeBatch.done}/${status.probeBatch.total}` : '批量判级'}
           </button>
+          <label
+            className="flex items-center gap-1.5 self-center text-xs text-muted-foreground"
+            title="默认只判「疑似可用」那批。勾上就把「混淆载荷」也排进来一起判 —— 那批大多是没接卡的死脚本，一条判不动要等满超时档（实测一条几秒到一分多钟），一批 50 条就是上百次真打第三方取址接口；拿不准先去那页签点单条「仍然判级」试水"
+          >
+            <input
+              type="checkbox"
+              className="align-middle"
+              checked={batchWithObfuscated}
+              disabled={Boolean(status?.probeBatch?.running)}
+              onChange={e => setBatchWithObfuscated(e.target.checked)}
+            />
+            连混淆载荷一起判
+          </label>
           {status?.running || status?.draining || status?.probeBatch?.running ? (
             <button
               onClick={handleStop}
@@ -1113,7 +1125,7 @@ export function SourceDiscoveryPanel() {
           {status?.last && !status.running ? (
             <div className="mb-4 text-xs text-muted-foreground">
               上一轮：扫 {status.last.reposScanned} 仓，候选 {status.last.seen}（新采 {status.last.created}），
-              抓正文 {status.last.downloaded}，疑似 {status.last.suspect}，不像音源 {status.last.notSource}，顶掉 {status.last.stale}
+              抓正文 {status.last.downloaded}，疑似 {status.last.suspect}，混淆载荷 {status.last.obfuscated}，不像音源 {status.last.notSource}，顶掉 {status.last.stale}
               {status.last.quota ? `｜GitHub 余量 ${status.last.quota.remaining}/${status.last.quota.limit}` : ''}
               {status.last.note ? `｜${status.last.note}` : ''}
               {status.last.truncatedRepos?.length ? (
@@ -1228,8 +1240,8 @@ export function SourceDiscoveryPanel() {
                       <td className="max-w-[22rem] px-4 py-3 text-xs text-muted-foreground">
                         {row.reason || '还没抓正文'}
                         {canForceProbe(row) ? (
-                          <div className="text-amber-600" title="静态特征读不懂（多半是混淆过的），但它带 @name 且正文体积像一份真载荷 —— 可以点「仍然判级」真跑一次；跑出平台出货会自动提升为疑似可用">
-                            静态特征读不懂（疑似混淆载荷，可「仍然判级」）
+                          <div className="text-amber-600" title="这一档不是「不像音源」，是「静态判不动」：没有 musicSearch 那类字面量，只有真跑一次才知道行不行。跑出平台出货会自动提升为疑似可用；判不动就留在这里">
+                            静态特征读不懂 —— 只有真跑一次才知道行不行
                           </div>
                         ) : null}
                       </td>
