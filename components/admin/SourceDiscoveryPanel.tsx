@@ -1217,16 +1217,18 @@ export function SourceDiscoveryPanel() {
           {candidates.length === 0 ? (
             <EmptyState icon={Radar} title="这一类没有候选" description="开一轮发现后再看，或换个分类" />
           ) : (
-            <div className="overflow-hidden rounded-lg border border-border">
+            <div className="overflow-auto rounded-lg border border-border">
               <table className="w-full text-sm">
                 <thead className="bg-accent/40 text-left text-xs uppercase text-muted-foreground">
                   <tr>
-                    <th className="px-4 py-3 font-medium">来源与地址</th>
+                    {/* 地址列收窄到约四分之一屏：整条 raw 地址本来就是长串，让它占满会把
+                        判定依据与判级那两列挤成一竖条；窄了之后行会变长一点，但每列都能读 */}
+                    <th className="w-[24rem] min-w-[20rem] px-4 py-3 font-medium">来源与地址</th>
                     <th className="px-4 py-3 font-medium">@name</th>
                     <th className="px-4 py-3 font-medium">分</th>
                     <th className="px-4 py-3 font-medium">大小</th>
-                    <th className="px-4 py-3 font-medium">判定依据</th>
-                    <th className="px-4 py-3 font-medium">判级（真跑一次取址）</th>
+                    <th className="min-w-[14rem] px-4 py-3 font-medium">判定依据</th>
+                    <th className="min-w-[12rem] px-4 py-3 font-medium">判级（真跑一次取址）</th>
                     <th className="px-4 py-3 text-right font-medium">操作</th>
                   </tr>
                 </thead>
@@ -1283,7 +1285,7 @@ export function SourceDiscoveryPanel() {
                       <td className="px-4 py-3 text-xs text-muted-foreground">
                         {row.sizeBytes ? `${Math.round(row.sizeBytes / 1024)}KB` : '—'}
                       </td>
-                      <td className="max-w-[22rem] px-4 py-3 text-xs text-muted-foreground">
+                      <td className="max-w-[26rem] px-4 py-3 text-xs text-muted-foreground">
                         {row.reason || '还没抓正文'}
                         {canForceProbe(row) ? (
                           <div className="text-amber-600" title="这一档不是「不像音源」，是「静态判不动」：没有 musicSearch 那类字面量，只有真跑一次才知道行不行。跑出平台出货会自动提升为疑似可用；判不动就留在这里">
