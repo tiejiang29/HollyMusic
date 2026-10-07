@@ -1596,6 +1596,11 @@ export interface CandidateView {
   importedPath: string
   /** P0-c：与**已装源**撞车的对象（content=字节相同 / name=同名不同内容）；null = 没撞 */
   duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
+  /**
+   * 只提示不拦：库里有条源的名字与它**近似**（作者后缀不同，归一后不相等），可能是同一个源的另一个版本。
+   * 不进任何判据 —— 见 `findSimilarInstalledName`。
+   */
+  similarTo: { path: string; name: string } | null
   /** 非空 = 这条来自某个 release 的资产（面板据此说"来自发布 vX"，并说明为什么不是仓库路径） */
   releaseTag: string
   /** 非空 = 正文在 rawUrl 那个 zip 里，这是条目名（整包的 sha256 记在 assetDigest） */
@@ -1663,9 +1668,11 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
   ranked.sort((a, b) => compareCandidatesForList(a.rank, b.rank))
   const page = ranked.slice(0, filter.take ?? 200)
   // 空列表时不去读盘上那十几份脚本
-  const index = page.length ? await installedTwinIndex() : { byHash: new Map<string, InstalledTwin>(), byName: new Map<string, InstalledTwin>() }
+  const index = page.length ? await installedTwinIndex() : { byHash: new Map<string, InstalledTwin>(), byName: new Map<string, InstalledTwin>(), names: [] }
   return page.map(({ row }) => {
     const twin = findInstalledTwin(index, row)
+    // 已经报了硬撞车就不再补近似那句，同一格出现两句话只会让人以为是两件事
+    const similar = twin ? null : findSimilarInstalledName(index.names, row.nameKey)
     return {
       id: row.id,
       repo: row.repo,
@@ -1682,6 +1689,7 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
       probedAt: row.probedAt ? row.probedAt.toISOString() : null,
       importedPath: row.importedPath,
       duplicateOf: twin ? { kind: twin.kind, path: twin.twin.path, name: twin.twin.name } : null,
+      similarTo: similar ? { path: similar.path, name: similar.name } : null,
       releaseTag: row.releaseTag,
       zipMember: row.zipMember,
       assetDigest: row.assetDigest,
@@ -2146,14 +2154,23 @@ export interface InstalledTwin {
  *
  * 内容哈希直接读盘上的文件，不拿配置里的旧值：订阅更新会原地换内容，只有读文件才知道现在装的是啥。
  */
-async function installedTwinIndex(): Promise<{ byHash: Map<string, InstalledTwin>; byName: Map<string, InstalledTwin> }> {
+async function installedTwinIndex(): Promise<{
+  byHash: Map<string, InstalledTwin>
+  byName: Map<string, InstalledTwin>
+  names: Array<{ key: string; twin: InstalledTwin }>
+}> {
   const config = await readConfig()
   const byHash = new Map<string, InstalledTwin>()
   const byName = new Map<string, InstalledTwin>()
+  // 归一键的有序表，给"名字近似"那一档软提示用（撞车判定只看上面两张表，不看它）
+  const names: Array<{ key: string; twin: InstalledTwin }> = []
   for (const source of config.sources) {
     const twin: InstalledTwin = { path: source.path, name: source.name || '' }
     const nameKey = toNameKey(source.name || '')
-    if (nameKey && !byName.has(nameKey)) byName.set(nameKey, twin)
+    if (nameKey && !byName.has(nameKey)) {
+      byName.set(nameKey, twin)
+      names.push({ key: nameKey, twin })
+    }
     // 配置里的 path 由 addSource 校验过，但那是写入时的事；读之前再过一道，别拿配置去拼任意路径
     const abs = path.resolve(process.cwd(), source.path)
     const insideScriptsDir = !path.relative(SOURCE_MANAGER_CONSTANTS.SCRIPTS_DIR, abs).startsWith('..')
@@ -2166,7 +2183,7 @@ async function installedTwinIndex(): Promise<{ byHash: Map<string, InstalledTwin
       // 配置里有、盘上没有：那是条坏源，不该让它把别的候选一起挡掉
     }
   }
-  return { byHash, byName }
+  return { byHash, byName, names }
 }
 
 /** 先比内容再比同名：内容一样意味着"再装一遍毫无意义"，同名只是"要不要并排装" */
@@ -2176,6 +2193,30 @@ function findInstalledTwin(
 ): { kind: 'content' | 'name'; twin: InstalledTwin } | null {
   if (row.contentHash && index.byHash.has(row.contentHash)) return { kind: 'content', twin: index.byHash.get(row.contentHash)! }
   if (row.nameKey && index.byName.has(row.nameKey)) return { kind: 'name', twin: index.byName.get(row.nameKey)! }
+  return null
+}
+
+/** 归一键里剩得下的最短一段：比这短的键（`lx`、`api`）包含谁都算"近似"，那是噪音不是提示 */
+const SIMILAR_NAME_MIN_KEY_LENGTH = 4
+
+/**
+ * 名字**近似**的已装源：一个归一键包含另一个、又不相等。
+ *
+ * 只用于提示，不参与任何闸门（导入的 409、按钮渲染、去重择优都看不到它）。
+ * 为什么要有：`toNameKey` 剥得掉版本号却剥不掉 `Pro`/`公益`/`二改` 这类作者自己加的后缀，
+ * 于是库里装着 `lx-玉宁熙V1.2.2`（键 `lx玉宁熙`）时，候选 `lx-玉宁熙-Pro`（键 `lx玉宁熙pro`）
+ * 既不撞内容也不撞同名，看着像"完全无关的新源"。管理员真正想知道的是"这俩是不是一家的另一个版本"，
+ * 那句话值一次点击，但不该替他做决定——并排装还是装新的，看红绿灯的是他。
+ */
+function findSimilarInstalledName(
+  names: Array<{ key: string; twin: InstalledTwin }>,
+  nameKey: string,
+): InstalledTwin | null {
+  if (nameKey.length < SIMILAR_NAME_MIN_KEY_LENGTH) return null
+  for (const item of names) {
+    if (item.key.length < SIMILAR_NAME_MIN_KEY_LENGTH || item.key === nameKey) continue
+    if (item.key.includes(nameKey) || nameKey.includes(item.key)) return item.twin
+  }
   return null
 }
 

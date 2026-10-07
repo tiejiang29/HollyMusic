@@ -159,6 +159,19 @@ export function mergeRepos(current: string[], added: string[]): string[] {
   return out
 }
 
+/**
+ * 「名字近似」那句提示的文案。**只提示，不参与任何判据**：导入按钮要不要二次确认仍由
+ * `needsForceConfirm`（内容/同名撞车 + 有没有出货）说了算，这句不改它。
+ *
+ * 为什么需要：作者给同一个源起的名字会漂移（`lx-玉宁熙V1.2.2` → `lx-玉宁熙-Pro`），
+ * 归一键剥得掉版本号却剥不掉 `Pro` 这种后缀，于是两条既不撞内容也不撞同名，看着像无关的新源。
+ * 已经有硬撞车时不再补这句 —— 同一格里两句话会被读成两件事。
+ */
+export function similarNameBadge(row: Pick<DiscoveryCandidate, 'duplicateOf' | 'similarTo'>): string | null {
+  if (row.duplicateOf || !row.similarTo) return null
+  return `库里有条名字近似的源 → ${row.similarTo.name || row.similarTo.path}（可能是同一个源的另一个版本）`
+}
+
 const STALE_REPO_DAYS = 365
 
 /**
@@ -1197,6 +1210,14 @@ export function SourceDiscoveryPanel() {
                             {row.duplicateOf.kind === 'content'
                               ? `库里已装着同一份 → ${row.duplicateOf.name || row.duplicateOf.path}`
                               : `库里已有同名源 → ${row.duplicateOf.name}`}
+                          </div>
+                        ) : null}
+                        {similarNameBadge(row) ? (
+                          <div
+                            className="text-muted-foreground/80 italic"
+                            title="只是提示，不影响你装：内容不同、名字归一后也不同，所以两档撞车都没命中。要不要并排装、要不要换掉库里那条，看判级那盏灯自己定"
+                          >
+                            {similarNameBadge(row)}
                           </div>
                         ) : null}
                       </td>

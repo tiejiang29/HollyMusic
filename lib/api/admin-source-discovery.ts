@@ -116,6 +116,8 @@ export interface DiscoveryCandidate {
   importedPath: string
   /** P0-c：撞上了**已经装着的源**（content=字节相同 / name=同名不同内容）；null = 没撞 */
   duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
+  /** 只提示不拦：库里有条源名字与它近似（作者后缀不同，归一后不相等），可能是同一个源的另一个版本 */
+  similarTo: { path: string; name: string } | null
   /** 非空 = 这条来自某个 release 的资产（此时 path 是资产文件名，不是仓库内路径） */
   releaseTag: string
   /** 非空 = 正文在 rawUrl 那个 zip 里，这是包内条目名 */

@@ -902,6 +902,28 @@ describe('导入前先跟已经装着的源比一次', () => {
     const [view] = await listCandidates()
     expect(view.duplicateOf).toEqual({ kind: 'content', path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' })
   })
+
+  it('名字只是**近似**（作者加了后缀）⇒ 报 similarTo、不报 duplicateOf，两档硬撞车都不越', async () => {
+    readConfigMock.mockResolvedValue({ sources: [{ path: 'custom-sources/lx-玉宁熙V1.2.2.js', name: 'lx-玉宁熙V1.2.2' }] })
+    // 真数据里就是这个形状：库里 lx-玉宁熙V1.2.2（键 lx玉宁熙），候选 lx-玉宁熙-Pro（键 lx玉宁熙pro）
+    const near = seedSuspect({ repo: 'a/b', contentHash: OTHER_HASH, nameKey: toNameKey('lx-玉宁熙-Pro'), scriptName: 'lx-玉宁熙-Pro' })
+    const exact = seedSuspect({ repo: 'c/d', path: 'x.js', contentHash: SAME_HASH, nameKey: toNameKey('lx-玉宁熙V1.2.2') })
+    const views = await listCandidates()
+    const nearView = views.find(v => v.id === near)!
+    expect(nearView.duplicateOf).toBeNull()
+    expect(nearView.similarTo).toEqual({ path: 'custom-sources/lx-玉宁熙V1.2.2.js', name: 'lx-玉宁熙V1.2.2' })
+    // 已经有硬撞车时不再补近似那句：同一格两句话会被读成两件事
+    const exactView = views.find(v => v.id === exact)!
+    expect(exactView.duplicateOf?.kind).toBe('content')
+    expect(exactView.similarTo).toBeNull()
+  })
+
+  it('键太短不算近似：`lx`、`api` 这种包含谁都"像"，那是噪音', async () => {
+    readConfigMock.mockResolvedValue({ sources: [{ path: 'custom-sources/玉宁熙 v1.js', name: '玉宁熙 v1' }] })
+    seedSuspect({ contentHash: OTHER_HASH, nameKey: toNameKey('玉宁熙Pro') })
+    const [view] = await listCandidates()
+    expect(view.similarTo).toBeNull()
+  })
 })
 
 // ————— 删掉音源 ⇒ 引用它的候选行写回 —————

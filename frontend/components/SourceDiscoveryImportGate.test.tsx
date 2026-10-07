@@ -10,7 +10,7 @@
 import { describe, expect, it } from 'vitest'
 import type { DiscoveryCandidate, ProbeCellView } from '@/lib/api/admin-source-discovery'
 
-const { okPlatformCount, needsForceConfirm, canForceProbe } = await import('@/components/admin/SourceDiscoveryPanel')
+const { okPlatformCount, needsForceConfirm, canForceProbe, similarNameBadge } = await import('@/components/admin/SourceDiscoveryPanel')
 
 const cell = (outcome: string): ProbeCellView => ({ outcome, latencyMs: 120, container: null, reason: null })
 
@@ -74,5 +74,30 @@ describe('canForceProbe（「仍然判级」的按钮口径）', () => {
     expect(canForceProbe(row({ scriptName: '   ' }))).toBe(false)
     expect(canForceProbe(row({ verdict: 'pending' }))).toBe(false)
     expect(canForceProbe(row({ verdict: 'suspect' }))).toBe(false)
+  })
+})
+
+describe('similarNameBadge（名字近似那句软提示）', () => {
+  const similar = { path: 'custom-sources/lx-玉宁熙V1.2.2.js', name: 'lx-玉宁熙V1.2.2' }
+  const cell = (outcome: string): ProbeCellView => ({ outcome, latencyMs: 120, container: null, reason: null })
+  const probeWith = (cells: Record<string, ProbeCellView>) => ({ cells, shaVerified: true, note: null })
+  const dup = (kind: 'content' | 'name') => ({ kind, path: 'custom-sources/a.js', name: '某源 v1' })
+
+  it('没有硬撞车时才报近似；库里那条没名字就用路径顶上', () => {
+    expect(similarNameBadge({ duplicateOf: null, similarTo: similar }))
+      .toBe('库里有条名字近似的源 → lx-玉宁熙V1.2.2（可能是同一个源的另一个版本）')
+    expect(similarNameBadge({ duplicateOf: null, similarTo: { path: 'custom-sources/无名.js', name: '' } }))
+      .toBe('库里有条名字近似的源 → custom-sources/无名.js（可能是同一个源的另一个版本）')
+  })
+
+  it('已经有硬撞车就不补这句（同一格两句话会被读成两件事）；没提示对象也不渲染', () => {
+    expect(similarNameBadge({ duplicateOf: dup('name'), similarTo: similar })).toBeNull()
+    expect(similarNameBadge({ duplicateOf: dup('content'), similarTo: similar })).toBeNull()
+    expect(similarNameBadge({ duplicateOf: null, similarTo: null })).toBeNull()
+  })
+
+  it('软提示不动判据：近似那条照常按红绿灯决定要不要二次确认，装不装由管理员定', () => {
+    expect(needsForceConfirm({ probe: probeWith({ tx: cell('ok') }), duplicateOf: null })).toBe(false)
+    expect(needsForceConfirm({ probe: probeWith({ tx: cell('timeout') }), duplicateOf: null })).toBe(true)
   })
 })
