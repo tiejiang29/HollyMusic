@@ -8,6 +8,7 @@
 import { usePlayerStore } from '@/lib/store/player-store'
 import { ProgressBar } from './ProgressBar'
 import { PlayerButton } from './PlayerButton'
+import { CastToSpeaker } from './CastToSpeaker'
 import { Mic2, ListMusic, Timer, Volume2, VolumeX } from 'lucide-react'
 
 export function PlayerTools() {
@@ -32,6 +33,7 @@ export function PlayerTools() {
         onClick={cycleSleepTimer}
         active={!!sleepTimer}
       />
+      <CastToSpeaker />
       <PlayerButton
         icon={VolIcon}
         label={isMuted ? '取消静音' : '静音'}

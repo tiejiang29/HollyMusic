@@ -46,7 +46,19 @@ export interface SpeakerConfig {
   lastSyncAt: string | null
   /** 最近一次失败的**脱敏**原因，给面板说明"为什么显示未登录" */
   lastError: string | null
+  /**
+   * 推给音箱的音频地址用哪个主机名（G1）。**必须填音箱够得着的局域网地址** ——
+   * 我们从后台/公网看到的 host（回环、隧道地址、域名反代）音箱多半拉不到。
+   * 空 = 没配，此时推歌会明确报"先在面板上填音箱可达的服务地址"，不会拼一个听起来能播其实放不出的 URL。
+   */
+  serverHost: string
+  /** 投歌用的音质档（音箱只可靠播 MP3，所以只允许 MP3 两档；G1.5 转码上线后再谈 flac） */
+  playQuality: SpeakerPlayQuality
+  /** 管理员显式禁用某型号的 Music API（参考实现也有这个覆盖位，兼容性问题时用来降级） */
+  musicApiDisabledModels: string[]
 }
+
+export type SpeakerPlayQuality = '320k' | '128k'
 
 const DEFAULT_CONFIG: SpeakerConfig = {
   enabled: false,
@@ -54,6 +66,9 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   devices: [],
   lastSyncAt: null,
   lastError: null,
+  serverHost: '',
+  playQuality: '320k',
+  musicApiDisabledModels: [],
 }
 
 export async function readSpeakerConfig(): Promise<SpeakerConfig> {
@@ -77,6 +92,10 @@ export interface SpeakerView {
   devices: SpeakerDevice[]
   lastSyncAt: string | null
   lastError: string | null
+  /** G1 之后面板要能改这三样（管理员要调的都在面板上，不写配置文件） */
+  serverHost: string
+  playQuality: SpeakerPlayQuality
+  musicApiDisabledModels: string[]
 }
 
 export async function getSpeakerView(): Promise<SpeakerView> {
@@ -95,12 +114,39 @@ export async function getSpeakerView(): Promise<SpeakerView> {
     devices: config.devices,
     lastSyncAt: config.lastSyncAt,
     lastError: config.lastError,
+    serverHost: config.serverHost,
+    playQuality: config.playQuality,
+    musicApiDisabledModels: config.musicApiDisabledModels,
   }
 }
 
 export async function setSpeakerEnabled(enabled: boolean): Promise<void> {
   const config = await readSpeakerConfig()
   await writeSpeakerConfig({ ...config, enabled })
+}
+
+/**
+ * 音箱拉流用的主机名。空串 = 没配（此时推歌会明确报错，不静默拼一个回环地址）。
+ * 传进来时只裁首尾空格 —— 大小写、带不带端口这些交给 `buildStreamBase` 去判并说清。
+ */
+export async function setSpeakerServerHost(serverHost: string): Promise<void> {
+  const config = await readSpeakerConfig()
+  await writeSpeakerConfig({ ...config, serverHost: serverHost.trim() })
+}
+
+export async function setSpeakerPlayQuality(playQuality: SpeakerPlayQuality): Promise<void> {
+  if (playQuality !== '320k' && playQuality !== '128k') {
+    throw new XiaomiLoginError('音箱只支持 MP3 两档（320k / 128k）', 400)
+  }
+  const config = await readSpeakerConfig()
+  await writeSpeakerConfig({ ...config, playQuality })
+}
+
+/** 某个型号推歌有问题时，管理员可以把它从 Music API 名单里摘掉（退回 player_play_url） */
+export async function setSpeakerMusicApiDisabled(models: string[]): Promise<void> {
+  const config = await readSpeakerConfig()
+  const cleaned = [...new Set(models.map(m => String(m ?? '').trim().toUpperCase()).filter(Boolean))]
+  await writeSpeakerConfig({ ...config, musicApiDisabledModels: cleaned })
 }
 
 /** 扫码成功后落凭据；换账号扫码时旧设备表一起清掉（那是另一个账号的音箱） */

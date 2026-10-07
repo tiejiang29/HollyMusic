@@ -14,7 +14,8 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   getSpeaker, startSpeakerQr, pollSpeakerQr, refreshSpeakerDevices,
   setSpeakerManaged, setSpeakerEnabled, speakerLogout,
-  type QrStartResult, type SpeakerView,
+  setSpeakerHost, setSpeakerQuality, controlSpeakerFromAdmin, setSpeakerVolumeFromAdmin, readSpeakerStatusFromAdmin,
+  type QrStartResult, type SpeakerView, type SpeakerStreamStatus,
 } from '@/lib/api/admin-speaker'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -34,6 +35,18 @@ export function clockText(iso: string | null): string {
   return Number.isFinite(d.getTime()) ? d.toLocaleString() : '—'
 }
 
+/**
+ * `player_get_play_status` 的 status 码 → 人话。
+ * `-1`（读不到）与 `0`（确实停了）必须分开显示：把"没报上来"写成"已停止"，
+ * 管理员就会去查一个根本不存在的问题。
+ */
+export const STATUS_LABEL: Record<number, string> = {
+  [-1]: '读不到状态',
+  0: '已停止',
+  1: '正在播',
+  2: '已暂停',
+}
+
 export function SpeakerPanel() {
   const [view, setView] = useState<SpeakerView | null>(null)
   const [loading, setLoading] = useState(true)
@@ -43,6 +56,11 @@ export function SpeakerPanel() {
   const [qrMsLeft, setQrMsLeft] = useState(0)
   const [busyDevices, setBusyDevices] = useState(false)
   const [busyDeviceId, setBusyDeviceId] = useState<string | null>(null)
+  /** 「音箱拉流地址」输入框的草稿：null = 没改过（显示库里的值），只有点保存才落库 */
+  const [hostDraft, setHostDraft] = useState<string | null>(null)
+  const [busySetting, setBusySetting] = useState(false)
+  /** 每台最近一次读到的播放状态（只在这台设备上，不写库、不进日志） */
+  const [statusByDevice, setStatusByDevice] = useState<Record<string, SpeakerStreamStatus>>({})
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -169,6 +187,66 @@ export function SpeakerPanel() {
       setView(await speakerLogout())
     } catch (e) {
       setError(e instanceof Error ? e.message : '退出失败')
+    }
+  }
+
+  // ---- G1：拉流地址、音质、播控 ----
+
+  const saveHost = async () => {
+    setBusySetting(true)
+    setError(null)
+    try {
+      setView(await setSpeakerHost(hostDraft ?? view?.serverHost ?? ''))
+      // 存完把草稿交回给库里的值：这样"保存成功"与"输入框内容"不会各说一套
+      setHostDraft(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存服务地址失败')
+    } finally {
+      setBusySetting(false)
+    }
+  }
+
+  const saveQuality = async (quality: '320k' | '128k') => {
+    try {
+      setView(await setSpeakerQuality(quality))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存音质失败')
+    }
+  }
+
+  const runControl = async (op: 'play' | 'pause' | 'stop', deviceID: string) => {
+    setBusyDeviceId(deviceID)
+    setError(null)
+    try {
+      await controlSpeakerFromAdmin(op, deviceID)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `${op} 失败`)
+    } finally {
+      setBusyDeviceId(null)
+    }
+  }
+
+  const runVolume = async (volume: number, deviceID: string) => {
+    setBusyDeviceId(deviceID)
+    try {
+      await setSpeakerVolumeFromAdmin(volume, deviceID)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '音量设置失败')
+    } finally {
+      setBusyDeviceId(null)
+    }
+  }
+
+  const readStatus = async (deviceID: string) => {
+    setBusyDeviceId(deviceID)
+    setError(null)
+    try {
+      const r = await readSpeakerStatusFromAdmin(deviceID)
+      setStatusByDevice(prev => ({ ...prev, [deviceID]: r.status }))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '读状态失败')
+    } finally {
+      setBusyDeviceId(null)
     }
   }
 
@@ -319,6 +397,53 @@ export function SpeakerPanel() {
             </div>
           ) : null}
 
+          {view.loggedIn ? (
+            <div className="rounded-lg border border-border p-4">
+              <h3 className="text-sm font-medium">推歌设置</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
+                音箱是**主动来拉流**的，所以这里必须填它够得着的局域网地址（回环、隧道地址、公网入口它多半打不开）
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <input
+                  value={hostDraft ?? view.serverHost}
+                  onChange={e => setHostDraft(e.target.value)}
+                  placeholder="172.16.1.20:3000"
+                  className="w-[20rem] rounded-md border border-border bg-background px-3 py-2 text-sm"
+                />
+                <button
+                  onClick={saveHost}
+                  disabled={busySetting || (hostDraft ?? view.serverHost).trim() === view.serverHost}
+                  className="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {busySetting ? '保存中…' : '保存地址'}
+                </button>
+              </div>
+              {view.serverHost ? (
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  音箱现在会去拉 <span className="font-mono">http://{view.serverHost}/api/speaker/stream?…</span>
+                  ，可以先用同一台局域网设备（比如手机连家里 WiFi）打开这个地址试试能不能出声音
+                </p>
+              ) : (
+                <p className="mt-2 text-[11px] text-destructive">没填地址时投歌会被直接拒绝（不会拼一个「看着能播」的 URL）</p>
+              )}
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-muted-foreground">投歌音质</span>
+                {(['320k', '128k'] as const).map(q => (
+                  <button
+                    key={q}
+                    onClick={() => saveQuality(q)}
+                    className={`rounded-full px-3 py-1 font-medium ${
+                      view.playQuality === q ? 'bg-primary text-primary-foreground' : 'bg-accent text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {q}
+                  </button>
+                ))}
+                <span className="text-muted-foreground">音箱只听得懂 MP3，库里的 FLAC 要等转码那一期</span>
+              </div>
+            </div>
+          ) : null}
+
           <div>
             <div className="mb-3 flex items-center justify-between">
               <h3 className="text-sm font-medium">账号下的音箱（{view.devices.length}）</h3>
@@ -344,6 +469,7 @@ export function SpeakerPanel() {
                       <th className="w-[9rem] px-4 py-3 font-medium">型号（hardware）</th>
                       <th className="w-[7rem] px-4 py-3 font-medium">在线</th>
                       <th className="w-[7rem] px-4 py-3 font-medium">纳管</th>
+                      <th className="w-[19rem] px-4 py-3 font-medium">播控</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -374,6 +500,47 @@ export function SpeakerPanel() {
                             />
                           )}
                         </td>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap items-center gap-1 text-xs">
+                            <button
+                              onClick={() => readStatus(d.deviceID)}
+                              disabled={!d.managed || busyDeviceId === d.deviceID}
+                              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              读状态
+                            </button>
+                            <button
+                              onClick={() => runControl('pause', d.deviceID)}
+                              disabled={!d.managed || busyDeviceId === d.deviceID}
+                              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              暂停
+                            </button>
+                            <button
+                              onClick={() => runControl('stop', d.deviceID)}
+                              disabled={!d.managed || busyDeviceId === d.deviceID}
+                              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              停止
+                            </button>
+                            <button
+                              onClick={() => runVolume(30, d.deviceID)}
+                              disabled={!d.managed || busyDeviceId === d.deviceID}
+                              title="把音量设成 30：推过去没声音时，先排掉「音箱被静音了」这一种"
+                              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              音量 30
+                            </button>
+                          </div>
+                          {statusByDevice[d.deviceID] ? (
+                            <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+                              {STATUS_LABEL[statusByDevice[d.deviceID].status] ?? `状态码 ${statusByDevice[d.deviceID].status}`}
+                              {' · '}位置 {Math.round(statusByDevice[d.deviceID].position / 1000)}s
+                              {' · '}时长 {statusByDevice[d.deviceID].duration > 0 ? `${Math.round(statusByDevice[d.deviceID].duration / 1000)}s` : '不报'}
+                              {statusByDevice[d.deviceID].volume >= 0 ? ` · 音量 ${statusByDevice[d.deviceID].volume}` : ''}
+                            </div>
+                          ) : null}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -381,7 +548,8 @@ export function SpeakerPanel() {
               </div>
             )}
             <p className="mt-2 text-xs text-muted-foreground">
-              型号决定这台将来走哪条推歌接口，所以即使现在还没有推歌能力也要先把它存下来、看得见
+              型号决定这台走哪条推歌接口（在名单里的走 <span className="font-mono">player_play_music</span>，
+              其余走 <span className="font-mono">player_play_url</span>）；投歌入口在播放页的「投到小爱」
             </p>
           </div>
         </div>

@@ -10,6 +10,7 @@ import { usePlayerStore } from '@/lib/store/player-store'
 import { ProgressBar } from './ProgressBar'
 import { PlayerButton } from './PlayerButton'
 import { QualityList } from './QualityList'
+import { CastToSpeaker } from './CastToSpeaker'
 import { MoreHorizontal, Repeat, Repeat1, Shuffle, Timer, Volume2, VolumeX, ChevronDown, Download, Loader2, ListPlus } from 'lucide-react'
 import { QUALITY_LABEL, QUALITY_ORDER, resolveQuality } from '@/lib/quality-options'
 import { useDownload } from '@/hooks/useDownload'
@@ -139,6 +140,8 @@ export function MobilePlayerMenu() {
             </span>
             <span className="text-[11px] text-muted-foreground">{downloading ? '下载中…' : (downloadError ?? QUALITY_LABEL[resolveQuality(quality, currentTrack?.musicInfo.types)])}</span>
           </button>
+
+          <CastToSpeaker variant="row" />
 
           <button
             type="button"

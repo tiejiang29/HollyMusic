@@ -32,6 +32,10 @@ export interface SpeakerView {
   devices: SpeakerDeviceView[]
   lastSyncAt: string | null
   lastError: string | null
+  /** 音箱拉流用的主机名（必须局域网可达）；空 = 没配，此时推歌会被明确拒绝 */
+  serverHost: string
+  playQuality: '320k' | '128k'
+  musicApiDisabledModels: string[]
 }
 
 export interface QrStartResult {
@@ -76,4 +80,52 @@ export function setSpeakerEnabled(enabled: boolean): Promise<SpeakerView> {
 /** 取消一张还没人扫的码（sessionId 不给也行，服务端只是清掉对应会话） */
 export function speakerLogout(sessionId?: string): Promise<SpeakerView> {
   return apiPost<SpeakerView>('admin/speaker', { action: 'logout', ...(sessionId ? { sessionId } : {}) })
+}
+
+/** 音箱拉流用的主机名（面板项，落 AppSetting；填错就等于"投过去没声音"，所以要能当场看清自己填了什么） */
+export function setSpeakerHost(serverHost: string): Promise<SpeakerView> {
+  return apiPost<SpeakerView>('admin/speaker', { action: 'setHost', serverHost })
+}
+
+export function setSpeakerQuality(quality: '320k' | '128k'): Promise<SpeakerView> {
+  return apiPost<SpeakerView>('admin/speaker', { action: 'setQuality', quality })
+}
+
+export function setSpeakerMusicApiDisabled(models: string[]): Promise<SpeakerView> {
+  return apiPost<SpeakerView>('admin/speaker', { action: 'setMusicApiDisabled', models })
+}
+
+/** 面板上的急救控制：推完没声时先用它把音箱停掉，别让人去拧物理按键 */
+export function controlSpeakerFromAdmin(
+  op: 'play' | 'pause' | 'stop', deviceID?: string,
+): Promise<{ ok: boolean; deviceName: string }> {
+  return apiPost<{ ok: boolean; deviceName: string }>('admin/speaker', { action: 'control', op, ...(deviceID ? { deviceID } : {}) })
+}
+
+export function setSpeakerVolumeFromAdmin(volume: number, deviceID?: string): Promise<{ ok: boolean; deviceName: string }> {
+  return apiPost<{ ok: boolean; deviceName: string }>('admin/speaker', { action: 'volume', volume, ...(deviceID ? { deviceID } : {}) })
+}
+
+/** 音箱报回来的播放状态（`status`：1=在播 2=暂停 0=停止 -1=读不到；-1 与 0 是两件事） */
+export interface SpeakerStreamStatus {
+  status: number
+  position: number
+  duration: number
+  volume: number
+  title: string
+}
+
+export interface SpeakerStatusRead {
+  device: SpeakerDeviceView
+  status: SpeakerStreamStatus
+}
+
+/** 读一次音箱当前状态（1=在播 2=暂停 0=停止 -1=读不到） */
+export function readSpeakerStatusFromAdmin(deviceID?: string): Promise<SpeakerStatusRead> {
+  return apiPost<SpeakerStatusRead>('admin/speaker', { action: 'status', ...(deviceID ? { deviceID } : {}) })
+}
+
+/** 面板上的「试推」：指定一个 uid 直接投一次，用来验地址通不通（日常入口在播放页） */
+export function testPushSpeaker(uid: string, deviceID?: string): Promise<import('./speaker').SpeakerPlayOutcome> {
+  return apiPost<import('./speaker').SpeakerPlayOutcome>('admin/speaker', { action: 'play', uid, ...(deviceID ? { deviceID } : {}) })
 }

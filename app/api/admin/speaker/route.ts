@@ -22,8 +22,10 @@ import { XiaomiLoginError, abandonQrLogin, pollQrLogin, startQrLogin } from '@/l
 import { XiaomiAuthError } from '@/lib/services/xiaomi/mina-client'
 import {
   clearSpeakerLogin, getSpeakerView, saveCredentials,
-  setDeviceManaged, setSpeakerEnabled, syncDevices,
+  setDeviceManaged, setSpeakerEnabled, setSpeakerMusicApiDisabled,
+  setSpeakerPlayQuality, setSpeakerServerHost, syncDevices,
 } from '@/lib/services/xiaomi/token-store'
+import { SpeakerError, controlSpeaker, playOnSpeaker, readSpeakerStatus, setSpeakerVolume } from '@/lib/services/xiaomi/speaker-play'
 
 function guard(err: unknown) {
   if (err instanceof AuthError) return createErrorResponse('UNAUTHORIZED', err.message, 401)
@@ -38,6 +40,8 @@ function guard(err: unknown) {
       : createErrorResponse('XIAOMI_UPSTREAM_ERROR', err.message, err.status)
   }
   if (err instanceof XiaomiLoginError) return createErrorResponse('INVALID_PARAMS', err.message, err.status)
+  // G1 的"还没配局域网地址 / 都离线 / 多台在线没指定"这类可操作提示，都归到这个码
+  if (err instanceof SpeakerError) return createErrorResponse('SPEAKER_NOT_READY', err.message, err.status)
   return null
 }
 
@@ -89,6 +93,51 @@ export async function POST(request: NextRequest) {
     if (action === 'setEnabled') {
       await setSpeakerEnabled(body?.enabled === true)
       return createSuccessResponse(await getSpeakerView())
+    }
+
+    // ---- G1：推歌相关的配置与急救控制（都在面板上，不落配置文件） ----
+    if (action === 'setHost') {
+      await setSpeakerServerHost(typeof body?.serverHost === 'string' ? body.serverHost : '')
+      return createSuccessResponse(await getSpeakerView())
+    }
+
+    if (action === 'setQuality') {
+      await setSpeakerPlayQuality(body?.quality === '128k' ? '128k' : '320k')
+      return createSuccessResponse(await getSpeakerView())
+    }
+
+    if (action === 'setMusicApiDisabled') {
+      const models = Array.isArray(body?.models) ? body.models.map((m: unknown) => String(m)) : []
+      await setSpeakerMusicApiDisabled(models)
+      return createSuccessResponse(await getSpeakerView())
+    }
+
+    // 投歌本身走 /api/speaker（登录用户就能投，不必是管理员）；面板这里只留"看与急救"
+    if (action === 'status') {
+      const deviceID = typeof body?.deviceID === 'string' && body.deviceID ? body.deviceID : undefined
+      return createSuccessResponse(await readSpeakerStatus(deviceID))
+    }
+
+    if (action === 'control') {
+      const op = body?.op === 'pause' || body?.op === 'stop' || body?.op === 'play' ? body.op : null
+      if (!op) return createErrorResponse('INVALID_PARAMS', 'op 只能是 pause / stop / play', 400)
+      const deviceID = typeof body?.deviceID === 'string' && body.deviceID ? body.deviceID : undefined
+      const device = await controlSpeaker(op, deviceID)
+      return createSuccessResponse({ ok: true, deviceName: device.name })
+    }
+
+    if (action === 'volume') {
+      const deviceID = typeof body?.deviceID === 'string' && body.deviceID ? body.deviceID : undefined
+      const device = await setSpeakerVolume(Number(body?.volume), deviceID)
+      return createSuccessResponse({ ok: true, deviceName: device.name })
+    }
+
+    if (action === 'play') {
+      // 面板上的「试推」：拿一个 uid 直接投一次，用来验地址通不通（真实入口在播放页）
+      const uid = typeof body?.uid === 'string' ? body.uid : ''
+      if (!uid) return createErrorResponse('INVALID_PARAMS', '缺少 uid', 400)
+      const deviceID = typeof body?.deviceID === 'string' && body.deviceID ? body.deviceID : undefined
+      return createSuccessResponse(await playOnSpeaker({ uid, deviceID }))
     }
 
     if (action === 'logout') {

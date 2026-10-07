@@ -18,7 +18,10 @@ vi.mock('@/lib/server/url-guard', () => ({
   assertPublicHttpUrl: vi.fn(async (url: string) => { guards.checked.push(url); return new URL(url) }),
 }))
 
-const { fetchDevices, isAuthFailure, XiaomiAuthError } = await import('@/lib/services/xiaomi/mina-client')
+const {
+  fetchDevices, isAuthFailure, XiaomiAuthError,
+  playUrl, playerOperation, setVolume, getPlayStatus, usePlayMusicApi, _resetUbusQueuesForTest,
+} = await import('@/lib/services/xiaomi/mina-client')
 const creds = {
   serviceToken: 'ST_t%2BzVg%3D%3D',
   passToken: 'PT%3D%3D',
@@ -144,5 +147,160 @@ describe('fetchDevices', () => {
   it('返回的不是 JSON（被风控页挡了）时给可读错误', async () => {
     reply('<html>blocked</html>')
     await expect(fetchDevices(creds)).rejects.toThrow(/不是 JSON/)
+  })
+})
+
+describe('ubus 播控（G1）', () => {
+  let requests: Array<{ url: string; body: string; headers: Record<string, string> }> = []
+
+  /** 装一条 ubus：按顺序回这些响应体（字符串原样，对象转 JSON） */
+  function ubusReply(bodies: Array<unknown | Error>) {
+    requests = []
+    const queue = [...bodies]
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const headers: Record<string, string> = {}
+      for (const [k, v] of Object.entries((init?.headers ?? {}) as Record<string, string>)) headers[k.toLowerCase()] = String(v)
+      requests.push({ url: String(input), body: String(init?.body ?? ''), headers })
+      const next = queue.length > 1 ? queue.shift() : (queue[0] ?? { code: 0, data: { code: 0 } })
+      if (next instanceof Error) throw next
+      return new Response(typeof next === 'string' ? next : JSON.stringify(next), {
+        status: 200, headers: new Headers({ 'content-type': 'application/json' }),
+      })
+    }))
+  }
+
+  const form = (i = 0): Record<string, string> =>
+    Object.fromEntries(new URLSearchParams(requests[i].body))
+
+  beforeEach(() => {
+    _resetUbusQueuesForTest()
+  })
+
+  it('打的是 /remote/ubus，form 五个字段齐、cookie 与设备列表同一套', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    await playUrl(creds, '705427729', 'http://172.16.1.20:3000/x.mp3')
+    expect(requests[0].url).toBe('https://api2.mina.mi.com/remote/ubus')
+    const f = form()
+    expect(f.deviceId).toBe('705427729')
+    expect(f.method).toBe('player_play_url')
+    expect(f.path).toBe('mediaplayer')
+    expect(JSON.parse(f.message)).toEqual({ url: 'http://172.16.1.20:3000/x.mp3', type: 2, media: 'app_ios' })
+    expect(f.requestId).toBeTruthy()
+    expect(requests[0].headers['content-type']).toBe('application/x-www-form-urlencoded')
+    expect(requests[0].headers.cookie).toContain('channel=MI_APP_STORE')
+  })
+
+  it('L05B 这类型号走 player_play_music，报文里 music 是字符串化的那串结构', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    expect(usePlayMusicApi('L05B')).toBe(true)
+    const ok = await playUrl(creds, '705427729', 'http://h/x.mp3', 'L05B')
+    expect(ok).toBe(true)
+    const f = form()
+    expect(f.method).toBe('player_play_music')
+    const message = JSON.parse(f.message) as Record<string, unknown>
+    expect(message.startaudioid).toBe('1732418460076477549')
+    const music = JSON.parse(message.music as string) as Record<string, unknown>
+    expect(music.play_behavior).toBe('REPLACE_ALL')
+    const payload = (music.payload as Record<string, unknown>)
+    expect((payload.audio_items as Array<Record<string, unknown>>)[0]).toMatchObject({
+      stream: { url: 'http://h/x.mp3' },
+      item_id: { audio_id: '1732418460076477549', cp: { name: 'xiaowei' } },
+    })
+  })
+
+  it('不在名单里的型号走 player_play_url（别把不认 Music API 的机器推哑）', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    await playUrl(creds, '1', 'http://h/x.mp3', 'S03')
+    expect(form().method).toBe('player_play_url')
+  })
+
+  it('管理员把型号摘出名单 ⇒ 即使原来在名单里也退回 play_url', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    expect(usePlayMusicApi('L05B', ['L05B'])).toBe(false)
+    await playUrl(creds, '1', 'http://h/x.mp3', 'L05B', { musicApiDisabled: ['L05B'] })
+    expect(form().method).toBe('player_play_url')
+  })
+
+  it('云端 code=0 但设备端 data.code 非 0 ⇒ 判失败（"亮灯不出声"就是这一类）', async () => {
+    ubusReply([{ code: 0, data: { code: 400, message: 'device refused' } }])
+    expect(await playUrl(creds, '1', 'http://h/x.mp3', 'L05B')).toBe(false)
+  })
+
+  it('play_music 被设备端拒 ⇒ 自动退一条 play_url，两条都发过', async () => {
+    ubusReply([
+      { code: 0, data: { code: 400 } },
+      { code: 0, data: { code: 0 } },
+    ])
+    expect(await playUrl(creds, '1', 'http://h/x.mp3', 'L05B')).toBe(true)
+    expect(form(0).method).toBe('player_play_music')
+    expect(form(1).method).toBe('player_play_url')
+  })
+
+  it('云端非 0 code 抛出去（是"没受理"，不是"没在放"），401 类仍归票失效', async () => {
+    ubusReply([{ code: 70016, message: '登录验证失败' }])
+    const err = await playUrl(creds, '1', 'http://h/x.mp3').catch(e => e)
+    expect(err).toBeInstanceOf(XiaomiAuthError)
+    expect((err as XiaomiAuthError).status).toBe(401)
+  })
+
+  it('同一台设备的指令严格串行（并发一交错就炸），不同设备互不影响', async () => {
+    const inflight: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const body = String((init as { body?: string })?.body ?? '')
+      inflight.push(new URLSearchParams(body).get('deviceId') ?? '?')
+      // 两条同时在飞 → 这里长度是 2，直接判死
+      expect(inflight).toHaveLength(1)
+      // 让出一个宏任务：并发发起时另一条会在这个空档里挤进来
+      await new Promise(resolve => setTimeout(resolve, 0))
+      inflight.pop()
+      return new Response(JSON.stringify({ code: 0, data: { code: 0 } }), { status: 200 })
+    }))
+    await Promise.all([
+      playUrl(creds, 'devA', 'http://h/1.mp3'),
+      playUrl(creds, 'devA', 'http://h/2.mp3'),
+      playUrl(creds, 'devA', 'http://h/3.mp3'),
+    ])
+    expect(inflight).toHaveLength(0)
+  })
+
+  it('暂停与恢复都走 player_play_operation；stop 先补一发 pause（有些固件单发 stop 不停）', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    expect(await playerOperation(creds, '1', 'pause')).toBe(true)
+    expect(JSON.parse(form(0).message).action).toBe('pause')
+    ubusReply([{ code: 0, data: { code: 0 } }, { code: 0, data: { code: 0 } }])
+    expect(await playerOperation(creds, '1', 'stop')).toBe(true)
+    expect(JSON.parse(form(0).message).action).toBe('pause')
+    expect(JSON.parse(form(1).message).action).toBe('stop')
+  })
+
+  it('音量夹到 0-100 并取整', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    await setVolume(creds, '1', 173.6)
+    expect(JSON.parse(form().message).volume).toBe(100)
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    await setVolume(creds, '1', -5)
+    expect(JSON.parse(form().message).volume).toBe(0)
+  })
+
+  it('状态回读：info 是字符串 JSON，时长可能在 play_song_detail 里；读不到一律 -1 不猜', async () => {
+    ubusReply([{ code: 0, data: { info: JSON.stringify({ status: 1, position: 12345, duration: 240000, volume: 30, title: '稻香' }) } }])
+    expect(await getPlayStatus(creds, '1')).toEqual({ status: 1, position: 12345, duration: 240000, volume: 30, title: '稻香' })
+    ubusReply([{ code: 0, data: { info: JSON.stringify({ status: 1, position: 10, play_song_detail: { duration: 99000 } }) } }])
+    expect((await getPlayStatus(creds, '1')).duration).toBe(99000)
+    ubusReply([{ code: 0, data: { info: '{不是 JSON' } }])
+    expect(await getPlayStatus(creds, '1')).toMatchObject({ status: -1, duration: -1 })
+  })
+
+  it('日志里不许出现推给音箱的 URL（它带着能放歌的令牌），但要留得下长度', async () => {
+    // 走"云端非 0 且不是鉴权"这条会打日志的分支
+    ubusReply([{ code: 5005, message: 'internal' }])
+    logSpy.warn.mockClear()
+    await expect(playUrl(creds, '1', 'http://172.16.1.20:3000/api/speaker/stream?st=SECRET_TOKEN&uid=tx-1&quality=320k', 'L05B'))
+      .rejects.toThrow(/播控被云端拒绝/)
+    const dumped = JSON.stringify(logSpy.warn.mock.calls)
+    expect(dumped).not.toContain('SECRET_TOKEN')
+    expect(dumped).not.toContain('172.16.1.20')
+    // 长度留着：排障时要能看出"报文是空的"还是"地址很长"
+    expect(dumped).toMatch(/music\(长\d+\)/)
   })
 })

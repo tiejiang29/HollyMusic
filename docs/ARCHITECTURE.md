@@ -275,6 +275,15 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 - **扫码的长轮询不在路由里等满 30 秒**：单次 lp 只等 8 秒就返回 `waiting`（把 Next 的请求槽挂住会拖垮同时进行的音频请求），前端隔 3 秒再来一次；过期由服务端会话时间戳判（5 分钟），不靠前端计数。轮询要同时带 `sessionId` 与一次性 `loginToken`（后者只在出二维码那一次响应里出现过），对不上就一律回同一句话，不给可用来试探哪些 id 有效的差异。
 - **设备表必须存 `hardware`**：G1 判"这台走 `player_play_music` 还是 `player_play_url`"只看它，G0 不存 G1 就得改结构。刷新列表时按 `deviceID` 保住管理员手工标的 `managed`。
 
+### 4.7.1 G1：投歌到音箱
+
+- **ubus 一条设备一条队**：`mina-client.enqueueUbus(deviceId, …)` 把同一台设备的指令串起来（云端不保证并发指令的执行顺序，两条一起发会变成"后发的被先发的盖掉"）；G2 的对话轮询将来也挤这条队。
+- **`player_play_music` 那串 `music` 是"字符串化后再放进 message"**（`{startaudioid, music: JSON.stringify(…)}`），不是嵌套对象 —— 抄错这一层设备端直接不认。型号名单照参考实现的 `MUSIC_API_MODELS`（我们那台 `L05B` 在里面）；面板上可把某型号摘出名单退回 `player_play_url`。
+- **`code==0` 只代表云端受理**：设备级的回执在 `data.code`，非 0 就是"音箱拒了"。推完等 2 秒回读一次 `player_get_play_status`（它的 `info` 是一段 JSON 字符串），把"亮灯不出声"变成能看见的失败；读不到状态与"确实停了"是两件事（`-1` vs `0`），面板上分开显示。
+- **给音箱的是本站出口 `/api/speaker/stream`，不是 `/api/audio`**：`/api/audio` 有"本地秒开优先"（`shouldServeLibraryFile`：库内音质 ≥ 请求档就直接端本地文件），请求 320k 也可能把 **FLAC** 端出来 —— 手机车机听得懂，音箱听不懂。与其改那条热路径的裁决规则，不如单开一条**只认 MP3** 的口：库内文件先读头部字节嗅容器（扩展名不算证据），不是 MP3 就改走在线取 320k/128k，拿回来还不是 MP3 就 415 明确失败（宁可失败也不给一个放不出来的地址）。
+- **`st` 令牌必须放在第一个参数位**：部分固件会把 URL 里的 `&` 换成空格，令牌在前才还能按"第一个空格之前就是令牌"还原（`readParams`）；令牌不在第一位就救不回来，只能 401。令牌本身是分享页那套 HMAC（绑定 uid+quality、时效 2 小时，因为这条 URL 会**经过小米云端**），日志与返回值里都只留脱敏形式。
+- **地址必须是音箱够得着的局域网地址**（面板项 `speakerServerHost`，落 `AppSetting`）：没填就拒绝推歌、填回环地址直接报错 —— 拼一个"我们这边能打开、音箱拉不到"的 URL 是这类功能最难查的失败形态。
+
 ---
 
 ## 5. API 路由参考
@@ -374,7 +383,9 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 | GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
 | GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`（撞同名时 `mode`：`replace` 换掉库里那条 / `parallel` 并排装）、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
-| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`logout`） |
+| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`logout`） |
+| GET/POST | `/api/speaker` | 登录用户级投歌：`GET` 返回可投音箱与就绪位；`POST` 的 `action` = `play`/`pause`/`resume`/`stop`/`volume`/`status` |
+| GET/HEAD | `/api/speaker/stream?st=&uid=&quality=` | **只出 MP3** 的音箱流出口（`st` 必须在第一个参数位，见 §4.7） |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |
 | POST | `/api/admin/sources/subscriptions` | 在线音源订阅 |
 | POST | `/api/admin/sources/upload` | 上传音源脚本（预校验 + 自动注册） |
