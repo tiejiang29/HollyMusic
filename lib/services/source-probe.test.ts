@@ -175,18 +175,18 @@ describe('runSourceProbe', () => {
     )
   })
 
-  it('「不适用」不进出口径：pt 摘掉的平台测出来是 unsupported，分母不该被它撑大', async () => {
-    vi.mocked(listSourcesWithStatus).mockResolvedValue([{ name: '摘了咪咕的源', path: 'e.js', enabled: true, pt: ['kw'] }] as never)
-    // 脚本自己声明了五个平台（周测按声明定范围），但瀑布那侧 pt 只放了酷我
+  it('「不适用」不进出口径：脚本没这平台时测出 unsupported（0ms 没出网），分母不该被它撑大', async () => {
+    vi.mocked(listSourcesWithStatus).mockResolvedValue([{ name: '只会酷我的源', path: 'e.js', enabled: true, pt: ['kw'] }] as never)
+    // 范围按脚本声明定（五个平台都进批次），其中四格脚本自己答"取不了址"）
     mocks.getHealthStatus.mockReturnValue([{
-      name: '摘了咪咕的源',
+      name: '只会酷我的源',
       supportedSources: ['kw', 'tx', 'wy', 'kg', 'mg'],
       supportedActions: Object.fromEntries(['kw', 'tx', 'wy', 'kg', 'mg'].map(p => [p, ['musicUrl']])),
     }] as never)
     mocks.probeSourceUrl.mockImplementation(async (name: string, musicInfo: { source: string }) =>
       musicInfo.source === 'kw'
         ? { ok: true, url: 'https://up.example/a.flac', latencyMs: 100 }
-        : { ok: false, outcome: 'unsupported', reason: `pt 白名单未包含 ${musicInfo.source}`, latencyMs: 0 })
+        : { ok: false, outcome: 'unsupported', reason: '脚本未声明该平台可取址', latencyMs: 0 })
     mocks.safePublicFetch.mockResolvedValue(audioResponse())
 
     const summary = await runSourceProbe('manual')

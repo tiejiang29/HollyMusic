@@ -346,3 +346,33 @@ describe('3c：按账本跳过冷却中的源', () => {
     }
   })
 })
+
+describe('周测取址不受 pt 拦（pt 只管派活，不能拿来筛题目）', () => {
+  /** 脚本声明了酷我和腾讯，但管理员在 pt 里只放了酷我 */
+  function txExcluded() {
+    const instance = fakeSource('摘了腾讯的源', async () => 'https://up.example/tx.flac', 'kw')
+    instance.config.pt = ['kw']
+    instance.sourceInfo!.sources.tx = { name: 'tx', type: 'music', actions: ['musicUrl'], qualitys: [...QUALITIES] }
+    return instance
+  }
+  const manager = () => managerWith([txExcluded()], { urlMs: 5000, perSourceMs: 5000, totalMs: 5000 })
+  const tx = { ...musicInfo, source: 'tx' } as never
+
+  it('probeSourceUrl 照样调脚本：被摘掉的平台也要有新数据，才知道该不该放回来', async () => {
+    const resolved = await manager().probeSourceUrl('摘了腾讯的源', tx, '320k', 5000)
+    expect(resolved.ok).toBe(true)
+    expect(resolved.url).toBe('https://up.example/tx.flac')
+  })
+
+  it('同一个源在真实瀑布里依旧接不到腾讯的活：改的只是看得见什么', async () => {
+    await expect(manager().getMusicUrlWithProvider(tx, '320k')).rejects.toThrow()
+    // pt 拦在调脚本之前：这格既没出网也没记账
+    expect(sourceHealth.view('摘了腾讯的源', 'tx')).toBeNull()
+  })
+
+  it('脚本压根没声明的平台仍判 unsupported —— 那是能力事实，不是决定', async () => {
+    const kg = await manager().probeSourceUrl('摘了腾讯的源', { ...musicInfo, source: 'kg' } as never, '320k', 5000)
+    expect(kg).toMatchObject({ ok: false, outcome: 'unsupported', latencyMs: 0 })
+    expect(kg.reason).toContain('未声明')
+  })
+})

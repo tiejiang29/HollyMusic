@@ -442,6 +442,12 @@ export class MusicSourceManager {
    * 为什么不复用 getMusicUrlWithProvider + excludeProviders：
    * 1. 那条路会把探测结果记进实时账本，3c 于是会拿"探测时的抖动"当真实用户的坏证据；
    * 2. 瀑布在头源出货后就短路了，根本轮不到被测的源——探测要的是"只有它在场"。
+   *
+   * **这里不看 `pt` 白名单**（与瀑布唯一的区别）：周测要回答的是"这个源在这个平台上
+   * 到底能不能取到址"，而 `pt` 是管理员当下"不让它上场"的决定。用决定去筛题目，那个
+   * 被摘掉的平台就永远没有新数据，管理员也永远不知道该不该把它放回来 —— 这一刀实测过：
+   * 测量范围改成按脚本声明之后，`pt` 闸门照样把 32 格拦在出网之前（`latencyMs=0`）。
+   * 派活侧照旧由 `pt` 说了算（`eligibleFor` 那道没动），所以改的只是"看得见什么"。
    */
   async probeSourceUrl(
     sourceName: string,
@@ -454,7 +460,6 @@ export class MusicSourceManager {
 
     const instance = this.instances.find(i => i.initialized && i.config.name === sourceName)
     if (!instance) return unsupported('音源未初始化或已停用')
-    if (!this.isAllowedByPt(instance, platform)) return unsupported(`pt 白名单未包含 ${platform}`)
     const sourceConfig = instance.sourceInfo?.sources[platform]
     if (!sourceConfig?.actions.includes('musicUrl')) return unsupported('脚本未声明该平台可取址')
 
