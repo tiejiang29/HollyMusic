@@ -7,9 +7,11 @@
  *   被修好之后才成立的（周测现在能覆盖全矩阵），但**决定权仍在人**：面板点一下才写。
  * - `music-sources.json` 只有一个原子写入者，任何"后台悄悄改配置"都等于开第二条写路径。
  *
- * 三条判据都是**连续两批同向**才提：只看最新一批的话，一首冷门歌没版权、或某次网络抖动
- * 就足够把一个好好地干着的平台的源摘掉。同理，`no-address`（源里没这首歌）与
- * `unsupported`（脚本压根没这个平台）都不算坏证据 —— 与账本那边的口径一致。
+ * 门槛是**不对称**的：「摘掉平台」与「调整顺位」要连续两批同向才提，「放回平台」最新一批出货就提。
+ * 两边误判的代价不一样 —— 只按最新一批就摘，一首冷门歌没版权、或某次网络抖动，就足够把一个
+ * 好好干着的平台的源摘掉，而且它再也拿不到翻案的数据；放错了只是那个平台多试一次不行，
+ * 3c 会熔断、下一批还会再建议摘。同理，`no-address`（源里没这首歌）与 `unsupported`
+ * （脚本压根没这个平台）都不算坏证据 —— 与账本那边的口径一致。
  */
 import { logger } from '@/lib/logger'
 import { readSetting, writeSetting } from '@/lib/services/app-setting'
@@ -71,24 +73,30 @@ function cellSummary(cells: Array<ProbeBatchCell | undefined>): string {
  */
 export function computeAdvice(rows: AdviceRow[], batches: ProbeBatch[]): Advice[] {
   const [latest, prev] = batches
-  // 只有一批就没有"同向"可言。宁可不提，也不拿单批抖动去改生产配置
-  if (!latest || !prev) return []
+  // 一批都没有就什么都谈不上。只有一批时仍能提"放回"（不对称的理由见下面那段），
+  // 但"摘除"与"顺位"要等第二批同向 —— 它们会动到用户实际会撞上的东西
+  if (!latest) return []
   const out: Advice[] = []
 
   for (const row of rows) {
     for (const platform of PLATFORMS) {
       const a = latest.cells.get(probeCellKey(row.name, platform))
-      const b = prev.cells.get(probeCellKey(row.name, platform))
-      if (!a || !b) continue
+      const b = prev?.cells.get(probeCellKey(row.name, platform))
+      if (!a) continue
       const inPt = row.pt.length === 0 || row.pt.includes(platform)
-      const bothOk = a.okCount > 0 && b.okCount > 0
-      // 坏 = 一批里没一首出货、且有真坏的行。`no-address`/`unsupported` 到不了这里
-      const bothBad = a.okCount === 0 && a.badCount > 0 && b.okCount === 0 && b.badCount > 0
-      if (!inPt && bothOk) {
+      // 放回与摘除的门槛**故意不对称**：
+      // - 放回只要最新一批出货。误放的代价是"那个平台又多试了一次不行"（3c 会熔断、下一批还会建议摘掉），
+      //   而要求两批同向在这里几乎永远凑不齐 —— 绕过 pt 真测之前那些格全是 `unsupported`，
+      //   上一批"没测到"不该成为不提放回的借口。
+      // - 摘除必须两批同向：误摘的代价是一个好平台再没有上场机会，也没有数据能翻案。
+      const bothBad = !!prev && !!b && a.okCount === 0 && a.badCount > 0 && b.okCount === 0 && b.badCount > 0
+      if (!inPt && a.okCount > 0) {
         out.push({
           id: `add-pt:${row.path}:${platform}`, kind: 'add-pt', path: row.path, source: row.name, platform,
           action: `把 ${platformLabel(platform)} 加回支持平台`,
-          evidence: `被 pt 摘着仍出货：${cellSummary([a, b])}`,
+          evidence: !b ? `最近一批出货：${cellSummary([a])}（只有这一批周测可比）`
+            : b.okCount > 0 ? `最近两批都出货：${cellSummary([a, b])}`
+              : `最近一批出货：${cellSummary([a])}（上一批 ${b.samples ? cellSummary([b]) : '没测到这一格'}）`,
           // 按平台清单的顺序补回去，保持配置里 pt 的写法稳定（否则每次固化都换一遍顺序）
           patch: { pt: [...PLATFORMS].filter(p => row.pt.includes(p) || p === platform) },
         })
@@ -96,7 +104,7 @@ export function computeAdvice(rows: AdviceRow[], batches: ProbeBatch[]): Advice[
         out.push({
           id: `drop-pt:${row.path}:${platform}`, kind: 'drop-pt', path: row.path, source: row.name, platform,
           action: `把 ${platformLabel(platform)} 从支持平台里摘掉`,
-          evidence: `连续两批判坏：${b.badReason ?? a.badReason ?? '原因未记'}`,
+          evidence: `连续两批判坏：${b?.badReason ?? a.badReason ?? '原因未记'}`,
           patch: { pt: row.pt.filter(p => p !== platform) },
         })
       }
@@ -105,13 +113,15 @@ export function computeAdvice(rows: AdviceRow[], batches: ProbeBatch[]): Advice[
 
   // priority 是**全局顺位**（瀑布按它排一次，再按平台筛），所以只能有一套建议。
   // 真数据上踩过：按平台各算一份时，同一个源在酷我被提到 1、在腾讯被压到 6，勾两条就互相覆盖。
+  if (!prev) return out
+  const batchList = [latest, prev]
   const ranked = rows
     .map(row => {
-      const cells = [latest, prev].flatMap(b =>
+      const cells = batchList.flatMap(b =>
         PLATFORMS.map(p => b.cells.get(probeCellKey(row.name, p))).filter((c): c is ProbeBatchCell => !!c))
-      const perBatch = [latest, prev].map(b =>
+      const perBatch = batchList.map(b =>
         PLATFORMS.some(p => (b.cells.get(probeCellKey(row.name, p))?.okCount ?? 0) > 0))
-      const okPlatforms = new Set([latest, prev].flatMap(b => PLATFORMS.filter(p => (b.cells.get(probeCellKey(row.name, p))?.okCount ?? 0) > 0)))
+      const okPlatforms = new Set(batchList.flatMap(b => PLATFORMS.filter(p => (b.cells.get(probeCellKey(row.name, p))?.okCount ?? 0) > 0)))
       return {
         row,
         measured: cells.length > 0,

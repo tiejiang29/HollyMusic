@@ -491,7 +491,7 @@ export function SourcesPanel() {
               <Lightbulb className="h-4 w-4 text-primary" />
               <span className="text-sm font-medium">周测建议</span>
               <span className="text-xs text-muted-foreground">
-                按最近 {advice.batchesUsed} 批周测算，<span className="font-medium">连续两批同向才提</span>；
+                按最近 {advice.batchesUsed} 批周测算，<span className="font-medium">放回平台一批出货即提，摘掉平台与调整顺位要连续两批同向</span>；
                 没有实测数据的源不会被挪位置
               </span>
             </div>

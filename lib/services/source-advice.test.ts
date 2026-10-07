@@ -59,10 +59,23 @@ const batch = (rows: Record<string, Record<string, CellSeed>>, runAt = new Date(
 const source = (name: string, priority: number, pt: string[]) => ({ path: `custom-sources/${name}.js`, name, priority, pt })
 
 describe('computeAdvice', () => {
-  it('只有一批周测时一条建议都不给（两批同向才提）', () => {
-    const rows = [source('甲', 1, ['kw'])]
-    expect(computeAdvice(rows, [batch({ 甲: { tx: { ok: 2 } } })])).toEqual([])
+  it('门槛不对称：单批也能提「放回」，但「摘除」与「顺位」要等第二批', () => {
+    const rows = [source('甲', 1, ['kw']), source('乙', 2, ['kw'])]
+    const out = computeAdvice(rows, [batch({ 甲: { tx: { ok: 2 } }, 乙: { kw: { bad: 2 } } })])
+    expect(out.map(a => a.kind)).toEqual(['add-pt'])
+    expect(out[0].evidence).toContain('只有这一批周测可比')
     expect(computeAdvice(rows, [])).toEqual([])
+  })
+
+  it('上一批被 pt 挡着没测到、这一批出货 ⇒ 照样提放回（真数据上就是这么卡住的）', () => {
+    const rows = [source('玉宁熙', 1, ['kw', 'wy'])]
+    const out = computeAdvice(rows, [
+      batch({ 玉宁熙: { kg: { ok: 2, latencies: [180, 220] } } }, new Date(Date.UTC(2026, 9, 8))),
+      batch({ 玉宁熙: { kg: { samples: 2, badCount: 0 } } }, new Date(Date.UTC(2026, 9, 1))),
+    ])
+    expect(out.map(a => `${a.kind}:${a.platform}`)).toEqual(['add-pt:kg'])
+    expect(out[0].evidence).toContain('最近一批出货')
+    expect(out[0].evidence).toContain('上一批 0/2 出货')
   })
 
   it('被 pt 摘着但连续两批都出货 ⇒ 建议放回，pt 按平台清单顺序补', () => {

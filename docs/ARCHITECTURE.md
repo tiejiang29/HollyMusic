@@ -187,8 +187,13 @@ failed`、HTTP 4xx/5xx 这类**传输层**失败留在"坏"里）、**缓存与�
 `无实测`（没轮到）、`不测`（pt 不含该平台，不是坏）、`冷却中 Ns / 冷却中·试探`（3c 正在跳它）。
 
 **周测（3c 的先验来源，2026-09-19 新增）**：`lib/services/source-probe.ts`。启动后每 7 天（或面板
-「立即周测」手动）把「启用源 × pt × 每平台 2 首基准曲」全矩阵跑一遍，结果写 `SourceProbeResult`
-（append）+ `SourceProbeRun`（批次元数据与样本快照）。三件事值得知道：
+「立即周测」手动）把「启用源 × 该平台能力 × 每平台 2 首基准曲」全矩阵跑一遍，结果写 `SourceProbeResult`
+（append）+ `SourceProbeRun`（批次元数据与样本快照）。几条值得知道：
+
+- **范围以脚本自己声明的平台为准，不看 `pt`**（2026-10-07 改）。`pt` 是面向用户的派活白名单；探测要是
+  也被它挡着，一个平台一旦被摘出 `pt` 就永远不再产生新数据，下次想放回去时没有任何证据。取址侧
+  `probeSourceUrl` 里原先那道 `isAllowedByPt` 闸门已删，判范围的是 `scopePlatformsForSource()`。
+  `unsupported` 的格子计入「不适用」，不进分母，也不参与好坏判定。
 
 - **探测不写实时账本**。取址走 `musicSourceManager.probeSourceUrl`（单源、跳过瀑布、不记账），字节段
   在这里自己用 `judgeUpstreamPayload` 判。探测证据和真实用户证据必须分开，否则探测自身的抖动
@@ -340,6 +345,9 @@ failed`、HTTP 4xx/5xx 这类**传输层**失败留在"坏"里）、**缓存与�
 | POST | `/api/admin/recommend/ai-filter`、`/ai-generate` | AI 辅助筛选 / AI 生成名单（只读建议，不写库） |
 | GET/POST | `/api/admin/recommend-tasks` | 推荐任务列表 / 创建（含 cancel/rerun/rollback 子接口） |
 | GET/POST | `/api/admin/sources` | 音源配置列表 / 新增 |
+| GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
+| GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
+| GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |
 | POST | `/api/admin/sources/subscriptions` | 在线音源订阅 |
 | POST | `/api/admin/sources/upload` | 上传音源脚本（预校验 + 自动注册） |
