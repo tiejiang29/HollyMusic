@@ -10,11 +10,12 @@ import { createHash } from 'node:crypto'
 import zlib from 'node:zlib'
 import path from 'node:path'
 
-const { prismaMock, importSubscriptionMock, readConfigMock, fsReadFileMock } = vi.hoisted(() => ({
+const { prismaMock, importSubscriptionMock, readConfigMock, fsReadFileMock, replaceSourceEntryMock } = vi.hoisted(() => ({
   prismaMock: { appSetting: {}, sourceCandidate: {} } as Record<string, Record<string, unknown>>,
   importSubscriptionMock: vi.fn(),
   readConfigMock: vi.fn(async () => ({ sources: [] as Array<{ path: string; name?: string }> })),
   fsReadFileMock: vi.fn(async () => '' as string),
+  replaceSourceEntryMock: vi.fn(async () => {}),
 }))
 
 // 已装源的内容哈希要读盘，这里隔掉：脚本正文由测试自己给
@@ -33,6 +34,8 @@ vi.mock('@/lib/services/source-manager-service', () => ({
   importSubscription: importSubscriptionMock,
   // "已导入"的判据看配置文件，不是候选状态 —— 用它来演"源被删了"的两种局面
   readConfig: readConfigMock,
+  // 撞同名选「替换」时由它换掉库里那条：这里只验"什么时候调、传的是哪两条路径"
+  replaceSourceEntry: replaceSourceEntryMock,
   SOURCE_MANAGER_CONSTANTS: { SCRIPTS_DIR: path.resolve(process.cwd(), 'custom-sources') },
   SourceSubscriptionError: class SourceSubscriptionError extends Error {
     readonly status: number
@@ -89,6 +92,8 @@ beforeEach(() => {
   nextId = 1
   settingRows.clear()
   importSubscriptionMock.mockReset()
+  replaceSourceEntryMock.mockReset()
+  replaceSourceEntryMock.mockResolvedValue(undefined)
   readConfigMock.mockReset()
   readConfigMock.mockResolvedValue({ sources: [] })
   fsReadFileMock.mockReset()
@@ -869,12 +874,76 @@ describe('导入前先跟已经装着的源比一次', () => {
     expect(importSubscriptionMock).not.toHaveBeenCalled()
   })
 
-  it('同名但内容不同 ⇒ 拒；force 能越 —— "我就要两条并排对照"是管理员的决定', async () => {
+  it('同名 ⇒ 一定要他选：mode=parallel 才并排装，force 不再顺带绕过这道门', async () => {
     const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
     await expect(importCandidate(id)).rejects.toThrow(/同名源/)
+    // 这条就是 dev 实测抓出来的洞：force 的原意是"判级没出货也硬装"，曾经顺带把同名闸门也越了
+    await expect(importCandidate(id, { force: true })).rejects.toThrow(/同名源/)
     importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/别的.js', name: 'X' })
-    await importCandidate(id, { force: true })
+    await importCandidate(id, { mode: 'parallel' })
     expect(importSubscriptionMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('撞同名的默认出路是**替换**：mode=replace 装新的、把库里那条连同脚本文件换掉', async () => {
+    readConfigMock.mockResolvedValue({
+      sources: [{ path: INSTALLED_PATH, name: '合成测试音源 v1.0.0', priority: 4, pt: ['kw'], enabled: true }],
+    })
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/合成测试音源 v1.2.0.js', name: '合成测试音源 v1.2.0' })
+
+    await importCandidate(id, { mode: 'replace' })
+    expect(importSubscriptionMock).toHaveBeenCalledTimes(1)
+    expect(replaceSourceEntryMock).toHaveBeenCalledWith({
+      newPath: 'custom-sources/合成测试音源 v1.2.0.js', oldPath: INSTALLED_PATH,
+    })
+  })
+
+  it('装进去的版本比库里那条低 ⇒ 拦一次；confirmDowngrade 才放行（替换照旧）', async () => {
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/新.js', name: 'X' })
+    // 这一节 beforeEach 装的是 v9.9.9，候选那行是 v1.2.0 ⇒ 更低
+    await expect(importCandidate(id, { mode: 'replace' })).rejects.toThrow(/要装入的版本（1\.2\.0）比库里那条（9\.9\.9）低/)
+    expect(importSubscriptionMock).not.toHaveBeenCalled()
+    expect(replaceSourceEntryMock).not.toHaveBeenCalled()
+
+    await importCandidate(id, { mode: 'replace', confirmDowngrade: true })
+    expect(importSubscriptionMock).toHaveBeenCalledTimes(1)
+    expect(replaceSourceEntryMock).toHaveBeenCalledWith({ newPath: 'custom-sources/新.js', oldPath: INSTALLED_PATH })
+  })
+
+  it('判不出高低（有一边没写版本号）⇒ 不编一个"更低"出来拦人', async () => {
+    readConfigMock.mockResolvedValue({ sources: [{ path: INSTALLED_PATH, name: '合成测试音源' }] })
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', scriptName: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/新.js', name: 'X' })
+    await expect(importCandidate(id, { mode: 'replace' })).resolves.toBeTruthy()
+    expect(replaceSourceEntryMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('并排装那条路不碰替换：他要的就是两条都在', async () => {
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/新.js', name: 'X' })
+    await importCandidate(id, { mode: 'parallel' })
+    expect(replaceSourceEntryMock).not.toHaveBeenCalled()
+  })
+
+  it('替换那一步失败 ⇒ 说清"新的已装上、旧的没换掉"，不能回一句"导入失败"', async () => {
+    // 库里那条用更低的版本，免得先撞上"倒退"那道闸门、测不到想测的这一步
+    readConfigMock.mockResolvedValue({ sources: [{ path: INSTALLED_PATH, name: '合成测试音源 v1.0.0' }] })
+    const id = seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    importSubscriptionMock.mockResolvedValue({ path: 'custom-sources/新.js', name: 'X' })
+    replaceSourceEntryMock.mockRejectedValueOnce(new Error('配置写入失败'))
+    await expect(importCandidate(id, { mode: 'replace' })).rejects.toThrow(/新源已导入为 custom-sources\/新\.js.*没能换掉/)
+    // 而且候选行确实被标成 imported 了 —— 新源是装上了的，这是真的
+    expect(rows.find(r => r.id === id)).toMatchObject({ state: 'imported', importedPath: 'custom-sources/新.js' })
+  })
+
+  it('列表里就把版本对照一起标出来（面板据此把按钮写成「替换导入」并在确认框里警告倒退）', async () => {
+    readConfigMock.mockResolvedValue({ sources: [{ path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' }] })
+    seedSuspect({ contentHash: OTHER_HASH, nameKey: '合成测试音源', probeJson: probeReportOf({ tx: 'ok' }) })
+    const [view] = await listCandidates()
+    expect(view.duplicateOf).toMatchObject({
+      kind: 'name', path: INSTALLED_PATH, incomingVersion: '1.2.0', currentVersion: '9.9.9', lowerVersion: true,
+    })
   })
 
   it('撞车先于判级报：库里就有那份，这条比"你还没判过"更有决定性', async () => {
@@ -898,7 +967,10 @@ describe('导入前先跟已经装着的源比一次', () => {
   it('列表里就把撞车对象标出来（面板据此提前提示，不必等管理员点了才知道）', async () => {
     seedSuspect({ contentHash: SAME_HASH, nameKey: '', scriptName: '合成测试音源 v1.2.0' })
     const [view] = await listCandidates()
-    expect(view.duplicateOf).toEqual({ kind: 'content', path: INSTALLED_PATH, name: '合成测试音源 v9.9.9' })
+    expect(view.duplicateOf).toEqual({
+      kind: 'content', path: INSTALLED_PATH, name: '合成测试音源 v9.9.9',
+      incomingVersion: '1.2.0', currentVersion: '9.9.9', lowerVersion: false,
+    })
   })
 
   it('名字只是**近似**（作者加了后缀）⇒ 报 similarTo、不报 duplicateOf，两档硬撞车都不越', async () => {

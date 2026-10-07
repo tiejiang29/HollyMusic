@@ -28,7 +28,7 @@ import { readSetting, writeSetting } from '@/lib/services/app-setting'
 import { safePublicFetch } from '@/lib/server/url-guard'
 import { gitBlobSha } from '@/lib/server/git-blob-sha'
 import { listZipEntries, extractZipEntry, type ZipLimits } from '@/lib/server/zip-read'
-import { parseScriptMeta, importSubscription, readConfig, SOURCE_MANAGER_CONSTANTS, SourceSubscriptionError } from '@/lib/services/source-manager-service'
+import { parseScriptMeta, importSubscription, readConfig, replaceSourceEntry, SOURCE_MANAGER_CONSTANTS, SourceSubscriptionError } from '@/lib/services/source-manager-service'
 import type { SourceConfig } from '@/lib/types/music'
 
 export const DISCOVERY_SETTING_KEY = 'sourceDiscovery'
@@ -1594,6 +1594,35 @@ function parseVersionFromPath(path: string, scriptName: string): string {
   return fromName ? fromName[1] : ''
 }
 
+/**
+ * 版本高低。**两边都说得出版本号才判得出来**：`toNameKey` 会把版本从名字里剥掉，所以"同名不同内容"
+ * 这一档里谁是新版常常只有文件名知道。
+ * 返回 null = 有一边压根没写版本 —— 判不出就别拿"版本更低"去吓管理员，宁可不提示。
+ */
+export function versionDirection(incoming: string, current: string): 'lower' | 'same' | 'higher' | null {
+  if (!incoming || !current) return null
+  const a = compareVersion(incoming)
+  const b = compareVersion(current)
+  return a < b ? 'lower' : a > b ? 'higher' : 'same'
+}
+
+/** 撞车对象连同版本对照一起给面板：按钮要写成「导入并替换」，更低版本要多问一句 */
+function twinView(
+  row: { path: string; scriptName: string },
+  twin: { kind: 'content' | 'name'; twin: InstalledTwin },
+) {
+  const incomingVersion = parseVersionFromPath(row.path, row.scriptName)
+  const currentVersion = parseVersionFromPath(twin.twin.path, twin.twin.name)
+  return {
+    kind: twin.kind,
+    path: twin.twin.path,
+    name: twin.twin.name,
+    incomingVersion,
+    currentVersion,
+    lowerVersion: twin.kind === 'name' && versionDirection(incomingVersion, currentVersion) === 'lower',
+  }
+}
+
 export interface CandidateView {
   id: number
   repo: string
@@ -1611,8 +1640,15 @@ export interface CandidateView {
   probedAt: string | null
   /** P0-c：已导入时它在 custom-sources 下的路径；空串 = 没导入过 */
   importedPath: string
-  /** P0-c：与**已装源**撞车的对象（content=字节相同 / name=同名不同内容）；null = 没撞 */
-  duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
+  /**
+   * P0-c：与**已装源**撞车的对象（content=字节相同 / name=同名不同内容）；null = 没撞。
+   * `name` 撞车时带两边版本号与 `lowerVersion`：面板据此把按钮写成「导入并替换」，
+   * 版本更低就多问一句（判不出高低时 lowerVersion 恒 false，不编造）。
+   */
+  duplicateOf: {
+    kind: 'content' | 'name'; path: string; name: string;
+    incomingVersion: string; currentVersion: string; lowerVersion: boolean;
+  } | null
   /**
    * 只提示不拦：库里有条源的名字与它**近似**（作者后缀不同，归一后不相等），可能是同一个源的另一个版本。
    * 不进任何判据 —— 见 `findSimilarInstalledName`。
@@ -1705,7 +1741,7 @@ export async function listCandidates(filter: { verdict?: string; state?: string;
       probe: parseProbeReport(row.probeJson),
       probedAt: row.probedAt ? row.probedAt.toISOString() : null,
       importedPath: row.importedPath,
-      duplicateOf: twin ? { kind: twin.kind, path: twin.twin.path, name: twin.twin.name } : null,
+      duplicateOf: twin ? twinView(row, twin) : null,
       similarTo: similar ? { path: similar.path, name: similar.name } : null,
       releaseTag: row.releaseTag,
       zipMember: row.zipMember,
@@ -2297,14 +2333,23 @@ export async function reopenCandidatesForRemovedSource(sourcePath: string): Prom
  *
  * 三道闸门，按"证据成本"从低到高排：
  * - 库里已装着**内容完全相同**的一份 ⇒ 直接拒，`force` 也不给越（同下面那条重复导入的理由）；
- *   只是**同名**不同内容 ⇒ 也拒，但 `force` 能越（"我就要两条并排做对照"是他自己的决定，
- *   代价是两条源共用健康账本那一格）；
+ * - 只是**同名**（归一化 `@name` 相等、内容不同 = 同一个源的另一版）：怎么去重**只由 `mode` 决定** ——
+ *   `'replace'` 换掉库里那条（新条目沿用旧的 priority/pt/enabled，旧脚本文件一并删），
+ *   `'parallel'` 保留并排两条；`mode` 没给或不认识 ⇒ 一律 409，让面板把选择摆出来。
+ *   **这里特意不看 `force`**：`force` 的意思是"判级没出货也硬装"，让它顺带绕过同名闸门，
+ *   实测的结果就是带了 force 的调用一条都没问过就把并排第二条装了进去（2026-10-07 dev 上跑出来的）。
+ *   替换前还有一道版本闸门：要装进去的版本比库里那条低 ⇒ 409，除非 `confirmDowngrade`。
+ *   沿用旧条目的三个字段而不是新脚本自报的那份，是因为顺位与平台白名单都是他人工调过的东西，
+ *   "换个版本"不该顺手把它们改掉（账本键是音源名，名字里的版本号一变账本本来就会重开）。
  * - 判级至少一个平台真出货，`force` 可以越过 —— 管理员对着红绿灯坚持要装，是他的决定；
  * - 已经导入且**那条源还在配置里**的不给重复导入，**这条不给 force 越** —— 点两下就在
  *   custom-sources 多一个 `-1.js`，那不属于"坚持"，属于垃圾。源已经在「音源管理」里删掉的，
  *   这条候选重新开放导入（判据看配置文件，不看候选状态）。
  */
-export async function importCandidate(id: number, opts: { force?: boolean } = {}): Promise<SourceConfig> {
+export async function importCandidate(
+  id: number,
+  opts: { force?: boolean; mode?: 'replace' | 'parallel'; confirmDowngrade?: boolean } = {},
+): Promise<SourceConfig> {
   const row = await prisma.sourceCandidate.findUnique({ where: { id } })
   if (!row) throw new SourceDiscoveryError('候选不存在', 404)
   if (row.verdict !== 'suspect') throw new SourceDiscoveryError('只导入判定为「疑似音源」的候选')
@@ -2320,10 +2365,23 @@ export async function importCandidate(id: number, opts: { force?: boolean } = {}
       409,
     )
   }
-  if (twin?.kind === 'name' && !opts.force) {
+  // `force` 只管"对着红灯坚持装"那一档（越过判级），**不再顺带表示"并排"** ——
+  // 一个参数兼两个意思时，带了 force 的调用方会静悄悄绕过下面这道"让他选"的闸门（实测踩过）
+  const parallel = opts.mode === 'parallel'
+  if (twin?.kind === 'name' && !parallel && opts.mode !== 'replace') {
     throw new SourceDiscoveryError(
       `库里已有同名源「${twin.twin.name}」—— 健康账本按音源名记账，两条同名会互相污染冷却与坏证据。`
-      + '确实要并排装请再点一次「确认强制导入」',
+      + '默认请选「替换」换掉旧的那条；确实要并排做对照再选「并排装」',
+      409,
+    )
+  }
+  // 替换前的版本闸门：装进一个更低的版本是"倒退"，不是更新，必须他本人再点一次确认。
+  // 判不出高低（有一边没写版本号）就不拦 —— 宁可不提示，也不编一个"更低"出来。
+  const twinInfo = twin ? twinView(row, twin) : null
+  if (twinInfo?.kind === 'name' && opts.mode === 'replace' && twinInfo.lowerVersion && !opts.confirmDowngrade) {
+    throw new SourceDiscoveryError(
+      `要装入的版本（${twinInfo.incomingVersion}）比库里那条（${twinInfo.currentVersion}）低 —— `
+      + '这是倒退不是更新。确认仍要替换请再点一次「仍然替换」',
       409,
     )
   }
@@ -2368,5 +2426,22 @@ export async function importCandidate(id: number, opts: { force?: boolean } = {}
 
   await prisma.sourceCandidate.update({ where: { id }, data: { state: 'imported', importedPath: source.path } })
   logger.info('[discovery] 候选已导入为音源', { id, 仓库: row.repo, 脚本: source.path })
+
+  // 替换排在标记之后：新源这时候**已经装上了**，替换失败不能假装整件事没发生 ——
+  // 报一条说清"新的已装、旧的没换掉"的错，比回一句"导入失败"更接近真相
+  if (twinInfo?.kind === 'name' && opts.mode === 'replace') {
+    try {
+      await replaceSourceEntry({ newPath: source.path, oldPath: twinInfo.path })
+      logger.info('[discovery] 同名旧源已替换', { 旧: twinInfo.path, 新: source.path })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      logger.warn('[discovery] 同名替换未完成', { 旧: twinInfo.path, 新: source.path, 原因: message.slice(0, 160) })
+      throw new SourceDiscoveryError(
+        `新源已导入为 ${source.path}，但没能换掉库里那条「${twinInfo.name}」（${message.slice(0, 80)}）`
+        + '——请到「音源管理」手动删掉旧的',
+        500,
+      )
+    }
+  }
   return source
 }

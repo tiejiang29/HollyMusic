@@ -121,7 +121,13 @@ export async function POST(request: NextRequest) {
       const id = Number(body?.id)
       if (!Number.isFinite(id) || id <= 0) return createErrorResponse('INVALID_PARAMS', '缺少合法的候选 id', 400)
       // 导入要重下载 + 一次性进程校验，最坏十几秒，但必须等它出结果才知道源名，所以同步返回
-      const source = await importCandidate(id, { force: body?.force === true })
+      // mode：撞同名时怎么选（replace=换掉库里那条 / parallel=并排装两条），不给就 409 让面板问
+      const mode = body?.mode === 'replace' || body?.mode === 'parallel' ? body.mode : undefined
+      const source = await importCandidate(id, {
+        force: body?.force === true,
+        mode,
+        confirmDowngrade: body?.confirmDowngrade === true,
+      })
       return createSuccessResponse({ imported: { id, path: source.path, name: source.name ?? source.path } })
     }
 

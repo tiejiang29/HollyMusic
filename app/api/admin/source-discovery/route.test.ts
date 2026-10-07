@@ -175,16 +175,28 @@ describe('动作校验', () => {
     }
   })
 
-  it('import 只认 id：正文/URL 传了没人看，force 原样交给服务层', async () => {
+  it('import 只认 id：正文/URL 传了没人看，force 与 mode 原样交给服务层', async () => {
     importCandidateMock.mockResolvedValue({ path: 'custom-sources/x.js', name: 'X 音源' })
 
     const response = await POST(request('POST', { action: 'import', id: 7, url: 'https://evil.test/a.js', content: 'boom' }))
     expect(response.status).toBe(200)
     expect((await response.json()).data.imported).toEqual({ id: 7, path: 'custom-sources/x.js', name: 'X 音源' })
-    expect(importCandidateMock).toHaveBeenCalledWith(7, { force: false })
+    expect(importCandidateMock).toHaveBeenCalledWith(7, { force: false, mode: undefined, confirmDowngrade: false })
 
     await POST(request('POST', { action: 'import', id: 7, force: true }))
-    expect(importCandidateMock).toHaveBeenLastCalledWith(7, { force: true })
+    expect(importCandidateMock).toHaveBeenLastCalledWith(7, { force: true, mode: undefined, confirmDowngrade: false })
+  })
+
+  it('撞同名的 mode 只认 replace / parallel：别的值一律当"没选"，让服务层去要求他选', async () => {
+    importCandidateMock.mockResolvedValue({ path: 'custom-sources/x.js', name: 'X' })
+    await POST(request('POST', { action: 'import', id: 7, mode: 'replace', confirmDowngrade: true }))
+    expect(importCandidateMock).toHaveBeenLastCalledWith(7, { force: false, mode: 'replace', confirmDowngrade: true })
+    // 拼错或自己编一个 mode（比如 'force'）不能变成"绕过闸门"
+    await POST(request('POST', { action: 'import', id: 7, mode: 'whatever' }))
+    expect(importCandidateMock).toHaveBeenLastCalledWith(7, { force: false, mode: undefined, confirmDowngrade: false })
+    // confirmDowngrade 只认真值：字符串 "true" 不算
+    await POST(request('POST', { action: 'import', id: 7, mode: 'parallel', confirmDowngrade: 'true' }))
+    expect(importCandidateMock).toHaveBeenLastCalledWith(7, { force: false, mode: 'parallel', confirmDowngrade: false })
   })
 
   it('import 缺 id 或 id 非法都 400，服务层一次都不碰', async () => {

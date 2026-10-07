@@ -357,7 +357,7 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 | GET/POST | `/api/admin/sources` | 音源配置列表 / 新增 |
 | GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
-| GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
+| GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`（撞同名时 `mode`：`replace` 换掉库里那条 / `parallel` 并排装）、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |
 | POST | `/api/admin/sources/subscriptions` | 在线音源订阅 |
 | POST | `/api/admin/sources/upload` | 上传音源脚本（预校验 + 自动注册） |

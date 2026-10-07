@@ -117,7 +117,10 @@ export interface DiscoveryCandidate {
   /** P0-c：已导入时它在 custom-sources 下的路径；空串 = 没导入过 */
   importedPath: string
   /** P0-c：撞上了**已经装着的源**（content=字节相同 / name=同名不同内容）；null = 没撞 */
-  duplicateOf: { kind: 'content' | 'name'; path: string; name: string } | null
+  duplicateOf: {
+    kind: 'content' | 'name'; path: string; name: string;
+    incomingVersion: string; currentVersion: string; lowerVersion: boolean;
+  } | null
   /** 只提示不拦：库里有条源名字与它近似（作者后缀不同，归一后不相等），可能是同一个源的另一个版本 */
   similarTo: { path: string; name: string } | null
   /** 非空 = 这条来自某个 release 的资产（此时 path 是资产文件名，不是仓库内路径） */
@@ -242,11 +245,18 @@ export function dismissDiscoveryCandidate(id: number): Promise<{ dismissed: numb
 }
 
 /**
- * 把候选导入成正式音源。只传 id：服务端按自己那行记录重下载并复验 blob sha，
- * 判级没有一个平台出货时会被 409 挡回来，`force` 是给管理员"看着红绿灯坚持装"的那一档。
+ * 把候选导入成正式音源。只传 id：服务端按自己那行记录重下载并复验锚点。
+ * - `mode`：撞同名时怎么选 —— 'replace' 换掉库里那条、'parallel' 并排装两条；没撞就不用给。
+ * - `force`：判级没有一个平台出货时的"坚持"位。
+ * - `confirmDowngrade`：替换的那条版本更低时，确认框里已经写明，这一位让服务端放行。
  */
-export function importDiscoveryCandidate(id: number, force = false): Promise<{ imported: { id: number; path: string; name: string } }> {
-  return apiPost<{ imported: { id: number; path: string; name: string } }>('admin/source-discovery', { action: 'import', id, force })
+export function importDiscoveryCandidate(
+  id: number,
+  opts: { mode?: 'plain' | 'replace' | 'parallel'; force?: boolean; confirmDowngrade?: boolean } = {},
+): Promise<{ imported: { id: number; path: string; name: string } }> {
+  return apiPost<{ imported: { id: number; path: string; name: string } }>('admin/source-discovery', {
+    action: 'import', id, mode: opts.mode, force: opts.force === true, confirmDowngrade: opts.confirmDowngrade === true,
+  })
 }
 
 /** 清掉已从扫描列表里移除的仓留下的候选行（已导入成音源的保留） */

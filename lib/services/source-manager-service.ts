@@ -671,6 +671,47 @@ export async function removeSource(sourcePath: string): Promise<void> {
   logger.info(`[source-manager-service] 删除源 + 脚本: ${sourcePath}`)
 }
 
+/**
+ * 替换的那步纯计算：把新条目接成"旧条目那几个手工字段的所有者"，并把旧条目从清单里摘掉。
+ * 返回 null = 没什么可换（新旧是同一条，或旧的已经不在了 —— 目标状态本来就只有那一条）。
+ *
+ * 只搬 `priority` / `pt` / `enabled`：顺位是他手工调优的基线，换版本不该顺手把源甩到队尾；
+ * `pt` 是他勾过的白名单，新版本能不能干该由周测说。名字、描述、订阅地址一律取新脚本那份。
+ */
+export function replaceInConfigList<T extends { path: string; priority?: number; pt?: string[]; enabled?: boolean }>(
+  sources: T[], newPath: string, oldPath: string,
+): T[] | null {
+  if (newPath === oldPath) return null
+  const newIdx = sources.findIndex(s => s.path === newPath)
+  const oldIdx = sources.findIndex(s => s.path === oldPath)
+  if (newIdx < 0 || oldIdx < 0) return null
+  const old = sources[oldIdx]
+  const next = [...sources]
+  next[newIdx] = { ...next[newIdx], priority: old.priority, pt: old.pt, enabled: old.enabled }
+  next.splice(oldIdx, 1)
+  return next
+}
+
+/**
+ * 用刚导入的那条**替换**库里同名的旧条：一次读一次写，随后删旧脚本文件。
+ * 新条目不在配置里是硬错误（说明"导入成功"这件事本身不成立），旧的不在就是无事可做。
+ */
+export async function replaceSourceEntry(opts: { newPath: string; oldPath: string }): Promise<void> {
+  assertScriptPath(opts.oldPath)
+  const config = await readConfig()
+  const replaced = replaceInConfigList(config.sources, opts.newPath, opts.oldPath)
+  if (replaced === null) {
+    if (opts.newPath !== opts.oldPath && !config.sources.some(s => s.path === opts.newPath)) {
+      throw new Error(`找不到刚导入的源: ${opts.newPath}`)
+    }
+    return
+  }
+  await writeConfig({ ...config, sources: replaced })
+  await notifyReload()
+  await deleteScript(opts.oldPath)
+  logger.info(`[source-manager-service] 同名替换：${opts.oldPath} → ${opts.newPath}`)
+}
+
 /** 从脚本 sourceInfo 提取支持平台（用于上传后自动填充 pt） */
 export function extractPlatforms(sourceInfo: Record<string, unknown> | undefined): string[] {
   if (!sourceInfo?.sources || typeof sourceInfo.sources !== 'object') return []

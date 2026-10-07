@@ -112,13 +112,46 @@ export function okPlatformCount(cells: Record<string, ProbeCellView> | undefined
 }
 
 /**
- * 一次点击能不能直接导？判级有平台出货**且**没撞上库里已有的同名源，才算"直接"。
+ * 判级没有一个平台真出货 ⇒ 导入要"坚持"一次（两下点击）。
  *
- * 导出是为了能直测：服务端 `importCandidate` 有同一套判据（至少一格 ok；同名要 force），
+ * 导出是为了能直测：服务端 `importCandidate` 有同一条判据（至少一格 ok 才放行，`force` 能越），
  * 两边算得不一样时，按钮会说"可以装"而接口回你 409，管理员看到的就是自相矛盾。
  */
-export function needsForceConfirm(row: Pick<DiscoveryCandidate, 'probe' | 'duplicateOf'>): boolean {
-  return okPlatformCount(row.probe?.cells) === 0 || row.duplicateOf?.kind === 'name'
+export function needsProbeForce(row: Pick<DiscoveryCandidate, 'probe'>): boolean {
+  return okPlatformCount(row.probe?.cells) === 0
+}
+
+/** 撞同名时这一次导入走哪种去重；没撞就是普通导入（撞内容不给导入按钮，见渲染处） */
+export type ImportMode = 'plain' | 'replace' | 'parallel'
+
+/**
+ * 撞同名那一次导入的确认框正文（导出来是为了能直测；措辞里那几条判据都要有回归钉着）。
+ *
+ * 三件事必须在他点之前看见：换掉的是哪条、顺位与平台白名单会被沿用、旧脚本文件会被删。
+ * 版本更低时多一句 —— 但只有两边都说得出版本号才说（`lowerVersion` 由服务端算，判不出就是 false）。
+ * mode='parallel' 说的是另一种代价：两条同名共用健康账本那一格。
+ */
+export function importConfirmText(
+  row: Pick<DiscoveryCandidate, 'duplicateOf' | 'probe'>,
+  mode: ImportMode,
+): string {
+  const twin = row.duplicateOf
+  if (twin?.kind !== 'name') return ''
+  const lineBreak = String.fromCharCode(10)
+  const incoming = twin.incomingVersion || '未标版本'
+  const current = twin.currentVersion || '未标版本'
+  const head = mode === 'parallel'
+    ? `库里已有同名源「${twin.name}」（版本 ${current}），确定要并排装两条？${lineBreak}`
+      + '健康账本按音源名记账，两条同名会共用那一格 —— 一条的冷却与坏证据会算到另一条头上。'
+    : `库里已有同名源「${twin.name}」（版本 ${current}）。${lineBreak}`
+      + `导入后替换它：新条目沿用它的顺位、平台白名单与启停状态，旧脚本文件一并删掉。${lineBreak}`
+      + `这次装入的版本 ${incoming}。`
+      + (twin.lowerVersion ? `${lineBreak}${lineBreak}注意：这比库里那条低，是倒退不是更新。仍然要换就点确定。` : '')
+  // 判级没出货这一档在确认框里一并说清，免得他点完才知道还要再坚持一次
+  const probeNote = needsProbeForce(row)
+    ? `${lineBreak}${lineBreak}另外：判级里还没有平台真出货，这次算「对着红灯坚持装」。`
+    : ''
+  return head + probeNote
 }
 
 /**
@@ -157,8 +190,8 @@ export function mergeRepos(current: string[], added: string[]): string[] {
 }
 
 /**
- * 「名字近似」那句提示的文案。**只提示，不参与任何判据**：导入按钮要不要二次确认仍由
- * `needsForceConfirm`（内容/同名撞车 + 有没有出货）说了算，这句不改它。
+ * 「名字近似」那句提示的文案。**只提示，不参与任何判据**：撞不撞车、要不要弹替换确认，
+ * 全由 `duplicateOf`（内容/同名撞车）和 `needsProbeForce`（有没有出货）说了算，这句不改它们。
  *
  * 为什么需要：作者给同一个源起的名字会漂移（`lx-玉宁熙V1.2.2` → `lx-玉宁熙-Pro`），
  * 归一键剥得掉版本号却剥不掉 `Pro` 这种后缀，于是两条既不撞内容也不撞同名，看着像无关的新源。
@@ -591,17 +624,28 @@ export function SourceDiscoveryPanel() {
     }
   }
 
-  const handleImport = async (row: DiscoveryCandidate) => {
-    const forced = needsForceConfirm(row)
-    if (forced && forceConfirmId !== row.id) {
+  const handleImport = async (row: DiscoveryCandidate, mode: ImportMode) => {
+    const isTwin = row.duplicateOf?.kind === 'name'
+    if (isTwin) {
+      // 撞同名不再靠"再点一次"表达坚持：替换与并排是两种结果，各配一个按钮，弹一次确认框
+      if (!confirm(importConfirmText(row, mode))) return
+    } else if (needsProbeForce(row) && forceConfirmId !== row.id) {
       setForceConfirmId(row.id)
       return
     }
     setForceConfirmId(null)
     setImportingId(row.id)
     try {
-      const result = await importDiscoveryCandidate(row.id, forced)
-      setImportNote(`已导入为「${result.imported.name}」（${result.imported.path}），到「音源管理」可调优先级或直接停用`)
+      const result = await importDiscoveryCandidate(row.id, {
+        mode,
+        // 判级没出货这一档仍然要显式坚持；确认框里已经把这句话说明白了
+        force: needsProbeForce(row),
+        confirmDowngrade: row.duplicateOf?.lowerVersion === true,
+      })
+      const twin = row.duplicateOf
+      setImportNote(`已导入为「${result.imported.name}」（${result.imported.path}）`
+        + (mode === 'replace' && twin?.kind === 'name' ? `，已替换掉库里那条「${twin.name}」` : '')
+        + '，到「音源管理」可调优先级或直接停用')
       await reload()
     } catch (e) {
       alert(e instanceof Error ? e.message : '导入失败')
@@ -1221,7 +1265,9 @@ export function SourceDiscoveryPanel() {
                           <div className={row.duplicateOf.kind === 'content' ? 'text-destructive' : 'text-amber-600'}>
                             {row.duplicateOf.kind === 'content'
                               ? `库里已装着同一份 → ${row.duplicateOf.name || row.duplicateOf.path}`
-                              : `库里已有同名源 → ${row.duplicateOf.name}`}
+                              : `库里已有同名源 → ${row.duplicateOf.name}（版本 ${row.duplicateOf.currentVersion || '未标'}）`
+                                + `｜这条 ${row.duplicateOf.incomingVersion || '未标'}`
+                                + (row.duplicateOf.lowerVersion ? '，更低' : '')}
                           </div>
                         ) : null}
                         {similarNameBadge(row) ? (
@@ -1267,27 +1313,48 @@ export function SourceDiscoveryPanel() {
                               : <Radar className="h-3.5 w-3.5" />}
                             {row.verdict === 'suspect' ? '判级' : '仍然判级'}
                           </button>
-                          {row.state === 'imported' || row.duplicateOf?.kind === 'content' ? null : (
-                            <button
-                              onClick={() => { void handleImport(row) }}
-                              disabled={row.verdict !== 'suspect' || importingId !== null}
-                              title={!needsForceConfirm(row)
-                                ? '按记录里的地址重新下载、复验 blob sha，通过后才装入音源列表'
-                                : row.duplicateOf?.kind === 'name'
-                                  ? '库里已经有同名源 —— 两条同名会共用健康账本那一格，再点一次表示坚持并排装'
+                          {row.state === 'imported' || row.duplicateOf?.kind === 'content' ? null
+                            : row.duplicateOf?.kind === 'name' ? (
+                              <>
+                                <button
+                                  onClick={() => { void handleImport(row, 'replace') }}
+                                  disabled={row.verdict !== 'suspect' || importingId !== null}
+                                  title={`库里已有同名源「${row.duplicateOf.name}」—— 装入这条并换掉它：沿用旧条目的顺位与平台白名单，旧脚本文件一并删掉`}
+                                  className="flex items-center gap-1 rounded bg-primary/15 px-2 py-1 text-xs text-primary hover:bg-primary/25 disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  {importingId === row.id
+                                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    : <Download className="h-3.5 w-3.5" />}
+                                  替换导入
+                                </button>
+                                <button
+                                  onClick={() => { void handleImport(row, 'parallel') }}
+                                  disabled={row.verdict !== 'suspect' || importingId !== null}
+                                  title="两条同名都装进清单：健康账本按音源名记账，它们会共用那一格，冷却与坏证据互相污染 —— 只有确实要做对照才这么点"
+                                  className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  并排装
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                onClick={() => { void handleImport(row, 'plain') }}
+                                disabled={row.verdict !== 'suspect' || importingId !== null}
+                                title={!needsProbeForce(row)
+                                  ? '按记录里的地址重新下载、复验 blob sha，通过后才装入音源列表'
                                   : '判级里没有平台真出货 —— 再点一次表示坚持导入'}
-                              className={`flex items-center gap-1 rounded px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40 ${
-                                forceConfirmId === row.id
-                                  ? 'bg-destructive/15 text-destructive hover:bg-destructive/25'
-                                  : 'text-muted-foreground hover:bg-accent hover:text-foreground'
-                              }`}
-                            >
-                              {importingId === row.id
-                                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                : <Download className="h-3.5 w-3.5" />}
-                              {forceConfirmId === row.id ? '确认强制导入' : '导入'}
-                            </button>
-                          )}
+                                className={`flex items-center gap-1 rounded px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40 ${
+                                  forceConfirmId === row.id
+                                    ? 'bg-destructive/15 text-destructive hover:bg-destructive/25'
+                                    : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+                                }`}
+                              >
+                                {importingId === row.id
+                                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  : <Download className="h-3.5 w-3.5" />}
+                                {forceConfirmId === row.id ? '确认强制导入' : '导入'}
+                              </button>
+                            )}
                           <button
                             onClick={() => handleDismiss(row.id)}
                             disabled={row.state === 'stale' || row.state === 'imported'}

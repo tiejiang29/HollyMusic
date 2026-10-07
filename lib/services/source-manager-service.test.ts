@@ -16,7 +16,7 @@ vi.mock('@/lib/logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
 
-const { listSourcesWithStatus, addSource, deleteScript, importSubscription, SourceSubscriptionError, _setRunnerClientForTest } = await import('./source-manager-service')
+const { listSourcesWithStatus, addSource, deleteScript, importSubscription, replaceInConfigList, SourceSubscriptionError, _setRunnerClientForTest } = await import('./source-manager-service')
 
 /** 假的执行通道：一旦被告知"开始校验脚本"，就说明 sha 那道门没拦住 —— 直接让它报错 */
 const validateScriptMock = vi.hoisted(() => vi.fn(async () => {
@@ -162,5 +162,45 @@ describe('导入前的 blob sha 复验', () => {
     // 顺序判据：拒绝必须发生在**执行之前**。把 sha 检查挪到 validate 之后，这一条就会红
     expect(validateScriptMock).not.toHaveBeenCalled()
     expect(fs.readdirSync(SCRIPTS_DIR)).toEqual(before)
+  })
+})
+
+// ————— 撞同名导入时，替换这一步的字段取舍 —————
+
+describe('replaceInConfigList（同名替换的那步纯计算）', () => {
+  const list = () => ([
+    { path: 'custom-sources/旧.js', name: '墨澜聚合音源 2.2.0', priority: 3, pt: ['kw', 'tx'], enabled: true, subscription: { url: 'https://old' } },
+    { path: 'custom-sources/别的.js', name: '别的', priority: 7, pt: ['wy'], enabled: false },
+    { path: 'custom-sources/新.js', name: '墨澜音乐源v2.3.4', priority: 12, pt: ['tx', 'kw', 'wy', 'kg', 'mg'], enabled: true },
+  ])
+
+  it('新条目接手旧条目的 priority / pt / enabled，其余字段（名字、订阅、描述）取新脚本那份', () => {
+    const out = replaceInConfigList(list(), 'custom-sources/新.js', 'custom-sources/旧.js')
+    expect(out).not.toBeNull()
+    const next = out!.find(s => s.path === 'custom-sources/新.js')!
+    expect(next).toMatchObject({ name: '墨澜音乐源v2.3.4', priority: 3, pt: ['kw', 'tx'], enabled: true })
+    expect(out!.some(s => s.path === 'custom-sources/旧.js')).toBe(false)
+    // 顺位接手不等于把别人挤掉：其余条目原样留着（writeConfig 自己按 priority 排）
+    expect(out!.map(s => s.path).sort()).toEqual(['custom-sources/别的.js', 'custom-sources/新.js'])
+  })
+
+  it('不动传入的数组本身（配置对象在别处还被读着）', () => {
+    const input = list()
+    replaceInConfigList(input, 'custom-sources/新.js', 'custom-sources/旧.js')
+    expect(input).toHaveLength(3)
+    expect(input[0].priority).toBe(3)
+  })
+
+  it('三种"没什么可换"：新旧同一条、旧的已经不在了（他在另一个页签删过）、新的没找到', () => {
+    expect(replaceInConfigList(list(), 'custom-sources/旧.js', 'custom-sources/旧.js')).toBeNull()
+    expect(replaceInConfigList(list(), 'custom-sources/新.js', 'custom-sources/早删了.js')).toBeNull()
+    // 新的不在是调用方的硬错误，由 wrapper 去区分 —— 这里只保证不返回半份清单
+    expect(replaceInConfigList(list(), 'custom-sources/不存在.js', 'custom-sources/旧.js')).toBeNull()
+  })
+
+  it('旧条目 pt 缺省（隐式全平台）时原样带过去，不敷成空数组 —— 那是"谁都不支持"', () => {
+    const sourceList = [{ path: 'custom-sources/旧.js', priority: 2 }, { path: 'custom-sources/新.js', priority: 9, pt: ['kw'] }]
+    const out = replaceInConfigList(sourceList, 'custom-sources/新.js', 'custom-sources/旧.js')!
+    expect(out.find(s => s.path === 'custom-sources/新.js')!.pt).toBeUndefined()
   })
 })
