@@ -47,6 +47,7 @@ vi.mock('@/lib/services/xiaomi/mina-client', async importOriginal => {
 const {
   SPEAKER_SETTING_KEY, readSpeakerConfig, writeSpeakerConfig, getSpeakerView, saveCredentials,
   clearSpeakerLogin, ensureFreshCredentials, syncDevices, setDeviceManaged, setSpeakerEnabled,
+  _resetRenewThrottleForTest,
 } = await import('@/lib/services/xiaomi/token-store')
 const { XiaomiAuthError } = await import('@/lib/services/xiaomi/mina-client')
 const { XiaomiLoginError } = await import('@/lib/services/xiaomi/qr-login')
@@ -73,6 +74,8 @@ beforeEach(() => {
   db.setting.clear()
   exchangeMock.mockReset()
   fetchDevicesMock.mockReset()
+  // 续期节流是模块级状态：不清掉，同批用例里第二条就永远走"60 秒内已试过"那条分支
+  _resetRenewThrottleForTest()
 })
 
 describe('视图：脱敏', () => {
@@ -146,6 +149,39 @@ describe('ensureFreshCredentials：什么时候出网续期', () => {
     const err = await ensureFreshCredentials().catch(e => e)
     expect(err).toBeInstanceOf(XiaomiAuthError)
     expect((err as XiaomiAuthError).status).toBe(401)
+  })
+
+  it('**换到的新票先验一次才算数**：票打不开设备列表就不写回库（面板不许显示"已登录"）', async () => {
+    await saveCredentials(creds(-HOUR))
+    const before = (await readSpeakerConfig()).credentials!
+    exchangeMock.mockResolvedValue({ serviceToken: 'BAD_TOKEN', ssecurity: 'S' })
+    fetchDevicesMock.mockRejectedValue(new XiaomiAuthError('小爱音箱的票已失效（code=70016），需要重新登录'))
+    await expect(ensureFreshCredentials()).rejects.toThrow(/重新扫码/)
+    const stored = await readSpeakerConfig()
+    expect(stored.credentials!.serviceToken).toBe(before.serviceToken)
+    expect(stored.lastError).toContain('打不开设备列表')
+    // 验证这一步确实打了设备列表（不是只信了换票接口给的串）
+    expect(fetchDevicesMock).toHaveBeenCalledTimes(1)
+    expect(fetchDevicesMock.mock.calls[0][0].serviceToken).toBe('BAD_TOKEN')
+  })
+
+  it('验证只是上游抖动（502 类）时新票照存 —— 换票成功了，没能证明它是坏的', async () => {
+    await saveCredentials(creds(-HOUR))
+    exchangeMock.mockResolvedValue({ serviceToken: 'NEW_TOKEN', ssecurity: 'S' })
+    fetchDevicesMock.mockRejectedValue(new XiaomiAuthError('读取设备列表失败（HTTP 500）', 502))
+    const c = await ensureFreshCredentials()
+    expect(c.serviceToken).toBe('NEW_TOKEN')
+    expect((await readSpeakerConfig()).credentials!.serviceToken).toBe('NEW_TOKEN')
+  })
+
+  it('60 秒内不重复打出网续票（管理员连点也不该把小米打成限流），话术也说清是"等一会儿"', async () => {
+    await saveCredentials(creds(-HOUR))
+    exchangeMock.mockRejectedValue(new XiaomiLoginError('换 micoapi 的票失败（code=70022）'))
+    await expect(ensureFreshCredentials()).rejects.toThrow(/静默续期没成功/)
+    expect(exchangeMock).toHaveBeenCalledTimes(1)
+    // 票已经过期了，第二次来还是不能打出去：只报"刚试过，等一会儿"
+    await expect(ensureFreshCredentials()).rejects.toThrow(/60 秒内不再重复打小米/)
+    expect(exchangeMock).toHaveBeenCalledTimes(1)
   })
 })
 

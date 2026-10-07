@@ -40,6 +40,18 @@ export interface SpeakerDevice {
 
 const text = (v: unknown): string => (typeof v === 'string' || typeof v === 'number' ? String(v) : '')
 
+/**
+ * 小米说"这张票不行"有三种写法，都得认（少认一种，续期就不会被触发，管理员只看到一句莫名的拒绝）：
+ * `code=401/319`、`code=70016`（"登录验证失败"），以及少数只写在 message 里的 `auth` 字样。
+ * 出处：`hanxi/xiaomusic` 的 `auth.py` 拿 `70016`/`登录验证失败` 当重新登录的判据，
+ * `Yonsm/MiService` 的 `mi_request` 拿 `message` 含 `auth` 当判据。
+ */
+const AUTH_CODES = new Set(['401', '319', '70016'])
+
+export function isAuthFailure(code: string, message: string): boolean {
+  return AUTH_CODES.has(code) || message.includes('登录验证失败') || /auth/i.test(message)
+}
+
 export async function fetchDevices(creds: XiaomiCredentials): Promise<SpeakerDevice[]> {
   const url = `${MINA_BASE}/admin/v2/device_list?master=1`
   await assertPublicHttpUrl(url)
@@ -67,10 +79,13 @@ export async function fetchDevices(creds: XiaomiCredentials): Promise<SpeakerDev
     throw new XiaomiAuthError('设备列表返回的不是 JSON（可能被风控页挡了）', 502)
   }
   const code = text(parsed.code)
+  const message = text(parsed.message) || text(parsed.description) || text(parsed.result)
   if (code && code !== '0') {
-    // 小米这套里 31x/401 一类是票的问题，其余按接口错误报出去
-    if (code === '401' || code === '319') throw new XiaomiAuthError('小爱音箱的票已失效，需要重新登录')
-    throw new XiaomiAuthError(`读取设备列表被拒绝（code=${code} ${text(parsed.message)}）`, 502)
+    // 200 里包着错误码是这套接口的常态：判"票失效"要码与话术一起看，只看 HTTP 状态会漏掉 70016
+    if (isAuthFailure(code, message)) {
+      throw new XiaomiAuthError(`小爱音箱的票已失效（code=${code}），需要重新登录`)
+    }
+    throw new XiaomiAuthError(`读取设备列表被拒绝（code=${code} ${message}）`, 502)
   }
   const list = Array.isArray(parsed.data) ? parsed.data as Record<string, unknown>[] : []
   return list.map(d => ({

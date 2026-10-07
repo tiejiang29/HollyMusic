@@ -27,6 +27,16 @@ export const SPEAKER_SETTING_KEY = 'speaker'
 /** 到期前 3 小时就刷，避免管理员正好在边界上点到一个死票 */
 const REFRESH_AHEAD_MS = 3 * 60 * 60 * 1000
 
+/**
+ * 两次续期之间的最小间隔：小米对频繁登录是限流的（`code=70022`，连续失败还会进更长的冷却），
+ * 而管理员连点几下"刷新设备列表"就会连着打 serviceLogin —— 没这道闸就是我们自己攒风控。
+ * 参照 miot 的 `RELOGIN_MIN_INTERVAL_MS` 与 xiaomusic 的 `LOGIN_COOLDOWN_SEC`。
+ */
+const RENEW_MIN_INTERVAL_MS = 60 * 1000
+
+/** 上一次真打出网续票的时刻（进程内，重启即清零 —— 清零后最多也就多续一次） */
+let lastRenewAt = 0
+
 export interface SpeakerConfig {
   /** 总开关：给 G1/G2 的自动任务看（关掉就不推歌、不轮对话）。
    *  面板上的手动动作不受它管 —— 关着也要能刷新设备列表、能看清登录状态 */
@@ -116,10 +126,29 @@ export async function clearSpeakerLogin(): Promise<void> {
  * 用 `passToken` 静默换一张新票（不需要重新扫码）。
  * 换票失败时**不清凭据** —— passToken 大概率还在，下一次操作还能再试；
  * 只有明确"这张 passToken 也不行了"才叫管理员重扫。
+ *
+ * **换到的票要先打一次设备列表才算数**（照 miot 的 `validateToken`）：光看"接口给了票"不够，
+ * 一张开不了门的票存进库以后，面板会显示"已登录"、每次操作却都失败，比明说"要重扫"难查得多。
+ * 验证拿回 401 类的错就当这张票不行（不落库）；只是上游抖动/超时（502 类）则不牵连新票 ——
+ * 换票这一步确实成功了，没能证明它是坏的，那就先存着（`devices` 带回 null 让调用方自己再试）。
+ *
+ * 返回值分三种而不是 `creds | null`：调用方要把"60 秒内刚试过所以没打"和"打了但没换成"
+ * 说成两句话，前者叫管理员等一会儿，后者才叫重新扫码。
  */
-async function renew(config: SpeakerConfig): Promise<XiaomiCredentials | null> {
+type RenewOutcome =
+  | { state: 'ok'; creds: XiaomiCredentials; devices: SpeakerDevice[] | null }
+  | { state: 'throttled' }
+  | { state: 'failed' }
+
+async function renew(config: SpeakerConfig): Promise<RenewOutcome> {
   const old = config.credentials
-  if (!old?.passToken || !old.userId) return null
+  if (!old?.passToken || !old.userId) return { state: 'failed' }
+  if (Date.now() - lastRenewAt < RENEW_MIN_INTERVAL_MS) {
+    // 60 秒内已经试过一次就不再打出网请求（小米对频繁登录限流：70022，连续失败还会进更长冷却）
+    logger.warn('[xiaomi] 距上次续期不足 60 秒，本轮跳过')
+    return { state: 'throttled' }
+  }
+  lastRenewAt = Date.now()
   try {
     const { serviceToken } = await exchangeServiceToken({
       passToken: old.passToken,
@@ -133,14 +162,30 @@ async function renew(config: SpeakerConfig): Promise<XiaomiCredentials | null> {
       expiresAt: new Date(Date.now() + SERVICE_TOKEN_TTL_MS).toISOString(),
       // passToken 每次换取也可能轮换，拿新的留着才续得上
     }
+    let devices: SpeakerDevice[] | null = null
+    try {
+      devices = await fetchDevices(next)
+    } catch (err) {
+      if (err instanceof XiaomiAuthError && err.status === 401) {
+        await writeSpeakerConfig({ ...config, lastError: '续到的新票打不开设备列表，请在面板上重新扫码' })
+        logger.warn('[xiaomi] 续到的新票验证失败（401 类），不写回凭据')
+        return { state: 'failed' }
+      }
+      logger.warn('[xiaomi] 续期后验证没打成（上游抖动），新票照存', {
+        原因: err instanceof Error ? err.message.slice(0, 120) : String(err),
+      })
+    }
     await writeSpeakerConfig({ ...config, credentials: next, lastError: null })
-    logger.info('[xiaomi] 已用 passToken 静默续期 serviceToken', { 账号尾号: next.accountTail })
-    return next
+    logger.info('[xiaomi] 已用 passToken 静默续期 serviceToken', {
+      账号尾号: next.accountTail,
+      验证: devices ? `通过（${devices.length} 台）` : '未复验（设备列表那次没打成）',
+    })
+    return { state: 'ok', creds: next, devices }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     await writeSpeakerConfig({ ...config, lastError: `续期失败：${message.slice(0, 120)}` })
     logger.warn('[xiaomi] 静默续期失败:', message.slice(0, 140))
-    return null
+    return { state: 'failed' }
   }
 }
 
@@ -160,28 +205,34 @@ export async function ensureFreshCredentials(): Promise<XiaomiCredentials> {
   if (Number.isFinite(msToExpiry) && msToExpiry > REFRESH_AHEAD_MS) return creds
 
   const renewed = await renew(config)
-  if (renewed) return renewed
+  if (renewed.state === 'ok') return renewed.creds
   if (Number.isFinite(msToExpiry) && msToExpiry <= 0) {
-    throw new XiaomiAuthError('小爱的票已过期且静默续期没成功，请在面板上重新扫码', 401)
+    throw new XiaomiAuthError(
+      renewed.state === 'throttled'
+        ? '刚刚试过续票（60 秒内不再重复打小米），过一会儿再点一次；一直不行才需要重新扫码'
+        : '小爱的票已过期且静默续期没成功，请在面板上重新扫码',
+      401,
+    )
   }
   // 票还没到期，续期失败只是少了一次刷新，先用着
   return creds
 }
 
-/** 拉一次设备列表；遇到 401 就当场续一次票再试一遍 */
+/** 拉一次设备列表；遇到"票不行"就当场续一次再试一遍 */
 export async function syncDevices(): Promise<SpeakerDevice[]> {
   let creds = await ensureFreshCredentials()
   let devices: SpeakerDevice[]
   try {
     devices = await fetchDevices(creds)
   } catch (err) {
-    // 只有"票不行"（401 身份）才值得当场续一张再试：上游 5xx / 非 JSON 拿去续票只会白跑一趟，
-    // 还会把一次网络抖动写成"续期失败"，管理员看到的错就变成假的。
+    // 只有"票不行"（401 身份，含 code=70016）才值得当场续一张再试：上游 5xx / 非 JSON 拿去续票
+    // 只会白跑一趟，还会把一次网络抖动写成"续期失败"，管理员看到的错就变成假的。
     if (!(err instanceof XiaomiAuthError) || err.status !== 401) throw err
     const renewed = await renew(await readSpeakerConfig())
-    if (!renewed) throw err
-    creds = renewed
-    devices = await fetchDevices(creds)
+    if (renewed.state !== 'ok') throw err
+    creds = renewed.creds
+    // 续期那一步已经拿新票打过一次设备列表了，能直接用就别再打第二遍
+    devices = renewed.devices ?? await fetchDevices(creds)
   }
   const config = await readSpeakerConfig()
   // managed 是管理员的手动标记，刷新列表时按 deviceID 保住它
@@ -206,3 +257,8 @@ export async function setDeviceManaged(deviceID: string, managed: boolean): Prom
 
 export { XiaomiAuthError, XiaomiLoginError }
 export type { SpeakerDevice, XiaomiCredentials }
+
+/** 只给测试用：续期节流是进程内状态，不清掉同一批用例里第二条就测不动了 */
+export function _resetRenewThrottleForTest(): void {
+  lastRenewAt = 0
+}

@@ -18,7 +18,7 @@ vi.mock('@/lib/server/url-guard', () => ({
   assertPublicHttpUrl: vi.fn(async (url: string) => { guards.checked.push(url); return new URL(url) }),
 }))
 
-const { fetchDevices, XiaomiAuthError } = await import('@/lib/services/xiaomi/mina-client')
+const { fetchDevices, isAuthFailure, XiaomiAuthError } = await import('@/lib/services/xiaomi/mina-client')
 const creds = {
   serviceToken: 'ST_t%2BzVg%3D%3D',
   passToken: 'PT%3D%3D',
@@ -98,13 +98,27 @@ describe('fetchDevices', () => {
     }
   })
 
-  it('body 里 code=401/319 也算票失效（小米这套是 200 包着错误码的）', async () => {
-    for (const code of [401, 319]) {
-      reply({ code, message: 'auth error' })
+  it('body 里 code=401/319/70016 也算票失效（小米这套是 200 包着错误码的）', async () => {
+    for (const code of [401, 319, 70016]) {
+      // message 故意写成不含 auth 的中性话术：这三个码必须**各自**就能判出"票不行"，
+      // 不能是靠话术兜出来的（少了哪个码，这条要红）
+      reply({ code, message: 'unknown failure' })
       const err = await fetchDevices(creds).catch(e => e)
       expect(err).toBeInstanceOf(XiaomiAuthError)
       expect((err as XiaomiAuthError).status).toBe(401)
+      // 码要留在话里，管理员报障时才有得说
+      expect((err as Error).message).toContain(`code=${code}`)
     }
+  })
+
+  it('票失效的三种判据各自成立：码、中文话术、message 里的 auth 字样', () => {
+    expect(isAuthFailure('401', '')).toBe(true)
+    expect(isAuthFailure('319', '')).toBe(true)
+    expect(isAuthFailure('70016', '')).toBe(true)
+    expect(isAuthFailure('0', '登录验证失败')).toBe(true)
+    expect(isAuthFailure('700070', 'session invalid, need re-auth')).toBe(true)
+    expect(isAuthFailure('500', 'internal error')).toBe(false)
+    expect(isAuthFailure('0', '')).toBe(false)
   })
 
   it('其它非 0 code 算上游拒绝（502），不冒充"要重新扫码"', async () => {
