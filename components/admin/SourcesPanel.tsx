@@ -270,7 +270,7 @@ export function SourcesPanel() {
     // 换行显式拼出来：这段文本要跨行，直接写在模板串里容易被工具重排成真的换行
     const lineBreak = String.fromCharCode(10)
     const summary = list.map(item => `· ${item.source}｜${adviceKindLabel(item.kind)}：${item.action}`).join(lineBreak)
-    const detail = `将改写 ${new Set(list.map(item => item.path)).size} 条源的配置（共 ${list.length} 条建议）：${lineBreak}${summary}`
+    const detail = `将改写 ${new Set(list.map(item => item.path)).size} 条源的配置（共 ${list.length} 组建议，一组可能含几个平台）：${lineBreak}${summary}`
       + `${lineBreak}${lineBreak}改完可以点「撤销上次固化」还原。确定吗？`
     if (!confirm(detail)) return
     setApplyingAdvice(true)

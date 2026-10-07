@@ -22,7 +22,7 @@ vi.mock('@/lib/services/user-context', () => ({
 
 const { buildAdviceMock, applyMock, undoMock } = vi.hoisted(() => ({
   buildAdviceMock: vi.fn(async () => ({
-    suggestions: [{ id: 'add-pt:a:kg', kind: 'add-pt', path: 'a', source: '甲', platform: 'kg', action: '把 酷狗 加回支持平台', evidence: '2/2 出货' }],
+    suggestions: [{ id: 'add-pt:a', kind: 'add-pt', path: 'a', source: '甲', platforms: ['kg'], action: '把 酷狗 加回支持平台', evidence: '2/2 出货' }],
     batchesUsed: 2, lastRunAt: '2026-10-07T00:00:00.000Z', canUndo: false,
   })),
   applyMock: vi.fn(async () => ({ applied: 1, changed: 1 })),

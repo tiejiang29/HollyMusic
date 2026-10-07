@@ -43,20 +43,20 @@ export function startSourceProbe(): Promise<{ started: boolean }> {
   return apiPost<{ started: boolean }>('admin/sources/probe', {})
 }
 
-/** 一条「按周测结果改配置」的建议。`patch` 不下发：固化时服务端自己重算 */
+/** 一条「按周测结果改配置」的建议：一个源的一个方向算一条，`platforms` 是这一组涉及的平台。`patch` 不下发：固化时服务端自己重算 */
 export interface SourceAdvice {
   id: string
   kind: 'add-pt' | 'drop-pt' | 'priority'
   path: string
   source: string
-  platform: string | null
+  platforms: string[]
   action: string
   evidence: string
 }
 
 export interface SourceAdviceView {
   suggestions: SourceAdvice[]
-  /** 参与判断的周测批数；< 2 时建议恒为空（两批同向才提） */
+  /** 参与判断的周测批数；一批时只可能出「放回平台」，摘除与顺位要两批同向 */
   batchesUsed: number
   lastRunAt: string | null
   canUndo: boolean

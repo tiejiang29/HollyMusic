@@ -1,12 +1,14 @@
 /**
  * 「按周测结果给建议」的判据测试。
  *
- * 钉的是四件事，每件都对应一次会写进生产配置的改动：
- * 1. **连续两批同向**才提 —— 单批抖动（一次超时、一首冷门歌）不该摘掉一个平台；
+ * 钉的是五件事，每件都对应一次会写进生产配置的改动：
+ * 1. **门槛不对称** —— 放回平台最新一批出货就提，摘除与顺位要连续两批同向（单批抖动不该摘掉一个平台）；
  * 2. `no-address`（源里没这首歌）与 `unsupported`（脚本没这平台）**不算坏证据**，与账本同口径；
  * 3. `pt` 为空是"隐式全平台"，不能拿一条建议去把它变成显式清单；
  * 4. priority 重排**只在有实测数据的源之间进行**，没数据的源一个位置都不动
  *    （马太效应是这套东西最初被否决的理由，这条就是它的反面保证）。
+ * 5. **一个源的一个方向合成一条**（一行一个勾），但每个平台的数字都得各自留在证据里 ——
+ *    合并的是点击次数，不是证据。
  * 另有一条流程性的：固化只认 id，值由服务端重算（客户端拿着旧页面也写不进旧值）。
  */
 
@@ -67,14 +69,34 @@ describe('computeAdvice', () => {
     expect(computeAdvice(rows, [])).toEqual([])
   })
 
+  it('一个源的几个平台合成一条（一行一个勾），证据逐平台都留着、patch 一次给全', () => {
+    const rows = [source('墨澜', 3, ['wy', 'kg'])]
+    const out = computeAdvice(rows, [
+      batch({ 墨澜: { kw: { ok: 2, latencies: [200, 300] }, tx: { ok: 1, latencies: [880] }, mg: { ok: 2, latencies: [260] } } },
+        new Date(Date.UTC(2026, 9, 8))),
+      batch({ 墨澜: { wy: { ok: 2 } } }, new Date(Date.UTC(2026, 9, 1))),
+    ])
+    expect(out).toHaveLength(1)
+    expect(out[0].id).toBe('add-pt:custom-sources/墨澜.js')
+    expect(out[0].platforms).toEqual(['kw', 'tx', 'mg'])
+    expect(out[0].action).toBe('把 酷我 / 腾讯 / 咪咕 加回支持平台')
+    // 三个平台各自的数字都在，不会被合并成一句笼话
+    expect(out[0].evidence).toContain('酷我 最近一批 2/2 出货，中位 200ms')
+    expect(out[0].evidence).toContain('腾讯 最近一批 1/1 出货，中位 880ms')
+    expect(out[0].evidence).toContain('咪咕 最近一批 2/2 出货，中位 260ms')
+    // 上一批整格没测到（kw/tx/mg 在上一批都没有行）要说清，不能写成 0/0
+    expect(out[0].evidence).toContain('上一批没测到这一格')
+    expect(out[0].patch.pt).toEqual(['kw', 'tx', 'wy', 'kg', 'mg'])
+  })
+
   it('上一批被 pt 挡着没测到、这一批出货 ⇒ 照样提放回（真数据上就是这么卡住的）', () => {
     const rows = [source('玉宁熙', 1, ['kw', 'wy'])]
     const out = computeAdvice(rows, [
       batch({ 玉宁熙: { kg: { ok: 2, latencies: [180, 220] } } }, new Date(Date.UTC(2026, 9, 8))),
       batch({ 玉宁熙: { kg: { samples: 2, badCount: 0 } } }, new Date(Date.UTC(2026, 9, 1))),
     ])
-    expect(out.map(a => `${a.kind}:${a.platform}`)).toEqual(['add-pt:kg'])
-    expect(out[0].evidence).toContain('最近一批出货')
+    expect(out.map(a => `${a.kind}:${a.platforms.join('+')}`)).toEqual(['add-pt:kg'])
+    expect(out[0].evidence).toContain('最近一批 2/2 出货')
     expect(out[0].evidence).toContain('上一批 0/2 出货')
   })
 
@@ -85,9 +107,10 @@ describe('computeAdvice', () => {
       batch({ 甲: { kg: { ok: 2, latencies: [500] } } }, new Date(Date.UTC(2026, 9, 1))),
     ])
     expect(out).toHaveLength(1)
-    expect(out[0]).toMatchObject({ kind: 'add-pt', source: '甲', platform: 'kg' })
+    expect(out[0]).toMatchObject({ kind: 'add-pt', source: '甲', platforms: ['kg'] })
     expect(out[0].patch.pt).toEqual(['kw', 'tx', 'kg'])
-    expect(out[0].evidence).toContain('4/4 出货')
+    expect(out[0].evidence).toContain('最近一批 2/2 出货')
+    expect(out[0].evidence).toContain('上一批 2/2 出货')
   })
 
   it('只有一批判坏、另一批其实是被摘着没测 ⇒ 不提摘掉', () => {
@@ -136,7 +159,7 @@ describe('computeAdvice', () => {
     const out = computeAdvice(rows, [b1, b2]).filter(a => a.kind === 'priority')
     expect(out.map(a => `${a.source}→${a.patch.priority}`)).toEqual(['甲→1', '乙→2'])
     // priority 是全局顺位：不带平台，且同一个源不会有两套互相矛盾的说法
-    expect(out.every(a => a.platform === null)).toBe(true)
+    expect(out.every(a => a.platforms.length === 0)).toBe(true)
     expect(new Set(out.map(a => a.path)).size).toBe(out.length)
   })
 
@@ -205,18 +228,59 @@ describe('固化：只认 id', () => {
     ] as never)
 
     const view = await buildAdvice()
-    expect(view.suggestions.map(a => a.id)).toEqual(['add-pt:custom-sources/甲.js:kg'])
+    expect(view.suggestions.map(a => a.id)).toEqual(['add-pt:custom-sources/甲.js'])
 
-    await applyAdvice(['add-pt:custom-sources/甲.js:kg'])
+    await applyAdvice(['add-pt:custom-sources/甲.js'])
     expect(mocks.updates).toHaveBeenCalledWith([{ path: 'custom-sources/甲.js', pt: ['kw', 'tx', 'kg'] }])
     // 快照先落库，撤销才有东西可还原
     expect(mocks.settings.get(UNDO_SETTING_KEY)).toMatchObject({ text: '{"sources":[]}' })
   })
 
+  it('一个勾 = 一组：这条源放回的两个平台一次写全，不会只写第一个', async () => {
+    mocks.config.sources = [
+      { path: 'custom-sources/甲.js', name: '甲', priority: 1, enabled: true, pt: ['kw'] },
+    ]
+    mocks.prisma.sourceProbeRun.findMany.mockResolvedValue([
+      { startedAt: new Date(Date.UTC(2026, 9, 8)) }, { startedAt: new Date(Date.UTC(2026, 9, 1)) },
+    ] as never)
+    const rowsFor = (runAt: Date, platform: string) =>
+      ({ runAt, source: '甲', platform, outcome: 'ok', latencyMs: 120, reason: null })
+    mocks.prisma.sourceProbeResult.findMany.mockResolvedValue([
+      rowsFor(new Date(Date.UTC(2026, 9, 8)), 'kg'), rowsFor(new Date(Date.UTC(2026, 9, 1)), 'kg'),
+      rowsFor(new Date(Date.UTC(2026, 9, 8)), 'mg'), rowsFor(new Date(Date.UTC(2026, 9, 1)), 'mg'),
+    ] as never)
+
+    const view = await buildAdvice()
+    expect(view.suggestions).toHaveLength(1)
+    expect(view.suggestions[0].platforms).toEqual(['kg', 'mg'])
+    await applyAdvice([view.suggestions[0].id])
+    expect(mocks.updates).toHaveBeenCalledWith([{ path: 'custom-sources/甲.js', pt: ['kw', 'kg', 'mg'] }])
+  })
+
+  it('同一源同时勾「放回」和「摘除」⇒ 合成一份 pt，不按各自算好的数组互相覆盖', async () => {
+    mocks.config.sources = [
+      { path: 'custom-sources/甲.js', name: '甲', priority: 1, enabled: true, pt: ['kw', 'tx'] },
+    ]
+    mocks.prisma.sourceProbeRun.findMany.mockResolvedValue([
+      { startedAt: new Date(Date.UTC(2026, 9, 8)) }, { startedAt: new Date(Date.UTC(2026, 9, 1)) },
+    ] as never)
+    const row = (runAt: Date, platform: string, outcome: string, reason: string | null = null) =>
+      ({ runAt, source: '甲', platform, outcome, latencyMs: outcome === 'ok' ? 120 : 0, reason })
+    mocks.prisma.sourceProbeResult.findMany.mockResolvedValue([
+      row(new Date(Date.UTC(2026, 9, 8)), 'kg', 'ok'), row(new Date(Date.UTC(2026, 9, 1)), 'kg', 'ok'),
+      row(new Date(Date.UTC(2026, 9, 8)), 'tx', 'fake', '假地址'), row(new Date(Date.UTC(2026, 9, 1)), 'tx', 'fake', '假地址'),
+    ] as never)
+
+    const view = await buildAdvice()
+    expect(view.suggestions.map(s => `${s.kind}:${s.platforms.join('+')}`)).toEqual(['add-pt:kg', 'drop-pt:tx'])
+    await applyAdvice(view.suggestions.map(s => s.id))
+    expect(mocks.updates).toHaveBeenCalledWith([{ path: 'custom-sources/甲.js', pt: ['kw', 'kg'] }])
+  })
+
   it('id 不在当前建议里（页面挂着旧建议）⇒ 一条都不写', async () => {
     mocks.config.sources = [{ path: 'custom-sources/甲.js', name: '甲', priority: 1, enabled: true, pt: ['kw'] }]
     mocks.prisma.sourceProbeRun.findMany.mockResolvedValue([] as never)
-    expect(await applyAdvice(['drop-pt:custom-sources/甲.js:tx'])).toEqual({ applied: 0, changed: 0 })
+    expect(await applyAdvice(['drop-pt:custom-sources/甲.js'])).toEqual({ applied: 0, changed: 0 })
     expect(mocks.updates).not.toHaveBeenCalled()
     expect(mocks.settings.size).toBe(0)
   })
