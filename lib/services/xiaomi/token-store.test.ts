@@ -47,7 +47,7 @@ vi.mock('@/lib/services/xiaomi/mina-client', async importOriginal => {
 const {
   SPEAKER_SETTING_KEY, readSpeakerConfig, writeSpeakerConfig, getSpeakerView, saveCredentials,
   clearSpeakerLogin, ensureFreshCredentials, syncDevices, setDeviceManaged, setSpeakerEnabled,
-  setSpeakerTranscode, setSpeakerTakeover, DEFAULT_FAILED_ANSWER_HINTS, _resetRenewThrottleForTest,
+  setSpeakerTakeover, DEFAULT_FAILED_ANSWER_HINTS, _resetRenewThrottleForTest,
 } = await import('@/lib/services/xiaomi/token-store')
 const { DEFAULT_CONTROL_RULES } = await import('@/lib/services/xiaomi/voice-control')
 const { XiaomiAuthError } = await import('@/lib/services/xiaomi/mina-client')
@@ -318,11 +318,10 @@ describe('登录与退出', () => {
   })
 })
 
-describe('转码与接管那些新键：老库里缺键必须补默认，不能把 undefined 发出去', () => {
-  it('一条配置都没存过时读到的是默认值（转码开着、ffmpeg 走 PATH 名、接管关着）', async () => {
+describe('接管那些新键：老库里缺键必须补默认，不能把 undefined 发出去', () => {
+  it('一条配置都没存过时读到的是默认值（接管关着、门槛与步长都在合法区间）', async () => {
     const c = await readSpeakerConfig()
     expect(c).toMatchObject({
-      transcodeEnabled: true, ffmpegPath: 'ffmpeg', transcodeNormalize: false, transcodeCapMb: 500,
       takeoverEnabled: false, takeoverWithoutEvidence: false, fuzzyMatchCutoff: 0.6,
       takeoverSources: ['tx'], volumeStep: 10,
     })
@@ -338,7 +337,6 @@ describe('转码与接管那些新键：老库里缺键必须补默认，不能�
       serverHost: '172.16.1.20:3000', playQuality: '320k', musicApiDisabledModels: [],
     }))
     const c = await readSpeakerConfig()
-    expect(c.ffmpegPath).toBe('ffmpeg')
     expect(c.controlRules.length).toBeGreaterThan(0)
     expect(c.failedAnswerHints).toBe(DEFAULT_FAILED_ANSWER_HINTS)
   })
@@ -351,21 +349,14 @@ describe('转码与接管那些新键：老库里缺键必须补默认，不能�
     expect((await readSpeakerConfig()).controlRules).toEqual([{ op: 'pause', words: ['暂停'] }])
   })
 
-  it('ffmpegPath 存成空白要回落成 PATH 名（空串会让每次 spawn 都失败在起跑线，面板却看着像配过了）', async () => {
-    await setSpeakerTranscode({ ffmpegPath: '   ' })
-    expect((await readSpeakerConfig()).ffmpegPath).toBe('ffmpeg')
-  })
-
-  it('数值一律钳进合法区间：上限可以是 0（= 不设限），门槛与步长不行', async () => {
-    await setSpeakerTranscode({ capMb: -5 })
-    expect((await readSpeakerConfig()).transcodeCapMb).toBe(0)
+  it('数值一律钳进合法区间：门槛与步长都不许越界', async () => {
     await setSpeakerTakeover({ cutoff: 0.01, volumeStep: 999 })
     const c = await readSpeakerConfig()
     expect(c.fuzzyMatchCutoff).toBe(0.2)
     expect(c.volumeStep).toBe(50)
   })
 
-  it('接管那六项写进去能读回来，且视图里带的是同一套（面板读的就是视图）', async () => {
+  it('接管那七项写进去能读回来，且视图里带的是同一套（面板读的就是视图）', async () => {
     await setSpeakerTakeover({ enabled: true, withoutEvidence: true, cutoff: 0.75, sources: ['kg', 'tx', 'kw', 'mg'], volumeStep: 5 })
     const v = await getSpeakerView()
     expect(v).toMatchObject({

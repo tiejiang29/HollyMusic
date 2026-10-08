@@ -39,19 +39,6 @@ vi.mock('@/lib/audio-serve', () => ({
   resolvePaths: h.resolvePaths,
 }))
 vi.mock('fs/promises', () => ({ default: { stat: h.stat } }))
-// 转码（G1.5）。默认"开关关着"，让原有那些用例走的还是老路径（非 MP3 ⇒ 改走在线）
-const tc = vi.hoisted(() => ({
-  readSpeakerConfig: vi.fn(),
-  probeFfmpeg: vi.fn(),
-  findMp3Transcode: vi.fn(),
-  requestMp3Transcode: vi.fn(),
-}))
-vi.mock('@/lib/services/xiaomi/token-store', () => ({ readSpeakerConfig: tc.readSpeakerConfig }))
-vi.mock('@/lib/server/audio-transcode', () => ({
-  probeFfmpeg: tc.probeFfmpeg,
-  findMp3Transcode: tc.findMp3Transcode,
-  requestMp3Transcode: tc.requestMp3Transcode,
-}))
 
 const { GET, readParams } = await import('@/app/api/speaker/stream/route')
 
@@ -62,12 +49,6 @@ const req = (qs: string) => new NextRequest(`http://127.0.0.1:3000/api/speaker/s
 const okUrl = (uid = 'tx-S1', quality = '320k') => `?st=${TOKEN}&uid=${encodeURIComponent(uid)}&quality=${quality}`
 
 beforeEach(() => {
-  for (const f of [tc.readSpeakerConfig, tc.probeFfmpeg, tc.findMp3Transcode, tc.requestMp3Transcode]) f.mockReset()
-  // 默认"开关关着"：转码那条路的探测与 spawn 只由下面那个 describe 里的用例触发，别串味
-  tc.readSpeakerConfig.mockResolvedValue({ transcodeEnabled: false, ffmpegPath: 'ffmpeg', transcodeNormalize: false, transcodeCapMb: 500 })
-  tc.probeFfmpeg.mockResolvedValue(null)
-  tc.findMp3Transcode.mockResolvedValue(null)
-  tc.requestMp3Transcode.mockResolvedValue({ state: 'started' })
   for (const f of [h.verifyShareAudioToken, h.resolveMusicInfoById, h.findLibrarySong, h.readHeadBytes,
     h.detectContainer, h.mimeFromContainer, h.stat, h.serve, h.full, h.partial, h.unsat, h.parseRange]) f.mockReset()
   h.verifyShareAudioToken.mockReturnValue(true)
@@ -256,116 +237,5 @@ describe('seek：音箱侧没有设备 seek，只能重推一条从中间开始�
     expect(p.get('st')).toBe(TOKEN)
     expect(p.get('uid')).toBe('tx-S1')
     expect(p.get('seek')).toBe('42')
-  })
-})
-
-describe('转码出口（G1.5：库里的 FLAC 也能投，但不许让设备等）', () => {
-  const on = () => tc.readSpeakerConfig.mockResolvedValue(
-    { transcodeEnabled: true, ffmpegPath: 'ffmpeg', transcodeNormalize: false, transcodeCapMb: 500 },
-  )
-  const flacInLibrary = () => {
-    h.findLibrarySong.mockResolvedValue({ filePath: '/lib/稻香.flac', quality: 'flac' })
-    h.readHeadBytes.mockResolvedValue(new Uint8Array([0x66, 0x4c, 0x61, 0x43]))
-    h.detectContainer.mockReturnValue('flac')
-  }
-  const probed = () => { on(); tc.probeFfmpeg.mockResolvedValue('ffmpeg version 6.0') }
-
-  it('产物已经在 ⇒ 发的就是它，一次都不打在线', async () => {
-    probed()
-    tc.requestMp3Transcode.mockResolvedValue({ state: 'ready', filePath: '/cache/tc.mp3', size: 5000 })
-    flacInLibrary()
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(200)
-    expect(tc.requestMp3Transcode).toHaveBeenCalledWith(expect.objectContaining({
-      sourceFile: '/lib/稻香.flac', uid: 'tx-S1', quality: '320k', bin: 'ffmpeg',
-    }))
-    expect(h.serve).not.toHaveBeenCalled()
-    expect(h.full.mock.calls[0][0]).toBe('/cache/tc.mp3')
-  })
-
-  it('产物不在 ⇒ 起一单后台的，**这一次立刻走在线**（设备只等得起 5 秒，堵住它等于让它重拉）', async () => {
-    probed()
-    tc.requestMp3Transcode.mockResolvedValue({ state: 'started' })
-    flacInLibrary()
-    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/mpeg' }) }))
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(200)
-    expect(h.serve).toHaveBeenCalledTimes(1)
-  })
-
-  it('转码通道满 ⇒ 也不许堵住这一条：这一单不起，照样走在线', async () => {
-    probed()
-    tc.requestMp3Transcode.mockResolvedValue({ state: 'busy' })
-    flacInLibrary()
-    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/mpeg' }) }))
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(200)
-    expect(h.serve).toHaveBeenCalledTimes(1)
-  })
-
-  it('开关关着时连探都不探（探一次要 spawn 一个进程，不能白 spawn）', async () => {
-    flacInLibrary()
-    await GET(req(okUrl()))
-    expect(tc.probeFfmpeg).not.toHaveBeenCalled()
-    expect(tc.requestMp3Transcode).not.toHaveBeenCalled()
-    expect(h.serve).toHaveBeenCalledTimes(1)
-  })
-
-  it('探不到 ffmpeg ⇒ 走原来的在线取档，不把投歌整体弄失败', async () => {
-    on(); tc.probeFfmpeg.mockResolvedValue(null)
-    flacInLibrary()
-    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/mpeg' }) }))
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(200)
-    expect(tc.requestMp3Transcode).not.toHaveBeenCalled()
-  })
-
-  it('在线拿回来的还是非 MP3 + 正在转 ⇒ 503 带 Retry-After，说"在转"而不是"没有 MP3"', async () => {
-    probed()
-    h.findLibrarySong.mockResolvedValue(null)
-    tc.requestMp3Transcode.mockResolvedValue({ state: 'started' })
-    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/flac' }) }))
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(503)
-    expect(res.headers.get('retry-after')).toBe('4')
-    expect((await res.json()).error.code).toBe('TRANSCODE_PENDING')
-  })
-
-  it('在线拿回来的还是非 MP3 但转码这条口没开 ⇒ 照旧 415，不许静默给一份它放不了的字节', async () => {
-    h.findLibrarySong.mockResolvedValue(null)
-    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/flac' }) }))
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(415)
-    expect((await res.json()).error.code).toBe('NOT_MP3')
-  })
-
-  it('库里只有 FLAC 又没在线档（loc- 那一类）＋ 正转着 ⇒ 503 让设备稍后重拉，不报"各音源都没给出可播地址"', async () => {
-    probed()
-    tc.requestMp3Transcode.mockResolvedValue({ state: 'started' })
-    flacInLibrary()
-    h.serve.mockRejectedValue(new Error('所有音源均无法获取播放链接'))
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(503)
-    expect((await res.json()).error.code).toBe('TRANSCODE_PENDING')
-  })
-
-  it('库里 FLAC 又没在线档、但这条口关着 ⇒ 还是原来的 502（不许把"没装 ffmpeg"说成"在转"）', async () => {
-    flacInLibrary()
-    h.serve.mockRejectedValue(new Error('所有音源均无法获取播放链接'))
-    const res = await GET(req(okUrl()))
-    expect(res.status).toBe(502)
-    expect((await res.json()).error.code).toBe('UPSTREAM_FAILED')
-  })
-
-  it('产物在时 seek 照旧按字节走（转出来的那份也是裸帧首的 CBR MP3）', async () => {
-    probed()
-    tc.requestMp3Transcode.mockResolvedValue({ state: 'ready', filePath: '/cache/tc.mp3', size: 2815999 })
-    flacInLibrary()
-    h.readHeadBytes.mockResolvedValue(new Uint8Array([0xff, 0xfb, 0x90, 0x00]))
-    h.detectContainer.mockReturnValue('flac')
-    h.stat.mockResolvedValue({ size: 2815999 })   // 产物 2.8MB：40s×40000B/s 那道粗偏移落在文件内
-    await GET(req(okUrl('tx-S1', '320k') + '&seek=40'))
-    // 第 5 个参数是起始字节：走的是"从中间开始的一条 200"，不是整文件
-    expect(h.full.mock.calls[0][4]).toBeGreaterThan(0)
   })
 })

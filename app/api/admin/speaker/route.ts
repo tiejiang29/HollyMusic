@@ -26,11 +26,10 @@ import {
   setSpeakerPlayQuality, setSpeakerServerHost, syncDevices,
 } from '@/lib/services/xiaomi/token-store'
 import { SpeakerError, controlSpeaker, playOnSpeaker, readSpeakerStatus, setSpeakerVolume } from '@/lib/services/xiaomi/speaker-play'
-import { setSpeakerConversation, setSpeakerTranscode, setSpeakerTakeover } from '@/lib/services/xiaomi/token-store'
+import { setSpeakerConversation, setSpeakerTakeover } from '@/lib/services/xiaomi/token-store'
 import { parseControlRules } from '@/lib/services/xiaomi/voice-control'
 import { getTakeoverLog, handleAskNow } from '@/lib/services/xiaomi/voice-takeover'
 import { ensureConversationMonitor, getConversationFeed } from '@/lib/services/xiaomi/conversation-monitor'
-import { probeFfmpeg, resetFfmpegProbe } from '@/lib/server/audio-transcode'
 
 function guard(err: unknown) {
   if (err instanceof AuthError) return createErrorResponse('UNAUTHORIZED', err.message, 401)
@@ -127,22 +126,6 @@ export async function POST(request: NextRequest) {
       // 面板每几秒问一次：顺带保证"开关开着就一定有人在轮询"（定时器是内存态，进程重启会丢）
       await ensureConversationMonitor()
       return createSuccessResponse(getConversationFeed())
-    }
-    if (action === 'tcSet' || action === 'tcProbe') {
-      // 转码那四项也是面板项（开关 / ffmpeg 路径 / 响度归一化 / 产物容量上限）。
-      // 探一次 ffmpeg 要 spawn，所以只在保存或点"重新探测"时探，不跟着每次 GET 跑
-      const view = action === 'tcSet'
-        ? await setSpeakerTranscode({
-          enabled: typeof body?.enabled === 'boolean' ? body.enabled : undefined,
-          ffmpegPath: body?.ffmpegPath,
-          normalize: typeof body?.normalize === 'boolean' ? body.normalize : undefined,
-          capMb: body?.capMb,
-        })
-        : await getSpeakerView()
-      const config = await readSpeakerConfig()
-      // 路径没变但管理员刚装完 ffmpeg 也想重探一次 ⇒ 先清掉那份缓存，否则"没探到"会一直挂着骗人
-      resetFfmpegProbe(config.ffmpegPath)
-      return createSuccessResponse({ view, ffmpeg: await probeFfmpeg(config.ffmpegPath) })
     }
     if (action === 'askSet') {
       const view = await setSpeakerTakeover({

@@ -64,21 +64,6 @@ export interface SpeakerConfig {
   /** 疑似"小爱没答上"的话术片段（面板可改）：G3 拿它判要不要接管 */
   failedAnswerHints: string[]
   /**
-   * 转码出口开关（G1.5）：库里不是 MP3 的那些（本地导入的 `loc-`、平台只剩更高档）
-   * 靠它变成能投。关掉就退回旧行为——非 MP3 改走在线取 MP3 档，取不到就明确报错。
-   */
-  transcodeEnabled: boolean
-  /**
-   * ffmpeg 可执行文件：PATH 里的名字（默认 `ffmpeg`）或绝对路径。
-   * 生产镜像里**没有** ffmpeg（本仓库的镜像只装了 nginx/openssl），所以这栏在 NAS 上要填
-   * 容器里能用的东西，或者等镜像带上它 —— 不要假装它一定存在，探不到就是探不到。
-   */
-  ffmpegPath: string
-  /** 响度归一化（`loudnorm`）：实测慢一个量级，默认关 */
-  transcodeNormalize: boolean
-  /** 转码产物总占用上限（MB），按 lastAccessAt 淘汰；0 = 不设限 */
-  transcodeCapMb: number
-  /**
    * 语音接管总开关（G3）。**默认关着**：它一开就是"听了你说的话就动那台音箱"，
    * 而这条链的前提（对话记录拉得到）今天实测还没被证明过（平台回 0 条）。
    */
@@ -135,16 +120,6 @@ export function clampVolumeStep(raw: unknown): number {
   return Math.min(VOLUME_STEP_MAX, Math.max(VOLUME_STEP_MIN, Math.round(n)))
 }
 
-/** 转码产物容量闸的合法区间（MB），0 = 不设限 */
-export const TRANSCODE_CAP_MB_MIN = 0
-export const TRANSCODE_CAP_MB_MAX = 20_000
-
-export function clampCapMb(raw: unknown): number {
-  const n = Number(raw)
-  if (!Number.isFinite(n)) return 500
-  return Math.min(TRANSCODE_CAP_MB_MAX, Math.max(TRANSCODE_CAP_MB_MIN, Math.round(n)))
-}
-
 const DEFAULT_CONFIG: SpeakerConfig = {
   enabled: false,
   credentials: null,
@@ -157,10 +132,6 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   conversationEnabled: false,
   conversationPollSec: 2,
   failedAnswerHints: DEFAULT_FAILED_ANSWER_HINTS,
-  transcodeEnabled: true,
-  ffmpegPath: 'ffmpeg',
-  transcodeNormalize: false,
-  transcodeCapMb: 500,
   takeoverEnabled: false,
   takeoverWithoutEvidence: false,
   fuzzyMatchCutoff: 0.6,
@@ -176,6 +147,12 @@ const DEFAULT_CONFIG: SpeakerConfig = {
  */
 export async function readSpeakerConfig(): Promise<SpeakerConfig> {
   const stored = await readSetting<Partial<SpeakerConfig>>(SPEAKER_SETTING_KEY, DEFAULT_CONFIG)
+  // 转码那一期整块撤了，但库里那行 JSON 还留着它四个键：读的时候抹掉，
+  // 免得下次写回时把没人读的旧配置又带一圈（面板上也别显示一个不生效的 ffmpeg 路径）
+  delete (stored as Record<string, unknown>).transcodeEnabled
+  delete (stored as Record<string, unknown>).ffmpegPath
+  delete (stored as Record<string, unknown>).transcodeNormalize
+  delete (stored as Record<string, unknown>).transcodeCapMb
   return {
     ...DEFAULT_CONFIG,
     ...stored,
@@ -185,13 +162,6 @@ export async function readSpeakerConfig(): Promise<SpeakerConfig> {
       ? stored.failedAnswerHints
       : DEFAULT_FAILED_ANSWER_HINTS,
     conversationPollSec: clampPollSec(stored.conversationPollSec),
-    // 老库里存的对象同样没有转码这四个键：`ffmpegPath` 为空串会让每次 spawn 都失败在起跑线，
-    // 所以这里补默认值，不指望有人重新保存一遍配置
-    ffmpegPath: typeof stored.ffmpegPath === 'string' && stored.ffmpegPath.trim()
-      ? stored.ffmpegPath.trim() : DEFAULT_CONFIG.ffmpegPath,
-    transcodeCapMb: clampCapMb(stored.transcodeCapMb),
-    transcodeEnabled: stored.transcodeEnabled !== false,
-    transcodeNormalize: !!stored.transcodeNormalize,
     // 接管那几项：词表存坏了（不是数组/空数组）要回落到默认表，否则第①层会一条都命不中
     takeoverEnabled: !!stored.takeoverEnabled,
     takeoverWithoutEvidence: !!stored.takeoverWithoutEvidence,
@@ -238,11 +208,6 @@ export interface SpeakerView {
   conversationEnabled: boolean
   conversationPollSec: number
   failedAnswerHints: string[]
-  /** 转码出口（G1.5）：库里非 MP3 的那些靠它变成能投 */
-  transcodeEnabled: boolean
-  ffmpegPath: string
-  transcodeNormalize: boolean
-  transcodeCapMb: number
   /** 语音接管（G3）那几项 */
   takeoverEnabled: boolean
   takeoverWithoutEvidence: boolean
@@ -275,10 +240,6 @@ export async function getSpeakerView(): Promise<SpeakerView> {
     conversationEnabled: config.conversationEnabled,
     conversationPollSec: config.conversationPollSec,
     failedAnswerHints: config.failedAnswerHints,
-    transcodeEnabled: config.transcodeEnabled,
-    ffmpegPath: config.ffmpegPath,
-    transcodeNormalize: config.transcodeNormalize,
-    transcodeCapMb: config.transcodeCapMb,
     takeoverEnabled: config.takeoverEnabled,
     takeoverWithoutEvidence: config.takeoverWithoutEvidence,
     fuzzyMatchCutoff: config.fuzzyMatchCutoff,
@@ -312,19 +273,6 @@ export async function setSpeakerTakeover(input: {
     const list = input.triggers.map(t => String(t).trim()).filter(Boolean)
     if (list.length) config.takeoverTriggers = list
   }
-  await writeSpeakerConfig(config)
-  return getSpeakerView()
-}
-
-/** 转码那四项（G1.5）：都是面板项，缺省位不传就不动 */
-export async function setSpeakerTranscode(input: {
-  enabled?: boolean; ffmpegPath?: unknown; normalize?: boolean; capMb?: unknown;
-}): Promise<SpeakerView> {
-  const config = await readSpeakerConfig()
-  if (typeof input.enabled === 'boolean') config.transcodeEnabled = input.enabled
-  if (typeof input.ffmpegPath === 'string') config.ffmpegPath = input.ffmpegPath.trim() || DEFAULT_CONFIG.ffmpegPath
-  if (typeof input.normalize === 'boolean') config.transcodeNormalize = input.normalize
-  if (input.capMb !== undefined) config.transcodeCapMb = clampCapMb(input.capMb)
   await writeSpeakerConfig(config)
   return getSpeakerView()
 }

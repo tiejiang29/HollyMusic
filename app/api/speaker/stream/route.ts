@@ -27,39 +27,14 @@ import { parseIntervalToSeconds } from '@/lib/types/player'
 import { findLibrarySong } from '@/lib/services/music-library'
 import { detectContainer, readHeadBytes, readBytesAt, mimeFromContainer } from '@/lib/server/audio-sniff'
 import { planMp3Seek, alignToFrameStart, NOMINAL_BYTES_PER_SEC, MP3_HEAD_BYTES } from '@/lib/server/mp3-seek'
-import { probeFfmpeg, requestMp3Transcode, type TranscodeState } from '@/lib/server/audio-transcode'
-import { readSpeakerConfig } from '@/lib/services/xiaomi/token-store'
 import type { QualityType } from '@/lib/types/music'
 
-/** 音箱只给 MP3 档（flac 这些靠 G1.5 的转码出口变成 MP3，不直接给） */
+/** 音箱只给 MP3 档。库里是 FLAC 时改走在线取 MP3 档；在线也给不出就明确 415（这一期不做转码） */
 const SPEAKER_QUALITIES: QualityType[] = ['320k', '128k']
 
 function fail(status: number, code: string, message: string, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify({ success: false, error: { code, message } }), {
     status, headers: { 'Content-Type': 'application/json', 'cache-control': 'no-store', ...headers },
-  })
-}
-
-/**
- * 转码这道闸（G1.5）。**绝不在设备面前等 ffmpeg**——真机实测它 5.1 秒拿不到字节就断开、
- * 0.1 秒后重拉同一地址，所以我们要么立刻给东西，要么给一个明确的"稍后再拉"。
- *
- * - `ready`：产物已经在，直接发（实测 20ms）；
- * - `started`：刚起了后台一单，这一次先按原来的路走（在线取档），下一次来捡现成的；
- * - `unavailable`：这条口没开 / 这台没装 ffmpeg —— 也按原来的路走，而且不许把"没装 ffmpeg"
- *   说成错误，那是正当配置；
- * - `busy`：同时在转的满了，连后台单都没起。
- */
-async function transcodeGate(
-  sourceFile: string, uid: string, quality: '320k' | '128k',
-): Promise<TranscodeState | { state: 'unavailable' }> {
-  const config = await readSpeakerConfig().catch(() => null)
-  if (!config?.transcodeEnabled) return { state: 'unavailable' }
-  // 音质档按请求那一档，不按面板那档：拖动/换队列时前端原样带着它签的令牌
-  if (!(await probeFfmpeg(config.ffmpegPath))) return { state: 'unavailable' }
-  return requestMp3Transcode({
-    bin: config.ffmpegPath, sourceFile, uid, quality,
-    normalize: config.transcodeNormalize, capMb: config.transcodeCapMb,
   })
 }
 
@@ -162,8 +137,6 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     // 音箱听不懂 flac，这里不是"降一档"而是直接拒 —— 静默降档会让管理员以为推的是高品
     return fail(400, 'QUALITY_NOT_SUPPORTED', `音箱只支持 MP3 档（320k/128k），请求的是 ${quality}`)
   }
-  // 上面那道判据已经保证是 MP3 两档之一，但 TS 不会跟着收窄（QualityType 还有 flac）
-  const mp3Quality: '320k' | '128k' = quality === '128k' ? '128k' : '320k'
   if (!verifyShareAudioToken(uid, quality, token)) {
     return fail(401, 'UNAUTHORIZED', '分享凭证无效或已过期')
   }
@@ -173,8 +146,6 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
 
   const rangeHeader = request.headers.get('range')
   const seekSec = readSeekSec(params)
-  /** 走过转码闸的结论，在线那条路也不通时要靠它把"为什么"说准（在转 vs 没装） */
-  let tcState: string = 'none'
 
   // ① 库里有文件且**容器真是 MP3** 才走本地（扩展名不算证据，读头部字节嗅容器）
   const row = await findLibrarySong(musicInfo)
@@ -184,15 +155,10 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     if (container === 'mp3') {
       return serveLocalMp3(row.filePath, row.quality, seekSec, rangeHeader, isHead, musicInfo.name)
     }
-    // ② 库里是 FLAC/wav 之类：问转码那道闸要一份现成的 MP3（G1.5）
-    const tc = await transcodeGate(row.filePath, uid, mp3Quality)
-    tcState = tc.state
-    if (tc.state === 'ready') {
-      logger.info('[speaker/stream] 转码出口交付', { 歌曲: musicInfo.name, 字节: tc.size, 复用: true })
-      return serveLocalMp3(tc.filePath, mp3Quality, seekSec, rangeHeader, isHead, musicInfo.name)
-    }
+    // ② 库里是 FLAC/wav 之类：音箱听不懂，改走在线取一档 MP3（在线那份本来就带磁盘缓存，
+    //    第二次起是直接发盘上的文件，不需要我们再转一份更差的副本）
     logger.info('[speaker/stream] 库内文件不是 MP3，改走在线取 MP3 档', {
-      歌曲: `${musicInfo.name}`, 库内: row.quality, 嗅到: container ?? '未知', 转码: tc.state,
+      歌曲: `${musicInfo.name}`, 库内: row.quality, 嗅到: container ?? '未知',
     })
   }
 
@@ -219,31 +185,15 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
       isHead,
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
     })
-    // 在线这一路拿回来的还是非 MP3（源把 flac 标成 320k 是发生过的）：
-    // 缓存那份已经在磁盘上，转一次码就变成能投的 MP3；转不了才明确报错
     const served = res.headers.get('content-type') ?? ''
     if (res.ok && !served.includes('audio/mpeg')) {
-      // 源把 flac 标成 320k 是发生过的（扩展名撒谎那一类）；那份缓存已在盘上，转一次就变成能投的
-      const tc = await transcodeGate(resolvePaths(cacheKey, served || null).filePath, uid, mp3Quality)
-      tcState = tc.state
-      if (tc.state === 'ready') {
-        return serveLocalMp3(tc.filePath, mp3Quality, seekSec, rangeHeader, isHead, musicInfo.name)
-      }
-      if (tc.state === 'started' || tc.state === 'busy') {
-        // 已经起了 / 排满了：这一份不能发（音箱放不了），但也别报"没 MP3"那种死错——
-        // 转完就有，让设备几秒后重拉一次就捡到现成的
-        return fail(503, 'TRANSCODE_PENDING', '正在转这一首，稍等几秒再拉一次', { 'retry-after': '4' })
-      }
+      // 源把 flac 标成 320k 是发生过的（扩展名撒谎那一类）；给音箱这份必须是 MP3，宁可直接报错
       return fail(415, 'NOT_MP3', `这一档拿回来的不是 MP3（${served || '未知类型'}），音箱放不了`)
     }
     return res
   } catch (err) {
     const message = err instanceof Error ? err.message : '音箱流出口失败'
     logger.warn('[speaker/stream] 失败:', message.slice(0, 160))
-    // 只有"我们手上正转着这一首"才值得让设备重拉；否则就是原样的取不到
-    if (message.includes('无法获取播放链接') && tcState === 'started') {
-      return fail(503, 'TRANSCODE_PENDING', '正在转这一首（库里那份不是 MP3，也没在线档），稍等几秒再拉', { 'retry-after': '4' })
-    }
     return fail(502, 'UPSTREAM_FAILED', message.includes('无法获取播放链接') ? '各音源都没给出这一档的可播地址' : message)
   }
 }
