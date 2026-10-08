@@ -56,9 +56,32 @@ export interface SpeakerConfig {
   playQuality: SpeakerPlayQuality
   /** 管理员显式禁用某型号的 Music API（参考实现也有这个覆盖位，兼容性问题时用来降级） */
   musicApiDisabledModels: string[]
+  /** 对话轮询开关（G0.5）。默认关着 —— 它会常驻打小米，得管理员明确要量才开 */
+  conversationEnabled: boolean
+  /** 对话轮询间隔（秒），1~30 */
+  conversationPollSec: number
+  /** 疑似"小爱没答上"的话术片段（面板可改）：G3 拿它判要不要接管 */
+  failedAnswerHints: string[]
 }
 
 export type SpeakerPlayQuality = '320k' | '128k'
+
+/**
+ * 默认的"疑似没答上"话术片段。
+ *
+ * 注意来源：三个参考实现（miot / miservice / xiaomusic）里**都没有**这种词表 —— 它们靠拦截用户
+ * 口令，不读小爱的回答。这份是我按常见小爱拒绝话术自己列的**初稿**，必须靠 G0.5 面板上的
+ * 真实回显来校准后再信它，所以现在只用于"标记 + 计数"，不参与任何自动决策。
+ */
+export const DEFAULT_FAILED_ANSWER_HINTS = [
+  '没有找到', '没找到', '找不到', '没有搜索到', '暂未找到',
+  '暂时还没有', '暂无', '不太明白', '没听清', '再说一遍', '换个说法',
+  '我还不能', '还不会', '服务开小差', '出了点问题', '稍后再试',
+]
+
+/** 轮询间隔的合法区间（照参考实现：miot 1~30s、xiaomusic 也有下限），下限防的是把小米接口打爆 */
+export const CONVERSATION_POLL_SEC_MIN = 1
+export const CONVERSATION_POLL_SEC_MAX = 30
 
 const DEFAULT_CONFIG: SpeakerConfig = {
   enabled: false,
@@ -69,10 +92,34 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   serverHost: '',
   playQuality: '320k',
   musicApiDisabledModels: [],
+  conversationEnabled: false,
+  conversationPollSec: 2,
+  failedAnswerHints: DEFAULT_FAILED_ANSWER_HINTS,
 }
 
+/**
+ * 读配置。**必须补齐缺键**：G0 那版库里存的对象没有 `conversationEnabled`/`failedAnswerHints` 这些新字段，
+ * 原样返回会让下面拿到 undefined（`undefined.filter(...)` 就是 500），而这台 NAS 上不会有人重新保存一遍配置。
+ */
 export async function readSpeakerConfig(): Promise<SpeakerConfig> {
-  return readSetting<SpeakerConfig>(SPEAKER_SETTING_KEY, DEFAULT_CONFIG)
+  const stored = await readSetting<Partial<SpeakerConfig>>(SPEAKER_SETTING_KEY, DEFAULT_CONFIG)
+  return {
+    ...DEFAULT_CONFIG,
+    ...stored,
+    devices: Array.isArray(stored.devices) ? stored.devices : [],
+    musicApiDisabledModels: Array.isArray(stored.musicApiDisabledModels) ? stored.musicApiDisabledModels : [],
+    failedAnswerHints: Array.isArray(stored.failedAnswerHints) && stored.failedAnswerHints.length > 0
+      ? stored.failedAnswerHints
+      : DEFAULT_FAILED_ANSWER_HINTS,
+    conversationPollSec: clampPollSec(stored.conversationPollSec),
+  }
+}
+
+/** 间隔夹到合法区间；坏值（undefined/NaN/0）退回默认 2 秒，不把它变成"每 0 秒打一次小米" */
+export function clampPollSec(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return DEFAULT_CONFIG.conversationPollSec
+  return Math.min(CONVERSATION_POLL_SEC_MAX, Math.max(CONVERSATION_POLL_SEC_MIN, Math.round(n)))
 }
 
 export async function writeSpeakerConfig(config: SpeakerConfig): Promise<void> {
@@ -96,6 +143,9 @@ export interface SpeakerView {
   serverHost: string
   playQuality: SpeakerPlayQuality
   musicApiDisabledModels: string[]
+  conversationEnabled: boolean
+  conversationPollSec: number
+  failedAnswerHints: string[]
 }
 
 export async function getSpeakerView(): Promise<SpeakerView> {
@@ -117,6 +167,9 @@ export async function getSpeakerView(): Promise<SpeakerView> {
     serverHost: config.serverHost,
     playQuality: config.playQuality,
     musicApiDisabledModels: config.musicApiDisabledModels,
+    conversationEnabled: config.conversationEnabled,
+    conversationPollSec: config.conversationPollSec,
+    failedAnswerHints: config.failedAnswerHints,
   }
 }
 
@@ -143,6 +196,21 @@ export async function setSpeakerPlayQuality(playQuality: SpeakerPlayQuality): Pr
 }
 
 /** 某个型号推歌有问题时，管理员可以把它从 Music API 名单里摘掉（退回 player_play_url） */
+/** 面板项：对话轮询开关 + 间隔 + 失败话术片段（G0.5/G3 都用这一处） */
+export async function setSpeakerConversation(input: {
+  enabled?: boolean; pollSec?: unknown; failedAnswerHints?: string[]; deviceID?: string;
+}): Promise<SpeakerView> {
+  const config = await readSpeakerConfig()
+  if (typeof input.enabled === 'boolean') config.conversationEnabled = input.enabled
+  if (input.pollSec !== undefined) config.conversationPollSec = clampPollSec(input.pollSec)
+  if (Array.isArray(input.failedAnswerHints)) {
+    const hints = input.failedAnswerHints.map(h => String(h).trim()).filter(Boolean)
+    config.failedAnswerHints = hints.length > 0 ? hints : DEFAULT_FAILED_ANSWER_HINTS
+  }
+  await writeSpeakerConfig(config)
+  return getSpeakerView()
+}
+
 export async function setSpeakerMusicApiDisabled(models: string[]): Promise<void> {
   const config = await readSpeakerConfig()
   const cleaned = [...new Set(models.map(m => String(m ?? '').trim().toUpperCase()).filter(Boolean))]

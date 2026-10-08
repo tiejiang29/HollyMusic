@@ -26,6 +26,8 @@ import {
   setSpeakerPlayQuality, setSpeakerServerHost, syncDevices,
 } from '@/lib/services/xiaomi/token-store'
 import { SpeakerError, controlSpeaker, playOnSpeaker, readSpeakerStatus, setSpeakerVolume } from '@/lib/services/xiaomi/speaker-play'
+import { setSpeakerConversation } from '@/lib/services/xiaomi/token-store'
+import { ensureConversationMonitor, getConversationFeed } from '@/lib/services/xiaomi/conversation-monitor'
 
 function guard(err: unknown) {
   if (err instanceof AuthError) return createErrorResponse('UNAUTHORIZED', err.message, 401)
@@ -106,6 +108,23 @@ export async function POST(request: NextRequest) {
       return createSuccessResponse(await getSpeakerView())
     }
 
+    if (action === 'convSet') {
+      // 面板项：轮询开关 / 间隔 / 失败话术片段。开关关掉要立刻停定时器，不能等下一拍
+      const view = await setSpeakerConversation({
+        enabled: typeof body?.enabled === 'boolean' ? body.enabled : undefined,
+        pollSec: body?.pollSec,
+        failedAnswerHints: Array.isArray(body?.failedAnswerHints) ? body.failedAnswerHints : undefined,
+      })
+      // 关与开都走同一条：ensure 会读刚落库的那份开关，关着就顺手停定时器并回 enabled:false
+      // （早先这里是手写两条分支，关掉时状态里的 enabled 还留着 true，面板读着别扭）
+      const state = await ensureConversationMonitor()
+      return createSuccessResponse({ view, state })
+    }
+    if (action === 'convList') {
+      // 面板每几秒问一次：顺带保证"开关开着就一定有人在轮询"（定时器是内存态，进程重启会丢）
+      await ensureConversationMonitor()
+      return createSuccessResponse(getConversationFeed())
+    }
     if (action === 'setMusicApiDisabled') {
       const models = Array.isArray(body?.models) ? body.models.map((m: unknown) => String(m)) : []
       await setSpeakerMusicApiDisabled(models)

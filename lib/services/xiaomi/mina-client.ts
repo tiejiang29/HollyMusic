@@ -391,6 +391,84 @@ export async function getPlayStatus(creds: XiaomiCredentials, deviceId: string):
   })
 }
 
+// ============================================================================
+// 对话记录（G0.5 量数 / G3 语音接管的输入）
+// ============================================================================
+
+const CONV_URL = 'https://userprofile.mina.mi.com/device_profile/v2/conversation'
+
+/** 一条对话：小爱侧记录的时间戳（毫秒）、用户说的那句、小爱回答的原文 */
+export interface AskRecord {
+  timestampMs: number
+  query: string
+  /** 小爱的 TTS 回答原文；这条没回答就给 '' */
+  answer: string
+}
+
+/**
+ * 拉一台设备的对话记录（按时间升序）。
+ *
+ * 出处：`songloft-org/songloft-plugin-miot`（Apache-2.0）`src/mina/client.ts` 的
+ * `getConversations` —— URL、`source=dialogu`、`limit`、以及**`data` 是一段 JSON 字符串要二次 parse**
+ * 这三件事都是从它那里确认的（漏了二次 parse 就会永远读到空列表，而且是静默的空）。
+ *
+ * 失败一律抛错、不返回空数组：调用方要靠"这次到底没取到"与"确实没人说话"的区分决定
+ * 动不动基线（参考实现把这两者分得很严：混同了要么把历史当新对话重放，要么把网络抖当成无声）。
+ */
+export async function fetchConversations(
+  creds: XiaomiCredentials, hardware: string, limit = 5,
+): Promise<AskRecord[]> {
+  if (!hardware) throw new XiaomiAuthError('这台设备没有 hardware 型号，拉不了对话记录', 400)
+  // 重试要复用同一个 timestamp（miot 就是这么做的）：每次重算会让三次的结果对不上
+  const url = `${CONV_URL}?source=dialogu&hardware=${encodeURIComponent(hardware)}&timestamp=${Date.now()}&limit=${limit}`
+  await assertPublicHttpUrl(url)
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${creds.deviceId} APP/xiaomi.smarthome APPV/62830`,
+      Cookie: `userId=${creds.userId}; serviceToken=${creds.serviceToken}; channel=MI_APP_STORE; deviceId=${creds.deviceId}`,
+      Accept: 'application/json',
+    },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(10000),
+  })
+  if (res.status === 401 || res.status === 403) throw new XiaomiAuthError('小爱的票已失效（对话记录，HTTP ' + res.status + '），需要重新登录')
+  const body = await res.text()
+  if (!res.ok) {
+    logger.warn('[xiaomi] 对话记录非 2xx', { 状态: res.status, 字节: body.length })
+    throw new XiaomiAuthError(`读取对话记录失败（HTTP ${res.status}）`, 502)
+  }
+  let outer: Record<string, unknown>
+  try {
+    outer = JSON.parse(body) as Record<string, unknown>
+  } catch {
+    throw new XiaomiAuthError('对话记录返回的不是 JSON（可能被风控页挡了）', 502)
+  }
+  const code = text(outer.code)
+  const message = text(outer.message)
+  if (code && code !== '0') {
+    if (isAuthFailure(code, message)) throw new XiaomiAuthError(`小爱的票已失效（对话记录，code=${code}），需要重新登录`)
+    throw new XiaomiAuthError(`读取对话记录被拒绝（code=${code} ${message}）`, 502)
+  }
+  // 外层 data 是**字符串**，得再 parse 一次；直接当对象用会静默拿到空列表
+  let data: Record<string, unknown> = {}
+  if (typeof outer.data === 'string') {
+    try { data = JSON.parse(outer.data) as Record<string, unknown> } catch { data = {} }
+  } else if (outer.data && typeof outer.data === 'object') {
+    data = outer.data as Record<string, unknown>
+  }
+  const records = Array.isArray(data.records) ? data.records as Record<string, unknown>[] : []
+  return records.map(r => {
+    const answers = Array.isArray(r.answers) ? r.answers as Record<string, unknown>[] : []
+    const tts = answers.find(a => text(a.type) === 'TTS')
+    const answer = tts && tts.tts && typeof tts.tts === 'object' ? text((tts.tts as Record<string, unknown>).text) : ''
+    return {
+      timestampMs: Number(r.time) || 0,
+      query: text(r.query),
+      answer,
+    }
+  }).filter(r => r.timestampMs > 0).sort((a, b) => a.timestampMs - b.timestampMs)
+}
+
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message.slice(0, 140) : String(err))
 
 /** 只给测试用：清掉进程内的串行队列（正常不该在业务里调） */

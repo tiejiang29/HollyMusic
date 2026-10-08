@@ -129,3 +129,48 @@ export function readSpeakerStatusFromAdmin(deviceID?: string): Promise<SpeakerSt
 export function testPushSpeaker(uid: string, deviceID?: string): Promise<import('./speaker').SpeakerPlayOutcome> {
   return apiPost<import('./speaker').SpeakerPlayOutcome>('admin/speaker', { action: 'play', uid, ...(deviceID ? { deviceID } : {}) })
 }
+
+/** 面板上的一行对话（G0.5 量数） */
+export interface SpeakerAskRow {
+  deviceID: string
+  deviceName: string
+  /** 小爱侧时间戳（毫秒） */
+  timestampMs: number
+  /** 我们看见它的时刻（毫秒）—— 两者之差就是"说出口到看得见"的延迟 */
+  receivedAt: number
+  query: string
+  answer: string
+  looksFailed: boolean
+  /** 启动那一轮读到的历史，不是刚说的话 */
+  fromBaseline: boolean
+}
+
+export interface ConversationState {
+  running: boolean
+  pollSec: number
+  enabled: boolean
+  lastPollAt: number | null
+  lastError: string | null
+  /**
+   * 每台设备各自的轮询账目：`polls` 在涨而 `seen` 是 0，说明"拉到了但平台真没记录"；
+   * `polls` 不涨才是"压根没在拉"。G0.5 要的就是这个分辨。
+   */
+  devices: Array<{ deviceID: string; name: string; primed: boolean; lastTs: number; polls: number; seen: number }>
+}
+
+export interface ConversationFeed {
+  rows: SpeakerAskRow[]
+  state: ConversationState
+}
+
+/** 对话轮询的面板项（开关 / 间隔秒 / 失败话术片段） */
+export function setSpeakerConversation(input: {
+  enabled?: boolean; pollSec?: number; failedAnswerHints?: string[];
+}): Promise<{ view: SpeakerView; state: ConversationState }> {
+  return apiPost<{ view: SpeakerView; state: ConversationState }>('admin/speaker', { action: 'convSet', ...input })
+}
+
+/** 拉对话回显（只读；顺带保证轮询在跑） */
+export function readConversationFeed(): Promise<ConversationFeed> {
+  return apiPost<ConversationFeed>('admin/speaker', { action: 'convList' })
+}

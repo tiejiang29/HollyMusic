@@ -304,6 +304,18 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 - **音量**：面板与播放页共用 `lib/cast-queue.ts` 里那份节流口径（250ms + 松手补发）；**音量会自己变**（实测途中 44→32，我们没发指令），所以要用就现读，不许假设恒定。
 - 会话是内存态且由**路由侧**持有（Next 的 instrumentation 是另一套模块副本，从它写进去的内存态路由读不到）：进程重启即丢（设备会循环最后一窗），这是有意接受的代价。
 
+### 4.7.3 对话回显（G0.5）：G3 的输入源，先只量时序
+
+`lib/services/xiaomi/conversation-monitor.ts` 按面板上的开关（`conversationEnabled`，默认关）每 `conversationPollSec` 秒（1~30，默认 2）拉一次小爱的对话记录，缓存在内存里给 admin 面板回显。它不改动任何东西、也不接管——G3 需要的"这句话小爱答上了没"以此为数据基础。
+
+三条口径（错一条面板就会看着很对但数据是假的）：
+
+- **基线只能用平台返回的 `record.time`，绝不能用 `Date.now()` 推**：本机时钟比小米快 ⇒ 启动后一段时间的真实对话被静默丢掉，比它慢 ⇒ 重放历史。首轮那批记录留着显示但标 `fromBaseline=true`，G3 的接管判据**不许吃这些**。
+- **"这次没取到"与"确实没有记录"必须分开**：`fetchConversations` 抛错时不动基线、不清 `lastError`（单台软错要留着，早先收尾一律清成 null，出现过"每台每次都失败、面板显示一切正常"）；返回 `[]` 才算真没有。
+- **平台会往回改写记录时间戳** ⇒ 只按"更大才收"会漏掉刚说的这句，留 10s 回退容忍，靠 `time|query|answer` 去重键防重播。
+
+真机实测（2026-10-08，L05B）：请求形状与鉴权都是通的（`code=0 / message=Success`，外层 `data` 是**字符串**、要二次 parse，内层键 `bitSet/records/nextEndTime`），但 `limit` 开到 120 仍 `records=0` —— 这台当前没有可读的对话历史。**"一条真实记录落到面板上"这最后一环还没被实测证明过**，要等对着音箱说一句话才能验；所以面板把每台的账目（`polls/seen/lastTs/primed`）如实摊开，0 行时能分清"没在拉"和"平台真没有"。这条未验的口径直接决定 G3 的默认立场：拿不到证据时不许假定"小爱答砸了"。
+
 ---
 
 ## 5. API 路由参考
@@ -403,7 +415,7 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 | GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
 | GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`（撞同名时 `mode`：`replace` 换掉库里那条 / `parallel` 并排装）、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
-| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`logout`） |
+| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`convSet`/`convList` 对话轮询开关与回显（见 §4.7.3）、`logout`） |
 | GET/POST | `/api/speaker` | 登录用户级投放：`GET` 返回可投音箱、就绪位与**当前会话**；`POST` 的 `action` = 投放 `cast`/`castRest`/`castSkip`/`seek`/`castStatus`/`castStop`，遥控 `pause`/`resume`/`stop`/`volume`，单推与排障 `play`/`status`（见 §4.7.2） |
 | GET/HEAD | `/api/speaker/stream?st=&uid=&quality=[&seek=秒]` | **只出 MP3** 的音箱流出口（`st` 必须第一位；`seek` 恒在最后，按帧对齐后整条 200 发剩余部分，见 §4.7.2） |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |

@@ -21,6 +21,7 @@ vi.mock('@/lib/server/url-guard', () => ({
 const {
   fetchDevices, isAuthFailure, XiaomiAuthError,
   playUrl, playItems, playerOperation, setVolume, getPlayStatus, usePlayMusicApi, _resetUbusQueuesForTest,
+  fetchConversations,
 } = await import('@/lib/services/xiaomi/mina-client')
 const creds = {
   serviceToken: 'ST_t%2BzVg%3D%3D',
@@ -364,5 +365,65 @@ describe('ubus 播控（G1）', () => {
     expect(dumped).not.toContain('172.16.1.20')
     // 长度留着：排障时要能看出"报文是空的"还是"地址很长"
     expect(dumped).toMatch(/music\(长\d+\)/)
+  })
+})
+
+describe('fetchConversations（G0.5 对话回显）', () => {
+  it('URL 带 source=dialogu/hardware/timestamp/limit，Cookie 比设备列表多一个 deviceId', async () => {
+    reply({ code: 0, data: JSON.stringify({ records: [] }) })
+    await fetchConversations(creds, 'L05B', 5)
+    const u = new URL(lastRequest!.url)
+    expect(u.searchParams.get('source')).toBe('dialogu')
+    expect(u.searchParams.get('hardware')).toBe('L05B')
+    expect(u.searchParams.get('limit')).toBe('5')
+    expect(Number(u.searchParams.get('timestamp'))).toBeGreaterThan(0)
+    expect(lastRequest!.headers.cookie).toContain('deviceId=' + creds.deviceId)
+    expect(lastRequest!.headers.cookie).toContain('serviceToken=')
+  })
+
+  it('records 里 time/query/TTS 回答各自归位：非 TTS 不算回答，没时间戳的丢掉，按时间升序返回', async () => {
+    reply({
+      code: 0,
+      data: JSON.stringify({
+        records: [
+          { time: 2000, query: '后说的', answers: [{ type: 'TTS', tts: { text: '好的' } }] },
+          { time: 1000, query: '先说的', answers: [{ type: 'TEXT', text: '不算这个' }] },
+          { time: 0, query: '没时间戳的丢掉', answers: [] },
+        ],
+      }),
+    })
+    expect(await fetchConversations(creds, 'L05B')).toEqual([
+      { timestampMs: 1000, query: '先说的', answer: '' },
+      { timestampMs: 2000, query: '后说的', answer: '好的' },
+    ])
+  })
+
+  it('外层 data 是对象时也认（平台两种都发过）', async () => {
+    reply({ code: 0, data: { records: [{ time: 5000, query: '甲', answers: [] }] } })
+    expect(await fetchConversations(creds, 'L05B')).toEqual([{ timestampMs: 5000, query: '甲', answer: '' }])
+  })
+
+  it('data 二次 parse 坏了 ⇒ 空列表，不炸（面板要能继续轮下一次）', async () => {
+    reply({ code: 0, data: '{不是 JSON' })
+    expect(await fetchConversations(creds, 'L05B')).toEqual([])
+  })
+
+  it('票失效要抛出来：200 包着"登录验证失败"算 auth，非 2xx 算 502 —— 都绝不能当成"没有新话"', async () => {
+    reply({ code: 70016, message: '登录验证失败' })
+    const e1 = await fetchConversations(creds, 'L05B').catch(e => e)
+    expect(e1).toBeInstanceOf(XiaomiAuthError)
+    expect(isAuthFailure('70016', '登录验证失败')).toBe(true)
+
+    reply('网关挂了', 500)
+    const e2 = await fetchConversations(creds, 'L05B').catch(e => e)
+    expect(e2).toBeInstanceOf(XiaomiAuthError)
+    expect((e2 as XiaomiAuthError).status).toBe(502)
+  })
+
+  it('没有型号就别打网络（拿空 hardware 去拉只会拿到一屏莫名其妙的错）', async () => {
+    reply({ code: 0, data: '{}' })
+    const err = await fetchConversations(creds, '').catch(e => e)
+    expect(err).toBeInstanceOf(XiaomiAuthError)
+    expect(lastRequest).toBeNull()
   })
 })

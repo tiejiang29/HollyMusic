@@ -15,7 +15,8 @@ import {
   getSpeaker, startSpeakerQr, pollSpeakerQr, refreshSpeakerDevices,
   setSpeakerManaged, setSpeakerEnabled, speakerLogout,
   setSpeakerHost, setSpeakerQuality, controlSpeakerFromAdmin, setSpeakerVolumeFromAdmin, readSpeakerStatusFromAdmin,
-  type QrStartResult, type SpeakerView, type SpeakerStreamStatus,
+  setSpeakerConversation, readConversationFeed,
+  type ConversationFeed, type QrStartResult, type SpeakerView, type SpeakerStreamStatus,
 } from '@/lib/api/admin-speaker'
 import { volumeSendDelayMs } from '@/lib/cast-queue'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
@@ -148,6 +149,10 @@ export function SpeakerPanel() {
   const [statusByDevice, setStatusByDevice] = useState<Record<string, SpeakerStreamStatus>>({})
   /** 打开的音量条：null = 没开。initial 来自点开时那一次状态回读，known=false 表示没读到、按默认档起调 */
   const [volPanel, setVolPanel] = useState<{ deviceID: string; initial: number; known: boolean } | null>(null)
+  /** 对话回显（G0.5）：读到的行 + 监视器状态；草稿只在本机改，点保存才落库 */
+  const [conv, setConv] = useState<ConversationFeed | null>(null)
+  const [convPollDraft, setConvPollDraft] = useState<string | null>(null)
+  const [convHintsDraft, setConvHintsDraft] = useState<string | null>(null)
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -163,6 +168,9 @@ export function SpeakerPanel() {
 
   useEffect(() => {
     reload()
+    // 一进来就读一次回显：开着轮询时这一下会让服务端确保监视器在跑，
+    // 也让"上次拉取 / 拉了几次 / 见过几条"立刻可见（不点开关也能看到账目）
+    readConversationFeed().then(setConv).catch(() => {})
   }, [reload])
 
   // 拿到二维码就开始问"扫了没"：单次请求最长 8 秒（服务端那侧的长轮询切片），
@@ -356,6 +364,31 @@ export function SpeakerPanel() {
       setError(e instanceof Error ? e.message : '读状态失败')
     } finally {
       setBusyDeviceId(null)
+    }
+  }
+
+  // 轮询开着时每 3 秒问一次服务端 —— 这一下不打小米，读的是服务端那份缓存
+  useEffect(() => {
+    if (!conv?.state.running) return
+    const timer = setInterval(() => {
+      readConversationFeed().then(setConv).catch(() => {})
+    }, 3000)
+    return () => clearInterval(timer)
+  }, [conv?.state.running])
+
+  const saveConversation = async (enabled: boolean, pollSec: number) => {
+    const hints = (convHintsDraft ?? '').split(/[,，\n]/).map(x => x.trim()).filter(Boolean)
+    try {
+      const r = await setSpeakerConversation({
+        enabled, pollSec,
+        ...(convHintsDraft !== null ? { failedAnswerHints: hints } : {}),
+      })
+      setView(r.view)
+      setConvHintsDraft(null)
+      setConvPollDraft(null)
+      setConv(await readConversationFeed())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存对话轮询设置失败')
     }
   }
 
@@ -685,6 +718,102 @@ export function SpeakerPanel() {
           </div>
         </div>
       )}
+
+      {view?.loggedIn ? (
+        <div className="mt-6 rounded-lg border border-border bg-card p-4">
+          <h3 className="text-sm font-semibold">对话回显（G0.5：只量时序，不动接管）</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            开着时每 {view.conversationPollSec} 秒拉一次小爱的对话记录，用来量两件事：一句话从说出口到看得见隔了几秒、
+            以及哪些回答属于「没答上」。下面那份话术是我的初稿，请照真实回显改准了再信它。
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded accent-primary"
+                checked={!!conv?.state.running}
+                onChange={e => void saveConversation(e.target.checked, Number(convPollDraft ?? view.conversationPollSec))}
+              />
+              轮询对话
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={30}
+              defaultValue={view.conversationPollSec}
+              onChange={e => setConvPollDraft(e.target.value)}
+              className="w-16 rounded border border-border bg-background px-2 py-1"
+              title="轮询间隔（秒，1~30）"
+            />
+            <button
+              onClick={() => void saveConversation(!!conv?.state.running, Number(convPollDraft ?? view.conversationPollSec))}
+              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              保存
+            </button>
+            {conv?.state.lastPollAt ? (
+              <span className="text-muted-foreground">
+                上次拉取 {clockText(new Date(conv.state.lastPollAt).toISOString())}
+                {' · '}
+                {conv.rows.filter(r => !r.fromBaseline).length} 条新话
+                {' · '}
+                {conv.state.devices.map(d => `${d.name || d.deviceID}：拉 ${d.polls} 次/见 ${d.seen} 条${d.primed ? '' : '/基线未建'}`).join(' ')}
+              </span>
+            ) : null}
+          </div>
+          <textarea
+            defaultValue={view.failedAnswerHints.join(', ')}
+            onChange={e => setConvHintsDraft(e.target.value)}
+            rows={2}
+            className="mt-2 w-full rounded border border-border bg-background px-2 py-1 font-mono text-[11px]"
+            title="疑似「没答上」的话术片段，逗号分隔；留空=任何回答都算没答上"
+          />
+          {conv?.state.lastError ? (
+            <p className="mt-2 flex items-center gap-1 text-xs text-destructive">
+              <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
+              {conv.state.lastError}
+            </p>
+          ) : null}
+          {conv && conv.rows.length > 0 ? (
+            <div className="mt-3 max-h-64 overflow-auto rounded border border-border">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-accent/40 text-left text-[11px] uppercase text-muted-foreground">
+                  <tr>
+                    <th className="px-2 py-1.5 font-medium">音箱说的时间</th>
+                    <th className="px-2 py-1.5 font-medium">你说</th>
+                    <th className="px-2 py-1.5 font-medium">小爱答</th>
+                    <th className="px-2 py-1.5 font-medium">延迟</th>
+                    <th className="px-2 py-1.5 font-medium">疑似没答上</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {conv.rows.map((r, i) => (
+                    <tr key={`${r.deviceID}-${r.timestampMs}-${i}`} className="border-t border-border">
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+                        {clockText(new Date(r.timestampMs).toISOString())}
+                        {r.fromBaseline ? <span className="ml-1 opacity-60">（历史）</span> : null}
+                      </td>
+                      <td className="px-2 py-1.5">{r.query || '—'}</td>
+                      <td className="px-2 py-1.5">{r.answer || '—'}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px]">
+                        {Math.max(0, Math.round((r.receivedAt - r.timestampMs) / 1000))}s
+                      </td>
+                      <td className="px-2 py-1.5">{r.looksFailed ? '是' : ''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-muted-foreground">
+              {!conv?.state.running ? '轮询没开，开了才会拉对话记录'
+                : conv.state.devices.some(d => d.polls > 0 && d.seen === 0)
+                  ? '轮询在跑、请求也是通的，但小米那边回的就是空记录（我把 limit 开到 120 仍然 0 条）。对着音箱说一句等几秒：出行了说明只是历史被清过；一直 0 条说明这台不往这个接口写对话 —— 那 G3 的「读小爱的回答来判成败」就没有依据，得先换路子。'
+                  : '已经在轮询了，对着音箱说一句试试'}
+            </p>
+          )}
+        </div>
+      ) : null}
     </div>
   )
 }
