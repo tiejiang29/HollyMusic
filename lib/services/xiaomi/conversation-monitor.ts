@@ -121,7 +121,11 @@ export async function ensureConversationMonitor(): Promise<MonitorState> {
   const pollSec = clampPollSec(config.conversationPollSec)
   if (!config.conversationEnabled) {
     if (timer || state.running) stopConversationMonitor()
-    return { ...state, enabled: false, pollSec }
+    // 状态本体里的 `enabled` 也要落回去：以前只把 enabled:false 贴在**返回值**上，而面板走的是
+    // `convList` → `getConversationFeed()`（读的是 state 本体），于是关掉开关后它还看着 enabled:true。
+    // 2026-10-08 修的是路由那两条手写分支，这是同一类的另一半。
+    state = { ...state, enabled: false, pollSec }
+    return state
   }
   // `running` 只是"我打算在跑"。真正的凭据是手上有没有定时器在等（timer）或有没有一拍在飞
   // （ticking）—— 两个都没有就是上一拍被硬错打停了，这里必须重新排起来，否则 tick() 里那句

@@ -176,11 +176,22 @@ describe('轮询时序', () => {
   })
 
   it('开关关着：不排程、一行都不读；面板再问一次也不会偷偷起来', async () => {
+    // 先真正常开着跑一拍，再关——否则"关"这个状态没被写过，断言等于白过
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(getConversationFeed().state.enabled).toBe(true)
+    const callsWhileOn = h.fetchConversations.mock.calls.length
+    expect(callsWhileOn).toBeGreaterThan(0)
+
     h.config.conversationEnabled = false
     const state = await ensureConversationMonitor()
     expect(state.running).toBe(false)
     await vi.advanceTimersByTimeAsync(30_000)
-    expect(h.fetchConversations).not.toHaveBeenCalled()
+    expect(h.fetchConversations.mock.calls.length).toBe(callsWhileOn)
+    // 面板读的是 getConversationFeed() 那份状态本体，不是 ensure 的返回值 ⇒ 两边都得是关
+    const feed = getConversationFeed()
+    expect(feed.state.running).toBe(false)
+    expect(feed.state.enabled).toBe(false)
   })
 
   it('没有在线纳管设备：说清原因而不是安静空转', async () => {
