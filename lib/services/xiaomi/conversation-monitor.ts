@@ -123,7 +123,10 @@ export async function ensureConversationMonitor(): Promise<MonitorState> {
     if (timer || state.running) stopConversationMonitor()
     return { ...state, enabled: false, pollSec }
   }
-  if (state.running && state.pollSec === pollSec) return state
+  // `running` 只是"我打算在跑"。真正的凭据是手上有没有定时器在等（timer）或有没有一拍在飞
+  // （ticking）—— 两个都没有就是上一拍被硬错打停了，这里必须重新排起来，否则 tick() 里那句
+  // "等面板下次来问时重新排程"是空的（实测：一次 code=999 之后永远停住）。
+  if (state.running && (timer !== null || ticking) && state.pollSec === pollSec) return state
   state = { ...state, enabled: true, running: true, pollSec }
   logger.info('[xiaomi] 对话轮询启动', { 间隔秒: pollSec, 设备数: config.devices.filter(d => d.managed && d.presence === 'online').length })
   schedule(0)
@@ -132,7 +135,9 @@ export async function ensureConversationMonitor(): Promise<MonitorState> {
 
 function schedule(delayMs: number): void {
   if (timer) clearTimeout(timer)
-  timer = setTimeout(() => { void tick() }, delayMs)
+  // 定时器一触发就把句柄清掉：不然 `timer` 永远指着一个已经响过的 Timeout，
+  // "手上还有没有在等的那一拍"就判不出来（硬错停住后面板再问也救不回来）
+  timer = setTimeout(() => { timer = null; void tick() }, delayMs)
 }
 
 /** 一拍：把所有在线纳管设备的对话记录拉一遍 */
@@ -157,7 +162,11 @@ async function tick(): Promise<void> {
         try {
           records = await fetchConversations(creds, device.hardware, 5)
         } catch (err) {
-          if (err instanceof XiaomiAuthError) throw err
+          // 只有**票的事**（status 401）才停整个轮询。`mina-client` 把"上游拒绝"也用同一个
+          // XiaomiAuthError 抛，但带的是 status=502（例：实测到的 code=999）—— 那是偶发的一拍，
+          // 当硬错停掉就等于"一次抖动把功能打死且再也起不来"（2026-10-08 就是这么挂在面板上的）。
+          // 这个 401/502 的分工与 token-store 那边同一口径。
+          if (err instanceof XiaomiAuthError && err.status === 401) throw err
           softError = `${device.name}：${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`
           logger.warn('[xiaomi] 单台对话轮询失败:', softError)
           continue

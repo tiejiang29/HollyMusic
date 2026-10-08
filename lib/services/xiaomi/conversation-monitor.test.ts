@@ -147,6 +147,34 @@ describe('轮询时序', () => {
     expect(h.fetchConversations.mock.calls.length).toBe(calls)
   })
 
+  it('上游偶发拒绝（mina-client 也抛 XiaomiAuthError，但 status=502）不算票失效 —— 下一拍照常拉', async () => {
+    h.fetchConversations.mockResolvedValue([])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    // 2026-10-08 实测：面板上看到的就是这一条（code=999），当时它把整个轮询打死且再也起不来
+    h.fetchConversations.mockRejectedValueOnce(new MockAuthError('读取对话记录被拒绝（code=999 ）', 502))
+    await vi.advanceTimersByTimeAsync(2100)
+    expect(getConversationFeed().state.lastError).toMatch(/code=999/)
+    const calls = h.fetchConversations.mock.calls.length
+    await vi.advanceTimersByTimeAsync(2100)
+    expect(h.fetchConversations.mock.calls.length).toBe(calls + 1)
+  })
+
+  it('硬错停住之后，面板再问一次就必须重新排起来（否则 ensure 里那句"等面板来问"是空的）', async () => {
+    h.fetchConversations.mockResolvedValue([])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    h.fetchConversations.mockRejectedValue(new MockAuthError('小爱的票已失效，需要重新登录'))
+    await vi.advanceTimersByTimeAsync(2100)
+    const calls = h.fetchConversations.mock.calls.length
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(h.fetchConversations.mock.calls.length).toBe(calls)
+    h.fetchConversations.mockResolvedValue([])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.fetchConversations.mock.calls.length).toBe(calls + 1)
+  })
+
   it('开关关着：不排程、一行都不读；面板再问一次也不会偷偷起来', async () => {
     h.config.conversationEnabled = false
     const state = await ensureConversationMonitor()
