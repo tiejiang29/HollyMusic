@@ -221,6 +221,22 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 重算，客户端挂着旧页面也写不进旧值），写前把配置原文存进 `AppSetting['source_advice_undo']`，
 撤销按字节还原，快照只留最近一份。
 
+**tx（QQ音乐）搜索要走 `zzc` 签名（2026-10-08）**：老的 `musicu.fcg` 对匿名请求已经不给结果——
+`DoSearchForQQMusicLite` 回子包 `code=2001/500003`，换 `Desktop/Mobile`、换 `ct=11/24`、补 `uin/guid`
+共 12 种组合全是 0 条（`code=0` 的那些是 `meta.estimate_sum>0` 而 `sum=0`，即引擎认得这个词、结果被压着
+不给），连 QQ 自家网页匿名搜也是空。现在走 `musics.fcg?sign=zzc…`：签名是**纯算法**（对载荷 JSON 串做
+SHA1 → 两组按下标取字符 + 20 字节 XOR → 去掉 `+/=` 的 base64），**不需要登录也不需要 token**，所以
+无人值守可用。实现集中在 `lib/music-core/tx-sign.js`：`txSearchRequest()` 一次给出 `url` 与 `text`，
+**调用方不许再 stringify 第二次**（键序一变签名就对不上，这条钉在测试里）；`pickTxSongs()` 同时认新版
+`body.song.list` 与老版 `body.item_song`。算法移植自 lyswhut/lx-music-desktop v2.12.3（#2848）的
+`tx/utils/crypto.js`，该仓库是 **Apache-2.0**，署名随文件注释。该 cgi 偶现拒人，所以重试 3 次（间隔
+300ms）后才抛错，且**把上游 code 带进错误消息**——以前只丢一句"搜索失败"，排查时分不清是被拒还是真没结果。
+UA 不必冒充客户端（实测我们那串老 UA 同样出 20 条）。tx 的其他接口（取词、取址、专辑曲目）仍走老接口，未受影响。
+
+> 顺带一条排查口径：**验某平台的搜索还活不活，必须用没搜过的关键词**。`searchCache` 的 TTL 是 210 分钟、
+> 键含 `keyword:page:limit`，所以旧结果会让人以为上游恢复了（这次那个 200/5 就是缓存）；换个 `limit`
+> 或 `page` 是最省事的绕缓存探针。
+
 ### 4.3 音频服务（lib/audio-serve.ts）
 
 音频流服务的核心语义：

@@ -5,7 +5,8 @@
  * 全部接口免登录实测验证：
  * - 搜歌手卡    c6.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg（明文老接口，uin=0 可用；
  *              singer 区块带 mid + 官方头像 T001 直链）
- * - 搜歌        musicu.fcg DoSearchForQQMusicLite（singer[].mid/album.mid/time_public/各音质size）
+ * - 搜歌        musics.fcg?sign=zzc… DoSearchForQQMusicDesktop（singer[].mid/album.mid/time_public/各音质size）
+ *              —— 老的 musicu.fcg 现在对匿名请求不给结果（code=2001 或 sum=0 空表），见 lib/music-core/tx-sign.js
  * - 专辑曲目    musicu.fcg music.musichallAlbum.AlbumSongList.GetAlbumSongList
  *              （按 albumMid 一次整张，叶惠美 11 曲实测）
  * - 封面        y.gtimg.cn 公式：专辑 T002R500x500M000{albumMid}.jpg / 歌手 T001R300x300M000{mid}.jpg
@@ -25,6 +26,13 @@ import { upsertMusicInfosInTransaction, getStorageSongmidForMusicInfo } from '@/
 import { logger } from '@/lib/logger'
 import { appleT2S } from '@/lib/services/itunes-service'
 import type { MusicInfo, QualityType } from '@/lib/types/music'
+
+// tx-sign 是 CommonJS（音乐源子进程也用它），按本仓既有做法用 require 引
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { txSearchRequest, pickTxSongs } = require('../music-core/tx-sign') as {
+  txSearchRequest: (q: string, page?: number, limit?: number) => { url: string; text: string }
+  pickTxSongs: (j: unknown) => { code: number | undefined; items: unknown[]; sum: number }
+}
 
 const TX_TIMEOUT = 10_000
 const POLITENESS_INTERVAL = 150
@@ -208,16 +216,30 @@ interface TxRawSong {
 }
 
 async function searchTxSongsRaw(keyword: string, page = 1, limit = 30): Promise<TxRawSong[]> {
-  interface Raw { code?: number; req?: { code?: number; data?: { body?: { item_song?: TxRawSong[] } } } }
-  const j = await appPost<Raw>({
-    req: {
-      module: 'music.search.SearchCgiService',
-      method: 'DoSearchForQQMusicLite',
-      param: { query: keyword, search_type: 0, num_per_page: limit, page_num: page, nqc_flag: 0, grp: 1 },
-    },
-  })
-  if (j?.code !== 0 || j.req?.code !== 0) return []
-  return j.req?.data?.body?.item_song || []
+  // 签名锁的是要发出去的那串字节，所以 url 与 body 都取自 txSearchRequest 的同一次调用
+  const { url, text } = txSearchRequest(keyword, page, limit)
+  try {
+    const j = await polite('u.y.qq.com', async () => {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'User-Agent': UA, 'Content-Type': 'application/json' },
+        body: text,
+        signal: AbortSignal.timeout(TX_TIMEOUT),
+      })
+      if (!resp.ok) throw new Error(`musics.fcg HTTP ${resp.status}`)
+      return await resp.json()
+    })
+    const { code, items } = pickTxSongs(j)
+    // 以前这里也是静默返回 []，于是歌手页/专辑匹配整条暗着坏掉——被拒一定要留一行
+    if (code !== 0) {
+      logger.warn('[tx-chain] tx 搜索被拒:', `code=${code ?? '无响应'} 关键词=${keyword}`)
+      return []
+    }
+    return items as TxRawSong[]
+  } catch (error) {
+    logger.warn('[tx-chain] tx 搜索失败:', error instanceof Error ? error.message : error)
+    return []
+  }
 }
 
 /** TX 原始歌 → tx MusicInfo（songmid=mid，与 music-core tx 源同构，uid 由入库方附加） */

@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { get, set, dbUpsert, dbGetStorageSongmid } = vi.hoisted(() => ({
+const { get, set, dbUpsert, dbGetStorageSongmid, loggerWarn } = vi.hoisted(() => ({
   get: vi.fn(),
   set: vi.fn(),
   dbUpsert: vi.fn(),
   dbGetStorageSongmid: vi.fn((mi: { source: string; songmid: string }) => mi.songmid),
+  loggerWarn: vi.fn(),
 }))
 
 vi.mock('@/lib/cache-manager', () => ({ searchCache: { get, set } }))
@@ -12,7 +13,7 @@ vi.mock('@/lib/db', () => ({
   upsertMusicInfosInTransaction: dbUpsert,
   getStorageSongmidForMusicInfo: dbGetStorageSongmid,
 }))
-vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
+vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: loggerWarn, error: vi.fn() } }))
 vi.mock('@/lib/services/itunes-service', () => ({
   appleT2S: vi.fn((v: string) => v),
 }))
@@ -71,25 +72,33 @@ describe('接口解析（fetch mock）', () => {
     }])
   })
 
-  it('getTxArtistSongs：singer[].mid 精确过滤（同名歌手免疫）', async () => {
+  it('getTxArtistSongs：走 musics.fcg+签名，且 singer[].mid 精确过滤（同名歌手免疫）', async () => {
+    const urls: string[] = []
     let call = 0
-    vi.stubGlobal('fetch', vi.fn(async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
+      urls.push(String(url))
       call++
-      if (call > 1) return { ok: true, json: async () => ({ code: 0, req: { code: 0, data: { body: { item_song: [] } } } }) }
+      if (call > 1) return { ok: true, json: async () => ({ code: 0, 'music.search.SearchCgiService': { code: 0, data: { body: { song: { list: [] } } } } }) }
       return {
         ok: true,
         json: async () => ({
           code: 0,
-          req: { code: 0, data: { body: { item_song: [
+          'music.search.SearchCgiService': { code: 0, data: { body: { song: { list: [
             { mid: 's1', name: '晴天', interval: 269, singer: [{ mid: '0025NhlN2yWrP4', name: '周杰伦' }], album: { mid: 'a1', name: '叶惠美' }, file: { media_mid: 'm1', size_128mp3: 1 } },
             { mid: 's2', name: '晴天翻唱', interval: 269, singer: [{ mid: '999other', name: '别人' }], album: { mid: 'a2', name: 'x' }, file: { media_mid: 'm2', size_128mp3: 1 } },
-          ] } } },
+          ] } } } },
         }),
       }
     }))
     const songs = await tx.getTxArtistSongs('0025NhlN2yWrP4', '周杰伦')
     expect(songs).toHaveLength(1)
     expect(songs?.[0]).toMatchObject({ name: '晴天', source: 'tx', songmid: 's1' })
+    // 探针：老域名（musicu.fcg）现在匿名不给结果，地址必须换成带 zzc 签名的那条
+    expect(urls.length).toBe(2)
+    for (const u of urls) {
+      expect(u).toContain('musics.fcg?sign=zzc')
+      expect(u).not.toContain('musicu')
+    }
   })
 
   it('getTxAlbumDetail：GetAlbumSongList songList[].songInfo 解析', async () => {
@@ -108,17 +117,32 @@ describe('接口解析（fetch mock）', () => {
   })
 
   it('findTxAlbumId：专辑名+歌手双校验', async () => {
+    let searched = ''
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
+      searched = String(url)
+      return {
+        ok: true,
+        json: async () => ({
+          code: 0,
+          'music.search.SearchCgiService': { code: 0, data: { body: { song: { list: [
+            { mid: 'q1', name: '爱在西元前', interval: 234, singer: [{ mid: '0025NhlN2yWrP4', name: '周杰伦' }], album: { mid: '000MkMni19ClKG', name: '范特西' }, file: { media_mid: 'z1' } },
+            { mid: 'q2', name: 'other', singer: [{ name: '路人' }], album: { mid: 'wrong', name: '范特西 翻唱版' }, file: { media_mid: 'z2' } },
+          ] } } } },
+        }),
+      }
+    }))
+    expect(await tx.findTxAlbumId('范特西', '周杰伦')).toBe('000MkMni19ClKG')
+    // 发出去的必须是签名串本身（签名锁字节，二次 stringify 变了键序就废）
+    expect(searched).toContain('musics.fcg?sign=zzc')
+  })
+
+  it('tx 搜索被上游拒时返回空表但留一行日志（这里以前静默坏掉，歌手页整条没数据也看不见）', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({
       ok: true,
-      json: async () => ({
-        code: 0,
-        req: { code: 0, data: { body: { item_song: [
-          { mid: 'q1', name: '爱在西元前', interval: 234, singer: [{ mid: '0025NhlN2yWrP4', name: '周杰伦' }], album: { mid: '000MkMni19ClKG', name: '范特西' }, file: { media_mid: 'z1' } },
-          { mid: 'q2', name: 'other', singer: [{ name: '路人' }], album: { mid: 'wrong', name: '范特西 翻唱版' }, file: { media_mid: 'z2' } },
-        ] } } },
-      }),
+      json: async () => ({ code: 0, 'music.search.SearchCgiService': { code: 2001, data: {} } }),
     })))
-    expect(await tx.findTxAlbumId('范特西', '周杰伦')).toBe('000MkMni19ClKG')
+    expect(await tx.getTxArtistSongs('0025NhlN2yWrP4', '周杰伦')).toBeNull()
+    expect(loggerWarn.mock.calls.map(c => String(c[0])).some(m => /tx 搜索被拒/.test(m))).toBe(true)
   })
 })
 
