@@ -36,6 +36,14 @@ export interface SpeakerView {
   serverHost: string
   playQuality: '320k' | '128k'
   musicApiDisabledModels: string[]
+  /** 对话轮询（G0.5）那三项 + 转码（G1.5）那四项，服务端视图里都有，面板直接读 */
+  conversationEnabled: boolean
+  conversationPollSec: number
+  failedAnswerHints: string[]
+  transcodeEnabled: boolean
+  ffmpegPath: string
+  transcodeNormalize: boolean
+  transcodeCapMb: number
 }
 
 export interface QrStartResult {
@@ -173,4 +181,21 @@ export function setSpeakerConversation(input: {
 /** 拉对话回显（只读；顺带保证轮询在跑） */
 export function readConversationFeed(): Promise<ConversationFeed> {
   return apiPost<ConversationFeed>('admin/speaker', { action: 'convList' })
+}
+
+/** 转码出口（G1.5）：`ffmpeg` 是探到的版本首行，null = 没探到（这时投 FLAC 会退回在线取档） */
+export interface TranscodeResult {
+  view: SpeakerView
+  ffmpeg: string | null
+}
+
+export function setSpeakerTranscode(input: {
+  enabled?: boolean; ffmpegPath?: string; normalize?: boolean; capMb?: number;
+}): Promise<TranscodeResult> {
+  return apiPost<TranscodeResult>('admin/speaker', { action: 'tcSet', ...input })
+}
+
+/** 重新探一次（刚装完 ffmpeg 用它，不然面板会一直挂着那句过期的"没探到"） */
+export function probeSpeakerFfmpeg(): Promise<TranscodeResult> {
+  return apiPost<TranscodeResult>('admin/speaker', { action: 'tcProbe' })
 }

@@ -316,6 +316,21 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 
 真机实测（2026-10-08，L05B）：请求形状与鉴权都是通的（`code=0 / message=Success`，外层 `data` 是**字符串**、要二次 parse，内层键 `bitSet/records/nextEndTime`），但 `limit` 开到 120 仍 `records=0` —— 这台当前没有可读的对话历史。**"一条真实记录落到面板上"这最后一环还没被实测证明过**，要等对着音箱说一句话才能验；所以面板把每台的账目（`polls/seen/lastTs/primed`）如实摊开，0 行时能分清"没在拉"和"平台真没有"。这条未验的口径直接决定 G3 的默认立场：拿不到证据时不许假定"小爱答砸了"。
 
+### 4.7.4 转码出口（G1.5）：库里的 FLAC 也能投
+
+`lib/server/audio-transcode.ts`。§4.7.1 那条 MP3 闸门遇到库里的 FLAC 会改走在线取 MP3 档——对平台歌曲好使，但对**没有在线源的文件**（本地导入的 `loc-`、平台只剩更高档的）就没退路。这一期把"转一份 MP3"补成第三条路。
+
+四个不显然的决定：
+
+- **产物落进 `audioServe` 那套缓存**（同一个根目录 + 同一条 `AudioCache` 记账，键带 `tc:` 前缀，如 `tc:kw-417112293:320k:loud`）：配额、LRU、孤儿扫描都认它，不再造第二套缓存概念。
+- **转整曲，绝不把 `seek` 烘进产物**：位置由出口那侧按字节偏移处理（§4.7.2 的帧对齐）。烘进去会让同一首歌按拖动次数存出 N 份，复用率归零。
+- **不写 ID3/封面**（`-vn` 丢封面流 + `-map_metadata -1` + `-id3v2_version 0`）：给音箱那份用不上标签，而字节偏移起播每多一段标签就多想一层（参考实现那个 `remove_id3tag` 开关防的是同一类事）。
+- **失败不当错误**：没装 ffmpeg / 管理员关了 / 转崩了 ⇒ 记一条警告并走回原来的路（在线取档、最后才 415）。**唯一例外是通道满**（同时最多 3 首），那时不许偷偷换一条在线档去挤源站，直接 503 + `Retry-After: 5`。请求断开（音箱挂线）会 `child.kill()` 并删掉 `.part`——僵尸 ffmpeg 是唯一真事故路径。
+
+真机实测（2026-10-08，L05B + 本机一份带 `libmp3lame` 的 ffmpeg）：70s 的 FLAC → 2,815,999 字节的 320k CBR MP3，**首包等 1.8 秒**（≈39× 实时），设备 `status=1`、`duration=70374ms`；第二次起 `复用=true`、20ms 出包；在这份产物上拖到 40s → `粗字节 1600000 → 起字节 1600782 对齐=true 码率来源=frame`，设备照播。产物头 4 字节是 `ff fb e0 00`（裸帧首，没有标签块）。
+
+**部署前提**：本仓库的生产镜像**没有 ffmpeg**（只装了 nginx/openssl），本机 PATH 里也没有。所以这条在 NAS 上生效前要先解决二进制来源（进主镜像 / 拆带 ffmpeg 的变体标签 / 指向容器里已有的某个构建）——这是还没定的问题，面板上那栏 `ffmpegPath` 就是为此留的。转码是**有损再编码**，FLAC→320k MP3 会丢信息，别当无损宣传（面板原文就这么写）。
+
 ---
 
 ## 5. API 路由参考
@@ -415,9 +430,9 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 | GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
 | GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`（撞同名时 `mode`：`replace` 换掉库里那条 / `parallel` 并排装）、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
-| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`convSet`/`convList` 对话轮询开关与回显（见 §4.7.3）、`logout`） |
+| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`convSet`/`convList` 对话轮询与回显（见 §4.7.3）、`tcSet`/`tcProbe` 转码设置与探测（见 §4.7.4）、`logout`） |
 | GET/POST | `/api/speaker` | 登录用户级投放：`GET` 返回可投音箱、就绪位与**当前会话**；`POST` 的 `action` = 投放 `cast`/`castRest`/`castSkip`/`seek`/`castStatus`/`castStop`，遥控 `pause`/`resume`/`stop`/`volume`，单推与排障 `play`/`status`（见 §4.7.2） |
-| GET/HEAD | `/api/speaker/stream?st=&uid=&quality=[&seek=秒]` | **只出 MP3** 的音箱流出口（`st` 必须第一位；`seek` 恒在最后，按帧对齐后整条 200 发剩余部分，见 §4.7.2） |
+| GET/HEAD | `/api/speaker/stream?st=&uid=&quality=[&seek=秒]` | **只出 MP3** 的音箱流出口（`st` 必须第一位；`seek` 恒在最后，按帧对齐后整条 200 发剩余部分，见 §4.7.2）。库内不是 MP3 时先试转码（§4.7.4），转不了才退回在线取档 |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |
 | POST | `/api/admin/sources/subscriptions` | 在线音源订阅 |
 | POST | `/api/admin/sources/upload` | 上传音源脚本（预校验 + 自动注册） |

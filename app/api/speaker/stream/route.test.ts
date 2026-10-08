@@ -39,6 +39,19 @@ vi.mock('@/lib/audio-serve', () => ({
   resolvePaths: h.resolvePaths,
 }))
 vi.mock('fs/promises', () => ({ default: { stat: h.stat } }))
+// 转码（G1.5）。默认"开关关着"，让原有那些用例走的还是老路径（非 MP3 ⇒ 改走在线）
+const tc = vi.hoisted(() => ({
+  readSpeakerConfig: vi.fn(),
+  probeFfmpeg: vi.fn(),
+  transcodeToMp3: vi.fn(),
+  Busy: class TranscodeBusyError extends Error {
+    constructor() { super('转码通道已满'); this.name = 'TranscodeBusyError' }
+  },
+}))
+vi.mock('@/lib/services/xiaomi/token-store', () => ({ readSpeakerConfig: tc.readSpeakerConfig }))
+vi.mock('@/lib/server/audio-transcode', () => ({
+  probeFfmpeg: tc.probeFfmpeg, transcodeToMp3: tc.transcodeToMp3, TranscodeBusyError: tc.Busy,
+}))
 
 const { GET, readParams } = await import('@/app/api/speaker/stream/route')
 
@@ -49,6 +62,10 @@ const req = (qs: string) => new NextRequest(`http://127.0.0.1:3000/api/speaker/s
 const okUrl = (uid = 'tx-S1', quality = '320k') => `?st=${TOKEN}&uid=${encodeURIComponent(uid)}&quality=${quality}`
 
 beforeEach(() => {
+  for (const f of [tc.readSpeakerConfig, tc.probeFfmpeg, tc.transcodeToMp3]) f.mockReset()
+  // 默认"开关关着"：转码那条路的探测与 spawn 只由下面那个 describe 里的用例触发，别串味
+  tc.readSpeakerConfig.mockResolvedValue({ transcodeEnabled: false, ffmpegPath: 'ffmpeg', transcodeNormalize: false, transcodeCapMb: 500 })
+  tc.probeFfmpeg.mockResolvedValue(null)
   for (const f of [h.verifyShareAudioToken, h.resolveMusicInfoById, h.findLibrarySong, h.readHeadBytes,
     h.detectContainer, h.mimeFromContainer, h.stat, h.serve, h.full, h.partial, h.unsat, h.parseRange]) f.mockReset()
   h.verifyShareAudioToken.mockReturnValue(true)
@@ -237,5 +254,78 @@ describe('seek：音箱侧没有设备 seek，只能重推一条从中间开始�
     expect(p.get('st')).toBe(TOKEN)
     expect(p.get('uid')).toBe('tx-S1')
     expect(p.get('seek')).toBe('42')
+  })
+})
+
+describe('转码出口（G1.5：库里的 FLAC 也能投）', () => {
+  const on = () => tc.readSpeakerConfig.mockResolvedValue(
+    { transcodeEnabled: true, ffmpegPath: 'ffmpeg', transcodeNormalize: false, transcodeCapMb: 500 },
+  )
+  const flacInLibrary = () => {
+    h.findLibrarySong.mockResolvedValue({ filePath: '/lib/稻香.flac', quality: 'flac' })
+    h.readHeadBytes.mockResolvedValue(new Uint8Array([0x66, 0x4c, 0x61, 0x43]))
+    h.detectContainer.mockReturnValue('flac')
+  }
+
+  it('转码可用 ⇒ 交付的是转好的那份 MP3，一次都不打在线', async () => {
+    on(); tc.probeFfmpeg.mockResolvedValue('ffmpeg version 6.0')
+    tc.transcodeToMp3.mockResolvedValue({ filePath: '/cache/tc.mp3', size: 5000, reused: false })
+    flacInLibrary()
+    const res = await GET(req(okUrl()))
+    expect(res.status).toBe(200)
+    expect(tc.transcodeToMp3).toHaveBeenCalledWith(expect.objectContaining({
+      sourceFile: '/lib/稻香.flac', uid: 'tx-S1', quality: '320k', bin: 'ffmpeg',
+    }))
+    expect(h.serve).not.toHaveBeenCalled()
+    expect(h.full.mock.calls[0][0]).toBe('/cache/tc.mp3')
+  })
+
+  it('开关关着时连探都不探（探一次要 spawn 一个进程，不能白 spawn）', async () => {
+    flacInLibrary()
+    await GET(req(okUrl()))
+    expect(tc.probeFfmpeg).not.toHaveBeenCalled()
+    expect(h.serve).toHaveBeenCalledTimes(1)
+  })
+
+  it('探不到 ffmpeg ⇒ 退回原来的在线取档，不把投歌整体弄失败', async () => {
+    on(); tc.probeFfmpeg.mockResolvedValue(null)
+    flacInLibrary()
+    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/mpeg' }) }))
+    const res = await GET(req(okUrl()))
+    expect(res.status).toBe(200)
+    expect(tc.transcodeToMp3).not.toHaveBeenCalled()
+    expect(h.serve).toHaveBeenCalledTimes(1)
+  })
+
+  it('通道满 ⇒ 503 带 Retry-After，不许偷偷换一条在线档去挤源站', async () => {
+    on(); tc.probeFfmpeg.mockResolvedValue('ffmpeg version 6.0')
+    tc.transcodeToMp3.mockRejectedValue(new tc.Busy())
+    flacInLibrary()
+    const res = await GET(req(okUrl()))
+    expect(res.status).toBe(503)
+    expect(res.headers.get('retry-after')).toBe('5')
+    expect((await res.json()).error.code).toBe('TRANSCODE_BUSY')
+    expect(h.serve).not.toHaveBeenCalled()
+  })
+
+  it('在线拿回来的还是非 MP3 ⇒ 转那份缓存，不再直接 415', async () => {
+    on(); tc.probeFfmpeg.mockResolvedValue('ffmpeg version 6.0')
+    h.findLibrarySong.mockResolvedValue(null)
+    tc.transcodeToMp3.mockResolvedValue({ filePath: '/cache/tc.mp3', size: 5000, reused: true })
+    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/flac' }) }))
+    const res = await GET(req(okUrl()))
+    expect(res.status).toBe(200)
+    expect(tc.transcodeToMp3).toHaveBeenCalledWith(expect.objectContaining({ sourceFile: '/cache/x.mp3' }))
+    expect(h.full.mock.calls[0][0]).toBe('/cache/tc.mp3')
+  })
+
+  it('转码失败（不是通道满）⇒ 照旧 415 说清楚，不许静默给音箱一份它放不了的字节', async () => {
+    on(); tc.probeFfmpeg.mockResolvedValue('ffmpeg version 6.0')
+    h.findLibrarySong.mockResolvedValue(null)
+    tc.transcodeToMp3.mockRejectedValue(new Error('ffmpeg 退出码 1：Encoder not found'))
+    h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/flac' }) }))
+    const res = await GET(req(okUrl()))
+    expect(res.status).toBe(415)
+    expect((await res.json()).error.code).toBe('NOT_MP3')
   })
 })

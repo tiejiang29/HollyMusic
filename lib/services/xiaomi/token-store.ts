@@ -62,6 +62,21 @@ export interface SpeakerConfig {
   conversationPollSec: number
   /** 疑似"小爱没答上"的话术片段（面板可改）：G3 拿它判要不要接管 */
   failedAnswerHints: string[]
+  /**
+   * 转码出口开关（G1.5）：库里不是 MP3 的那些（本地导入的 `loc-`、平台只剩更高档）
+   * 靠它变成能投。关掉就退回旧行为——非 MP3 改走在线取 MP3 档，取不到就明确报错。
+   */
+  transcodeEnabled: boolean
+  /**
+   * ffmpeg 可执行文件：PATH 里的名字（默认 `ffmpeg`）或绝对路径。
+   * 生产镜像里**没有** ffmpeg（本仓库的镜像只装了 nginx/openssl），所以这栏在 NAS 上要填
+   * 容器里能用的东西，或者等镜像带上它 —— 不要假装它一定存在，探不到就是探不到。
+   */
+  ffmpegPath: string
+  /** 响度归一化（`loudnorm`）：实测慢一个量级，默认关 */
+  transcodeNormalize: boolean
+  /** 转码产物总占用上限（MB），按 lastAccessAt 淘汰；0 = 不设限 */
+  transcodeCapMb: number
 }
 
 export type SpeakerPlayQuality = '320k' | '128k'
@@ -83,6 +98,16 @@ export const DEFAULT_FAILED_ANSWER_HINTS = [
 export const CONVERSATION_POLL_SEC_MIN = 1
 export const CONVERSATION_POLL_SEC_MAX = 30
 
+/** 转码产物容量闸的合法区间（MB），0 = 不设限 */
+export const TRANSCODE_CAP_MB_MIN = 0
+export const TRANSCODE_CAP_MB_MAX = 20_000
+
+export function clampCapMb(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 500
+  return Math.min(TRANSCODE_CAP_MB_MAX, Math.max(TRANSCODE_CAP_MB_MIN, Math.round(n)))
+}
+
 const DEFAULT_CONFIG: SpeakerConfig = {
   enabled: false,
   credentials: null,
@@ -95,6 +120,10 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   conversationEnabled: false,
   conversationPollSec: 2,
   failedAnswerHints: DEFAULT_FAILED_ANSWER_HINTS,
+  transcodeEnabled: true,
+  ffmpegPath: 'ffmpeg',
+  transcodeNormalize: false,
+  transcodeCapMb: 500,
 }
 
 /**
@@ -112,6 +141,13 @@ export async function readSpeakerConfig(): Promise<SpeakerConfig> {
       ? stored.failedAnswerHints
       : DEFAULT_FAILED_ANSWER_HINTS,
     conversationPollSec: clampPollSec(stored.conversationPollSec),
+    // 老库里存的对象同样没有转码这四个键：`ffmpegPath` 为空串会让每次 spawn 都失败在起跑线，
+    // 所以这里补默认值，不指望有人重新保存一遍配置
+    ffmpegPath: typeof stored.ffmpegPath === 'string' && stored.ffmpegPath.trim()
+      ? stored.ffmpegPath.trim() : DEFAULT_CONFIG.ffmpegPath,
+    transcodeCapMb: clampCapMb(stored.transcodeCapMb),
+    transcodeEnabled: stored.transcodeEnabled !== false,
+    transcodeNormalize: !!stored.transcodeNormalize,
   }
 }
 
@@ -146,6 +182,11 @@ export interface SpeakerView {
   conversationEnabled: boolean
   conversationPollSec: number
   failedAnswerHints: string[]
+  /** 转码出口（G1.5）：库里非 MP3 的那些靠它变成能投 */
+  transcodeEnabled: boolean
+  ffmpegPath: string
+  transcodeNormalize: boolean
+  transcodeCapMb: number
 }
 
 export async function getSpeakerView(): Promise<SpeakerView> {
@@ -170,7 +211,24 @@ export async function getSpeakerView(): Promise<SpeakerView> {
     conversationEnabled: config.conversationEnabled,
     conversationPollSec: config.conversationPollSec,
     failedAnswerHints: config.failedAnswerHints,
+    transcodeEnabled: config.transcodeEnabled,
+    ffmpegPath: config.ffmpegPath,
+    transcodeNormalize: config.transcodeNormalize,
+    transcodeCapMb: config.transcodeCapMb,
   }
+}
+
+/** 转码那四项（G1.5）：都是面板项，缺省位不传就不动 */
+export async function setSpeakerTranscode(input: {
+  enabled?: boolean; ffmpegPath?: unknown; normalize?: boolean; capMb?: unknown;
+}): Promise<SpeakerView> {
+  const config = await readSpeakerConfig()
+  if (typeof input.enabled === 'boolean') config.transcodeEnabled = input.enabled
+  if (typeof input.ffmpegPath === 'string') config.ffmpegPath = input.ffmpegPath.trim() || DEFAULT_CONFIG.ffmpegPath
+  if (typeof input.normalize === 'boolean') config.transcodeNormalize = input.normalize
+  if (input.capMb !== undefined) config.transcodeCapMb = clampCapMb(input.capMb)
+  await writeSpeakerConfig(config)
+  return getSpeakerView()
 }
 
 export async function setSpeakerEnabled(enabled: boolean): Promise<void> {

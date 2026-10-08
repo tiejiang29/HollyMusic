@@ -16,6 +16,7 @@ import {
   setSpeakerManaged, setSpeakerEnabled, speakerLogout,
   setSpeakerHost, setSpeakerQuality, controlSpeakerFromAdmin, setSpeakerVolumeFromAdmin, readSpeakerStatusFromAdmin,
   setSpeakerConversation, readConversationFeed,
+  setSpeakerTranscode, probeSpeakerFfmpeg,
   type ConversationFeed, type QrStartResult, type SpeakerView, type SpeakerStreamStatus,
 } from '@/lib/api/admin-speaker'
 import { volumeSendDelayMs } from '@/lib/cast-queue'
@@ -153,6 +154,10 @@ export function SpeakerPanel() {
   const [conv, setConv] = useState<ConversationFeed | null>(null)
   const [convPollDraft, setConvPollDraft] = useState<string | null>(null)
   const [convHintsDraft, setConvHintsDraft] = useState<string | null>(null)
+  /** 转码（G1.5）：探到的 ffmpeg 版本串（undefined = 还没探过）+ 两个草稿 */
+  const [ffmpegFound, setFfmpegFound] = useState<string | null | undefined>(undefined)
+  const [ffmpegPathDraft, setFfmpegPathDraft] = useState<string | null>(null)
+  const [tcCapDraft, setTcCapDraft] = useState<string | null>(null)
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -171,6 +176,8 @@ export function SpeakerPanel() {
     // 一进来就读一次回显：开着轮询时这一下会让服务端确保监视器在跑，
     // 也让"上次拉取 / 拉了几次 / 见过几条"立刻可见（不点开关也能看到账目）
     readConversationFeed().then(setConv).catch(() => {})
+    // 转码这项要 spawn 才能知道 ffmpeg 在不在，所以只在进页面时探一次，不在每次 GET 里探
+    probeSpeakerFfmpeg().then(r => setFfmpegFound(r.ffmpeg)).catch(() => setFfmpegFound(null))
   }, [reload])
 
   // 拿到二维码就开始问"扫了没"：单次请求最长 8 秒（服务端那侧的长轮询切片），
@@ -389,6 +396,30 @@ export function SpeakerPanel() {
       setConv(await readConversationFeed())
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存对话轮询设置失败')
+    }
+  }
+
+  const saveTranscode = async (patch: { enabled?: boolean; normalize?: boolean }) => {
+    try {
+      const r = await setSpeakerTranscode({
+        ...patch,
+        ...(ffmpegPathDraft !== null ? { ffmpegPath: ffmpegPathDraft } : {}),
+        ...(tcCapDraft !== null ? { capMb: Number(tcCapDraft) } : {}),
+      })
+      setView(r.view)
+      setFfmpegFound(r.ffmpeg)
+      setFfmpegPathDraft(null)
+      setTcCapDraft(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存转码设置失败')
+    }
+  }
+
+  const reprobeFfmpeg = async () => {
+    try {
+      setFfmpegFound((await probeSpeakerFfmpeg()).ffmpeg)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '探测 ffmpeg 失败')
     }
   }
 
@@ -812,6 +843,77 @@ export function SpeakerPanel() {
                   : '已经在轮询了，对着音箱说一句试试'}
             </p>
           )}
+        </div>
+      ) : null}
+
+      {view ? (
+        <div className="mt-6 rounded-lg border border-border bg-card p-4">
+          <h3 className="text-sm font-semibold">转码出口（G1.5：让库里的 FLAC 也能投）</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            音箱听不懂 FLAC。库里那些不是 MP3 的文件（本地导入的、平台只剩高档的）以前只能改走在线取 MP3 档，
+            在线也取不到就没辙。开着这个就用 ffmpeg 现转一份存进音频缓存，之后按字节续播、拖动定位都照旧。
+            <span className="text-foreground">转码是有损再编码</span>，FLAC 转 320k MP3 会丢信息，别当无损用。
+          </p>
+          <p className="mt-2 text-xs">
+            {ffmpegFound === undefined ? 'ffmpeg：正在探…'
+              : ffmpegFound
+                ? <span className="text-foreground font-mono text-[11px]">ffmpeg：{ffmpegFound}</span>
+                : <span className="text-destructive">ffmpeg：没探到 —— 开着也不会转，投 FLAC 会退回「在线取 MP3 档」那条路</span>}
+            {' '}
+            <button
+              onClick={() => void reprobeFfmpeg()}
+              className="ml-1 rounded-full px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              重新探测
+            </button>
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded accent-primary"
+                checked={view.transcodeEnabled}
+                onChange={e => void saveTranscode({ enabled: e.target.checked })}
+              />
+              允许转码
+            </label>
+            <label className="flex items-center gap-1" title="loudnorm 实测慢一个量级，默认不开">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded accent-primary"
+                checked={view.transcodeNormalize}
+                onChange={e => void saveTranscode({ normalize: e.target.checked })}
+              />
+              响度归一化
+            </label>
+            <input
+              type="text"
+              defaultValue={view.ffmpegPath}
+              placeholder="ffmpeg"
+              onChange={e => setFfmpegPathDraft(e.target.value)}
+              className="w-64 rounded border border-border bg-background px-2 py-1 font-mono text-[11px]"
+              title="PATH 里的名字，或绝对路径（Windows 用反斜杠也行）"
+            />
+            <input
+              type="number"
+              min={0}
+              max={20000}
+              defaultValue={view.transcodeCapMb}
+              onChange={e => setTcCapDraft(e.target.value)}
+              className="w-20 rounded border border-border bg-background px-2 py-1"
+              title="转码产物总占用上限（MB），超了按最久没读的淘汰；0 = 不设限"
+            />
+            <span className="text-muted-foreground">MB 上限</span>
+            <button
+              onClick={() => void saveTranscode({})}
+              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              保存
+            </button>
+          </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            同时在转的最多 3 首，第 4 首要等（返回 503 让音箱稍后重拉）；产物落在音频缓存里，和在线下载那份额用同一套配额。
+          </p>
         </div>
       ) : null}
     </div>

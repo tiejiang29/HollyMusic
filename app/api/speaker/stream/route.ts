@@ -27,15 +27,49 @@ import { parseIntervalToSeconds } from '@/lib/types/player'
 import { findLibrarySong } from '@/lib/services/music-library'
 import { detectContainer, readHeadBytes, readBytesAt, mimeFromContainer } from '@/lib/server/audio-sniff'
 import { planMp3Seek, alignToFrameStart, NOMINAL_BYTES_PER_SEC, MP3_HEAD_BYTES } from '@/lib/server/mp3-seek'
+import { probeFfmpeg, transcodeToMp3, TranscodeBusyError, type TranscodeResult } from '@/lib/server/audio-transcode'
+import { readSpeakerConfig } from '@/lib/services/xiaomi/token-store'
 import type { QualityType } from '@/lib/types/music'
 
-/** 音箱只给 MP3 档（G1.5 的转码上线之前不放开 flac） */
+/** 音箱只给 MP3 档（flac 这些靠 G1.5 的转码出口变成 MP3，不直接给） */
 const SPEAKER_QUALITIES: QualityType[] = ['320k', '128k']
 
-function fail(status: number, code: string, message: string): Response {
+function fail(status: number, code: string, message: string, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify({ success: false, error: { code, message } }), {
-    status, headers: { 'Content-Type': 'application/json', 'cache-control': 'no-store' },
+    status, headers: { 'Content-Type': 'application/json', 'cache-control': 'no-store', ...headers },
   })
+}
+
+/**
+ * 试一次转码（G1.5）。**失败不当成错误**，返回 null 让调用方走回原来的路（在线取 MP3 档 / 415），
+ * 因为"这台没装 ffmpeg"或"管理员关了它"都是正当配置，不该让一次投歌因为转码而整体失败。
+ *
+ * 只有一件事例外：转码通道满了（同时在转的已到上限）。这时候**不能悄悄换条路**去在线拉一档——
+ * 那条路会把源站打满，而且此刻本机 CPU 已经排了三首在转，再挤一首只会让所有首包一起变慢。
+ * 所以这一种是明确 503 + Retry-After，让设备稍后重拉。
+ */
+async function tryTranscode(
+  sourceFile: string, uid: string, quality: '320k' | '128k', name: string, signal: AbortSignal,
+): Promise<TranscodeResult | null | 'busy'> {
+  const config = await readSpeakerConfig().catch(() => null)
+  if (!config?.transcodeEnabled) return null
+  const found = await probeFfmpeg(config.ffmpegPath)
+  if (!found) return null
+  try {
+    const r = await transcodeToMp3({
+      bin: config.ffmpegPath, sourceFile, uid,
+      // 音质档按请求那一档，不按面板那档：拖动/换队列时前端会原样带着它签的令牌
+      quality, normalize: config.transcodeNormalize, capMb: config.transcodeCapMb, signal,
+    })
+    logger.info('[speaker/stream] 转码出口交付', {
+      歌曲: name, 字节: r.size, 复用: r.reused, 响度: config.transcodeNormalize,
+    })
+    return r
+  } catch (err) {
+    if (err instanceof TranscodeBusyError) return 'busy'
+    logger.warn('[speaker/stream] 转码没成，退回原路径:', (err instanceof Error ? err.message : String(err)).slice(0, 160))
+    return null
+  }
 }
 
 /**
@@ -99,6 +133,33 @@ async function alignSeekStart(filePath: string, rough: number): Promise<{ start:
   return delta === null ? { start: rough, aligned: false } : { start: rough + delta, aligned: true }
 }
 
+/**
+ * 把一条本地 MP3 文件（库内的，或 G1.5 转码出来的）按音箱要的方式发出去。
+ *
+ * 两种情形都走这同一条：① 没 seek ⇒ 正常 Range（206/200/416 由 audio-serve 那套构造）；
+ * ② 有 seek ⇒ 恒按 **200 整发剩余部分**，因为"从中间开始的一条流"不是原文件的某个连续区间，
+ * 设备照惯例发的 `Range: bytes=0-` 在这里没有意义（回 206 且起点不是 0 会被它当成应答错乱，
+ * 2026-10-08 实测过：改回 200 之后设备才出声）。
+ */
+async function serveLocalMp3(
+  filePath: string, quality: string, seekSec: number,
+  rangeHeader: string | null, isHead: boolean, name: string,
+): Promise<Response> {
+  const contentType = mimeFromContainer('mp3') ?? 'audio/mpeg'
+  if (seekSec <= 0) return serveFile(filePath, contentType, rangeHeader, isHead)
+  const stat = await fsp.stat(filePath)
+  const head = await readHeadBytes(filePath, MP3_HEAD_BYTES)
+  const plan = planMp3Seek(head ?? new Uint8Array(), seekSec, nominalBytesPerSec(quality))
+  if (plan.offset >= stat.size) return buildUnsatisfiable(stat.size)
+  const seek = await alignSeekStart(filePath, plan.offset)
+  logger.info('[speaker/stream] 按 seek 重推', {
+    秒: seekSec, 粗字节: plan.offset, 起字节: seek.start, 对齐: seek.aligned,
+    文件字节: stat.size, 码率来源: plan.from, 每秒字节: plan.bytesPerSec,
+  })
+  if (!seek.aligned) logger.warn('[speaker/stream] 没找到帧首，按粗偏移发（设备可能不出声）', { 歌曲: name })
+  return buildFullResponse(filePath, stat.size - seek.start, contentType, isHead, seek.start)
+}
+
 async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promise<Response> {
   const params = readParams(request)
   const uid = params.get('uid') ?? ''
@@ -110,6 +171,8 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     // 音箱听不懂 flac，这里不是"降一档"而是直接拒 —— 静默降档会让管理员以为推的是高品
     return fail(400, 'QUALITY_NOT_SUPPORTED', `音箱只支持 MP3 档（320k/128k），请求的是 ${quality}`)
   }
+  // 上面那道判据已经保证是 MP3 两档之一，但 TS 不会跟着收窄（QualityType 还有 flac）
+  const mp3Quality: '320k' | '128k' = quality === '128k' ? '128k' : '320k'
   if (!verifyShareAudioToken(uid, quality, token)) {
     return fail(401, 'UNAUTHORIZED', '分享凭证无效或已过期')
   }
@@ -126,33 +189,18 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     const head = await readHeadBytes(row.filePath)
     const container = detectContainer(head ?? new Uint8Array())
     if (container === 'mp3') {
-      const contentType = mimeFromContainer('mp3') ?? 'audio/mpeg'
-      if (seekSec > 0) {
-        // seek 优先于请求头里的 Range：seek 定义"这条流从哪儿开始"，Range 只是设备自己的缓冲偏好
-        const stat = await fsp.stat(row.filePath)
-        const head = await readHeadBytes(row.filePath, MP3_HEAD_BYTES)
-        const plan = planMp3Seek(head ?? new Uint8Array(), seekSec, nominalBytesPerSec(row.quality))
-        if (plan.offset >= stat.size) return buildUnsatisfiable(stat.size)
-        const seek = await alignSeekStart(row.filePath, plan.offset)
-        logger.info('[speaker/stream] 按 seek 重推', {
-          秒: seekSec, 粗字节: plan.offset, 起字节: seek.start, 对齐: seek.aligned,
-          文件字节: stat.size, 码率来源: plan.from, 每秒字节: plan.bytesPerSec,
-        })
-        if (!seek.aligned) logger.warn('[speaker/stream] 没找到帧首，按粗偏移发（设备可能不出声）', { 歌曲: musicInfo.name })
-        // 这条流是"从第 seek 秒开始的一首歌"，本身就不是原文件的某个连续区间：
-        // 设备照惯例发的 `Range: bytes=0-` 在这里没有意义（回 206 且起点不是 0，它会不会当成
-        // 应答错乱而反复重试，正是要验的事），所以直接按 200 把剩下的部分整条给它。
-        void rangeHeader
-        return buildFullResponse(row.filePath, stat.size - seek.start, contentType, isHead, seek.start)
-      }
-      return serveFile(row.filePath, contentType, rangeHeader, isHead)
+      return serveLocalMp3(row.filePath, row.quality, seekSec, rangeHeader, isHead, musicInfo.name)
     }
+    // ② 库里是 FLAC/wav 之类：先试转码（G1.5），转出来的那份也是本地 MP3，seek 照旧按字节算
+    const tc = await tryTranscode(row.filePath, uid, mp3Quality, musicInfo.name, request.signal)
+    if (tc === 'busy') return fail(503, 'TRANSCODE_BUSY', '同时转码的已排满，稍后再试', { 'retry-after': '5' })
+    if (tc) return serveLocalMp3(tc.filePath, mp3Quality, seekSec, rangeHeader, isHead, musicInfo.name)
     logger.info('[speaker/stream] 库内文件不是 MP3，改走在线取 MP3 档', {
       歌曲: `${musicInfo.name}`, 库内: row.quality, 嗅到: container ?? '未知',
     })
   }
 
-  // ② 在线取 320k/128k：走 audioServe（带缓存与进行中重复请求合并），拿到响应后**按字节给的 MIME 再核一次**
+  // ③ 在线取 320k/128k：走 audioServe（带缓存与进行中重复请求合并），拿到响应后**按字节给的 MIME 再核一次**
   try {
     const cacheKey = `${musicInfo.source}:${musicInfo.songmid}:${quality}`
     const resolver: UpstreamUrlResolver = async excludeProviders => {
@@ -175,10 +223,18 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
       isHead,
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
     })
+    // 在线这一路拿回来的还是非 MP3（源把 flac 标成 320k 是发生过的）：
+    // 缓存那份已经在磁盘上，转一次码就变成能投的 MP3；转不了才明确报错
     const served = res.headers.get('content-type') ?? ''
     if (res.ok && !served.includes('audio/mpeg')) {
-      // 源把 flac 标成 320k 是发生过的（扩展名撒谎那一类）；给音箱这份必须是 MP3
-      return fail(415, 'NOT_MP3', `这一档拿回来的不是 MP3（${served || '未知类型'}），音箱放不了，等转码那期`)
+      const cached = resolvePaths(cacheKey, served || null).filePath
+      const tc = await tryTranscode(cached, uid, mp3Quality, musicInfo.name, request.signal)
+      if (tc === 'busy') return fail(503, 'TRANSCODE_BUSY', '同时转码的已排满，稍后再试', { 'retry-after': '5' })
+      if (tc) {
+        // 转好的这份才是给音箱的那份：seek/Range 都按它重新算
+        return serveLocalMp3(tc.filePath, mp3Quality, seekSec, rangeHeader, isHead, musicInfo.name)
+      }
+      return fail(415, 'NOT_MP3', `这一档拿回来的不是 MP3（${served || '未知类型'}），音箱放不了`)
     }
     return res
   } catch (err) {
