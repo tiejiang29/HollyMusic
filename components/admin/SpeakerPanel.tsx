@@ -862,7 +862,7 @@ export function SpeakerPanel() {
             <p className="mt-2 text-xs text-muted-foreground">
               {!conv?.state.running ? '轮询没开，开了才会拉对话记录'
                 : conv.state.devices.some(d => d.polls > 0 && d.seen === 0)
-                  ? '轮询在跑、请求也是通的，但小米那边回的就是空记录（我把 limit 开到 120 仍然 0 条）。对着音箱说一句等几秒：出行了说明只是历史被清过；一直 0 条说明这台不往这个接口写对话 —— 那 G3 的「读小爱的回答来判成败」就没有依据，得先换路子。'
+                  ? '轮询在跑、请求也是通的（code=0），但一条记录都没有。先查 Cookie 里的 deviceId 是不是**这台音箱自己的 deviceID** —— 填成登录那台设备时平台不报错、只是静默回空记录（2026-10-09 就是这么误判成"这台不写对话历史"的）。都对还是一片空，才轮到另一种解释：这个账号确实没留着可读的历史。'
                   : '已经在轮询了，对着音箱说一句试试'}
             </p>
           )}
@@ -877,9 +877,10 @@ export function SpeakerPanel() {
             ② 其余当点歌，<b>先看小爱答上了没</b>——答上了不抢，像没答上才去我们的曲库找最像的一条顶上；
             ③ 都对不上就什么都不做。
           </p>
-          <p className="mt-1 text-xs text-destructive">
-            前提还没验过：对话接口今天实测回的是 0 条记录（见上面那张卡）。所以这一层只能用下面那条
-            <b>模拟口令</b>走同一条判据链路，别当成「对着音箱说话已经能用了」。
+          <p className="mt-1 text-xs text-muted-foreground">
+            数据源已经通了（2026-10-09 实测到真记录）。只剩一条要注意的：<b>进程重启后的第一轮全算历史</b>
+            （标着「历史」那批不会触发接管），所以要验真实口令，得等面板开始轮询之后再对音箱说话；
+            不想等也可以直接用下面那条<b>模拟口令</b>走同一条判据链路。
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
             <label className="flex items-center gap-1">

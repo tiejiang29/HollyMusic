@@ -369,16 +369,26 @@ describe('ubus 播控（G1）', () => {
 })
 
 describe('fetchConversations（G0.5 对话回显）', () => {
-  it('URL 带 source=dialogu/hardware/timestamp/limit，Cookie 比设备列表多一个 deviceId', async () => {
+  // cookie 里那个 deviceId 必须是**这台音箱**的 deviceID，不是 creds.deviceId（登录用的那台）
+  const CONV_DEVICE = { hardware: 'L05B', deviceID: 'spk-1' }
+
+  it('URL 带 source=dialogu/hardware/timestamp/limit，Cookie 比设备列表多带一个 deviceId', async () => {
     reply({ code: 0, data: JSON.stringify({ records: [] }) })
-    await fetchConversations(creds, 'L05B', 5)
+    await fetchConversations(creds, CONV_DEVICE, 5)
     const u = new URL(lastRequest!.url)
     expect(u.searchParams.get('source')).toBe('dialogu')
     expect(u.searchParams.get('hardware')).toBe('L05B')
     expect(u.searchParams.get('limit')).toBe('5')
     expect(Number(u.searchParams.get('timestamp'))).toBeGreaterThan(0)
-    expect(lastRequest!.headers.cookie).toContain('deviceId=' + creds.deviceId)
     expect(lastRequest!.headers.cookie).toContain('serviceToken=')
+  })
+
+  it('Cookie 里的 deviceId 用那台音箱的 ID —— 填登录设备那个平台会静默回 0 条（2026-10-09 实测踩过）', async () => {
+    reply({ code: 0, data: JSON.stringify({ records: [{ time: 1000, query: '甲', answers: [] }] }) })
+    await fetchConversations(creds, CONV_DEVICE)
+    const cookie = lastRequest!.headers.cookie as string
+    expect(cookie).toContain('deviceId=' + CONV_DEVICE.deviceID)
+    expect(cookie).not.toContain('deviceId=' + creds.deviceId)
   })
 
   it('records 里 time/query/TTS 回答各自归位：非 TTS 不算回答，没时间戳的丢掉，按时间升序返回', async () => {
@@ -392,7 +402,7 @@ describe('fetchConversations（G0.5 对话回显）', () => {
         ],
       }),
     })
-    expect(await fetchConversations(creds, 'L05B')).toEqual([
+    expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([
       { timestampMs: 1000, query: '先说的', answer: '' },
       { timestampMs: 2000, query: '后说的', answer: '好的' },
     ])
@@ -400,29 +410,29 @@ describe('fetchConversations（G0.5 对话回显）', () => {
 
   it('外层 data 是对象时也认（平台两种都发过）', async () => {
     reply({ code: 0, data: { records: [{ time: 5000, query: '甲', answers: [] }] } })
-    expect(await fetchConversations(creds, 'L05B')).toEqual([{ timestampMs: 5000, query: '甲', answer: '' }])
+    expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([{ timestampMs: 5000, query: '甲', answer: '' }])
   })
 
   it('data 二次 parse 坏了 ⇒ 空列表，不炸（面板要能继续轮下一次）', async () => {
     reply({ code: 0, data: '{不是 JSON' })
-    expect(await fetchConversations(creds, 'L05B')).toEqual([])
+    expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([])
   })
 
   it('票失效要抛出来：200 包着"登录验证失败"算 auth，非 2xx 算 502 —— 都绝不能当成"没有新话"', async () => {
     reply({ code: 70016, message: '登录验证失败' })
-    const e1 = await fetchConversations(creds, 'L05B').catch(e => e)
+    const e1 = await fetchConversations(creds, CONV_DEVICE).catch(e => e)
     expect(e1).toBeInstanceOf(XiaomiAuthError)
     expect(isAuthFailure('70016', '登录验证失败')).toBe(true)
 
     reply('网关挂了', 500)
-    const e2 = await fetchConversations(creds, 'L05B').catch(e => e)
+    const e2 = await fetchConversations(creds, CONV_DEVICE).catch(e => e)
     expect(e2).toBeInstanceOf(XiaomiAuthError)
     expect((e2 as XiaomiAuthError).status).toBe(502)
   })
 
   it('没有型号就别打网络（拿空 hardware 去拉只会拿到一屏莫名其妙的错）', async () => {
     reply({ code: 0, data: '{}' })
-    const err = await fetchConversations(creds, '').catch(e => e)
+    const err = await fetchConversations(creds, { hardware: '', deviceID: 'spk-1' }).catch(e => e)
     expect(err).toBeInstanceOf(XiaomiAuthError)
     expect(lastRequest).toBeNull()
   })

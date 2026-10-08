@@ -160,7 +160,7 @@ async function tick(): Promise<void> {
         account(device.deviceID, device.name, device.hardware)
         let records
         try {
-          records = await fetchConversations(creds, device.hardware, 5)
+          records = await fetchConversations(creds, device, 5)
         } catch (err) {
           // 只有**票的事**（status 401）才停整个轮询。`mina-client` 把"上游拒绝"也用同一个
           // XiaomiAuthError 抛，但带的是 status=502（例：实测到的 code=999）—— 那是偶发的一拍，

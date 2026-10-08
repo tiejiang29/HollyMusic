@@ -416,16 +416,20 @@ export interface AskRecord {
  * 动不动基线（参考实现把这两者分得很严：混同了要么把历史当新对话重放，要么把网络抖当成无声）。
  */
 export async function fetchConversations(
-  creds: XiaomiCredentials, hardware: string, limit = 5,
+  creds: XiaomiCredentials, device: { hardware: string; deviceID: string }, limit = 5,
 ): Promise<AskRecord[]> {
-  if (!hardware) throw new XiaomiAuthError('这台设备没有 hardware 型号，拉不了对话记录', 400)
+  if (!device.hardware) throw new XiaomiAuthError('这台设备没有 hardware 型号，拉不了对话记录', 400)
+  if (!device.deviceID) throw new XiaomiAuthError('这台设备没有 deviceID，拉不了对话记录', 400)
   // 重试要复用同一个 timestamp（miot 就是这么做的）：每次重算会让三次的结果对不上
-  const url = `${CONV_URL}?source=dialogu&hardware=${encodeURIComponent(hardware)}&timestamp=${Date.now()}&limit=${limit}`
+  const url = `${CONV_URL}?source=dialogu&hardware=${encodeURIComponent(device.hardware)}&timestamp=${Date.now()}&limit=${limit}`
   await assertPublicHttpUrl(url)
   const res = await fetch(url, {
     headers: {
       'User-Agent': `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${creds.deviceId} APP/xiaomi.smarthome APPV/62830`,
-      Cookie: `userId=${creds.userId}; serviceToken=${creds.serviceToken}; channel=MI_APP_STORE; deviceId=${creds.deviceId}`,
+      // **这里的 deviceId 必须是那台音箱的 deviceID**，不是登录时用的那台设备（creds.deviceId）。
+      // 填错时平台照回 `code=0 / message=Success`，但 `records` 恒为空 —— 静默的 0 条，一点错都不报，
+      // 我们因此把"平台没有对话历史"当了两个小时的事实（2026-10-09 对照实测：换成音箱的 ID 立刻回 7 条）。
+      Cookie: `userId=${creds.userId}; serviceToken=${creds.serviceToken}; channel=MI_APP_STORE; deviceId=${device.deviceID}`,
       Accept: 'application/json',
     },
     redirect: 'manual',
