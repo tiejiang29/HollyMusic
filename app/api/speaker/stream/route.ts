@@ -27,7 +27,7 @@ import { parseIntervalToSeconds } from '@/lib/types/player'
 import { findLibrarySong } from '@/lib/services/music-library'
 import { detectContainer, readHeadBytes, readBytesAt, mimeFromContainer } from '@/lib/server/audio-sniff'
 import { planMp3Seek, alignToFrameStart, NOMINAL_BYTES_PER_SEC, MP3_HEAD_BYTES } from '@/lib/server/mp3-seek'
-import { probeFfmpeg, transcodeToMp3, TranscodeBusyError, type TranscodeResult } from '@/lib/server/audio-transcode'
+import { probeFfmpeg, requestMp3Transcode, type TranscodeState } from '@/lib/server/audio-transcode'
 import { readSpeakerConfig } from '@/lib/services/xiaomi/token-store'
 import type { QualityType } from '@/lib/types/music'
 
@@ -41,35 +41,26 @@ function fail(status: number, code: string, message: string, headers?: Record<st
 }
 
 /**
- * 试一次转码（G1.5）。**失败不当成错误**，返回 null 让调用方走回原来的路（在线取 MP3 档 / 415），
- * 因为"这台没装 ffmpeg"或"管理员关了它"都是正当配置，不该让一次投歌因为转码而整体失败。
+ * 转码这道闸（G1.5）。**绝不在设备面前等 ffmpeg**——真机实测它 5.1 秒拿不到字节就断开、
+ * 0.1 秒后重拉同一地址，所以我们要么立刻给东西，要么给一个明确的"稍后再拉"。
  *
- * 只有一件事例外：转码通道满了（同时在转的已到上限）。这时候**不能悄悄换条路**去在线拉一档——
- * 那条路会把源站打满，而且此刻本机 CPU 已经排了三首在转，再挤一首只会让所有首包一起变慢。
- * 所以这一种是明确 503 + Retry-After，让设备稍后重拉。
+ * - `ready`：产物已经在，直接发（实测 20ms）；
+ * - `started`：刚起了后台一单，这一次先按原来的路走（在线取档），下一次来捡现成的；
+ * - `unavailable`：这条口没开 / 这台没装 ffmpeg —— 也按原来的路走，而且不许把"没装 ffmpeg"
+ *   说成错误，那是正当配置；
+ * - `busy`：同时在转的满了，连后台单都没起。
  */
-async function tryTranscode(
-  sourceFile: string, uid: string, quality: '320k' | '128k', name: string, signal: AbortSignal,
-): Promise<TranscodeResult | null | 'busy'> {
+async function transcodeGate(
+  sourceFile: string, uid: string, quality: '320k' | '128k',
+): Promise<TranscodeState | { state: 'unavailable' }> {
   const config = await readSpeakerConfig().catch(() => null)
-  if (!config?.transcodeEnabled) return null
-  const found = await probeFfmpeg(config.ffmpegPath)
-  if (!found) return null
-  try {
-    const r = await transcodeToMp3({
-      bin: config.ffmpegPath, sourceFile, uid,
-      // 音质档按请求那一档，不按面板那档：拖动/换队列时前端会原样带着它签的令牌
-      quality, normalize: config.transcodeNormalize, capMb: config.transcodeCapMb, signal,
-    })
-    logger.info('[speaker/stream] 转码出口交付', {
-      歌曲: name, 字节: r.size, 复用: r.reused, 响度: config.transcodeNormalize,
-    })
-    return r
-  } catch (err) {
-    if (err instanceof TranscodeBusyError) return 'busy'
-    logger.warn('[speaker/stream] 转码没成，退回原路径:', (err instanceof Error ? err.message : String(err)).slice(0, 160))
-    return null
-  }
+  if (!config?.transcodeEnabled) return { state: 'unavailable' }
+  // 音质档按请求那一档，不按面板那档：拖动/换队列时前端原样带着它签的令牌
+  if (!(await probeFfmpeg(config.ffmpegPath))) return { state: 'unavailable' }
+  return requestMp3Transcode({
+    bin: config.ffmpegPath, sourceFile, uid, quality,
+    normalize: config.transcodeNormalize, capMb: config.transcodeCapMb,
+  })
 }
 
 /**
@@ -182,6 +173,8 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
 
   const rangeHeader = request.headers.get('range')
   const seekSec = readSeekSec(params)
+  /** 走过转码闸的结论，在线那条路也不通时要靠它把"为什么"说准（在转 vs 没装） */
+  let tcState: string = 'none'
 
   // ① 库里有文件且**容器真是 MP3** 才走本地（扩展名不算证据，读头部字节嗅容器）
   const row = await findLibrarySong(musicInfo)
@@ -191,12 +184,15 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     if (container === 'mp3') {
       return serveLocalMp3(row.filePath, row.quality, seekSec, rangeHeader, isHead, musicInfo.name)
     }
-    // ② 库里是 FLAC/wav 之类：先试转码（G1.5），转出来的那份也是本地 MP3，seek 照旧按字节算
-    const tc = await tryTranscode(row.filePath, uid, mp3Quality, musicInfo.name, request.signal)
-    if (tc === 'busy') return fail(503, 'TRANSCODE_BUSY', '同时转码的已排满，稍后再试', { 'retry-after': '5' })
-    if (tc) return serveLocalMp3(tc.filePath, mp3Quality, seekSec, rangeHeader, isHead, musicInfo.name)
+    // ② 库里是 FLAC/wav 之类：问转码那道闸要一份现成的 MP3（G1.5）
+    const tc = await transcodeGate(row.filePath, uid, mp3Quality)
+    tcState = tc.state
+    if (tc.state === 'ready') {
+      logger.info('[speaker/stream] 转码出口交付', { 歌曲: musicInfo.name, 字节: tc.size, 复用: true })
+      return serveLocalMp3(tc.filePath, mp3Quality, seekSec, rangeHeader, isHead, musicInfo.name)
+    }
     logger.info('[speaker/stream] 库内文件不是 MP3，改走在线取 MP3 档', {
-      歌曲: `${musicInfo.name}`, 库内: row.quality, 嗅到: container ?? '未知',
+      歌曲: `${musicInfo.name}`, 库内: row.quality, 嗅到: container ?? '未知', 转码: tc.state,
     })
   }
 
@@ -227,12 +223,16 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     // 缓存那份已经在磁盘上，转一次码就变成能投的 MP3；转不了才明确报错
     const served = res.headers.get('content-type') ?? ''
     if (res.ok && !served.includes('audio/mpeg')) {
-      const cached = resolvePaths(cacheKey, served || null).filePath
-      const tc = await tryTranscode(cached, uid, mp3Quality, musicInfo.name, request.signal)
-      if (tc === 'busy') return fail(503, 'TRANSCODE_BUSY', '同时转码的已排满，稍后再试', { 'retry-after': '5' })
-      if (tc) {
-        // 转好的这份才是给音箱的那份：seek/Range 都按它重新算
+      // 源把 flac 标成 320k 是发生过的（扩展名撒谎那一类）；那份缓存已在盘上，转一次就变成能投的
+      const tc = await transcodeGate(resolvePaths(cacheKey, served || null).filePath, uid, mp3Quality)
+      tcState = tc.state
+      if (tc.state === 'ready') {
         return serveLocalMp3(tc.filePath, mp3Quality, seekSec, rangeHeader, isHead, musicInfo.name)
+      }
+      if (tc.state === 'started' || tc.state === 'busy') {
+        // 已经起了 / 排满了：这一份不能发（音箱放不了），但也别报"没 MP3"那种死错——
+        // 转完就有，让设备几秒后重拉一次就捡到现成的
+        return fail(503, 'TRANSCODE_PENDING', '正在转这一首，稍等几秒再拉一次', { 'retry-after': '4' })
       }
       return fail(415, 'NOT_MP3', `这一档拿回来的不是 MP3（${served || '未知类型'}），音箱放不了`)
     }
@@ -240,6 +240,10 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
   } catch (err) {
     const message = err instanceof Error ? err.message : '音箱流出口失败'
     logger.warn('[speaker/stream] 失败:', message.slice(0, 160))
+    // 只有"我们手上正转着这一首"才值得让设备重拉；否则就是原样的取不到
+    if (message.includes('无法获取播放链接') && tcState === 'started') {
+      return fail(503, 'TRANSCODE_PENDING', '正在转这一首（库里那份不是 MP3，也没在线档），稍等几秒再拉', { 'retry-after': '4' })
+    }
     return fail(502, 'UPSTREAM_FAILED', message.includes('无法获取播放链接') ? '各音源都没给出这一档的可播地址' : message)
   }
 }

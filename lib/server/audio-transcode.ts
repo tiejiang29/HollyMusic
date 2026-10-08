@@ -5,7 +5,7 @@
  * 这条对平台歌曲好使，但对**没有在线源的文件**（本地导入的 `loc-`、平台只剩更高档的）就没退路，
  * 音箱就播不了。转码是唯一的兜底。
  *
- * 三个决定都跟"产物要能复用"有关：
+ * 四个决定都跟"产物要能复用"有关：
  *
  * 1. **产物落进 `audioServe` 那套缓存**（同一个根目录、同一份 `AudioCache` 表）：
  *    配额、LRU、孤儿扫描都认它，不再造第二套缓存概念。缓存键带 `tc:` 前缀，与在线下载的
@@ -15,11 +15,16 @@
  * 3. **不放 ID3/封面**（`-vn` 丢掉封面流，mp3 muxer 默认也不写 ID3v2）：参考实现里那个
  *    `remove_id3tag` 开关防的就是"大封面标签音箱读不了"，而字节偏移起播还要正确跳过标签块。
  *    给音箱那份不需要标签，就不写。
+ * 4. **不在设备面前阻塞，也不因为它挂断就杀进程**。这条是被真机教的（2026-10-08）：
+ *    设备**约 5.1 秒**没拿到字节就断开、隔 0.1 秒重拉同一地址。我们"转完才发"的那版
+ *    把挂断当成取消去 kill ffmpeg ⇒ 每次都在差一点点时白干，日志里连排七条
+ *    `转码没成，退回原路径: 请求已断开`，那首歌永远转不出来。现在的形状是：
+ *    命中就直接发产物（实测 20ms）；没命中就**后台起一单**、这次立刻走原来的在线取档；
+ *    两头都不行才回 503 + Retry-After，让设备几秒后回来捡现成的。
  *
  * 转码是**有损再编码**：FLAC → 320k MP3 会丢信息，不许当无损宣传（面板上就是这么写的）。
  *
- * 并发上限是硬闸：一次 ffmpeg 会吃满一个核，而这条口是"音箱一边等一边拉"的，
- * 不设上限等于让三四个人的拖动把服务器 CPU 打满、所有人的首包一起变慢。
+ * 并发上限是硬闸：一次 ffmpeg 会吃满一个核，不设上限等于让三四个人的拖动把服务器 CPU 打满。
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import path from 'path'
@@ -28,14 +33,11 @@ import { logger } from '@/lib/logger'
 import { prisma } from '@/lib/db'
 import { resolvePaths, getAudioServeConfig } from '@/lib/audio-serve'
 
-/** 同时在转几首；超了直接 503，不排队（音箱等不了一个队） */
+/** 同时在转几首；超了这一单不起（让设备先走在线，或稍后重拉） */
 export const MAX_TRANSCODE = 3
 /** 单首要转多久——超过就杀掉（NAS 实测 47~51× 实时，3 分钟的歌 4 秒就够，这里是极端保护） */
 export const TRANSCODE_TIMEOUT_MS = 180_000
 
-export class TranscodeBusyError extends Error {
-  constructor() { super('转码通道已满，稍后再试'); this.name = 'TranscodeBusyError' }
-}
 export class TranscodeFailedError extends Error {
   constructor(message: string) { super(message); this.name = 'TranscodeFailedError' }
 }
@@ -64,7 +66,8 @@ export function ffmpegArgs(input: string, output: string, quality: '320k' | '128
 }
 
 let running = 0
-const inflight = new Map<string, Promise<TranscodeResult>>()
+/** 进行中的后台单：同一首并发只起一个进程 */
+const jobs = new Map<string, Promise<void>>()
 /** 探到一次就记住（含"探到没有"），别每个请求都 spawn 一遍 */
 const probeCache = new Map<string, string | null>()
 
@@ -75,6 +78,16 @@ export interface TranscodeResult {
   /** 命中已有缓存（没花 CPU） */
   reused: boolean
 }
+
+/**
+ * `ready` = 产物已经在了，直接发；
+ * `started` = 刚起了后台一单（这次别等它，走你原来那条路），稍后再问就变 ready；
+ * `busy` = 同时在转的满了，这一单没起。
+ */
+export type TranscodeState =
+  | { state: 'ready'; filePath: string; size: number }
+  | { state: 'started' }
+  | { state: 'busy' }
 
 /**
  * 探一次 ffmpeg 是否可用。返回版本首行（截断）或 null。
@@ -108,7 +121,12 @@ export async function probeFfmpeg(bin: string): Promise<string | null> {
 export function _resetTranscodeProbeForTest(): void {
   probeCache.clear()
   running = 0
-  inflight.clear()
+  jobs.clear()
+}
+
+/** 等后台那几单都落地（探针和测试用；业务路径不许等） */
+export async function waitForTranscodeJobs(): Promise<void> {
+  while (jobs.size > 0) await Promise.allSettled([...jobs.values()])
 }
 
 /**
@@ -120,13 +138,12 @@ export function resetFfmpegProbe(bin?: string): void {
   else probeCache.delete(bin.trim())
 }
 
-/** 已经在转同一首了 ⇒ 跟着等那一次，不重复起进程 */
-function joinInflight(key: string, make: () => Promise<TranscodeResult>): Promise<TranscodeResult> {
-  const existing = inflight.get(key)
-  if (existing) return existing
-  const p = make().finally(() => inflight.delete(key))
-  inflight.set(key, p)
-  return p
+/** 只看现成的产物、不起新单（调用方"先问一次再决定这次走哪条路"时用） */
+export async function findMp3Transcode(
+  uid: string, quality: '320k' | '128k', normalize: boolean,
+): Promise<{ filePath: string; size: number } | null> {
+  const hit = await lookupCached(transcodeCacheKey(uid, quality, normalize))
+  return hit ? { filePath: hit.filePath, size: hit.size } : null
 }
 
 /** 查缓存：DB 有行、磁盘也在 ⇒ 直接给 */
@@ -170,58 +187,56 @@ async function enforceCap(capMb: number): Promise<void> {
   }
 }
 
-/** 起一次 ffmpeg，转整曲；产物先落 `.part`，成功了才改名（半途而废的不留尸体） */
-async function runFfmpeg(
+/**
+ * 起一次 ffmpeg。**只有超时这一种情况杀进程**——客户端挂断不杀（见文件头第 4 条：
+ * 设备 5.1 秒就不等了，杀掉等于每次都白干、那首歌永远转不出来）。
+ * 产物先落 `.part`，成功了才改名，半途而废的不留尸体。
+ */
+function runFfmpeg(
   bin: string, sourceFile: string, destPath: string,
-  quality: '320k' | '128k', normalize: boolean, signal?: AbortSignal,
+  quality: '320k' | '128k', normalize: boolean,
 ): Promise<number> {
-  if (running >= MAX_TRANSCODE) throw new TranscodeBusyError()
-  running++
   const partPath = `${destPath}.part`
-  try {
-    return await new Promise<number>((resolve, reject) => {
-      const child = spawn(bin, ffmpegArgs(sourceFile, partPath, quality, normalize), { windowsHide: true })
-      let errTail = ''
-      let settled = false
-      const killTimer = setTimeout(() => {
-        // 超时/被中断必须**杀掉进程**：僵尸 ffmpeg 是唯一真事故路径（它还在吃 CPU，而我们已经不再等它）
-        try { child.kill() } catch {}
-        fail(new TranscodeFailedError('转码超时，已终止'))
-      }, TRANSCODE_TIMEOUT_MS)
-      const fail = (e: Error) => {
-        if (settled) return
-        settled = true
-        clearTimeout(killTimer)
-        signal?.removeEventListener('abort', onAbort)
-        fsp.unlink(partPath).catch(() => {})
-        reject(e)
-      }
-      const ok = () => {
-        if (settled) return
-        settled = true
-        clearTimeout(killTimer)
-        signal?.removeEventListener('abort', onAbort)
-        fsp.stat(partPath).then(s => resolve(s.size)).catch(() => fail(new TranscodeFailedError('转码产物不见了')))
-      }
-      // 音箱挂断（切歌/暂停/超时）时这条转码就没意义了，杀进程比留着跑完更省
-      const onAbort = () => { try { child.kill() } catch {} fail(new TranscodeFailedError('请求已断开，转码被取消')) }
-      if (signal) {
-        if (signal.aborted) { onAbort(); return }
-        signal.addEventListener('abort', onAbort, { once: true })
-      }
-      child.stderr.on('data', d => { errTail = (errTail + String(d)).slice(-400) })
-      child.on('error', () => fail(new TranscodeFailedError('起不了 ffmpeg（检查面板上的路径装没装）')))
-      child.on('close', code => {
-        if (code === 0) return ok()
-        fail(new TranscodeFailedError(`ffmpeg 退出码 ${code}：${errTail.trim().slice(0, 120) || '没有输出'}`))
-      })
+  return new Promise<number>((resolve, reject) => {
+    let child: ChildProcessWithoutNullStreams
+    try {
+      child = spawn(bin, ffmpegArgs(sourceFile, partPath, quality, normalize), { windowsHide: true })
+    } catch {
+      return reject(new TranscodeFailedError('起不了 ffmpeg（检查面板上的路径装没装）'))
+    }
+    let errTail = ''
+    let settled = false
+    const fail = (e: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(killTimer)
+      fsp.unlink(partPath).catch(() => {})
+      reject(e)
+    }
+    const ok = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(killTimer)
+      fsp.stat(partPath).then(r => resolve(r.size)).catch(() => reject(new TranscodeFailedError('转码产物不见了')))
+    }
+    const killTimer = setTimeout(() => {
+      try { child.kill() } catch {}
+      fail(new TranscodeFailedError('转码超时，已终止'))
+    }, TRANSCODE_TIMEOUT_MS)
+    child.stderr.on('data', d => { errTail = (errTail + String(d)).slice(-400) })
+    child.on('error', () => fail(new TranscodeFailedError('起不了 ffmpeg（检查面板上的路径装没装）')))
+    child.on('close', code => {
+      if (code === 0) return ok()
+      fail(new TranscodeFailedError(`ffmpeg 退出码 ${code}：${errTail.trim().slice(0, 120) || '没有输出'}`))
     })
-  } finally {
-    running--
-  }
+  })
 }
 
-export async function transcodeToMp3(input: {
+/**
+ * 要一份这首歌的 MP3：**有就给，没有就起一单后台的并说"起了"**。
+ * 这条函数永远不等 ffmpeg —— 设备只等得起 5 秒左右，而产物是给下一次用的。
+ */
+export async function requestMp3Transcode(input: {
   bin: string
   /** 源：本地文件的绝对路径（FLAC/wav/…都行，ffmpeg 认就行） */
   sourceFile: string
@@ -229,28 +244,33 @@ export async function transcodeToMp3(input: {
   quality: '320k' | '128k'
   normalize: boolean
   capMb: number
-  signal?: AbortSignal
-}): Promise<TranscodeResult> {
+}): Promise<TranscodeState> {
   const cacheKey = transcodeCacheKey(input.uid, input.quality, input.normalize)
   const hit = await lookupCached(cacheKey)
-  if (hit) return hit
-
-  await enforceCap(input.capMb)
-  const paths = resolvePaths(cacheKey, 'audio/mpeg')
-
-  return joinInflight(cacheKey, async () => {
-    // 排队/并发期间可能已经有人转完了 ⇒ 再看一眼缓存
-    const again = await lookupCached(cacheKey)
-    if (again) return again
-    await fsp.mkdir(paths.shardDir, { recursive: true })
-    const size = await runFfmpeg(input.bin, input.sourceFile, paths.filePath, input.quality, input.normalize, input.signal)
-    await fsp.rename(`${paths.filePath}.part`, paths.filePath)
-    await prisma.audioCache.upsert({
-      where: { cacheKey },
-      create: { cacheKey, filePath: paths.relativeFilePath, size, contentType: 'audio/mpeg' },
-      update: { filePath: paths.relativeFilePath, size, contentType: 'audio/mpeg', lastAccessAt: new Date() },
-    })
-    logger.info('[transcode] 已转码入库', { 键: cacheKey, 字节: size, 响度: input.normalize })
-    return { filePath: paths.filePath, size, reused: false }
-  })
+  if (hit) return { state: 'ready', filePath: hit.filePath, size: hit.size }
+  // 判满与占名额之间不许有 await：早先名额是在 job 内部才 ++ 的，而那之前还有两个 await，
+  // 十个并发请求会全部通过判据 ⇒ 真起十个 ffmpeg 把机器吃干
+  if (jobs.has(cacheKey)) return { state: 'started' }
+  if (running >= MAX_TRANSCODE) return { state: 'busy' }
+  running++
+  {
+    const paths = resolvePaths(cacheKey, 'audio/mpeg')
+    const job = (async () => {
+      await enforceCap(input.capMb)
+      await fsp.mkdir(paths.shardDir, { recursive: true })
+      const size = await runFfmpeg(input.bin, input.sourceFile, paths.filePath, input.quality, input.normalize)
+      await fsp.rename(`${paths.filePath}.part`, paths.filePath)
+      await prisma.audioCache.upsert({
+        where: { cacheKey },
+        create: { cacheKey, filePath: paths.relativeFilePath, size, contentType: 'audio/mpeg' },
+        update: { filePath: paths.relativeFilePath, size, contentType: 'audio/mpeg', lastAccessAt: new Date() },
+      })
+      logger.info('[transcode] 已转码入库', { 键: cacheKey, 字节: size, 响度: input.normalize })
+    })().catch(err => {
+      // 失败只记账：这一单没成，下次有人要同一首会重新起一单（不会留个永久坏产物）
+      logger.warn('[transcode] 后台转码失败:', (err instanceof Error ? err.message : String(err)).slice(0, 160))
+    }).finally(() => { jobs.delete(cacheKey); running-- })
+    jobs.set(cacheKey, job)
+  }
+  return { state: 'started' }
 }
