@@ -384,7 +384,7 @@ UA 不必冒充客户端（实测我们那串老 UA 同样出 20 条）。tx 的
 
 | 方法 | 路径 | 说明 | 鉴权 |
 |---|---|---|---|
-| GET | `/api/search?source=&keyword=&page=&limit=` | 音乐搜索；`source=all` 五源并发汇聚，结果去重入库并附 uid | user |
+| GET | `/api/search?source=&keyword=&page=&limit=` | 音乐搜索；`source=all` 五源并发汇聚，结果去重入库并附 uid。失败口径分两半：**上游把某个平台拒了 ⇒ 502 `SEARCH_FAILED`**（`source=all` 部分源失败仍是 200，另带 `failedSources`），**我们这边的基础故障（入库/参数/程序错）⇒ 500** | user |
 | GET | `/api/search/suggest?keyword=` | 搜索联想（网易 + 本地库 + TX 专辑三路并行，1.2s 截断） | user |
 | GET | `/api/search-sources` | 当前启用的搜索平台列表 | user |
 | GET | `/api/discover/playlists` | 歌单广场（分页/标签/排序/关键词） | user |

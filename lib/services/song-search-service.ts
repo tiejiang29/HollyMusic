@@ -15,6 +15,20 @@ const SEARCH_CACHE_TTL = 210 * 60 * 1000
 
 export interface SingleSourceSearchResult extends Omit<SearchResult, 'list'> { list: Song[] }
 
+/**
+ * 上游把这一台拒了（被风控、要签名、接口换了……），**不是我们这边的程序错误**。
+ *
+ * 为什么要单独一个类：路由原来把所有异常一律兜成 500 INTERNAL_ERROR，于是"QQ 搜索被拒"
+ * 和"数据库挂了"在前端长成同一个样子，而 `source=all` 那条分支同样一件事给的却是
+ * 502 + `failedSources`。有了这个类型，两条分支就能按"上游的错"和"我们的错"分开口径。
+ */
+export class SearchUpstreamError extends Error {
+  constructor(readonly source: SourceType, readonly upstreamMessage: string) {
+    super(`${source} 平台搜索失败: ${upstreamMessage}`)
+    this.name = 'SearchUpstreamError'
+  }
+}
+
 export async function searchOneSource(source: SourceType, keyword: string, page: number, limit: number): Promise<SingleSourceSearchResult> {
   const cacheKey = `search:${source}:${keyword}:${page}:${limit}`
   const cached = searchCache.get(cacheKey) as (SearchResult & { list: Song[] }) | null
@@ -23,7 +37,13 @@ export async function searchOneSource(source: SourceType, keyword: string, page:
     return cached
   }
 
-  const result: SearchResult = await musicSearch.search(source, keyword, page, limit)
+  let result: SearchResult
+  try {
+    result = await musicSearch.search(source, keyword, page, limit)
+  } catch (error) {
+    // 只包上游那一下；下面的入库失败仍然算基础设施错误（出 500 才对）
+    throw new SearchUpstreamError(source, error instanceof Error ? error.message : String(error))
+  }
 
   // 整页搜索结果在同一事务内顺序写入，避免 SQLite 多写入并发争抢写锁。
   // 入库失败时不返回或缓存无法被播放、歌词等接口查询到的 uid。

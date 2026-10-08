@@ -58,4 +58,17 @@ describe('GET /api/search', () => {
     expect((await response.json()).error.code).toBe('INTERNAL_ERROR')
     expect(set).not.toHaveBeenCalled()
   })
+
+  it('上游把这一台拒了 ⇒ 502 SEARCH_FAILED 并把平台与原话带出来（不许长成"程序错误"）', async () => {
+    search.mockRejectedValueOnce(new Error('搜索失败: 上游 code=2001（已重试 3 次）'))
+
+    const response = await GET(makeRequest())
+    const body = await response.json()
+
+    expect(response.status).toBe(502)
+    expect(body.error.code).toBe('SEARCH_FAILED')
+    expect(body.error.message).toContain('kw')
+    expect(body.error.message).toContain('code=2001')
+    expect(set).not.toHaveBeenCalled()
+  })
 })

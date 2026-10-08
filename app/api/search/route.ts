@@ -14,7 +14,7 @@ import { readIntParam } from '@/lib/server/params'
 import { getMusicInfo, prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { requireUser, AuthError } from '@/lib/services/user-context'
-import { searchOneSource } from '@/lib/services/song-search-service'
+import { searchOneSource, SearchUpstreamError } from '@/lib/services/song-search-service'
 import { searchArtistCardsChain } from '@/lib/services/source-chain'
 import { searchAlbums } from '@/lib/services/album-service'
 import { dedupeByIdentity } from '@/lib/song-identity'
@@ -181,10 +181,15 @@ export async function GET(request: NextRequest) {
     if (error instanceof AuthError) {
       return createErrorResponse('UNAUTHORIZED', error.message, 401)
     }
+    // 上游拒了这一个平台不是我们这边的程序错误：口径与 `source=all` 那条"全部失败"一致，
+    // 都出 502 + SEARCH_FAILED，别让前端把"这平台暂时搜不到"读成"站坏了"
+    if (error instanceof SearchUpstreamError) {
+      logger.warn(`[search] ${error.source} 上游拒绝:`, error.upstreamMessage)
+      return createErrorResponse(ErrorCodes.SEARCH_FAILED, error.message, 502)
+    }
     logger.error('搜索失败:', error)
-    // 兜底：catch 触发即"预期外的程序错误"（DB/缓存/入参等基础设施问题）→ INTERNAL_ERROR。
-    // 真正的"所有源都失败"应在 allSettled 路径上显式 throw 一个语义化错误类，再在此分支路由到 SEARCH_FAILED；
-    // 当前业务代码没有 throw SEARCH_FAILED 的地方，本兜底即按程序错误归类。
+    // 兜底：走到这里即"预期外的程序错误"（DB/缓存/入参等基础设施问题）→ INTERNAL_ERROR。
+    // 上游的错已经在上面按 SearchUpstreamError 分流走了，不许再往这里掉。
     return createErrorResponse(
       ErrorCodes.INTERNAL_ERROR,
       error instanceof Error ? error.message : '搜索失败',
