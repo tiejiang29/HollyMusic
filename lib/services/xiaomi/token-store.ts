@@ -104,13 +104,21 @@ export const CONVERSATION_POLL_SEC_MAX = 30
 /** 相似度门槛合法区间：低于 0.2 什么都能配上，高于 0.95 基本永远配不上 */
 export const FUZZY_CUTOFF_MIN = 0.2
 export const FUZZY_CUTOFF_MAX = 0.95
+/**
+ * 默认门槛。2026-10-09 用 16 条真实形状的口令在判据上扫出来的分布：
+ * 对的那些（含"播放周杰伦的七里香""我想听一下告白气球"）**全是 100%**（相等或包含命中），
+ * 该拒的最高只有 67%（打错字的"喜欢您"→《喜欢你》），垃圾那批是 0/25/31/43/60%。
+ * 0.6 会放过"稻香这首歌"→《青春这首歌》这种**共用尾缀**的错配；0.75 与 0.85 在这批上
+ * 结果完全一样，所以取一个中间偏宽的 0.75。
+ */
+export const FUZZY_CUTOFF_DEFAULT = 0.75
 /** 音量步长合法区间（一次"大声点"调几档） */
 export const VOLUME_STEP_MIN = 1
 export const VOLUME_STEP_MAX = 50
 
 export function clampCutoff(raw: unknown): number {
   const n = Number(raw)
-  if (!Number.isFinite(n)) return 0.6
+  if (!Number.isFinite(n)) return FUZZY_CUTOFF_DEFAULT
   return Math.min(FUZZY_CUTOFF_MAX, Math.max(FUZZY_CUTOFF_MIN, n))
 }
 
@@ -134,7 +142,7 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   failedAnswerHints: DEFAULT_FAILED_ANSWER_HINTS,
   takeoverEnabled: false,
   takeoverWithoutEvidence: false,
-  fuzzyMatchCutoff: 0.6,
+  fuzzyMatchCutoff: FUZZY_CUTOFF_DEFAULT,
   takeoverSources: ['tx'],
   controlRules: DEFAULT_CONTROL_RULES,
   volumeStep: 10,

@@ -322,7 +322,7 @@ describe('接管那些新键：老库里缺键必须补默认，不能把 undefi
   it('一条配置都没存过时读到的是默认值（接管关着、门槛与步长都在合法区间）', async () => {
     const c = await readSpeakerConfig()
     expect(c).toMatchObject({
-      takeoverEnabled: false, takeoverWithoutEvidence: false, fuzzyMatchCutoff: 0.6,
+      takeoverEnabled: false, takeoverWithoutEvidence: false, fuzzyMatchCutoff: 0.75,
       takeoverSources: ['tx'], volumeStep: 10,
     })
     expect(c.controlRules.length).toBe(DEFAULT_CONTROL_RULES.length)

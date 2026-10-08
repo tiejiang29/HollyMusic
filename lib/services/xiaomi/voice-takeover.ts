@@ -46,6 +46,8 @@ export interface TakeoverDecision {
 
 /** 口令最多老几秒还接（超过就当没听见：轮询卡了一下回来的旧话不该打断现在正在放的歌） */
 export const STALE_ASK_SEC = 90
+/** "互相包含"的长度窗口：口令整句里嵌着两个字的词也算包含，会把闲聊配成抢播（实测过） */
+export const CONTAINS_WINDOW_CHARS = 4
 
 /**
  * 判"小爱这句答砸了没"。
@@ -125,10 +127,15 @@ async function pickCandidate(query: string, config: SpeakerConfig): Promise<Cand
       const name = similarity(query, s.name ?? '')
       const bySinger = s.singer ? similarity(query, s.singer) * 0.2 : 0
       // 互相包含就算同一首：口令是"放稻香"而曲名是"稻香"时，编辑距离会被那两个字拖到阈值以下；
-      // 但只认长度 ≥2 的那一方（单字互相包含纯属巧合，会把"今天几号"配上任意一首带"天"的歌）
+      // 但只认长度 ≥2 的那一方（单字互相包含纯属巧合，会把"今天几号"配上任意一首带"天"的歌）。
+      // **还要卡一个长度窗口**：口令是一整句话，句子里随便嵌着两个字的词就"互相包含"了 ——
+      // 实测过「播放 一首绝对不存在的歌名QQZXTY」配上真歌名《不存在的》打出 100%（那是抢播，不是点歌）。
+      // 窗口取 +4 字：够放"稻香这首歌"这类说法，又拦得住整句闲聊。
       const qn = normalizeUtterance(query)
       const nn = normalizeUtterance(s.name ?? '')
-      const contains = qn.length >= 2 && nn.length >= 2 && (nn.includes(qn) || qn.includes(nn))
+      const longer = Math.max(qn.length, nn.length)
+      const shorter = Math.min(qn.length, nn.length)
+      const contains = shorter >= 2 && (nn.includes(qn) || qn.includes(nn)) && longer <= shorter + CONTAINS_WINDOW_CHARS
       const score = contains ? 1 : Math.max(name, name * 0.7 + bySinger)
       if (!best || score > best.score) {
         best = {

@@ -145,6 +145,18 @@ describe('判据矩阵', () => {
     expect(d).toMatchObject({ verdict: 'takeover', uid: 'tx-S1', name: '稻香' })
   })
 
+  it('窗口内的说法照旧认：「稻香这首歌」还是配上《稻香》', async () => {
+    h.searchOneSource.mockResolvedValue({ list: [{ name: '稻香', singer: '周杰伦', uid: 'tx-S1', interval: '223' }] })
+    const d = await decideTakeover(row({ query: '播放稻香这首歌', answer: '没有找到' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'tx-S1' })
+  })
+
+  it('整句里嵌着两个真歌名不许当点歌（这是模拟口令实测打出来的）', async () => {
+    h.searchOneSource.mockResolvedValue({ list: [{ name: '不存在的', singer: '某歌手', uid: 'tx-Y', interval: '200' }] })
+    const d = await decideTakeover(row({ query: '播放 一首绝对不存在的歌名QQZXTY', answer: '没有找到相关的歌曲' }), config())
+    expect(d.verdict).toBe('no-hit')
+  })
+
   it('一台源搜索挂了不算"没搜到"：换下一台，同时留下警告', async () => {
     h.readSpeakerConfig.mockResolvedValue(config({ takeoverSources: ['tx', 'kg'] }))
     h.searchOneSource
