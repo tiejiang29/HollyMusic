@@ -17,6 +17,7 @@ import {
   setSpeakerHost, setSpeakerQuality, controlSpeakerFromAdmin, setSpeakerVolumeFromAdmin, readSpeakerStatusFromAdmin,
   type QrStartResult, type SpeakerView, type SpeakerStreamStatus,
 } from '@/lib/api/admin-speaker'
+import { volumeSendDelayMs } from '@/lib/cast-queue'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Speaker, QrCode, RefreshCw, LogOut, Loader2, TriangleAlert } from 'lucide-react'
@@ -47,23 +48,8 @@ export const STATUS_LABEL: Record<number, string> = {
   2: '已暂停',
 }
 
-/**
- * 拖动音量条时的最小发送间隔（毫秒）。
- * 音量指令走小米云端一次 HTTP + 一次 ubus，一次拖动会产生几十个中间值；
- * 全发既慢又容易撞上小米的限流（70022），所以按间隔发、松手那下必发。
- */
-export const VOLUME_SEND_INTERVAL_MS = 250
-
 /** 读不到当前音量时，音量条的起始档 */
 const DEFAULT_VOLUME = 50
-
-/** 距上次发出还要等多久（null = 现在就发）。导出给测试：节流口径只在这一处算。 */
-export function volumeSendDelayMs(
-  now: number, lastSentAt: number, interval: number = VOLUME_SEND_INTERVAL_MS,
-): number | null {
-  const left = interval - (now - lastSentAt)
-  return left > 0 ? left : null
-}
 
 /**
  * 点开「音量」后弹出的竖向滚动条：拖动即调整，不需要再点提交。
@@ -74,9 +60,9 @@ export function volumeSendDelayMs(
 function VolumeSlider({ initial, onSend }: { initial: number; onSend: (v: number) => Promise<void> }) {
   const [value, setValue] = useState(initial)
   const [sending, setSending] = useState(false)
-  /** 每次渲染换一份回调也没关系：真正的发送走最新那份 */
+  /** 发送走最新那份回调；ref 的赋值放 effect 里（渲染期写 ref 会被 React 的规则拦掉） */
   const sendRef = useRef(onSend)
-  sendRef.current = onSend
+  useEffect(() => { sendRef.current = onSend })
   const lastSentAt = useRef(-Infinity)
   const timer = useRef<number | null>(null)
   /** 最后一次已经发出去的值：松手时只有它和当前值不一致才补发，避免同一值发两遍 */

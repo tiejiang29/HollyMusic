@@ -104,9 +104,12 @@ export function pickDevice(devices: SpeakerDevice[], deviceID?: string): Speaker
 }
 
 /** 现签一条给音箱的流地址：`st` 在第一个参数位（部分固件会把 URL 里的 & 换成空格） */
-export function buildStreamUrl(base: string, uid: string, quality: SpeakerPlayQuality): string {
+export function buildStreamUrl(base: string, uid: string, quality: SpeakerPlayQuality, seekSec = 0): string {
   const token = createShareAudioToken(uid, quality, SPEAKER_STREAM_TTL_SEC)
-  return `${base}/api/speaker/stream?st=${token}&uid=${encodeURIComponent(uid)}&quality=${quality}`
+  // seek 只在真要改位置时追加，且始终排在最后：这条地址的含义是"从第几秒开始发"，
+  // 而 st 必须留在第一位（固件改写分隔符后只有第一位救得回来）
+  const seek = seekSec > 0 ? `&seek=${Math.round(seekSec * 10) / 10}` : ''
+  return `${base}/api/speaker/stream?st=${token}&uid=${encodeURIComponent(uid)}&quality=${quality}${seek}`
 }
 
 /** 只用于日志：保留结构与长度，抹掉令牌 */

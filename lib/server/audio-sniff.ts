@@ -222,6 +222,24 @@ export function detectContainer(head: Uint8Array): string | null {
 }
 
 /** 识别「明确非音频」的二进制格式；未识别返回 null */
+/** 从文件的指定位置读一段字节（MP3 seek 要在新起点附近找帧首）；读不到返回 null */
+export async function readBytesAt(
+  filePath: string, position: number, bytes: number
+): Promise<Uint8Array | null> {
+  if (position < 0) return null
+  let handle: fsp.FileHandle | null = null
+  try {
+    handle = await fsp.open(filePath, 'r')
+    const buf = Buffer.alloc(bytes)
+    const { bytesRead } = await handle.read(buf, 0, bytes, position)
+    return bytesRead > 0 ? buf.subarray(0, bytesRead) : null
+  } catch {
+    return null
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
 export function detectRejectBinary(head: Uint8Array): string | null {
   for (const t of REJECT_BINARY_TESTS) {
     if (t.test(head)) return t.name

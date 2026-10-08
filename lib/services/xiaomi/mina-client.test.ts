@@ -20,7 +20,7 @@ vi.mock('@/lib/server/url-guard', () => ({
 
 const {
   fetchDevices, isAuthFailure, XiaomiAuthError,
-  playUrl, playerOperation, setVolume, getPlayStatus, usePlayMusicApi, _resetUbusQueuesForTest,
+  playUrl, playItems, playerOperation, setVolume, getPlayStatus, usePlayMusicApi, _resetUbusQueuesForTest,
 } = await import('@/lib/services/xiaomi/mina-client')
 const creds = {
   serviceToken: 'ST_t%2BzVg%3D%3D',
@@ -208,6 +208,17 @@ describe('ubus 播控（G1）', () => {
     })
   })
 
+  it('audio_id 设备原样回显：它就是投放会话"播到窗里第几项"的游标', async () => {
+    // 真机原文（2026-10-08 批量推实测）：audio_id 只在 play_song_detail 里，且就是我们填进去的那串
+    ubusReply([{ code: 0, data: { info: JSON.stringify({
+      status: 1, volume: 30, loop_type: 1, media_type: 3,
+      play_song_detail: { audio_id: '17913857242411', position: 177684, duration: 248869 },
+    }) } }])
+    const st = await getPlayStatus(creds, '1')
+    expect(st.audioId).toBe('17913857242411')
+    expect(st.position).toBe(177684)
+  })
+
   it('不在名单里的型号走 player_play_url（别把不认 Music API 的机器推哑）', async () => {
     ubusReply([{ code: 0, data: { code: 0 } }])
     await playUrl(creds, '1', 'http://h/x.mp3', 'S03')
@@ -234,6 +245,43 @@ describe('ubus 播控（G1）', () => {
     expect(await playUrl(creds, '1', 'http://h/x.mp3', 'L05B')).toBe(true)
     expect(form(0).method).toBe('player_play_music')
     expect(form(1).method).toBe('player_play_url')
+  })
+
+  it('playItems 一次推多项：audio_items 按顺序、episode_index 递增、startaudioid 取第一项', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    const r = await playItems(creds, '1', [
+      { url: 'http://h/a.mp3', audioId: '111' },
+      { url: 'http://h/b.mp3', audioId: '222' },
+      { url: 'http://h/c.mp3', audioId: '333' },
+    ], 'L05B')
+    expect(r).toEqual({ accepted: true, batched: true })
+    expect(form().method).toBe('player_play_music')
+    const message = JSON.parse(form().message) as Record<string, unknown>
+    expect(message.startaudioid).toBe('111')
+    const music = JSON.parse(message.music as string) as Record<string, unknown>
+    const items = (music.payload as Record<string, unknown>).audio_items as Array<Record<string, unknown>>
+    expect(items.map(x => [
+      (x.stream as Record<string, unknown>).url,
+      (x.item_id as Record<string, unknown>).audio_id,
+      ((x.item_id as Record<string, unknown>).cp as Record<string, unknown>).episode_index,
+    ])).toEqual([['http://h/a.mp3', '111', 0], ['http://h/b.mp3', '222', 1], ['http://h/c.mp3', '333', 2]])
+  })
+
+  it('批量退化到 play_url 时只装得下第一项 ⇒ batched=false，看门狗据此逐首补', async () => {
+    ubusReply([{ code: 0, data: { code: 400 } }, { code: 0, data: { code: 0 } }])
+    const r = await playItems(creds, '1', [
+      { url: 'http://h/a.mp3', audioId: '1' },
+      { url: 'http://h/b.mp3', audioId: '2' },
+    ], 'L05B')
+    expect(r).toEqual({ accepted: true, batched: false })
+    expect(form(1).method).toBe('player_play_url')
+    expect(JSON.parse(form(1).message)).toMatchObject({ url: 'http://h/a.mp3' })
+  })
+
+  it('空列表不碰小米（会话清空时不许发一条没内容的推歌）', async () => {
+    ubusReply([{ code: 0, data: { code: 0 } }])
+    expect(await playItems(creds, '1', [], 'L05B')).toEqual({ accepted: false, batched: false })
+    expect(requests).toHaveLength(0)
   })
 
   it('云端非 0 code 抛出去（是"没受理"，不是"没在放"），401 类仍归票失效', async () => {
@@ -284,14 +332,14 @@ describe('ubus 播控（G1）', () => {
 
   it('状态回读：info 是字符串 JSON，时长可能在 play_song_detail 里；读不到一律 -1 不猜', async () => {
     ubusReply([{ code: 0, data: { info: JSON.stringify({ status: 1, position: 12345, duration: 240000, volume: 30, title: '稻香' }) } }])
-    expect(await getPlayStatus(creds, '1')).toEqual({ status: 1, position: 12345, duration: 240000, volume: 30, title: '稻香' })
+    expect(await getPlayStatus(creds, '1')).toEqual({ status: 1, position: 12345, duration: 240000, volume: 30, title: '稻香', audioId: '' })
     ubusReply([{ code: 0, data: { info: JSON.stringify({ status: 1, position: 10, play_song_detail: { duration: 99000 } }) } }])
     expect((await getPlayStatus(creds, '1')).duration).toBe(99000)
     ubusReply([{ code: 0, data: { info: '{不是 JSON' } }])
     expect(await getPlayStatus(creds, '1')).toMatchObject({ status: -1, duration: -1 })
   })
 
-  it('真机形状（L05B 实测回包）：顶层没有 position，位置只在 play_song_detail 里', async () => {
+  it('真机形状（L05B 实测回包）：顶层没有 position，位置与 audio_id 都只在 play_song_detail 里', async () => {
     // 这就是"位置一直显示 0s"的成因：只读顶层会静默兜成 0，看着像设备没报
     const info = JSON.stringify({
       status: 2, volume: 30, loop_type: 1, media_type: 3,
@@ -300,7 +348,8 @@ describe('ubus 播控（G1）', () => {
     })
     ubusReply([{ code: 0, message: 'Msg has been successfully proxy…', data: { code: 0, info } }])
     expect(await getPlayStatus(creds, '1')).toEqual({
-      status: 2, position: 177266, duration: 248869, volume: 30, title: '',
+      // audio_id 是设备原样回显我们填的那串 ⇒ 投放会话靠它认"播到窗里第几项"
+      status: 2, position: 177266, duration: 248869, volume: 30, title: '', audioId: '1732418460076477549',
     })
   })
 

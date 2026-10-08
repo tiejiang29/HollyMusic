@@ -2,7 +2,7 @@
 import { usePlayerStore } from '@/lib/store/player-store'
 import { useFavoritesStore } from '@/lib/store/favorites-store'
 import { CoverImage } from '@/components/shared/CoverImage'
-import { Heart, Share2, Download, Loader2, ListPlus } from 'lucide-react'
+import { Heart, Share2, Download, Loader2, ListPlus, Speaker } from 'lucide-react'
 import { QUALITY_LABEL, resolveQuality } from '@/lib/quality-options'
 import { shareContent, buildSongShareUrl } from '@/lib/share'
 import { useDownload } from '@/hooks/useDownload'
@@ -13,6 +13,8 @@ export function NowPlaying() {
   const track = usePlayerStore(s => s.currentTrack)
   const quality = usePlayerStore(s => s.quality)
   const effectiveQuality = usePlayerStore(s => s.effectiveQuality)
+  const cast = usePlayerStore(s => s.cast)
+  const exitCast = usePlayerStore(s => s.exitCast)
   const toggleLyrics = usePlayerStore(s => s.toggleLyrics)
   const isFav = useFavoritesStore(s => (track ? s.ids.has(track.uid) : false))
   const toggle = useFavoritesStore(s => s.toggle)
@@ -43,6 +45,16 @@ export function NowPlaying() {
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="truncate text-xs font-medium md:text-sm">{track.name}</span>
+          {cast && (
+            <button
+              onClick={() => void exitCast(true).catch(() => {})}
+              title={`正在投送到 ${cast.deviceName}，点击退出`}
+              className="flex shrink-0 max-w-[10rem] items-center gap-1 rounded bg-primary/20 px-1.5 py-0.5 text-[10px] font-medium text-primary"
+            >
+              <Speaker className="h-3 w-3 shrink-0" />
+              <span className="truncate">投放到 {cast.deviceName}</span>
+            </button>
+          )}
           {effectiveQuality && (
             <span
               className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${

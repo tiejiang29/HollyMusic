@@ -29,6 +29,8 @@ export function MobilePlayerMenu() {
   const currentTrack = usePlayerStore(s => s.currentTrack)
   const sleepTimer = usePlayerStore(s => s.sleepTimer)
   const cycleSleepTimer = usePlayerStore(s => s.cycleSleepTimer)
+  const cast = usePlayerStore(s => s.cast)
+  const setCastVolume = usePlayerStore(s => s.setCastVolume)
   const volume = usePlayerStore(s => s.volume)
   const isMuted = usePlayerStore(s => s.isMuted)
   const setVolume = usePlayerStore(s => s.setVolume)
@@ -157,8 +159,13 @@ export function MobilePlayerMenu() {
           </button>
 
           <div className="mt-1 flex items-center gap-2 border-t border-border px-2 pt-2">
-            <PlayerButton icon={VolIcon} label={isMuted ? '取消静音' : '静音'} onClick={toggleMute} size="sm" active={isMuted} />
-            <ProgressBar value={isMuted ? 0 : volume * 100} onChange={pct => setVolume(pct / 100)} />
+            {!cast && (
+              <PlayerButton icon={VolIcon} label={isMuted ? '取消静音' : '静音'} onClick={toggleMute} size="sm" active={isMuted} />
+            )}
+            <ProgressBar
+              value={cast ? Math.max(0, cast.volume) : (isMuted ? 0 : volume * 100)}
+              onChange={pct => (cast ? setCastVolume(pct) : setVolume(pct / 100))}
+            />
           </div>
         </div>
       )}

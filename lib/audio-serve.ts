@@ -1281,7 +1281,9 @@ export function buildFullResponse(
   filePath: string,
   size: number,
   contentType: string,
-  isHead: boolean
+  isHead: boolean,
+  /** 从文件的第几个字节开始发（音箱 seek 用：那条流本身就是"从中间开始的一首歌"，不是原文件的区间） */
+  start = 0
 ): Response {
   const headers: Record<string, string> = {
     'Content-Type': contentType,
@@ -1290,7 +1292,7 @@ export function buildFullResponse(
     'Cache-Control': 'public, max-age=3600',
   }
   if (isHead) return new Response(null, { status: 200, headers })
-  const stream = fs.createReadStream(filePath)
+  const stream = start > 0 ? fs.createReadStream(filePath, { start }) : fs.createReadStream(filePath)
   return new Response(wrapFileStream(stream), { status: 200, headers })
 }
 

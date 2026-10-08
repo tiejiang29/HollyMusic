@@ -20,8 +20,12 @@ export function PlayerTools() {
   const toggleLyrics = usePlayerStore(s => s.toggleLyrics)
   const sleepTimer = usePlayerStore(s => s.sleepTimer)
   const cycleSleepTimer = usePlayerStore(s => s.cycleSleepTimer)
+  const cast = usePlayerStore(s => s.cast)
+  const setCastVolume = usePlayerStore(s => s.setCastVolume)
 
-  const VolIcon = isMuted || volume === 0 ? VolumeX : Volume2
+  // 投放态量的是**音箱音量**（0-100）；本地已静音，所以应用音量与静音按钮这时不再有意义
+  const shownPct = cast ? Math.max(0, cast.volume) : (isMuted ? 0 : volume * 100)
+  const VolIcon = cast ? Volume2 : (isMuted || volume === 0 ? VolumeX : Volume2)
 
   return (
     <div className="hidden items-center justify-end gap-1 md:flex md:w-[30%]">
@@ -34,14 +38,19 @@ export function PlayerTools() {
         active={!!sleepTimer}
       />
       <CastToSpeaker />
-      <PlayerButton
-        icon={VolIcon}
-        label={isMuted ? '取消静音' : '静音'}
-        onClick={toggleMute}
-        active={isMuted}
-      />
+      {!cast && (
+        <PlayerButton
+          icon={VolIcon}
+          label={isMuted ? '取消静音' : '静音'}
+          onClick={toggleMute}
+          active={isMuted}
+        />
+      )}
       <div className="w-24">
-        <ProgressBar value={isMuted ? 0 : volume * 100} onChange={pct => setVolume(pct / 100)} />
+        <ProgressBar
+          value={shownPct}
+          onChange={pct => (cast ? setCastVolume(pct) : setVolume(pct / 100))}
+        />
       </div>
     </div>
   )

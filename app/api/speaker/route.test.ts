@@ -7,6 +7,10 @@
  *    这样播放页不会摆一个点了只会报错的按钮；
  * 3. **小米侧的 401 不许发成本站 401**（否则会话被作废，用户会被踢下线）—— 与 `/api/admin/speaker` 同一口径。
  * 另钉一条：推歌"受理但没在放"要回 200 且带 reason，不能报成功。
+ *
+ * G2 投放态再加三条要紧的：`castStatus` **只读服务端会话、一次小米都不打**（客户端每几秒问一次，
+ * 照着打到小米就是限流）；`cast` 收的是**播放顺序**（当前曲 + rest），顺序错了播的就不是他要的歌；
+ * 以及 `stop` 必须连会话一起清 —— 留着看门狗只会让进度条在设备已经安静之后继续假装走。
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -34,6 +38,15 @@ const h = vi.hoisted(() => ({
   setSpeakerVolume: vi.fn(),
   readSpeakerStatus: vi.fn(),
 }))
+const c = vi.hoisted(() => ({
+  startCast: vi.fn(),
+  updateCastRest: vi.fn(),
+  skipCast: vi.fn(),
+  seekCast: vi.fn(),
+  stopCast: vi.fn(async () => undefined),
+  castView: vi.fn(async () => null),
+  refreshCast: vi.fn(),
+}))
 vi.mock('@/lib/services/xiaomi/token-store', () => ({ readSpeakerConfig: h.readSpeakerConfig }))
 vi.mock('@/lib/services/xiaomi/speaker-play', () => ({
   SpeakerError: class SpeakerError extends Error {
@@ -45,6 +58,8 @@ vi.mock('@/lib/services/xiaomi/speaker-play', () => ({
   setSpeakerVolume: h.setSpeakerVolume,
   readSpeakerStatus: h.readSpeakerStatus,
 }))
+
+vi.mock('@/lib/services/xiaomi/cast-session', () => c)
 
 const { GET, POST } = await import('@/app/api/speaker/route')
 const { XiaomiAuthError } = await import('@/lib/services/xiaomi/mina-client')
@@ -62,10 +77,18 @@ const post = (body: unknown) => new NextRequest('http://localhost/api/speaker', 
   method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' },
 })
 
+const view = {
+  deviceID: '1', deviceName: '小爱音箱Play', hardware: 'L05B', uid: 'tx-S1',
+  posSec: 12, durSec: 220, playing: true, status: 1, volume: 40,
+  windowSize: 10, pendingTracks: 25, lastError: null,
+}
+
 beforeEach(() => {
   authMode = 'user'
-  for (const f of Object.values(h)) f.mockReset()
+  for (const f of [...Object.values(h), ...Object.values(c)]) f.mockReset()
   h.readSpeakerConfig.mockResolvedValue(configOf())
+  c.castView.mockResolvedValue(null)
+  c.stopCast.mockResolvedValue(undefined)
 })
 
 describe('闸门与就绪', () => {
@@ -161,5 +184,96 @@ describe('错误身份', () => {
     h.playOnSpeaker.mockRejectedValue(new XiaomiAuthError('播控被云端拒绝（player_play_url，HTTP 500）', 502))
     const res = await POST(post({ action: 'play', uid: 'tx-1' }))
     expect((await res.json()).error.code).toBe('XIAOMI_UPSTREAM_ERROR')
+  })
+})
+
+describe('投放会话动作（G2）', () => {
+  it('cast：把当前曲与之后的顺序整个交给会话', async () => {
+    c.startCast.mockResolvedValue(view)
+    const res = await POST(post({
+      action: 'cast', current: { uid: 'tx-S1', durSec: 220 },
+      rest: [{ uid: 'tx-S2', durSec: 180 }, { uid: 'kw-9', durSec: 0 }], deviceID: '1',
+    }))
+    expect((await res.json()).data.uid).toBe('tx-S1')
+    expect(c.startCast).toHaveBeenCalledWith({
+      current: { uid: 'tx-S1', durSec: 220 },
+      rest: [{ uid: 'tx-S2', durSec: 180 }, { uid: 'kw-9', durSec: 0 }],
+      deviceID: '1', seekSec: 0, loopOne: false,
+    })
+  })
+
+  it('cast 缺 current ⇒ 400，不去猜要投什么', async () => {
+    const res = await POST(post({ action: 'cast', rest: [] }))
+    expect(res.status).toBe(400)
+    expect(c.startCast).not.toHaveBeenCalled()
+  })
+
+  it('脏条目丢掉：不是数组的 rest 当空表，uid 为空的条目不进列表', async () => {
+    c.updateCastRest.mockReturnValue(view)
+    await POST(post({ action: 'castRest', rest: [{ uid: '', durSec: 5 }, { uid: 'tx-S3', durSec: '180' }, null] }))
+    expect(c.updateCastRest).toHaveBeenCalledWith([{ uid: 'tx-S3', durSec: 180 }], undefined)
+    await POST(post({ action: 'castRest', rest: '不是数组' }))
+    expect(c.updateCastRest).toHaveBeenLastCalledWith([], undefined)
+  })
+
+  it('下一首/上一首只挪一格（前端传几都只跳一首）', async () => {
+    c.skipCast.mockResolvedValue(view)
+    await POST(post({ action: 'castSkip', delta: 7 }))
+    expect(c.skipCast).toHaveBeenCalledWith(1, undefined)
+    await POST(post({ action: 'castSkip', delta: -3 }))
+    expect(c.skipCast).toHaveBeenLastCalledWith(-1, undefined)
+  })
+
+  it('seek 原样把秒数交给会话（服务端再换算成字节偏移重推）', async () => {
+    c.seekCast.mockResolvedValue(view)
+    await POST(post({ action: 'seek', sec: 96.5 }))
+    expect(c.seekCast).toHaveBeenCalledWith(96.5, undefined)
+  })
+
+  it('castStatus 只读会话，一次都不打小米（客户端轮询不能放大成 ubus 洪水）', async () => {
+    c.castView.mockResolvedValue(view)
+    const res = await POST(post({ action: 'castStatus' }))
+    expect((await res.json()).data.casting.posSec).toBe(12)
+    expect(h.readSpeakerStatus).not.toHaveBeenCalled()
+    expect(h.playOnSpeaker).not.toHaveBeenCalled()
+  })
+
+  it('GET 也带会话：刷新页面后认得出"还在投着"', async () => {
+    c.castView.mockResolvedValue(view)
+    const res = await GET(new NextRequest('http://localhost/api/speaker'))
+    expect((await res.json()).data.casting?.uid).toBe('tx-S1')
+  })
+
+  it('castStop 清会话并回 casting:null', async () => {
+    const res = await POST(post({ action: 'castStop', deviceID: '1' }))
+    expect(c.stopCast).toHaveBeenCalledWith('1')
+    expect((await res.json()).data.casting).toBeNull()
+  })
+
+  it('stop 既停设备也清会话（留着看门狗进度会假装在走）', async () => {
+    h.controlSpeaker.mockResolvedValue(device)
+    const res = await POST(post({ action: 'stop' }))
+    expect(c.stopCast).toHaveBeenCalledTimes(1)
+    expect((await res.json()).data.casting).toBeNull()
+  })
+
+  it('暂停之后刷一次会话状态，好让进度定住而不是按墙钟跑', async () => {
+    h.controlSpeaker.mockResolvedValue(device)
+    c.refreshCast.mockResolvedValue(view)
+    const res = await POST(post({ action: 'pause' }))
+    expect(c.refreshCast).toHaveBeenCalledTimes(1)
+    expect((await res.json()).data.casting.uid).toBe('tx-S1')
+  })
+
+  it('会话报错（没在投）沿用 SPEAKER_NOT_READY，小米 401 仍降成 502', async () => {
+    const { SpeakerError } = await import('@/lib/services/xiaomi/speaker-play')
+    c.seekCast.mockRejectedValue(new SpeakerError('现在没有投放会话（先点「投到小爱」）', 409))
+    const res = await POST(post({ action: 'seek', sec: 10 }))
+    expect(res.status).toBe(409)
+    expect((await res.json()).error.code).toBe('SPEAKER_NOT_READY')
+    c.skipCast.mockRejectedValue(new XiaomiAuthError('小爱的票已失效，需要重新登录', 401))
+    const res2 = await POST(post({ action: 'castSkip', delta: 1 }))
+    expect(res2.status).toBe(502)
+    expect((await res2.json()).error.code).toBe('XIAOMI_UNAUTHORIZED')
   })
 })

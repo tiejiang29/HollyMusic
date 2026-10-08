@@ -285,6 +285,25 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 - **面板上的音量是"点开竖向滚动条、拖动即发"**：一次 ubus 往返实测 0.34~0.46 秒，拖一格会产生几十个中间值，全发既排队又容易撞小米限流（70022），所以按 250ms 间隔发（`volumeSendDelayMs`，边界口径有单测）、松手必补发落点。点开时**先读一次状态**把起始值摆成音箱现在的音量 —— 起始值乱猜会拖出"往下拖反而变响"。
 - **地址必须是音箱够得着的局域网地址**（面板项 `speakerServerHost`，落 `AppSetting`）：没填就拒绝推歌、填回环地址直接报错 —— 拼一个"我们这边能打开、音箱拉不到"的 URL 是这类功能最难查的失败形态。
 
+### 4.7.2 投放态（G2）：本地静音、进度跟音箱、连续播放
+
+设计定则只有一句：**换个执行者，不换状态源**。`player-store` 的 `isPlaying/currentTime/duration/seek/next()` 一个字段都不改，播放栏、歌词、队列、锁屏 MediaSession 照旧读写它们；投放态下这些动作落到 `/api/speaker`，本地 `<audio>` 完全不参与（`loadStreamUrl` 在投放态直接返回）。
+
+四条实测事实决定了形状（真机 L05B，2026-10-08）：
+
+- **网页标签页一隐藏，计时器被浏览器夹成一分钟才醒一次**（1s/5s 两个 `setInterval` 一起被夹；fetch 本身没问题，冻的是"唤醒"）。所以"提前 3 秒推下一首"这类亚分钟判据**不许放在前端**，连续播放由服务端 `cast-session` 的看门狗负责。
+- **`player_play_music` 的 `audio_items` 是数组，设备会按顺序自己播完**（推 10 项实测严格按序，边界处新项已到 `pos=3s`）——连播整包交给设备；但**一批放完它从头循环**（`player_set_loop` 只有单曲/列表/随机，没有"不循环"），所以尾巴必须我们收：`advance()` 要么补下一窗，要么整条队列见底就 `stop`。
+- **重推会让那一项从 0 起播**（拿同一条地址中段重推，192ms 后 `audio_id` 换新、`pos=0`）。所以补推只能卡在**边界**：判据是窗内最后一项 `剩余 ≤ 0.5s`（窗尾与"投放期间改过队列"两种情况都会动手，后者不必等整窗见底）。`play_behavior:'APPEND'` 是假的——云端 `code=0` 但设备当场播这一项、掐掉当前歌。
+- **`play_song_detail.audio_id` 原样回显我们填的值** ⇒ 它就是"播到窗里第几项"的游标，不需要任何新接口；设备报的 `duration` 是当前项的（seek 后就是剩余长度），所以界面总长取元数据 `interval`。
+
+其余要点：
+
+- **窗口 10 首**（报文 4KB；单项约 340 字符）。不一次推整张队列的三条硬理由：`st` 令牌只 2 小时（长队列后面全是死链）、ubus 表单体积没人试过（1200 首是 651KB）、队列会被用户改。播放顺序由前端 `lib/cast-queue.ts` 按播放模式算好交出去（随机在这里**冻结成一份确定列表**，服务端不再回头问）。
+- **拖动定位**：出口 `/api/speaker/stream?seek=<秒>` 换算成字节偏移 —— `ID3v2 大小 + 秒 × 码率`（码率优先读第一帧头，不信音质档标签），再**往前对齐到真正的帧首**（`秒×码率` 几乎必然落在半帧上，设备解码器起手找不到同步字就会 330ms 内重拉 5 次然后一声不出），并且这条**按 200 整条发剩余部分**而不是 206（设备照惯例发的 `Range: bytes=0-` 对"从中间开始的一条流"没有意义）。重推必须带上剩余项一起排，否则连播丢失。
+- **状态一致性**：`castStatus` 只读服务端会话（**一次都不打小米**），设备侧的读由看门狗按 5s（窗尾 1s）做，两次之间按 `position + 已过时间` 外推、每次轮询 snap 回真值；刚推完还没读到状态那一段服务端按"在播"报（否则客户端第一次轮询就把乐观态按回 false，出现"音箱在唱、按钮显示播放中"）。
+- **音量**：面板与播放页共用 `lib/cast-queue.ts` 里那份节流口径（250ms + 松手补发）；**音量会自己变**（实测途中 44→32，我们没发指令），所以要用就现读，不许假设恒定。
+- 会话是内存态且由**路由侧**持有（Next 的 instrumentation 是另一套模块副本，从它写进去的内存态路由读不到）：进程重启即丢（设备会循环最后一窗），这是有意接受的代价。
+
 ---
 
 ## 5. API 路由参考
@@ -385,8 +404,8 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
 | GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`（撞同名时 `mode`：`replace` 换掉库里那条 / `parallel` 并排装）、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
 | GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`logout`） |
-| GET/POST | `/api/speaker` | 登录用户级投歌：`GET` 返回可投音箱与就绪位；`POST` 的 `action` = `play`/`pause`/`resume`/`stop`/`volume`/`status` |
-| GET/HEAD | `/api/speaker/stream?st=&uid=&quality=` | **只出 MP3** 的音箱流出口（`st` 必须在第一个参数位，见 §4.7） |
+| GET/POST | `/api/speaker` | 登录用户级投放：`GET` 返回可投音箱、就绪位与**当前会话**；`POST` 的 `action` = 投放 `cast`/`castRest`/`castSkip`/`seek`/`castStatus`/`castStop`，遥控 `pause`/`resume`/`stop`/`volume`，单推与排障 `play`/`status`（见 §4.7.2） |
+| GET/HEAD | `/api/speaker/stream?st=&uid=&quality=[&seek=秒]` | **只出 MP3** 的音箱流出口（`st` 必须第一位；`seek` 恒在最后，按帧对齐后整条 200 发剩余部分，见 §4.7.2） |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |
 | POST | `/api/admin/sources/subscriptions` | 在线音源订阅 |
 | POST | `/api/admin/sources/upload` | 上传音源脚本（预校验 + 自动注册） |

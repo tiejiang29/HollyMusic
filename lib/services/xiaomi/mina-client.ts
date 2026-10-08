@@ -136,6 +136,8 @@ export interface PlayStatus {
   volume: number
   /** 设备自己认为在放什么（不少固件这条是它自己的曲库项，不是我们推的 URL） */
   title: string
+  /** 我们推给它时填的 `audio_id`，设备原样回显；'' = 这台没报。投放会话拿它当"播到第几项"的游标 */
+  audioId: string
 }
 
 interface UbusResponse {
@@ -250,19 +252,66 @@ function deviceOk(result: UbusResponse, action: string): boolean {
   return true
 }
 
-function playMusicMessage(url: string, keepLight: boolean, audioId: string): Record<string, unknown> {
+/** 一项要推给音箱的播放内容：一条我们自己的流地址 + 我们给它编的 audio_id */
+export interface PlayItem {
+  url: string
+  audioId: string
+}
+
+/**
+ * `player_play_music` 的报文。
+ *
+ * **`audio_items` 是数组，且设备会按顺序自己播完**（2026-10-08 真机实测：推 10 项时
+ * 24100→24101→24102→24103 依次出声，边界处新项已经跑到 pos=3s），所以连续播放这件事
+ * 可以整包交给音箱，不用我们掐着秒推下一首。
+ * 代价是它放完一批会**从头循环**（`player_set_loop` 只有单曲/列表/随机三档，没有"不循环"），
+ * 尾巴得由调用方收。`audio_id` 是我们填的、设备**原样回显** ⇒ 它同时是"现在播到第几项"的游标。
+ */
+function playMusicMessage(items: PlayItem[], keepLight: boolean): Record<string, unknown> {
   const music = {
     payload: {
       audio_type: keepLight ? 'MUSIC' : '',
-      audio_items: [{
-        item_id: { audio_id: audioId, cp: { album_id: '-1', episode_index: 0, id: MUSIC_CP_ID, name: 'xiaowei' } },
-        stream: { url },
-      }],
+      audio_items: items.map((it, i) => ({
+        item_id: { audio_id: it.audioId, cp: { album_id: '-1', episode_index: i, id: MUSIC_CP_ID, name: 'xiaowei' } },
+        stream: { url: it.url },
+      })),
       list_params: { listId: '-1', loadmore_offset: 0, origin: 'xiaowei', type: 'MUSIC' },
     },
     play_behavior: 'REPLACE_ALL',
   }
-  return { startaudioid: audioId, music: JSON.stringify(music) }
+  return { startaudioid: items[0]?.audioId ?? DEFAULT_MUSIC_AUDIO_ID, music: JSON.stringify(music) }
+}
+
+/**
+ * 一次推一组（一首或多首）给音箱。
+ *
+ * 走不通 `player_play_music` 时退回 `player_play_url` —— 那条口只收单条地址，
+ * 所以退化的同时**只有第一项会播**，剩下的靠调用方的看门狗逐首补推。
+ */
+export async function playItems(
+  creds: XiaomiCredentials,
+  deviceId: string,
+  items: PlayItem[],
+  hardware = '',
+  opts: { keepLight?: boolean; musicApiDisabled?: string[] } = {},
+): Promise<{ accepted: boolean; batched: boolean }> {
+  const keepLight = opts.keepLight ?? false
+  if (items.length === 0) return { accepted: false, batched: false }
+  return enqueueUbus(deviceId, async () => {
+    if (usePlayMusicApi(hardware, opts.musicApiDisabled ?? [])) {
+      try {
+        const got = await ubus(creds, deviceId, 'player_play_music', 'mediaplayer', playMusicMessage(items, keepLight))
+        if (deviceOk(got, 'player_play_music')) return { accepted: true, batched: true }
+        logger.warn('[xiaomi] player_play_music 设备端没认，退回 player_play_url', { 型号: hardware, 项数: items.length })
+      } catch (err) {
+        logger.warn('[xiaomi] player_play_music 失败，退回 player_play_url:', errMessage(err))
+      }
+    }
+    const got = await ubus(creds, deviceId, 'player_play_url', 'mediaplayer', {
+      url: items[0].url, type: keepLight ? 1 : 2, media: 'app_ios',
+    })
+    return { accepted: deviceOk(got, 'player_play_url'), batched: false }
+  })
 }
 
 /** 推一条 URL 给音箱；`hardware` 决定走 play_music 还是 play_url（分流判据就是它） */
@@ -273,23 +322,8 @@ export async function playUrl(
   hardware = '',
   opts: { keepLight?: boolean; musicApiDisabled?: string[] } = {},
 ): Promise<boolean> {
-  return enqueueUbus(deviceId, async () => {
-    const keepLight = opts.keepLight ?? false
-    if (usePlayMusicApi(hardware, opts.musicApiDisabled ?? [])) {
-      const music = playMusicMessage(url, keepLight, DEFAULT_MUSIC_AUDIO_ID)
-      try {
-        const got = await ubus(creds, deviceId, 'player_play_music', 'mediaplayer', music)
-        if (deviceOk(got, 'player_play_music')) return true
-        logger.warn('[xiaomi] player_play_music 设备端没认，退回 player_play_url', { 型号: hardware })
-      } catch (err) {
-        logger.warn('[xiaomi] player_play_music 失败，退回 player_play_url:', errMessage(err))
-      }
-    }
-    const got = await ubus(creds, deviceId, 'player_play_url', 'mediaplayer', {
-      url, type: keepLight ? 1 : 2, media: 'app_ios',
-    })
-    return deviceOk(got, 'player_play_url')
-  })
+  const r = await playItems(creds, deviceId, [{ url, audioId: DEFAULT_MUSIC_AUDIO_ID }], hardware, opts)
+  return r.accepted
 }
 
 /** 播放控制：play / pause / stop 都走 `player_play_operation` */
@@ -349,6 +383,10 @@ export async function getPlayStatus(creds: XiaomiCredentials, deviceId: string):
       duration: pick('duration'),
       volume: num(info.volume),
       title: typeof info.title === 'string' ? info.title : '',
+      // 设备**原样回显**我们填的 audio_id（真机实测）⇒ 投放会话靠它认"播到窗里第几项"
+      audioId: detail.audio_id === undefined || detail.audio_id === null
+        ? ''
+        : String(detail.audio_id),
     }
   })
 }
