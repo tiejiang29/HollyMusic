@@ -20,6 +20,7 @@ import {
   ensureFreshCredentials, readSpeakerConfig, clampPollSec,
 } from '@/lib/services/xiaomi/token-store'
 import { XiaomiAuthError, fetchConversations } from '@/lib/services/xiaomi/mina-client'
+import { submitAsk } from '@/lib/services/xiaomi/voice-takeover'
 
 /** 面板上的一行 */
 export interface AskRow {
@@ -161,7 +162,9 @@ async function tick(): Promise<void> {
           logger.warn('[xiaomi] 单台对话轮询失败:', softError)
           continue
         }
-        absorb(device.deviceID, device.name, records, config.failedAnswerHints)
+        const fresh = absorb(device.deviceID, device.name, records, config.failedAnswerHints)
+        // 接管（G3）只吃"刚说的话"那批，历史一条都不许动别人的播放
+        if (config.takeoverEnabled && fresh.length) for (const row of fresh) submitAsk(row)
       }
       state = { ...state, lastPollAt: Date.now(), lastError: softError, devices: snapshotDevices(targets) }
     }
@@ -181,8 +184,8 @@ async function tick(): Promise<void> {
   }
 }
 
-/** 把拉到的记录按基线规则收成进 feed */
-function absorb(deviceID: string, deviceName: string, records: { timestampMs: number; query: string; answer: string }[], hints: string[]): void {
+/** 把拉到的记录按基线规则收成进 feed，并返回"这轮新增的非历史行"（给 G3 的接管用） */
+function absorb(deviceID: string, deviceName: string, records: { timestampMs: number; query: string; answer: string }[], hints: string[]): AskRow[] {
   const b = ensureAccount(deviceID, deviceName, '')
   const now = Date.now()
   const rows: AskRow[] = []
@@ -212,9 +215,10 @@ function absorb(deviceID: string, deviceName: string, records: { timestampMs: nu
     b.primed = true
     if (rows.length > 0) logger.info('[xiaomi] 对话基线建立', { 设备: deviceName, 历史条数: rows.length })
   }
-  if (rows.length === 0) return
+  if (rows.length === 0) return []
   feed.unshift(...rows.reverse())
   if (feed.length > FEED_MAX) feed.length = FEED_MAX
+  return rows.filter(r => !r.fromBaseline)
 }
 
 /** 只给测试用 */

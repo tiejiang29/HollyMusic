@@ -45,6 +45,17 @@ const h = vi.hoisted(() => ({
   syncDevices: vi.fn(),
   setDeviceManaged: vi.fn(),
   setSpeakerEnabled: vi.fn(),
+  // 面板项那三组（对话轮询 / 转码 / 接管）：都是写库的，隔掉
+  setSpeakerConversation: vi.fn(),
+  setSpeakerTranscode: vi.fn(),
+  setSpeakerTakeover: vi.fn(),
+  readSpeakerConfig: vi.fn(),
+  ensureConversationMonitor: vi.fn(),
+  getConversationFeed: vi.fn(),
+  probeFfmpeg: vi.fn(),
+  resetFfmpegProbe: vi.fn(),
+  getTakeoverLog: vi.fn(),
+  handleAskNow: vi.fn(),
 }))
 
 vi.mock('@/lib/services/xiaomi/qr-login', async importOriginal => {
@@ -61,8 +72,22 @@ vi.mock('@/lib/services/xiaomi/token-store', async importOriginal => {
     syncDevices: h.syncDevices,
     setDeviceManaged: h.setDeviceManaged,
     setSpeakerEnabled: h.setSpeakerEnabled,
+    setSpeakerConversation: h.setSpeakerConversation,
+    setSpeakerTranscode: h.setSpeakerTranscode,
+    setSpeakerTakeover: h.setSpeakerTakeover,
+    readSpeakerConfig: h.readSpeakerConfig,
   }
 })
+vi.mock('@/lib/services/xiaomi/conversation-monitor', () => ({
+  ensureConversationMonitor: h.ensureConversationMonitor,
+  getConversationFeed: h.getConversationFeed,
+}))
+vi.mock('@/lib/server/audio-transcode', () => ({
+  probeFfmpeg: h.probeFfmpeg, resetFfmpegProbe: h.resetFfmpegProbe,
+}))
+vi.mock('@/lib/services/xiaomi/voice-takeover', () => ({
+  getTakeoverLog: h.getTakeoverLog, handleAskNow: h.handleAskNow,
+}))
 
 // 客户端与服务端的 action 名要能对上：两边各改一半时这条会红
 const sent = vi.hoisted(() => ({ calls: [] as Array<{ url: string; body: unknown }> }))
@@ -95,6 +120,13 @@ beforeEach(() => {
   h.startQrLogin.mockResolvedValue({ sessionId: 's', loginToken: 't', qrPngBase64: 'e', expiresInMs: 300000 })
   h.pollQrLogin.mockResolvedValue({ state: 'waiting' })
   h.syncDevices.mockResolvedValue([])
+  for (const f of [h.setSpeakerConversation, h.setSpeakerTranscode, h.setSpeakerTakeover]) f.mockResolvedValue(VIEW)
+  h.readSpeakerConfig.mockResolvedValue({ devices: VIEW.devices, ffmpegPath: 'ffmpeg', takeoverEnabled: false })
+  h.ensureConversationMonitor.mockResolvedValue({ running: false, pollSec: 2, enabled: false, lastPollAt: null, lastError: null, devices: [] })
+  h.getConversationFeed.mockReturnValue({ rows: [], state: { running: false, pollSec: 2, enabled: false, lastPollAt: null, lastError: null, devices: [] } })
+  h.probeFfmpeg.mockResolvedValue(null)
+  h.getTakeoverLog.mockReturnValue([])
+  h.handleAskNow.mockResolvedValue({ at: 1, deviceID: '705427729', deviceName: '小爱音箱Play', query: '甲', answer: '', verdict: 'standby', reason: 'r', acted: '没动', synthetic: true })
   sent.calls = []
 })
 
@@ -108,8 +140,15 @@ describe('客户端与服务端的 action 名对齐（改一边忘另一边会�
     await client.setSpeakerManaged('705427729', false)
     await client.setSpeakerEnabled(true)
     await client.speakerLogout('s')
+    await client.setSpeakerConversation({ enabled: true, pollSec: 2 })
+    await client.readConversationFeed()
+    await client.setSpeakerTranscode({ enabled: true })
+    await client.probeSpeakerFfmpeg()
+    await client.setSpeakerTakeover({ enabled: true })
+    await client.readTakeoverLog()
+    await client.simulateAsk('下一首', '好的')
 
-    expect(sent.calls).toHaveLength(7)
+    expect(sent.calls).toHaveLength(14)
     expect(sent.calls.every(c => c.url === 'admin/speaker')).toBe(true)
     for (const c of sent.calls) {
       if (c.body === undefined) continue
@@ -120,7 +159,10 @@ describe('客户端与服务端的 action 名对齐（改一边忘另一边会�
     }
     // action 名逐个字钉住：面板/客户端/路由三处用的是同一套词
     expect(sent.calls.map(c => (c.body as { action?: string })?.action ?? '(GET)'))
-      .toEqual(['(GET)', 'qrStart', 'qrPoll', 'devices', 'setManaged', 'setEnabled', 'logout'])
+      .toEqual([
+        '(GET)', 'qrStart', 'qrPoll', 'devices', 'setManaged', 'setEnabled', 'logout',
+        'convSet', 'convList', 'tcSet', 'tcProbe', 'askSet', 'askLog', 'askSimulate',
+      ])
   })
 })
 
@@ -260,5 +302,30 @@ describe('错误身份（面板要靠这个决定给不给"重新扫码"）', ()
     expect(res.status).toBe(502)
     expect(body.error.code).toBe('XIAOMI_UNAUTHORIZED')
     expect(body.error.message).toContain('还没有登录')
+  })
+})
+
+describe('接管那几个 action 的入参门槛', () => {
+  it('模拟口令没写"你说" ⇒ 400，不打判据也不动音箱', async () => {
+    const res = await POST(req({ action: 'askSimulate', query: '  ' }))
+    expect(res.status).toBe(400)
+    expect(h.handleAskNow).not.toHaveBeenCalled()
+  })
+
+  it('账号下没设备 ⇒ 合成不出来，明确报错而不是拿 undefined 当设备', async () => {
+    h.readSpeakerConfig.mockResolvedValue({ devices: [], ffmpegPath: 'ffmpeg', takeoverEnabled: true })
+    const res = await POST(req({ action: 'askSimulate', query: '下一首' }))
+    expect(res.status).toBe(409)
+    expect(h.handleAskNow).not.toHaveBeenCalled()
+  })
+
+  it('askSet 把面板那几行文本转成规则再交给服务层（解析坏了就是空表，服务层会回落默认表）', async () => {
+    await POST(req({ action: 'askSet', controlRulesText: `pause=暂停
+next=下一首` }))
+    const arg = h.setSpeakerTakeover.mock.calls[0][0]
+    expect(arg.controlRules).toEqual([
+      { op: 'pause', words: ['暂停'] },
+      { op: 'next', words: ['下一首'] },
+    ])
   })
 })

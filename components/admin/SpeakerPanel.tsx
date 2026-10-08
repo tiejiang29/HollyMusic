@@ -17,8 +17,10 @@ import {
   setSpeakerHost, setSpeakerQuality, controlSpeakerFromAdmin, setSpeakerVolumeFromAdmin, readSpeakerStatusFromAdmin,
   setSpeakerConversation, readConversationFeed,
   setSpeakerTranscode, probeSpeakerFfmpeg,
-  type ConversationFeed, type QrStartResult, type SpeakerView, type SpeakerStreamStatus,
+  setSpeakerTakeover, readTakeoverLog, simulateAsk,
+  type ConversationFeed, type QrStartResult, type SpeakerView, type SpeakerStreamStatus, type TakeoverLogRow,
 } from '@/lib/api/admin-speaker'
+import { formatControlRules } from '@/lib/services/xiaomi/voice-control'
 import { volumeSendDelayMs } from '@/lib/cast-queue'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -158,6 +160,16 @@ export function SpeakerPanel() {
   const [ffmpegFound, setFfmpegFound] = useState<string | null | undefined>(undefined)
   const [ffmpegPathDraft, setFfmpegPathDraft] = useState<string | null>(null)
   const [tcCapDraft, setTcCapDraft] = useState<string | null>(null)
+  /** 语音接管（G3）：账目 + 各草稿 + 模拟口令的输入与结果 */
+  const [askLog, setAskLog] = useState<TakeoverLogRow[]>([])
+  const [askRulesDraft, setAskRulesDraft] = useState<string | null>(null)
+  const [askSourcesDraft, setAskSourcesDraft] = useState<string | null>(null)
+  const [askCutoffDraft, setAskCutoffDraft] = useState<string | null>(null)
+  const [askStepDraft, setAskStepDraft] = useState<string | null>(null)
+  const [askTriggersDraft, setAskTriggersDraft] = useState<string | null>(null)
+  const [simQuery, setSimQuery] = useState('')
+  const [simAnswer, setSimAnswer] = useState('')
+  const [simResult, setSimResult] = useState<TakeoverLogRow | null>(null)
 
   const reload = useCallback(async () => {
     setLoading(true)
@@ -178,7 +190,49 @@ export function SpeakerPanel() {
     readConversationFeed().then(setConv).catch(() => {})
     // 转码这项要 spawn 才能知道 ffmpeg 在不在，所以只在进页面时探一次，不在每次 GET 里探
     probeSpeakerFfmpeg().then(r => setFfmpegFound(r.ffmpeg)).catch(() => setFfmpegFound(null))
+    readTakeoverLog().then(r => setAskLog(r.rows)).catch(() => {})
   }, [reload])
+
+  // 接管开着时账目每 4 秒自己刷一次（关着就别白打接口）
+  useEffect(() => {
+    if (!view?.takeoverEnabled) return
+    const timer = setInterval(() => {
+      readTakeoverLog().then(r => setAskLog(r.rows)).catch(() => {})
+    }, 4000)
+    return () => clearInterval(timer)
+  }, [view?.takeoverEnabled])
+
+  const saveTakeover = async (patch: { enabled?: boolean; withoutEvidence?: boolean }) => {
+    try {
+      const r = await setSpeakerTakeover({
+        ...patch,
+        ...(askRulesDraft !== null ? { controlRulesText: askRulesDraft } : {}),
+        ...(askSourcesDraft !== null ? { sources: askSourcesDraft.split(/[,，\s]+/).filter(Boolean) } : {}),
+        ...(askCutoffDraft !== null ? { cutoff: Number(askCutoffDraft) } : {}),
+        ...(askStepDraft !== null ? { volumeStep: Number(askStepDraft) } : {}),
+        ...(askTriggersDraft !== null ? { triggers: askTriggersDraft.split(/[,，\s]+/).filter(Boolean) } : {}),
+      })
+      setView(r.view)
+      setAskRulesDraft(null)
+      setAskSourcesDraft(null)
+      setAskCutoffDraft(null)
+      setAskStepDraft(null)
+      setAskTriggersDraft(null)
+      setAskLog((await readTakeoverLog()).rows)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存接管设置失败')
+    }
+  }
+
+  const runSimulate = async () => {
+    if (!simQuery.trim()) return
+    try {
+      setSimResult(await simulateAsk(simQuery, simAnswer))
+      setAskLog((await readTakeoverLog()).rows)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '模拟口令失败')
+    }
+  }
 
   // 拿到二维码就开始问"扫了没"：单次请求最长 8 秒（服务端那侧的长轮询切片），
   // 收到 waiting 再隔 3 秒问一次；signedIn / expired / failed 都终止循环。
@@ -914,6 +968,158 @@ export function SpeakerPanel() {
           <p className="mt-2 text-[11px] text-muted-foreground">
             同时在转的最多 3 首，第 4 首要等（返回 503 让音箱稍后重拉）；产物落在音频缓存里，和在线下载那份额用同一套配额。
           </p>
+        </div>
+      ) : null}
+
+      {view ? (
+        <div className="mt-6 rounded-lg border border-border bg-card p-4">
+          <h3 className="text-sm font-semibold">语音接管（G3：小爱答砸了才由我们顶上）</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            三层短路：① 命中下面那张控制词表就照做（但<b>只在这台正被我们投放时动</b>，否则交回小爱）；
+            ② 其余当点歌，<b>先看小爱答上了没</b>——答上了不抢，像没答上才去我们的曲库找最像的一条顶上；
+            ③ 都对不上就什么都不做。
+          </p>
+          <p className="mt-1 text-xs text-destructive">
+            前提还没验过：对话接口今天实测回的是 0 条记录（见上面那张卡）。所以这一层只能用下面那条
+            <b>模拟口令</b>走同一条判据链路，别当成「对着音箱说话已经能用了」。
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded accent-primary"
+                checked={view.takeoverEnabled}
+                onChange={e => void saveTakeover({ enabled: e.target.checked })}
+              />
+              允许接管
+            </label>
+            <label className="flex items-center gap-1" title="拿不到小爱的回答时站哪边">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded accent-primary"
+                checked={view.takeoverWithoutEvidence}
+                onChange={e => void saveTakeover({ withoutEvidence: e.target.checked })}
+              />
+              没证据也接管
+            </label>
+            <span className="text-muted-foreground">相似度门槛</span>
+            <input
+              type="number"
+              min={0.2}
+              max={0.95}
+              step={0.05}
+              defaultValue={view.fuzzyMatchCutoff}
+              onChange={e => setAskCutoffDraft(e.target.value)}
+              className="w-20 rounded border border-border bg-background px-2 py-1"
+            />
+            <span className="text-muted-foreground">音量步长</span>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              defaultValue={view.volumeStep}
+              onChange={e => setAskStepDraft(e.target.value)}
+              className="w-16 rounded border border-border bg-background px-2 py-1"
+            />
+            <input
+              type="text"
+              defaultValue={view.takeoverSources.join(', ')}
+              onChange={e => setAskSourcesDraft(e.target.value)}
+              className="w-28 rounded border border-border bg-background px-2 py-1 font-mono text-[11px]"
+              title="去哪几台源搜候选，逗号分隔，最多三台"
+            />
+            <button
+              onClick={() => void saveTakeover({})}
+              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              保存
+            </button>
+          </div>
+          <label className="mt-3 block text-[11px] text-muted-foreground">
+            点歌触发词（逗号分隔）：<span className="text-foreground">只有这句话里含其中一个词，才会在「它没答上」时去搜歌</span>。
+            这条不是锦上添花——我模拟「今天天气怎么样」时，酷我库里真有一首就叫这个名，相似度 100%，直接把一句天气问答变成了放歌。
+            <input
+              type="text"
+              defaultValue={view.takeoverTriggers.join(', ')}
+              onChange={e => setAskTriggersDraft(e.target.value)}
+              className="mt-1 w-full rounded border border-border bg-background px-2 py-1 font-mono text-[11px]"
+            />
+          </label>
+          <label className="mt-3 block text-[11px] text-muted-foreground">
+            控制词表（一行一条，格式 <code className="font-mono">操作=词,词</code>；顺序有意义，先具体后笼统）
+            <textarea
+              defaultValue={formatControlRules(view.controlRules as never)}
+              onChange={e => setAskRulesDraft(e.target.value)}
+              rows={7}
+              className="mt-1 w-full rounded border border-border bg-background px-2 py-1 font-mono text-[11px]"
+            />
+          </label>
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+            <input
+              type="text"
+              value={simQuery}
+              onChange={e => setSimQuery(e.target.value)}
+              placeholder="假装你说：下一首"
+              className="w-48 rounded border border-border bg-background px-2 py-1"
+            />
+            <input
+              type="text"
+              value={simAnswer}
+              onChange={e => setSimAnswer(e.target.value)}
+              placeholder="假装小爱答：没有找到（留空=没拿到回答）"
+              className="w-64 rounded border border-border bg-background px-2 py-1"
+            />
+            <button
+              onClick={() => void runSimulate()}
+              className="rounded-full px-2.5 py-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              走一遍判据
+            </button>
+          </div>
+          {simResult ? (
+            <p className="mt-2 text-xs">
+              <span className="font-mono text-[11px] text-muted-foreground">{simResult.verdict}</span>
+              {' · '}
+              {simResult.reason}
+              {' → '}
+              <span className="text-foreground">{simResult.acted}</span>
+            </p>
+          ) : null}
+          {askLog.length > 0 ? (
+            <div className="mt-3 max-h-56 overflow-auto rounded border border-border">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-accent/40 text-left text-[11px] uppercase text-muted-foreground">
+                  <tr>
+                    <th className="px-2 py-1.5 font-medium">时刻</th>
+                    <th className="px-2 py-1.5 font-medium">来源</th>
+                    <th className="px-2 py-1.5 font-medium">你说</th>
+                    <th className="px-2 py-1.5 font-medium">小爱答</th>
+                    <th className="px-2 py-1.5 font-medium">判定</th>
+                    <th className="px-2 py-1.5 font-medium">做了什么</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {askLog.map((r, i) => (
+                    <tr key={`${r.at}-${i}`} className="border-t border-border align-top">
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+                        {clockText(new Date(r.at).toISOString())}
+                      </td>
+                      <td className="px-2 py-1.5 text-[11px] text-muted-foreground">{r.synthetic ? '合成' : '真话'}</td>
+                      <td className="px-2 py-1.5">{r.query || '—'}</td>
+                      <td className="px-2 py-1.5">{r.answer || '—'}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px]">{r.verdict}</td>
+                      <td className="px-2 py-1.5">
+                        {r.acted}
+                        <div className="text-[11px] text-muted-foreground">{r.reason}</div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-muted-foreground">还没有判过任何一条口令</p>
+          )}
         </div>
       ) : null}
     </div>

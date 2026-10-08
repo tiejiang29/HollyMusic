@@ -26,7 +26,9 @@ import {
   setSpeakerPlayQuality, setSpeakerServerHost, syncDevices,
 } from '@/lib/services/xiaomi/token-store'
 import { SpeakerError, controlSpeaker, playOnSpeaker, readSpeakerStatus, setSpeakerVolume } from '@/lib/services/xiaomi/speaker-play'
-import { setSpeakerConversation, setSpeakerTranscode } from '@/lib/services/xiaomi/token-store'
+import { setSpeakerConversation, setSpeakerTranscode, setSpeakerTakeover } from '@/lib/services/xiaomi/token-store'
+import { parseControlRules } from '@/lib/services/xiaomi/voice-control'
+import { getTakeoverLog, handleAskNow } from '@/lib/services/xiaomi/voice-takeover'
 import { ensureConversationMonitor, getConversationFeed } from '@/lib/services/xiaomi/conversation-monitor'
 import { probeFfmpeg, resetFfmpegProbe } from '@/lib/server/audio-transcode'
 
@@ -141,6 +143,40 @@ export async function POST(request: NextRequest) {
       // 路径没变但管理员刚装完 ffmpeg 也想重探一次 ⇒ 先清掉那份缓存，否则"没探到"会一直挂着骗人
       resetFfmpegProbe(config.ffmpegPath)
       return createSuccessResponse({ view, ffmpeg: await probeFfmpeg(config.ffmpegPath) })
+    }
+    if (action === 'askSet') {
+      const view = await setSpeakerTakeover({
+        enabled: typeof body?.enabled === 'boolean' ? body.enabled : undefined,
+        withoutEvidence: typeof body?.withoutEvidence === 'boolean' ? body.withoutEvidence : undefined,
+        cutoff: body?.cutoff,
+        sources: Array.isArray(body?.sources) ? body.sources : undefined,
+        controlRules: body?.controlRulesText !== undefined
+          ? parseControlRules(String(body.controlRulesText)) : undefined,
+        volumeStep: body?.volumeStep,
+        triggers: Array.isArray(body?.triggers) ? body.triggers : undefined,
+      })
+      return createSuccessResponse({ view })
+    }
+    if (action === 'askLog') {
+      return createSuccessResponse({ rows: getTakeoverLog() })
+    }
+    if (action === 'askSimulate') {
+      // **喂一条合成口令走同一条链路**（不是真话，日志里标 synthetic）。
+      // 为什么要它：今天实测到对话接口回的是 0 条记录，也就是说"真实一条口令"我们
+      // 还没拿到过 —— 没有这个入口，第①②层的判据就只能停在单元测试里。
+      const query = typeof body?.query === 'string' ? body.query : ''
+      if (!query.trim()) return createErrorResponse('INVALID_PARAMS', '要说一句什么口令？', 400)
+      const config = await readSpeakerConfig()
+      const device = config.devices.find(d => d.managed && d.presence === 'online') ?? config.devices[0]
+      if (!device) return createErrorResponse('SPEAKER_NOT_READY', '账号下没有设备，合成不出来', 409)
+      const row = {
+        deviceID: device.deviceID, deviceName: device.name,
+        timestampMs: Date.now(), receivedAt: Date.now(),
+        query, answer: typeof body?.answer === 'string' ? body.answer : '',
+        looksFailed: false, fromBaseline: false,
+      }
+      // 执行与否**照面板那套判据走**（含 takeoverEnabled），模拟不是后门：关着就只判不动
+      return createSuccessResponse(await handleAskNow(row, { synthetic: true, config }))
     }
     if (action === 'setMusicApiDisabled') {
       const models = Array.isArray(body?.models) ? body.models.map((m: unknown) => String(m)) : []

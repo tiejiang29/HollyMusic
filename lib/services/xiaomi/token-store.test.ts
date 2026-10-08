@@ -47,8 +47,9 @@ vi.mock('@/lib/services/xiaomi/mina-client', async importOriginal => {
 const {
   SPEAKER_SETTING_KEY, readSpeakerConfig, writeSpeakerConfig, getSpeakerView, saveCredentials,
   clearSpeakerLogin, ensureFreshCredentials, syncDevices, setDeviceManaged, setSpeakerEnabled,
-  _resetRenewThrottleForTest,
+  setSpeakerTranscode, setSpeakerTakeover, DEFAULT_FAILED_ANSWER_HINTS, _resetRenewThrottleForTest,
 } = await import('@/lib/services/xiaomi/token-store')
+const { DEFAULT_CONTROL_RULES } = await import('@/lib/services/xiaomi/voice-control')
 const { XiaomiAuthError } = await import('@/lib/services/xiaomi/mina-client')
 const { XiaomiLoginError } = await import('@/lib/services/xiaomi/qr-login')
 
@@ -314,5 +315,62 @@ describe('登录与退出', () => {
     await setDeviceManaged('1', false)
     const stored = await readSpeakerConfig()
     expect(stored.devices.map(d => [d.deviceID, d.managed])).toEqual([['1', false], ['2', true]])
+  })
+})
+
+describe('转码与接管那些新键：老库里缺键必须补默认，不能把 undefined 发出去', () => {
+  it('一条配置都没存过时读到的是默认值（转码开着、ffmpeg 走 PATH 名、接管关着）', async () => {
+    const c = await readSpeakerConfig()
+    expect(c).toMatchObject({
+      transcodeEnabled: true, ffmpegPath: 'ffmpeg', transcodeNormalize: false, transcodeCapMb: 500,
+      takeoverEnabled: false, takeoverWithoutEvidence: false, fuzzyMatchCutoff: 0.6,
+      takeoverSources: ['tx'], volumeStep: 10,
+    })
+    expect(c.controlRules.length).toBe(DEFAULT_CONTROL_RULES.length)
+    // 点歌触发词表也要有默认（空表会让第②层永远不接，配了开关却没反应最难查）
+    expect(c.takeoverTriggers.length).toBeGreaterThan(0)
+    expect(c.takeoverTriggers).toContain('播放')
+  })
+
+  it('G0 那版存下来的对象里没有这些键 —— 读它不能炸，也不能把词表读成空（空表 = 第①层一条都命不中）', async () => {
+    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({
+      enabled: true, credentials: null, devices: [], lastSyncAt: null, lastError: null,
+      serverHost: '172.16.1.20:3000', playQuality: '320k', musicApiDisabledModels: [],
+    }))
+    const c = await readSpeakerConfig()
+    expect(c.ffmpegPath).toBe('ffmpeg')
+    expect(c.controlRules.length).toBeGreaterThan(0)
+    expect(c.failedAnswerHints).toBe(DEFAULT_FAILED_ANSWER_HINTS)
+  })
+
+  it('词表被存坏（非数组 / 混进非法条目）时按条目过滤或整体回落，不原样发出去', async () => {
+    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({ controlRules: '不是数组' }))
+    expect((await readSpeakerConfig()).controlRules.length).toBe(DEFAULT_CONTROL_RULES.length)
+
+    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({ controlRules: [{ op: 'pause', words: ['暂停'] }, { op: 99, words: 'x' }] }))
+    expect((await readSpeakerConfig()).controlRules).toEqual([{ op: 'pause', words: ['暂停'] }])
+  })
+
+  it('ffmpegPath 存成空白要回落成 PATH 名（空串会让每次 spawn 都失败在起跑线，面板却看着像配过了）', async () => {
+    await setSpeakerTranscode({ ffmpegPath: '   ' })
+    expect((await readSpeakerConfig()).ffmpegPath).toBe('ffmpeg')
+  })
+
+  it('数值一律钳进合法区间：上限可以是 0（= 不设限），门槛与步长不行', async () => {
+    await setSpeakerTranscode({ capMb: -5 })
+    expect((await readSpeakerConfig()).transcodeCapMb).toBe(0)
+    await setSpeakerTakeover({ cutoff: 0.01, volumeStep: 999 })
+    const c = await readSpeakerConfig()
+    expect(c.fuzzyMatchCutoff).toBe(0.2)
+    expect(c.volumeStep).toBe(50)
+  })
+
+  it('接管那六项写进去能读回来，且视图里带的是同一套（面板读的就是视图）', async () => {
+    await setSpeakerTakeover({ enabled: true, withoutEvidence: true, cutoff: 0.75, sources: ['kg', 'tx', 'kw', 'mg'], volumeStep: 5 })
+    const v = await getSpeakerView()
+    expect(v).toMatchObject({
+      takeoverEnabled: true, takeoverWithoutEvidence: true, fuzzyMatchCutoff: 0.75,
+      takeoverSources: ['kg', 'tx', 'kw'], volumeStep: 5,
+    })
   })
 })

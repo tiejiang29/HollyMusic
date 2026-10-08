@@ -21,6 +21,7 @@ import {
   type XiaomiCredentials,
 } from '@/lib/services/xiaomi/qr-login'
 import { XiaomiAuthError, fetchDevices, type SpeakerDevice } from '@/lib/services/xiaomi/mina-client'
+import { DEFAULT_CONTROL_RULES, DEFAULT_MUSIC_TRIGGERS, type ControlRule } from '@/lib/services/xiaomi/voice-control'
 
 export const SPEAKER_SETTING_KEY = 'speaker'
 
@@ -77,6 +78,23 @@ export interface SpeakerConfig {
   transcodeNormalize: boolean
   /** 转码产物总占用上限（MB），按 lastAccessAt 淘汰；0 = 不设限 */
   transcodeCapMb: number
+  /**
+   * 语音接管总开关（G3）。**默认关着**：它一开就是"听了你说的话就动那台音箱"，
+   * 而这条链的前提（对话记录拉得到）今天实测还没被证明过（平台回 0 条）。
+   */
+  takeoverEnabled: boolean
+  /** 拿不到小爱的回答时站哪边：false=不动（默认），true=也接管。这条是留给管理员定的，不替他判 */
+  takeoverWithoutEvidence: boolean
+  /** 曲名相似度门槛（0~1）：低于它就算搜到了也不认（防"今天几号"被硬配上一首歌） */
+  fuzzyMatchCutoff: number
+  /** 接管时去哪几台源搜候选（按顺序试，最多用前三台） */
+  takeoverSources: string[]
+  /** 第①层那张控制词表（面板可改；空则回落到代码里的默认表） */
+  controlRules: ControlRule[]
+  /** "大声点/小声点"一次调几档 */
+  volumeStep: number
+  /** 第②层的门槛：这句话里要有哪个词才算点歌（面板可改） */
+  takeoverTriggers: string[]
 }
 
 export type SpeakerPlayQuality = '320k' | '128k'
@@ -97,6 +115,25 @@ export const DEFAULT_FAILED_ANSWER_HINTS = [
 /** 轮询间隔的合法区间（照参考实现：miot 1~30s、xiaomusic 也有下限），下限防的是把小米接口打爆 */
 export const CONVERSATION_POLL_SEC_MIN = 1
 export const CONVERSATION_POLL_SEC_MAX = 30
+
+/** 相似度门槛合法区间：低于 0.2 什么都能配上，高于 0.95 基本永远配不上 */
+export const FUZZY_CUTOFF_MIN = 0.2
+export const FUZZY_CUTOFF_MAX = 0.95
+/** 音量步长合法区间（一次"大声点"调几档） */
+export const VOLUME_STEP_MIN = 1
+export const VOLUME_STEP_MAX = 50
+
+export function clampCutoff(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 0.6
+  return Math.min(FUZZY_CUTOFF_MAX, Math.max(FUZZY_CUTOFF_MIN, n))
+}
+
+export function clampVolumeStep(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 10
+  return Math.min(VOLUME_STEP_MAX, Math.max(VOLUME_STEP_MIN, Math.round(n)))
+}
 
 /** 转码产物容量闸的合法区间（MB），0 = 不设限 */
 export const TRANSCODE_CAP_MB_MIN = 0
@@ -124,6 +161,13 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   ffmpegPath: 'ffmpeg',
   transcodeNormalize: false,
   transcodeCapMb: 500,
+  takeoverEnabled: false,
+  takeoverWithoutEvidence: false,
+  fuzzyMatchCutoff: 0.6,
+  takeoverSources: ['tx'],
+  controlRules: DEFAULT_CONTROL_RULES,
+  volumeStep: 10,
+  takeoverTriggers: DEFAULT_MUSIC_TRIGGERS,
 }
 
 /**
@@ -148,6 +192,18 @@ export async function readSpeakerConfig(): Promise<SpeakerConfig> {
     transcodeCapMb: clampCapMb(stored.transcodeCapMb),
     transcodeEnabled: stored.transcodeEnabled !== false,
     transcodeNormalize: !!stored.transcodeNormalize,
+    // 接管那几项：词表存坏了（不是数组/空数组）要回落到默认表，否则第①层会一条都命不中
+    takeoverEnabled: !!stored.takeoverEnabled,
+    takeoverWithoutEvidence: !!stored.takeoverWithoutEvidence,
+    fuzzyMatchCutoff: clampCutoff(stored.fuzzyMatchCutoff),
+    takeoverSources: Array.isArray(stored.takeoverSources) && stored.takeoverSources.length
+      ? stored.takeoverSources.map(s => String(s)) : DEFAULT_CONFIG.takeoverSources,
+    controlRules: Array.isArray(stored.controlRules) && stored.controlRules.length > 0
+      ? stored.controlRules.filter(r => r && typeof r.op === 'string' && Array.isArray(r.words))
+      : DEFAULT_CONTROL_RULES,
+    volumeStep: clampVolumeStep(stored.volumeStep),
+    takeoverTriggers: Array.isArray(stored.takeoverTriggers) && stored.takeoverTriggers.length
+      ? stored.takeoverTriggers.map(t => String(t)) : DEFAULT_MUSIC_TRIGGERS,
   }
 }
 
@@ -187,6 +243,14 @@ export interface SpeakerView {
   ffmpegPath: string
   transcodeNormalize: boolean
   transcodeCapMb: number
+  /** 语音接管（G3）那几项 */
+  takeoverEnabled: boolean
+  takeoverWithoutEvidence: boolean
+  fuzzyMatchCutoff: number
+  takeoverSources: string[]
+  controlRules: ControlRule[]
+  volumeStep: number
+  takeoverTriggers: string[]
 }
 
 export async function getSpeakerView(): Promise<SpeakerView> {
@@ -215,7 +279,41 @@ export async function getSpeakerView(): Promise<SpeakerView> {
     ffmpegPath: config.ffmpegPath,
     transcodeNormalize: config.transcodeNormalize,
     transcodeCapMb: config.transcodeCapMb,
+    takeoverEnabled: config.takeoverEnabled,
+    takeoverWithoutEvidence: config.takeoverWithoutEvidence,
+    fuzzyMatchCutoff: config.fuzzyMatchCutoff,
+    takeoverSources: config.takeoverSources,
+    controlRules: config.controlRules,
+    volumeStep: config.volumeStep,
+    takeoverTriggers: config.takeoverTriggers,
   }
+}
+
+/**
+ * 接管那六项都是面板项（G3）。词表传进来的是**已经解析好的规则**（路由用 `parseControlRules`
+ * 把面板那几行文本转过来）；解析成空表时这里回落到默认表 —— 空表会让第①层一条都命不中，
+ * 那种"配了等于没配"最难查。
+ */
+export async function setSpeakerTakeover(input: {
+  enabled?: boolean; withoutEvidence?: boolean; cutoff?: unknown;
+  sources?: string[]; controlRules?: ControlRule[]; volumeStep?: unknown; triggers?: string[];
+}): Promise<SpeakerView> {
+  const config = await readSpeakerConfig()
+  if (typeof input.enabled === 'boolean') config.takeoverEnabled = input.enabled
+  if (typeof input.withoutEvidence === 'boolean') config.takeoverWithoutEvidence = input.withoutEvidence
+  if (input.cutoff !== undefined) config.fuzzyMatchCutoff = clampCutoff(input.cutoff)
+  if (Array.isArray(input.sources)) {
+    const list = input.sources.map(x => String(x).trim()).filter(Boolean).slice(0, 3)
+    if (list.length) config.takeoverSources = list
+  }
+  if (Array.isArray(input.controlRules) && input.controlRules.length) config.controlRules = input.controlRules
+  if (input.volumeStep !== undefined) config.volumeStep = clampVolumeStep(input.volumeStep)
+  if (Array.isArray(input.triggers)) {
+    const list = input.triggers.map(t => String(t).trim()).filter(Boolean)
+    if (list.length) config.takeoverTriggers = list
+  }
+  await writeSpeakerConfig(config)
+  return getSpeakerView()
 }
 
 /** 转码那四项（G1.5）：都是面板项，缺省位不传就不动 */

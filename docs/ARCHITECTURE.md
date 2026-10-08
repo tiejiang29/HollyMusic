@@ -327,9 +327,26 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 - **不写 ID3/封面**（`-vn` 丢封面流 + `-map_metadata -1` + `-id3v2_version 0`）：给音箱那份用不上标签，而字节偏移起播每多一段标签就多想一层（参考实现那个 `remove_id3tag` 开关防的是同一类事）。
 - **失败不当错误**：没装 ffmpeg / 管理员关了 / 转崩了 ⇒ 记一条警告并走回原来的路（在线取档、最后才 415）。**唯一例外是通道满**（同时最多 3 首），那时不许偷偷换一条在线档去挤源站，直接 503 + `Retry-After: 5`。请求断开（音箱挂线）会 `child.kill()` 并删掉 `.part`——僵尸 ffmpeg 是唯一真事故路径。
 
-真机实测（2026-10-08，L05B + 本机一份带 `libmp3lame` 的 ffmpeg）：70s 的 FLAC → 2,815,999 字节的 320k CBR MP3，**首包等 1.8 秒**（≈39× 实时），设备 `status=1`、`duration=70374ms`；第二次起 `复用=true`、20ms 出包；在这份产物上拖到 40s → `粗字节 1600000 → 起字节 1600782 对齐=true 码率来源=frame`，设备照播。产物头 4 字节是 `ff fb e0 00`（裸帧首，没有标签块）。
+真机实测（2026-10-08，L05B + 本机一份带 `libmp3lame` 的 ffmpeg）：70s 的 FLAC → 2,815,999 字节的 320k CBR MP3（≈39× 实时），产物头 4 字节是 `ff fb e0 00`（裸帧首，没有标签块）；命中时 20ms 出包；在这份产物上拖到 40s → `粗字节 1600000 → 起字节 1600782 对齐=true 码率来源=frame`，设备 `status=1`、`posSec` 照走。
+
+**这条口最初是"转完才发 + 挂断就杀"，被真机否掉了**：设备约 **5.1 秒**拿不到字节就自己断开、0.1 秒后重拉同一地址 ⇒ 每次都在差一点点时白干，日志里连排七条 `转码没成，退回原路径: 请求已断开`，那首歌永远转不出来。现在的不阻塞形状（`requestMp3Transcode` 返回 `ready | started | busy`）：命中就发产物；没命中就**起一单后台的**、这一次立刻走原来的在线取档；两头都不通（本地文件又没在线档）才回 `503 TRANSCODE_PENDING` + `Retry-After: 4`，让设备几秒后回来捡现成的。**只有超时才杀进程**。名额也在返回前就同步占掉——判满与占用之间隔着 `await` 时，十个并发请求能真起十个 ffmpeg（第一版就是这样）。
 
 **部署前提**：本仓库的生产镜像**没有 ffmpeg**（只装了 nginx/openssl），本机 PATH 里也没有。所以这条在 NAS 上生效前要先解决二进制来源（进主镜像 / 拆带 ffmpeg 的变体标签 / 指向容器里已有的某个构建）——这是还没定的问题，面板上那栏 `ffmpegPath` 就是为此留的。转码是**有损再编码**，FLAC→320k MP3 会丢信息，别当无损宣传（面板原文就这么写）。
+
+### 4.7.5 语音接管（G3）：小爱答砸了、而且这话像点歌，才由我们顶上
+
+`voice-control.ts`（词表与相似度，纯函数）+ `voice-takeover.ts`（判据与执行）。数据来自 §4.7.3 那份对话回显：每拍到"刚说的话"（`fromBaseline=false`）就递给 `submitAsk`，**排队串行**——连着说"下一首 下一首"时不许两条并发抢同一条 ubus 队。
+
+三层短路，顺序是有意的（越靠前越便宜、越确定）：
+
+- **① 控制词表命中 ⇒ 照做**，零网络零模型。词表面板可改可落库（`操作=词,词` 一行一条，**顺序有意义：先具体后笼统**）。闸门写死：`暂停/继续/上一首/下一首/停止/音量` 这七件**只在这台正被我们投放时才动**——没会话时用户说"暂停"小米自己就暂停了，我们再插一条就是重复甚至打架，那种情况判完只记一句"交回小爱"。播放模式（随机·单曲循环）**不在这张表里**：它是前端 `player-store` 的概念，服务端会话没有对应物，硬加只会接一个假动作。
+- **② 其余先看小爱办成没办成，再看这话像不像点歌**——两道门都要过：
+  - `answeredOk` 是**三态**不是两态：命中失败话术 `false`、正常回答 `true`、**空回答 `null`（= 我们没有证据）**。只有 `false` 直接放行；`null` 时按面板项"没证据也接管"决定，**默认不动**。
+  - `matchMusicTrigger`：**这句话里必须含一个点歌触发词**（面板可改的 `takeoverTriggers`）才去搜歌。这条不是锦上添花——模拟时我说了句「今天天气怎么样」，小爱答"没有找到"，而酷我库里**真有一首就叫《今天天气怎么样》**，相似度 100%，于是我们把一句天气问答变成了放歌。"它没答上"根本推不出"他要听歌"。默认表刻意不收单个"放"字（"放假""星期放"会误开）。
+  - 过了这两道才去 `takeoverSources` 那几台源搜（最多三台、一次 10 条，**用去掉触发词的那半句**去搜），候选曲名与这句话的相似度 `1 - 莱氏距离/较长串`，并且**互相包含即算同一首**（口令"稻香"vs 曲名"稻香 (Live)"时编辑距离会拖到阈值下；只认长度 ≥2 的一侧）。低于 `fuzzyMatchCutoff`（默认 0.6）就不投。
+- **③ 都对不上就什么都不做**。可选的 LLM 那层**没接**：AI 凭据现在只在浏览器 localStorage、服务端拿不到，要做得先把凭据落 `AppSetting`——那是另一件事，不在这里偷偷加。
+
+**必须记下的前提**：§4.7.3 实测到对话接口 `limit` 开到 120 仍是 `records=0`，所以"真实的一条口令"至今没进过这条链。面板因此带一个**模拟口令**入口（`askSimulate`，只 admin）：把合成的"你说/小爱答"喂进**同一条判据与执行链**，账目里明确标 `合成`，且开关关着时照样只判不动（模拟不是后门）。用它在他真机上验过的：控制词但无会话 ⇒ 判 `control`、"没动（交回小爱）"、一条指令都不发；有会话时"小声一点" ⇒ 音量 43→33、"音量调到 25" ⇒ 25（**起点是现读的**，音量会漂）；「稻香」+ 回答"没有找到" ⇒ 搜到 `kw-440613`、100% ⇒ `startCast` 顶上，设备 `status=1`、`posSec` 从 10 走到 13；「今天天气怎么样」+ 没答上 ⇒ `not-music`，一次搜索都不发。所以第①②层的判据与执行是**真机验过的**，而"真话能不能走到这里"仍然只有 §4.7.3 那条待办能回答。
 
 ---
 
@@ -430,7 +447,7 @@ apply（`music-sources.json` 只有一个原子写入者）。门槛**不对称*
 | GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
 | GET/POST/PUT | `/api/admin/source-discovery` | 候选列表 / 动作（`probe`、`probe-batch`、`import`（撞同名时 `mode`：`replace` 换掉库里那条 / `parallel` 并排装）、`dismiss`、`prune`、`crawl`、`drain`、`stop`、`search`、`freshness`）/ 扫描清单与 token |
-| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`convSet`/`convList` 对话轮询与回显（见 §4.7.3）、`tcSet`/`tcProbe` 转码设置与探测（见 §4.7.4）、`logout`） |
+| GET/POST | `/api/admin/speaker` | 小爱音箱网关：状态视图（只回脱敏尾巴）/ 动作（`qrStart` 出二维码、`qrPoll` 问一次扫码状态、`devices` 刷新设备列表、`setManaged`、`setEnabled`、`setHost`、`setQuality`、`status`、`control`、`volume`、`play` 试推、`convSet`/`convList` 对话轮询与回显（见 §4.7.3）、`tcSet`/`tcProbe` 转码设置与探测（见 §4.7.4）、`askSet`/`askLog`/`askSimulate` 语音接管的设置·账目·模拟口令（见 §4.7.5）、`logout`） |
 | GET/POST | `/api/speaker` | 登录用户级投放：`GET` 返回可投音箱、就绪位与**当前会话**；`POST` 的 `action` = 投放 `cast`/`castRest`/`castSkip`/`seek`/`castStatus`/`castStop`，遥控 `pause`/`resume`/`stop`/`volume`，单推与排障 `play`/`status`（见 §4.7.2） |
 | GET/HEAD | `/api/speaker/stream?st=&uid=&quality=[&seek=秒]` | **只出 MP3** 的音箱流出口（`st` 必须第一位；`seek` 恒在最后，按帧对齐后整条 200 发剩余部分，见 §4.7.2）。库内不是 MP3 时先试转码（§4.7.4），转不了才退回在线取档 |
 | PUT/POST/DELETE | `/api/admin/sources/[id]` | 修改 / 手动更新订阅脚本 / 删除音源 |

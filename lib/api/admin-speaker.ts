@@ -44,6 +44,14 @@ export interface SpeakerView {
   ffmpegPath: string
   transcodeNormalize: boolean
   transcodeCapMb: number
+  /** 语音接管（G3）那六项 */
+  takeoverEnabled: boolean
+  takeoverWithoutEvidence: boolean
+  fuzzyMatchCutoff: number
+  takeoverSources: string[]
+  controlRules: Array<{ op: string; words: string[] }>
+  volumeStep: number
+  takeoverTriggers: string[]
 }
 
 export interface QrStartResult {
@@ -198,4 +206,34 @@ export function setSpeakerTranscode(input: {
 /** 重新探一次（刚装完 ffmpeg 用它，不然面板会一直挂着那句过期的"没探到"） */
 export function probeSpeakerFfmpeg(): Promise<TranscodeResult> {
   return apiPost<TranscodeResult>('admin/speaker', { action: 'tcProbe' })
+}
+
+/** 面板上的一行接管账目 */
+export interface TakeoverLogRow {
+  at: number
+  deviceID: string
+  deviceName: string
+  query: string
+  answer: string
+  verdict: 'control' | 'takeover' | 'standby' | 'no-hit' | 'answered' | 'stale' | 'rejected'
+  reason: string
+  acted: string
+  /** 面板"模拟口令"喂的那条，不是真话 */
+  synthetic: boolean
+}
+
+export function setSpeakerTakeover(input: {
+  enabled?: boolean; withoutEvidence?: boolean; cutoff?: number;
+  sources?: string[]; controlRulesText?: string; volumeStep?: number; triggers?: string[];
+}): Promise<{ view: SpeakerView }> {
+  return apiPost<{ view: SpeakerView }>('admin/speaker', { action: 'askSet', ...input })
+}
+
+export function readTakeoverLog(): Promise<{ rows: TakeoverLogRow[] }> {
+  return apiPost<{ rows: TakeoverLogRow[] }>('admin/speaker', { action: 'askLog' })
+}
+
+/** 喂一条合成口令走同一条判据链路（真机拉不到对话记录时唯一的验证手段） */
+export function simulateAsk(query: string, answer: string): Promise<TakeoverLogRow> {
+  return apiPost<TakeoverLogRow>('admin/speaker', { action: 'askSimulate', query, answer })
 }

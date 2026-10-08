@@ -16,12 +16,14 @@ class MockAuthError extends Error {
 }
 
 const h = vi.hoisted(() => ({
+  submitAsk: vi.fn(),
   config: {
     enabled: true, credentials: {}, devices: [] as Array<Record<string, unknown>>,
     lastSyncAt: null, lastError: null, serverHost: '', playQuality: '320k',
     musicApiDisabledModels: [] as string[],
     conversationEnabled: true, conversationPollSec: 2,
     failedAnswerHints: ['没有找到', '没听清'],
+    takeoverEnabled: false,
   },
   readSpeakerConfig: vi.fn(),
   ensureFreshCredentials: vi.fn(async () => ({ serviceToken: 'ST', userId: '1', deviceId: 'D' })),
@@ -43,6 +45,7 @@ vi.mock('@/lib/services/xiaomi/mina-client', () => ({
   fetchConversations: h.fetchConversations,
   XiaomiAuthError: MockAuthError,
 }))
+vi.mock('@/lib/services/xiaomi/voice-takeover', () => ({ submitAsk: h.submitAsk }))
 
 const mod = await import('@/lib/services/xiaomi/conversation-monitor')
 const { ensureConversationMonitor, getConversationFeed, stopConversationMonitor, looksLikeFailedAnswer, _resetConversationMonitorForTest } = mod
@@ -57,6 +60,8 @@ beforeEach(() => {
   h.config.devices = [DEVICE]
   h.readSpeakerConfig.mockImplementation(async () => ({ ...h.config }))
   h.fetchConversations.mockReset()
+  h.submitAsk.mockReset()
+  h.config.takeoverEnabled = false
   _resetConversationMonitorForTest()
 })
 
@@ -225,5 +230,41 @@ describe('每台设备的轮询账目（0 行时得能分清"没在拉"和"平�
     h.config.devices = [{ ...DEVICE, presence: 'offline' }]
     await vi.advanceTimersByTimeAsync(2100)
     expect(getConversationFeed().state.devices).toEqual([])
+  })
+})
+
+describe('接管（G3）的进料口', () => {
+  it('开关关着时一条都不递给接管（默认状态不许动别人的播放）', async () => {
+    h.fetchConversations.mockResolvedValue([rec(1000, '甲')])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    h.fetchConversations.mockResolvedValue([rec(2000, '乙')])
+    await vi.advanceTimersByTimeAsync(2100)
+    expect(h.submitAsk).not.toHaveBeenCalled()
+  })
+
+  it('开着时只递"刚说的"那批，启动时的历史一条都不许递', async () => {
+    h.config.takeoverEnabled = true
+    h.fetchConversations.mockResolvedValue([rec(1000, '昨天的话'), rec(2000, '昨天第二句')])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.submitAsk).not.toHaveBeenCalled()   // 首轮全是 fromBaseline
+
+    h.fetchConversations.mockResolvedValue([rec(1000, '昨天的话'), rec(2000, '昨天第二句'), rec(9000, '刚说的')])
+    await vi.advanceTimersByTimeAsync(2100)
+    expect(h.submitAsk).toHaveBeenCalledTimes(1)
+    expect(h.submitAsk.mock.calls[0][0]).toMatchObject({ query: '刚说的', fromBaseline: false })
+  })
+
+  it('重复拉到同一句不重递（去重键在基线那侧，接管不该被同一句话触发两次）', async () => {
+    h.config.takeoverEnabled = true
+    h.fetchConversations.mockResolvedValue([])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    h.fetchConversations.mockResolvedValue([rec(5000, '下一首')])
+    await vi.advanceTimersByTimeAsync(2100)
+    expect(h.submitAsk).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(2100)
+    expect(h.submitAsk).toHaveBeenCalledTimes(1)
   })
 })
