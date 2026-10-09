@@ -113,13 +113,19 @@ interface Session {
   lastError: string | null
 }
 
-const sessions = new Map<string, Session>()
+/**
+ * 会话表与 audio_id 计数器挂 `globalThis`，理由与对话监视器那条一样（那里记着实测后果）：
+ * 模块被热重载/打包复制成几份时，**每份各有一个看门狗在推同一台音箱**，同一句话会被并行副本
+ * 各投一次；`audio_id` 也靠自增序号保证唯一，两份各有各的计数就会撞号。
+ */
+interface CastRuntime { sessions: Map<string, Session>; audioSeq: number }
+const globalWithRt = globalThis as typeof globalThis & { __xiaomiCastSession?: CastRuntime }
+const rt: CastRuntime = globalWithRt.__xiaomiCastSession ??= { sessions: new Map<string, Session>(), audioSeq: 0 }
 
-let audioSeq = 0
 /** audio_id：够短、唯一、纯数字串（设备只认形状，回显原样） */
 function nextAudioId(): string {
-  audioSeq += 1
-  return `${Date.now()}${String(audioSeq % 1000).padStart(3, '0')}`
+  rt.audioSeq += 1
+  return `${Date.now()}${String(rt.audioSeq % 1000).padStart(3, '0')}`
 }
 
 /**
@@ -228,6 +234,7 @@ function dedupeTracks(items: CastTrack[], excludeUid: string): CastTrack[] {
 
 /** 推一窗给设备并接管会话状态：窗内容、游标、起播时刻都在这一步归零重来 */
 async function pushWindow(s: Session, slots: WindowSlot[]): Promise<boolean> {
+  const t0 = Date.now()
   const config = await readSpeakerConfig()
   const creds = await ensureFreshCredentials()
   const items: PlayItem[] = slots.map(x => ({ url: x.url, audioId: x.audioId }))
@@ -252,6 +259,8 @@ async function pushWindow(s: Session, slots: WindowSlot[]): Promise<boolean> {
   logger.info('[xiaomi] 投放窗口已推给音箱', {
     音箱: s.deviceName, 首数: slots.length, 当前: slots[0].uid,
     起点秒: Math.round(slots[0].seekSec), 批量: r.batched,
+    // 这一段含"读配置 + 可能续票 + 一次 ubus"，是接管延迟里执行段的主要开销之一
+    用时ms: Date.now() - t0,
   })
   if (!r.batched && slots.length > 1) {
     logger.warn('[xiaomi] 这台不认批量窗口，只播第一项，剩下的靠看门狗逐首补', { 型号: s.hardware })
@@ -382,7 +391,7 @@ function applyStatus(s: Session, st: PlayStatus): void {
 function primeStatus(s: Session): void {
   setTimeout(() => {
     void (async () => {
-      if (!sessions.has(s.deviceID)) return
+      if (!rt.sessions.has(s.deviceID)) return
       try {
         const creds = await ensureFreshCredentials()
         applyStatus(s, await getPlayStatus(creds, s.deviceID))
@@ -444,16 +453,16 @@ async function tick(s: Session): Promise<void> {
   } finally {
     s.ticking = false
   }
-  if (!errored && sessions.has(s.deviceID)) scheduleTick(s, nextDelay)
+  if (!errored && rt.sessions.has(s.deviceID)) scheduleTick(s, nextDelay)
 }
 
 /** 停掉别台已有的投放：一次只允许一个投放会话，免得歌在两个房间同时响 */
 async function stopOtherSessions(exceptDeviceID: string): Promise<void> {
-  for (const [id, s] of [...sessions]) {
+  for (const [id, s] of [...rt.sessions]) {
     if (id === exceptDeviceID) continue
     if (s.timer) clearTimeout(s.timer)
     await stopDevice(s).catch(() => {})
-    sessions.delete(id)
+    rt.sessions.delete(id)
   }
 }
 
@@ -502,20 +511,20 @@ export async function startCast(input: StartCastInput): Promise<CastView> {
     pushFails: 0,
     lastError: null,
   }
-  const old = sessions.get(device.deviceID)
+  const old = rt.sessions.get(device.deviceID)
   if (old?.timer) clearTimeout(old.timer)
   await stopOtherSessions(device.deviceID)
   if (!(await pushWindow(s, slots))) {
     throw new SpeakerError(s.lastError ?? '音箱没认这条推歌', 502)
   }
-  sessions.set(device.deviceID, s)
+  rt.sessions.set(device.deviceID, s)
   primeStatus(s)
   scheduleTick(s, POLL_MS)
   return buildView(s)
 }
 
 function requireSession(deviceID?: string): Session {
-  const s = deviceID ? sessions.get(deviceID) : sessions.values().next().value
+  const s = deviceID ? rt.sessions.get(deviceID) : rt.sessions.values().next().value
   if (!s) throw new SpeakerError('现在没有投放会话（先点「投到小爱」）', 409)
   return s
 }
@@ -532,7 +541,7 @@ export async function skipCast(delta: number, deviceID?: string): Promise<CastVi
     // 窗里没了：从 rest 切下一窗。切不出来时 advance 会收口（停音箱 + 清会话），
     // 这里不能假装还在投放 —— 会话已不在表里，如实报错让前端退出投放态
     await advance(s)
-    if (!sessions.has(s.deviceID)) throw new SpeakerError('队列已经放完，音箱停了', 409)
+    if (!rt.sessions.has(s.deviceID)) throw new SpeakerError('队列已经放完，音箱停了', 409)
     return buildView(s)
   }
   // 先回本窗里的前一格（设备自己往后播的那些也算"刚听过"，它们不在 history 里就是回不去）
@@ -594,7 +603,7 @@ export async function refreshCast(deviceID?: string): Promise<CastView> {
   s.pausedWithinItem = st.status === PLAY_STATUS_PLAYING ? null : (st.position >= 0 ? st.position / 1000 : 0)
   const idx = s.window.findIndex(x => x.audioId === st.audioId)
   if (idx >= 0) s.playingIdx = idx
-  if (!s.timer && sessions.has(s.deviceID)) scheduleTick(s, POLL_MS)
+  if (!s.timer && rt.sessions.has(s.deviceID)) scheduleTick(s, POLL_MS)
   return buildView(s)
 }
 
@@ -603,7 +612,7 @@ export async function refreshCast(deviceID?: string): Promise<CastView> {
  * 看门狗要是因为出错停了，这里顺手把它拉起来，免得投完以后进度永远不动。
  */
 export async function castView(deviceID?: string): Promise<CastView | null> {
-  const s = deviceID ? sessions.get(deviceID) : sessions.values().next().value
+  const s = deviceID ? rt.sessions.get(deviceID) : rt.sessions.values().next().value
   if (!s) return null
   if (!s.timer && !s.ticking) scheduleTick(s, 0)
   return buildView(s)
@@ -611,20 +620,20 @@ export async function castView(deviceID?: string): Promise<CastView | null> {
 
 /** 退出投放：停掉音箱并清会话 */
 export async function stopCast(deviceID?: string): Promise<void> {
-  const s = deviceID ? sessions.get(deviceID) : sessions.values().next().value
+  const s = deviceID ? rt.sessions.get(deviceID) : rt.sessions.values().next().value
   if (!s) return
   await stopDevice(s)
   clearSession(s.deviceID)
 }
 
 function clearSession(deviceID: string): void {
-  const s = sessions.get(deviceID)
+  const s = rt.sessions.get(deviceID)
   if (s?.timer) clearTimeout(s.timer)
-  sessions.delete(deviceID)
+  rt.sessions.delete(deviceID)
 }
 
 /** 测试用：清掉所有会话与定时器 */
 export function _resetCastSessionsForTest(): void {
-  for (const s of sessions.values()) if (s.timer) clearTimeout(s.timer)
-  sessions.clear()
+  for (const s of rt.sessions.values()) if (s.timer) clearTimeout(s.timer)
+  rt.sessions.clear()
 }

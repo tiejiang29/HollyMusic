@@ -354,3 +354,26 @@ describe('判定结果回填到那一行（③）与时钟偏移告警（②）'
     expect(getConversationFeed().state.clockSkewMs).toBeNull()
   })
 })
+
+describe('同一进程内的单例（模块被复制成几份也只准有一条轮询链）', () => {
+  // 2026-10-09 在 dev 上真撞过：每改一次代码热重载一次，旧副本的 setTimeout 链不死，
+  // 结果同一句口令被并行副本各判一次、同一首歌半秒内重推六条 ⇒ 状态必须挂 globalThis
+  it('第二份副本再 ensure 一次，不许多出一条并行的定时器链', async () => {
+    h.config.takeoverEnabled = true
+    h.fetchConversations.mockResolvedValue([])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    const before = h.fetchConversations.mock.calls.length
+
+    vi.resetModules()
+    const second = await import('@/lib/services/xiaomi/conversation-monitor')
+    await second.ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(2100)
+
+    // 只有一条链在跳：这一拍打一次。两份并行会各打一次，读数就会是 +2
+    expect(h.fetchConversations.mock.calls.length).toBe(before + 1)
+    // 账本也是同一份：从任一副本读都该看见同一个 polls
+    expect(second.getConversationFeed().state.devices[0].polls)
+      .toBe(getConversationFeed().state.devices[0].polls)
+  })
+})

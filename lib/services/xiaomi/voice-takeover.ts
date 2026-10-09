@@ -162,17 +162,22 @@ export interface TakeoverLogRow {
 }
 
 const LOG_MAX = 40
-const log: TakeoverLogRow[] = []
-/** 一条条排队处理：连着说"下一首 下一首"时不许两条并发去抢同一条 ubus 队 */
-let chain: Promise<unknown> = Promise.resolve()
+/**
+ * 账本与队列同样挂 `globalThis`：模块被热重载复制成几份时，**串行队列必须是同一条** ——
+ * 两份各有各的 `chain`，等于两句话并发去抢同一条 ubus 队（这正是它当初要串行的理由）。
+ * 同一进程内的同一份账也才拼得出最近 40 条这个上限。
+ */
+interface TakeoverRuntime { log: TakeoverLogRow[]; chain: Promise<unknown> }
+const globalWithRt = globalThis as typeof globalThis & { __xiaomiVoiceTakeover?: TakeoverRuntime }
+const rt: TakeoverRuntime = globalWithRt.__xiaomiVoiceTakeover ??= { log: [], chain: Promise.resolve() }
 
 export function getTakeoverLog(): TakeoverLogRow[] {
-  return log.slice(0, LOG_MAX)
+  return rt.log.slice(0, LOG_MAX)
 }
 
 function pushLog(row: TakeoverLogRow): void {
-  log.unshift(row)
-  if (log.length > LOG_MAX) log.length = LOG_MAX
+  rt.log.unshift(row)
+  if (rt.log.length > LOG_MAX) rt.log.length = LOG_MAX
 }
 
 const clampVolume = (v: number): number => Math.min(100, Math.max(0, Math.round(v)))
@@ -226,7 +231,12 @@ export async function handleAskNow(
   row: AskRow, opts: { synthetic?: boolean; config?: SpeakerConfig } = {},
 ): Promise<TakeoverLogRow> {
   const config = opts.config ?? await readSpeakerConfig()
+  // 分段计时是照着"从说完话到音箱出声 14 秒"这条实测摆的：判据（含搜歌）与执行（含推流）
+  // 分开看才知道该压哪一段，别到时候又靠猜
+  const decideStart = Date.now()
   const d = await decideTakeover(row, config)
+  const decideMs = Date.now() - decideStart
+  const actStart = Date.now()
   let acted = '没动'
   try {
     if (d.verdict === 'control') {
@@ -257,6 +267,7 @@ export async function handleAskNow(
   pushLog(entry)
   logger.info('[voice-takeover] 判了一条口令', {
     判定: d.verdict, 说了: row.query.slice(0, 30), 答了: row.answer.slice(0, 30), 做了: acted, 合成: !!opts.synthetic,
+    判据ms: decideMs, 执行ms: Date.now() - actStart,
   })
   return entry
 }
@@ -268,7 +279,7 @@ export async function handleAskNow(
  * 省得管理员在两张表之间对齐同一句话）。异常不许冒出去：口令处理失败最坏就是"这句没接住"。
  */
 export function submitAsk(row: AskRow, done?: (entry: TakeoverLogRow) => void): void {
-  chain = chain.then(async () => {
+  rt.chain = rt.chain.then(async () => {
     const entry = await handleAskNow(row)
     try {
       done?.(entry)
@@ -282,6 +293,6 @@ export function submitAsk(row: AskRow, done?: (entry: TakeoverLogRow) => void): 
 
 /** 只给测试用 */
 export function _resetVoiceTakeoverForTest(): void {
-  log.length = 0
-  chain = Promise.resolve()
+  rt.log.length = 0
+  rt.chain = Promise.resolve()
 }

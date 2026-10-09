@@ -84,15 +84,34 @@ const FEED_MAX = 60
  */
 const REWIND_TOLERANCE_MS = 10_000
 
-const feed: AskRow[] = []
-const baselines = new Map<string, { name: string; hardware: string; lastTs: number; primed: boolean; seen: Set<string>; polls: number }>()
+/**
+ * 这一组内存态**必须跨模块副本共享**，所以挂在 `globalThis` 上。
+ *
+ * 为什么这不是过度设计：Next 的热重载会把本文件再求值一遍，而**旧副本里那条 setTimeout 链不会死** ——
+ * 2026-10-09 21:10 在 dev 上实测到同一句口令被并行的副本各判一次，同一首歌半秒内重推六条
+ * 「投放窗口已推给音箱」。生产单进程也不会天然免疫：`instrumentation` 拿到的就是另一套 lib 副本
+ * （见 HANDOFF 里那条老教训）。同一进程内不论模块被打成几份，账本只有这一份。
+ */
+interface Account { name: string; hardware: string; lastTs: number; primed: boolean; seen: Set<string>; polls: number }
+interface MonitorRuntime {
+  feed: AskRow[]
+  baselines: Map<string, Account>
+  timer: ReturnType<typeof setTimeout> | null
+  ticking: boolean
+  state: MonitorState
+}
+const globalWithRt = globalThis as typeof globalThis & { __xiaomiConversationMonitor?: MonitorRuntime }
+const rt: MonitorRuntime = globalWithRt.__xiaomiConversationMonitor ??= {
+  feed: [], baselines: new Map<string, Account>(), timer: null, ticking: false,
+  state: { running: false, pollSec: 2, enabled: false, lastPollAt: null, lastError: null, devices: [], clockSkewMs: null },
+}
 
 /** 拿到（或建出）这台设备的账目 */
 function ensureAccount(deviceID: string, name: string, hardware: string) {
-  let b = baselines.get(deviceID)
+  let b = rt.baselines.get(deviceID)
   if (!b) {
     b = { name, hardware, lastTs: 0, primed: false, seen: new Set<string>(), polls: 0 }
-    baselines.set(deviceID, b)
+    rt.baselines.set(deviceID, b)
   }
   return b
 }
@@ -106,7 +125,7 @@ function account(deviceID: string, name: string, hardware: string) {
 
 function snapshotDevices(targets: Array<{ deviceID: string }>): MonitorState['devices'] {
   return targets.map(d => {
-    const b = baselines.get(d.deviceID)
+    const b = rt.baselines.get(d.deviceID)
     return {
       deviceID: d.deviceID, name: b?.name ?? '', primed: b?.primed ?? false,
       lastTs: b?.lastTs ?? 0, polls: b?.polls ?? 0, seen: b?.seen.size ?? 0,
@@ -114,12 +133,6 @@ function snapshotDevices(targets: Array<{ deviceID: string }>): MonitorState['de
   })
 }
 
-let timer: ReturnType<typeof setTimeout> | null = null
-let ticking = false
-let state: MonitorState = {
-  running: false, pollSec: 2, enabled: false,
-  lastPollAt: null, lastError: null, devices: [], clockSkewMs: null,
-}
 
 /** 话术片段命中即算"疑似没答上"。空答案也算 —— 小爱光响灯不出话是同一类失败 */
 export function looksLikeFailedAnswer(answer: string, hints: string[]): boolean {
@@ -129,13 +142,13 @@ export function looksLikeFailedAnswer(answer: string, hints: string[]): boolean 
 }
 
 export function getConversationFeed(): { rows: AskRow[]; state: MonitorState } {
-  return { rows: feed.slice(0, FEED_MAX), state }
+  return { rows: rt.feed.slice(0, FEED_MAX), state: rt.state }
 }
 
 export function stopConversationMonitor(): void {
-  if (timer) clearTimeout(timer)
-  timer = null
-  state = { ...state, running: false }
+  if (rt.timer) clearTimeout(rt.timer)
+  rt.timer = null
+  rt.state = { ...rt.state, running: false }
 }
 
 /**
@@ -146,41 +159,41 @@ export async function ensureConversationMonitor(): Promise<MonitorState> {
   const config = await readSpeakerConfig()
   const pollSec = clampPollSec(config.conversationPollSec)
   if (!config.conversationEnabled) {
-    if (timer || state.running) stopConversationMonitor()
+    if (rt.timer || rt.state.running) stopConversationMonitor()
     // 状态本体里的 `enabled` 也要落回去：以前只把 enabled:false 贴在**返回值**上，而面板走的是
     // `convList` → `getConversationFeed()`（读的是 state 本体），于是关掉开关后它还看着 enabled:true。
     // 2026-10-08 修的是路由那两条手写分支，这是同一类的另一半。
-    state = { ...state, enabled: false, pollSec }
-    return state
+    rt.state = { ...rt.state, enabled: false, pollSec }
+    return rt.state
   }
   // `running` 只是"我打算在跑"。真正的凭据是手上有没有定时器在等（timer）或有没有一拍在飞
   // （ticking）—— 两个都没有就是上一拍被硬错打停了，这里必须重新排起来，否则 tick() 里那句
   // "等面板下次来问时重新排程"是空的（实测：一次 code=999 之后永远停住）。
-  if (state.running && (timer !== null || ticking) && state.pollSec === pollSec) return state
-  state = { ...state, enabled: true, running: true, pollSec }
+  if (rt.state.running && (rt.timer !== null || rt.ticking) && rt.state.pollSec === pollSec) return rt.state
+  rt.state = { ...rt.state, enabled: true, running: true, pollSec }
   logger.info('[xiaomi] 对话轮询启动', { 间隔秒: pollSec, 设备数: config.devices.filter(d => d.managed && d.presence === 'online').length })
   schedule(0)
-  return state
+  return rt.state
 }
 
 function schedule(delayMs: number): void {
-  if (timer) clearTimeout(timer)
+  if (rt.timer) clearTimeout(rt.timer)
   // 定时器一触发就把句柄清掉：不然 `timer` 永远指着一个已经响过的 Timeout，
   // "手上还有没有在等的那一拍"就判不出来（硬错停住后面板再问也救不回来）
-  timer = setTimeout(() => { timer = null; void tick() }, delayMs)
+  rt.timer = setTimeout(() => { rt.timer = null; void tick() }, delayMs)
 }
 
 /** 一拍：把所有在线纳管设备的对话记录拉一遍 */
 async function tick(): Promise<void> {
-  if (ticking) return
-  ticking = true
+  if (rt.ticking) return
+  rt.ticking = true
   let failedHard = false
   try {
     const config = await readSpeakerConfig()
     if (!config.conversationEnabled) { stopConversationMonitor(); return }
     const targets = config.devices.filter(d => d.managed && d.presence === 'online' && d.hardware)
     if (targets.length === 0) {
-      state = { ...state, lastPollAt: Date.now(), lastError: '没有在线且纳管的设备，暂无可轮询', devices: [] }
+      rt.state = { ...rt.state, lastPollAt: Date.now(), lastError: '没有在线且纳管的设备，暂无可轮询', devices: [] }
     } else {
       const creds = await ensureFreshCredentials()
       // 单台失败不阻断别台，但**要留在 lastError 上**：早先这里收尾时把 lastError 一律清成 null，
@@ -219,8 +232,8 @@ async function tick(): Promise<void> {
           })
         }
       }
-      state = {
-        ...state, lastPollAt: Date.now(), lastError: softError,
+      rt.state = {
+        ...rt.state, lastPollAt: Date.now(), lastError: softError,
         devices: snapshotDevices(targets),
         clockSkewMs: maxSkew > CLOCK_SKEW_ALARM_MS ? maxSkew : null,
       }
@@ -228,15 +241,15 @@ async function tick(): Promise<void> {
   } catch (err) {
     failedHard = true
     const message = err instanceof Error ? err.message : String(err)
-    state = { ...state, lastError: message.slice(0, 200) }
+    rt.state = { ...rt.state, lastError: message.slice(0, 200) }
     logger.warn('[xiaomi] 对话轮询出错:', message.slice(0, 160))
   } finally {
-    ticking = false
+    rt.ticking = false
   }
   // 票失效这类硬错不再自己爬：等面板下一次来问时 ensureConversationMonitor 会重新排程
   if (!failedHard) {
     const config = await readSpeakerConfig()
-    if (config.conversationEnabled) schedule(state.pollSec * 1000)
+    if (config.conversationEnabled) schedule(rt.state.pollSec * 1000)
     else stopConversationMonitor()
   }
 }
@@ -255,7 +268,7 @@ function absorb(deviceID: string, deviceName: string, records: { timestampMs: nu
   for (const r of records) {
     const key = `${r.timestampMs}|${r.query}`
     if (b.seen.has(key)) {
-      const prior = feed.find(x => x.deviceID === deviceID && x.timestampMs === r.timestampMs && x.query === r.query)
+      const prior = rt.feed.find(x => x.deviceID === deviceID && x.timestampMs === r.timestampMs && x.query === r.query)
       if (prior && !prior.answer && r.answer) {
         prior.answer = r.answer
         prior.looksFailed = looksLikeFailedAnswer(r.answer, hints)
@@ -286,15 +299,16 @@ function absorb(deviceID: string, deviceName: string, records: { timestampMs: nu
     if (rows.length > 0) logger.info('[xiaomi] 对话基线建立', { 设备: deviceName, 历史条数: rows.length })
   }
   if (rows.length === 0) return []
-  feed.unshift(...rows.reverse())
-  if (feed.length > FEED_MAX) feed.length = FEED_MAX
+  rt.feed.unshift(...rows.reverse())
+  if (rt.feed.length > FEED_MAX) rt.feed.length = FEED_MAX
   return rows.filter(r => !r.fromBaseline)
 }
 
 /** 只给测试用 */
 export function _resetConversationMonitorForTest(): void {
   stopConversationMonitor()
-  feed.length = 0
-  baselines.clear()
-  state = { running: false, pollSec: 2, enabled: false, lastPollAt: null, lastError: null, devices: [], clockSkewMs: null }
+  // 清的是**同一份 globalThis 上的账**：测试里 reload 模块拿到的也是它，别留下上一条用例的基线
+  rt.feed.length = 0
+  rt.baselines.clear()
+  rt.state = { running: false, pollSec: 2, enabled: false, lastPollAt: null, lastError: null, devices: [], clockSkewMs: null }
 }

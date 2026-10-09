@@ -17,6 +17,7 @@
  */
 import { NextRequest } from 'next/server'
 import fsp from 'fs/promises'
+import { existsSync } from 'fs'
 import { logger } from '@/lib/logger'
 import { resolveMusicInfoById } from '@/lib/db'
 import { musicSourceManager } from '@/lib/music-source-manager'
@@ -147,12 +148,20 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
   const rangeHeader = request.headers.get('range')
   const seekSec = readSeekSec(params)
 
+  // 设备**约 5.1 秒**拿不到字节就断开、0.1 秒后重拉同一地址 —— 所以"它来拉到、我们备好响应"
+  // 这段必须量出来才知道抢播慢在哪一段。起点取在这里：前面那些只是字符串活，量了会稀释数字
+  const t0 = Date.now()
+  const logReady = (route: string) => logger.info('[speaker/stream] 响应准备好了', {
+    歌曲: musicInfo.name, 走的路: route, 用时ms: Date.now() - t0, 起点秒: seekSec,
+  })
+
   // ① 库里有文件且**容器真是 MP3** 才走本地（扩展名不算证据，读头部字节嗅容器）
   const row = await findLibrarySong(musicInfo)
   if (row) {
     const head = await readHeadBytes(row.filePath)
     const container = detectContainer(head ?? new Uint8Array())
     if (container === 'mp3') {
+      logReady('库内 MP3')
       return serveLocalMp3(row.filePath, row.quality, seekSec, rangeHeader, isHead, musicInfo.name)
     }
     // ② 库里是 FLAC/wav 之类：音箱听不懂，改走在线取一档 MP3（在线那份本来就带磁盘缓存，
@@ -178,6 +187,9 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
       logger.info('[speaker/stream] 在线档按 seek 重推', { 秒: seekSec, 粗字节: rough, 起字节: seek.start, 对齐: seek.aligned })
       effectiveRange = `bytes=${seek.start}-`
     }
+    // 命中盘上缓存与真要回源，这两条的耗时差一个量级，所以先记下"进来时那份缓存在不在"
+    // —— 这是给上面那条计时日志分母用的，不参与任何业务判断
+    const cachedBefore = existsSync(resolvePaths(cacheKey, 'audio/mpeg').filePath)
     const res = await audioServe.serve({
       cacheKey,
       upstreamUrlResolver: resolver,
@@ -186,6 +198,7 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
     })
     const served = res.headers.get('content-type') ?? ''
+    logReady(res.ok ? (cachedBefore ? '在线档（盘上已有缓存）' : '在线档（回源取）') : `在线档（上游 ${res.status}）`)
     if (res.ok && !served.includes('audio/mpeg')) {
       // 源把 flac 标成 320k 是发生过的（扩展名撒谎那一类）；给音箱这份必须是 MP3，宁可直接报错
       return fail(415, 'NOT_MP3', `这一档拿回来的不是 MP3（${served || '未知类型'}），音箱放不了`)
