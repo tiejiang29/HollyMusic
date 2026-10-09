@@ -61,22 +61,12 @@ export interface SpeakerConfig {
   conversationEnabled: boolean
   /** 对话轮询间隔（秒），1~30 */
   conversationPollSec: number
-  /** 疑似"小爱没答上"的话术片段（面板可改）：G3 拿它判要不要接管 */
+  /** 疑似"小爱没答上"的话术片段（面板可改）：只用于回显那一格的标记，**不参与接管判据** */
   failedAnswerHints: string[]
   /**
    * 语音接管总开关（G3）。**默认关着**：它一开就是"听了你说的话就动那台音箱"。
-   * （原来这条注释写的"前提没验过、平台回 0 条"已作废 —— 记录拉得到，是我们把 Cookie 的
-   * deviceId 填成了登录那台设备，2026-10-09 修在 51b2f72。）
    */
   takeoverEnabled: boolean
-  /** 拿不到小爱的回答时站哪边：false=不动（默认），true=也接管。这条是留给管理员定的，不替他判 */
-  takeoverWithoutEvidence: boolean
-  /**
-   * 读回答要等多久（秒，0~10）。**0~10 的来源是 mi-song-gpt 的上限**：对话记录是先落 query、
-   * 回答晚一点才补进同一条，所以"空回答"里混着"我们读早了"这一类，等满窗口再判才不脏。
-   * 0 = 退回老行为（读到空就立刻判没证据）。
-   */
-  takeoverAnswerWaitSec: number
   /**
    * 候选要"像整曲"的门槛（秒，0=关）。防的是我们自己也挑到 30 秒铃声/剪辑版：
    * 2026-10-09 实测小爱给的是 30024ms 的片段，而《你不知道》整曲是 225s。
@@ -142,18 +132,8 @@ export function clampVolumeStep(raw: unknown): number {
   return Math.min(VOLUME_STEP_MAX, Math.max(VOLUME_STEP_MIN, Math.round(n)))
 }
 
-/** 等回答的合法区间：0=不等（老行为），上限照 mi-song-gpt 的 10 秒，再长用户就听到小爱说完了 */
-export const ANSWER_WAIT_SEC_MIN = 0
-export const ANSWER_WAIT_SEC_MAX = 10
-export const ANSWER_WAIT_SEC_DEFAULT = 6
 /** "像整曲"的门槛上限取 10 分钟，防止填成 999 之类把候选清光 */
 export const MIN_TRACK_SEC_MAX = 600
-
-export function clampAnswerWaitSec(raw: unknown): number {
-  const n = Number(raw)
-  if (!Number.isFinite(n)) return ANSWER_WAIT_SEC_DEFAULT
-  return Math.min(ANSWER_WAIT_SEC_MAX, Math.max(ANSWER_WAIT_SEC_MIN, Math.round(n)))
-}
 
 export function clampMinTrackSec(raw: unknown): number {
   const n = Number(raw)
@@ -174,8 +154,6 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   conversationPollSec: 2,
   failedAnswerHints: DEFAULT_FAILED_ANSWER_HINTS,
   takeoverEnabled: false,
-  takeoverWithoutEvidence: false,
-  takeoverAnswerWaitSec: ANSWER_WAIT_SEC_DEFAULT,
   takeoverMinTrackSec: 90,
   fuzzyMatchCutoff: FUZZY_CUTOFF_DEFAULT,
   takeoverSources: ['tx'],
@@ -196,6 +174,10 @@ export async function readSpeakerConfig(): Promise<SpeakerConfig> {
   delete (stored as Record<string, unknown>).ffmpegPath
   delete (stored as Record<string, unknown>).transcodeNormalize
   delete (stored as Record<string, unknown>).transcodeCapMb
+  // 判据改成"命中触发词就接管"之后，这两项没有对应的判据了（回答不再参与），
+  // 库里留着会在写回时被一路带下去、面板上还挂两个不生效的格子
+  delete (stored as Record<string, unknown>).takeoverWithoutEvidence
+  delete (stored as Record<string, unknown>).takeoverAnswerWaitSec
   return {
     ...DEFAULT_CONFIG,
     ...stored,
@@ -207,8 +189,6 @@ export async function readSpeakerConfig(): Promise<SpeakerConfig> {
     conversationPollSec: clampPollSec(stored.conversationPollSec),
     // 接管那几项：词表存坏了（不是数组/空数组）要回落到默认表，否则第①层会一条都命不中
     takeoverEnabled: !!stored.takeoverEnabled,
-    takeoverWithoutEvidence: !!stored.takeoverWithoutEvidence,
-    takeoverAnswerWaitSec: clampAnswerWaitSec(stored.takeoverAnswerWaitSec),
     takeoverMinTrackSec: clampMinTrackSec(stored.takeoverMinTrackSec),
     fuzzyMatchCutoff: clampCutoff(stored.fuzzyMatchCutoff),
     takeoverSources: Array.isArray(stored.takeoverSources) && stored.takeoverSources.length
@@ -255,8 +235,6 @@ export interface SpeakerView {
   failedAnswerHints: string[]
   /** 语音接管（G3）那几项 */
   takeoverEnabled: boolean
-  takeoverWithoutEvidence: boolean
-  takeoverAnswerWaitSec: number
   takeoverMinTrackSec: number
   fuzzyMatchCutoff: number
   takeoverSources: string[]
@@ -288,8 +266,6 @@ export async function getSpeakerView(): Promise<SpeakerView> {
     conversationPollSec: config.conversationPollSec,
     failedAnswerHints: config.failedAnswerHints,
     takeoverEnabled: config.takeoverEnabled,
-    takeoverWithoutEvidence: config.takeoverWithoutEvidence,
-    takeoverAnswerWaitSec: config.takeoverAnswerWaitSec,
     takeoverMinTrackSec: config.takeoverMinTrackSec,
     fuzzyMatchCutoff: config.fuzzyMatchCutoff,
     takeoverSources: config.takeoverSources,
@@ -305,15 +281,13 @@ export async function getSpeakerView(): Promise<SpeakerView> {
  * 那种"配了等于没配"最难查。
  */
 export async function setSpeakerTakeover(input: {
-  enabled?: boolean; withoutEvidence?: boolean; cutoff?: unknown;
+  enabled?: boolean; cutoff?: unknown;
   sources?: string[]; controlRules?: ControlRule[]; volumeStep?: unknown; triggers?: string[];
-  answerWaitSec?: unknown; minTrackSec?: unknown;
+  minTrackSec?: unknown;
 }): Promise<SpeakerView> {
   const config = await readSpeakerConfig()
   if (typeof input.enabled === 'boolean') config.takeoverEnabled = input.enabled
-  if (typeof input.withoutEvidence === 'boolean') config.takeoverWithoutEvidence = input.withoutEvidence
   if (input.cutoff !== undefined) config.fuzzyMatchCutoff = clampCutoff(input.cutoff)
-  if (input.answerWaitSec !== undefined) config.takeoverAnswerWaitSec = clampAnswerWaitSec(input.answerWaitSec)
   if (input.minTrackSec !== undefined) config.takeoverMinTrackSec = clampMinTrackSec(input.minTrackSec)
   if (Array.isArray(input.sources)) {
     const list = input.sources.map(x => String(x).trim()).filter(Boolean).slice(0, 3)

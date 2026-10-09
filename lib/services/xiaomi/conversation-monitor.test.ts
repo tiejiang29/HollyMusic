@@ -24,8 +24,6 @@ const h = vi.hoisted(() => ({
     conversationEnabled: true, conversationPollSec: 2,
     failedAnswerHints: ['没有找到', '没听清'],
     takeoverEnabled: false,
-    // 等回答窗口的默认值：夹具里给 0（= 读到空立刻判），要测挂起的那几条各自改成 >0
-    takeoverAnswerWaitSec: 0,
   },
   readSpeakerConfig: vi.fn(),
   ensureFreshCredentials: vi.fn(async () => ({ serviceToken: 'ST', userId: '1', deviceId: 'D' })),
@@ -64,7 +62,6 @@ beforeEach(() => {
   h.fetchConversations.mockReset()
   h.submitAsk.mockReset()
   h.config.takeoverEnabled = false
-  h.config.takeoverAnswerWaitSec = 0
   _resetConversationMonitorForTest()
 })
 
@@ -355,103 +352,5 @@ describe('判定结果回填到那一行（③）与时钟偏移告警（②）'
     h.fetchConversations.mockResolvedValue([rec(Date.now() + 30_000, '正常的一句')])
     await vi.advanceTimersByTimeAsync(2100)
     expect(getConversationFeed().state.clockSkewMs).toBeNull()
-  })
-})
-describe('等回答窗口（回答是后补进同一条记录的，读早了不等于小爱没答）', () => {
-  it('空回答先挂起：面板当拍到就有这一行，下一拍带回回答才递，且只递一次', async () => {
-    h.config.takeoverEnabled = true
-    h.config.takeoverAnswerWaitSec = 6
-    h.fetchConversations.mockResolvedValue([])
-    await ensureConversationMonitor()
-    await vi.advanceTimersByTimeAsync(50)
-
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香')])
-    await vi.advanceTimersByTimeAsync(2100)
-    expect(h.submitAsk).not.toHaveBeenCalled()
-    const row = getConversationFeed().rows.find(r => r.query === '播放稻香')!
-    expect(row.answer).toBe('')
-    expect(row.answerWaitUntil).toBeGreaterThan(0)
-
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '好的，为你播放稻香')])
-    await vi.advanceTimersByTimeAsync(2100)
-    expect(h.submitAsk).toHaveBeenCalledTimes(1)
-    expect(h.submitAsk.mock.calls[0][0]).toMatchObject({ query: '播放稻香', answer: '好的，为你播放稻香' })
-    // 补回答那一拍没有新口令（fresh 是空的）也要能结算 ⇒ 面板上仍是一行
-    expect(getConversationFeed().rows.filter(r => r.timestampMs === 5000)).toHaveLength(1)
-  })
-
-  it('等满窗口仍空：按"没证据"递出去，并在行上留下"真等过"的记号', async () => {
-    h.config.takeoverEnabled = true
-    h.config.takeoverAnswerWaitSec = 2
-    // 先跑一拍建基线（首轮那批永远只当历史看），再说这句话
-    h.fetchConversations.mockResolvedValue([])
-    await ensureConversationMonitor()
-    await vi.advanceTimersByTimeAsync(50)
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香')])
-    await vi.advanceTimersByTimeAsync(2100)
-    expect(h.submitAsk).not.toHaveBeenCalled()
-
-    await vi.advanceTimersByTimeAsync(2100)
-    expect(h.submitAsk).toHaveBeenCalledTimes(1)
-    const arg = h.submitAsk.mock.calls[0][0]
-    expect(arg.answer).toBe('')
-    expect(arg.answerTimedOut).toBe(true)
-  })
-
-  it('挂起期间用户改口：旧句的回答就算回来了也不许再动设备', async () => {
-    h.config.takeoverEnabled = true
-    h.config.takeoverAnswerWaitSec = 10
-    h.fetchConversations.mockResolvedValue([])
-    await ensureConversationMonitor()
-    await vi.advanceTimersByTimeAsync(50)
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香')])
-    await vi.advanceTimersByTimeAsync(2100)
-    expect(h.submitAsk).not.toHaveBeenCalled()
-
-    // 同一拍里：旧句补上了回答 + 来了更新的一句
-    h.fetchConversations.mockResolvedValue([
-      rec(5000, '播放稻香', '好的，为你播放稻香'),
-      rec(7000, '换一首', '想听什么呢'),
-    ])
-    await vi.advanceTimersByTimeAsync(2100)
-    expect(h.submitAsk.mock.calls.map(c => c[0].query)).toEqual(['换一首'])
-  })
-
-  it('窗口填 0 = 退回老行为（读到空立刻判）—— 反证上面那条判据真的在起作用', async () => {
-    h.config.takeoverEnabled = true
-    h.config.takeoverAnswerWaitSec = 0
-    h.fetchConversations.mockResolvedValue([])
-    await ensureConversationMonitor()
-    await vi.advanceTimersByTimeAsync(50)
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香')])
-    await vi.advanceTimersByTimeAsync(2100)
-    expect(h.submitAsk).toHaveBeenCalledTimes(1)
-    expect(h.submitAsk.mock.calls[0][0].answer).toBe('')
-    expect(h.submitAsk.mock.calls[0][0].answerTimedOut).toBeUndefined()
-  })
-
-  it('接管开关关着时不挂起（挂起只为接管服务，别留一堆没人结算的行）', async () => {
-    h.config.takeoverEnabled = false
-    h.config.takeoverAnswerWaitSec = 10
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香')])
-    await ensureConversationMonitor()
-    await vi.advanceTimersByTimeAsync(50)
-    expect(getConversationFeed().rows.find(r => r.query === '播放稻香')!.answerWaitUntil).toBeUndefined()
-    expect(h.submitAsk).not.toHaveBeenCalled()
-  })
-
-  it('停掉轮询时挂着的那几行作废：重新开起来后旧句的回答不再动设备', async () => {
-    h.config.takeoverEnabled = true
-    h.config.takeoverAnswerWaitSec = 30
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香')])
-    await ensureConversationMonitor()
-    await vi.advanceTimersByTimeAsync(50)
-    expect(h.submitAsk).not.toHaveBeenCalled()
-
-    stopConversationMonitor()
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '好的，为你播放稻香')])
-    await ensureConversationMonitor()
-    await vi.advanceTimersByTimeAsync(4200)
-    expect(h.submitAsk).not.toHaveBeenCalled()
   })
 })

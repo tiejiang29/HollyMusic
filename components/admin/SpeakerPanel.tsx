@@ -162,7 +162,6 @@ export function SpeakerPanel() {
   const [askCutoffDraft, setAskCutoffDraft] = useState<string | null>(null)
   const [askStepDraft, setAskStepDraft] = useState<string | null>(null)
   const [askTriggersDraft, setAskTriggersDraft] = useState<string | null>(null)
-  const [askWaitDraft, setAskWaitDraft] = useState<string | null>(null)
   const [minTrackDraft, setMinTrackDraft] = useState<string | null>(null)
   const [simQuery, setSimQuery] = useState('')
   const [simAnswer, setSimAnswer] = useState('')
@@ -200,7 +199,7 @@ export function SpeakerPanel() {
     return () => clearInterval(timer)
   }, [view?.takeoverEnabled, view?.conversationEnabled])
 
-  const saveTakeover = async (patch: { enabled?: boolean; withoutEvidence?: boolean }) => {
+  const saveTakeover = async (patch: { enabled?: boolean }) => {
     try {
       const r = await setSpeakerTakeover({
         ...patch,
@@ -209,7 +208,6 @@ export function SpeakerPanel() {
         ...(askCutoffDraft !== null ? { cutoff: Number(askCutoffDraft) } : {}),
         ...(askStepDraft !== null ? { volumeStep: Number(askStepDraft) } : {}),
         ...(askTriggersDraft !== null ? { triggers: askTriggersDraft.split(/[,，\s]+/).filter(Boolean) } : {}),
-        ...(askWaitDraft !== null ? { answerWaitSec: Number(askWaitDraft) } : {}),
         ...(minTrackDraft !== null ? { minTrackSec: Number(minTrackDraft) } : {}),
       })
       setView(r.view)
@@ -218,7 +216,6 @@ export function SpeakerPanel() {
       setAskCutoffDraft(null)
       setAskStepDraft(null)
       setAskTriggersDraft(null)
-      setAskWaitDraft(null)
       setMinTrackDraft(null)
       setAskLog((await readTakeoverLog()).rows)
     } catch (e) {
@@ -841,7 +838,7 @@ export function SpeakerPanel() {
             <p className="mt-2 text-xs text-destructive">
               平台最新一条记录的时间戳比本机此刻还晚 {Math.round(conv.state.clockSkewMs / 60000)} 分钟 ⇒
               <b> 本机时钟慢了 </b>（或那台音箱的时钟快）。基线用的一直是平台时间戳，所以这条
-              <b>不影响判据</b>，只是"隔了几秒才看得见"那一列会被算歪，看到它就先去核对系统时间。
+              <b>不影响判据</b>，只是「隔了几秒才看得见」那一列会被算歪，看到它就先去核对系统时间。
             </p>
           ) : null}
           {conv && conv.rows.length > 0 ? (
@@ -865,16 +862,7 @@ export function SpeakerPanel() {
                         {r.fromBaseline ? <span className="ml-1 opacity-60">（历史）</span> : null}
                       </td>
                       <td className="px-2 py-1.5">{r.query || '—'}</td>
-                      <td className="px-2 py-1.5">
-                        {r.answer || '—'}
-                        {/* 回答是后补进同一条记录的：等满之前别急着显示"没答上"，那是我们的读早 */}
-                        {!r.answer && r.answerWaitUntil ? (
-                          <span className="ml-1 opacity-60">（等它的回答…）</span>
-                        ) : null}
-                        {!r.answer && r.answerTimedOut ? (
-                          <span className="ml-1 opacity-60">（等满了还是空）</span>
-                        ) : null}
-                      </td>
+                      <td className="px-2 py-1.5">{r.answer || '—'}</td>
                       <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px]">
                         {Math.max(0, Math.round((r.receivedAt - r.timestampMs) / 1000))}s
                       </td>
@@ -889,7 +877,7 @@ export function SpeakerPanel() {
                         ) : (
                           <span
                             className="opacity-60"
-                            title="没递进判据的三种情况：启动时那批历史、接管开关关着、等回答期间被更新的一句超过"
+                            title="没递进判据的两种情况：启动时那批历史、接管开关关着"
                           >
                             没递进判据
                           </span>
@@ -913,16 +901,23 @@ export function SpeakerPanel() {
 
       {view ? (
         <div className="mt-6 rounded-lg border border-border bg-card p-4">
-          <h3 className="text-sm font-semibold">语音接管（G3：小爱答砸了才由我们顶上）</h3>
+          <h3 className="text-sm font-semibold">语音接管（G3：你说点歌就由我们放整曲）</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            三层短路：① 命中下面那张控制词表就照做（但<b>只在这台正被我们投放时动</b>，否则交回小爱）；
-            ② 其余当点歌，<b>先看小爱答上了没</b>——答上了不抢，像没答上才去我们的曲库找最像的一条顶上；
+            两层短路：① 命中下面那张控制词表就照做（但<b>只在这台正被我们投放时动</b>，否则交回小爱）；
+            ② 句子里有<b>点歌触发词</b>（播放 / 我想听 / 来一首…）就<em>不看小爱答了什么</em>，直接去我们的曲库找最像的一条整曲顶上；
             ③ 都对不上就什么都不做。
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            数据源已经通了（2026-10-09 实测到真记录）。只剩一条要注意的：<b>进程重启后的第一轮全算历史</b>
-            （标着「历史」那批不会触发接管），所以要验真实口令，得等面板开始轮询之后再对音箱说话；
-            不想等也可以直接用下面那条<b>模拟口令</b>走同一条判据链路。
+            为什么不看它的回答：这台没音乐会员，小爱接住点歌口令后回的永远是「请欣赏X 试听版，开通音乐会员听全曲」那一套
+            —— <b>它答得越顺，端上来的越是 30 秒片段</b>（实测设备上报 30024ms，而《七里香》整曲 04:59）。
+            代价也没藏着：不看回答就没人替你判「这句到底是不是点歌」，所以剩下三道闸一道都不松 ——
+            触发词、相似度门槛、「像整曲」的时长门槛。<b>含触发词的闲聊会被去搜歌</b>（多半 no-hit 不动），
+            真撞上就把那个词从下面那张表里摘掉。
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            一条要注意的：<b>进程重启后的第一轮全算历史</b>（标着「历史」那批不会触发接管），
+            所以要验真实口令，得等面板开始轮询之后再对音箱说话；不想等也可以直接用下面那条
+            <b>模拟口令</b>走同一条判据链路。
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
             <label className="flex items-center gap-1">
@@ -933,15 +928,6 @@ export function SpeakerPanel() {
                 onChange={e => void saveTakeover({ enabled: e.target.checked })}
               />
               允许接管
-            </label>
-            <label className="flex items-center gap-1" title="拿不到小爱的回答时站哪边">
-              <input
-                type="checkbox"
-                className="h-4 w-4 rounded accent-primary"
-                checked={view.takeoverWithoutEvidence}
-                onChange={e => void saveTakeover({ withoutEvidence: e.target.checked })}
-              />
-              没证据也接管
             </label>
             <span className="text-muted-foreground">相似度门槛</span>
             <input
@@ -962,17 +948,6 @@ export function SpeakerPanel() {
               onChange={e => setAskStepDraft(e.target.value)}
               className="w-16 rounded border border-border bg-background px-2 py-1"
               title="说「大声点」时一次加/减多少"
-            />
-            <span className="text-muted-foreground">等回答</span>
-            <input
-              type="number"
-              min={0}
-              max={10}
-              step={1}
-              defaultValue={view.takeoverAnswerWaitSec}
-              onChange={e => setAskWaitDraft(e.target.value)}
-              className="w-14 rounded border border-border bg-background px-2 py-1"
-              title="一句口令先空着不等于小爱没答上——回答是后补进同一条记录的（实测）。这里填最多等几秒，0=读到空就立刻判"
             />
             <span className="text-muted-foreground">像整曲</span>
             <input
@@ -1000,8 +975,9 @@ export function SpeakerPanel() {
             </button>
           </div>
           <label className="mt-3 block text-[11px] text-muted-foreground">
-            点歌触发词（逗号分隔）：<span className="text-foreground">只有这句话里含其中一个词，才会在「它没答上」时去搜歌</span>。
-            这条不是锦上添花——我模拟「今天天气怎么样」时，酷我库里真有一首就叫这个名，相似度 100%，直接把一句天气问答变成了放歌。
+            点歌触发词（逗号分隔）：<span className="text-foreground">这句话里含其中一个词，我们就去搜歌并顶上（不看小爱答了什么）</span>。
+            这张表现在<b>就是唯一的点歌判据</b>，词填宽了闲聊也会招来放歌：我模拟「今天天气怎么样」时，酷我库里真有一首就叫这个名，相似度 100%。
+            默认表刻意不收单个「放」字（「放假」「星期放」会误开）。
             <input
               type="text"
               defaultValue={view.takeoverTriggers.join(', ')}

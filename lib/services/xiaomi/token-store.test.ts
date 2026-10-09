@@ -322,10 +322,10 @@ describe('接管那些新键：老库里缺键必须补默认，不能把 undefi
   it('一条配置都没存过时读到的是默认值（接管关着、门槛与步长都在合法区间）', async () => {
     const c = await readSpeakerConfig()
     expect(c).toMatchObject({
-      takeoverEnabled: false, takeoverWithoutEvidence: false, fuzzyMatchCutoff: 0.75,
+      takeoverEnabled: false, fuzzyMatchCutoff: 0.75,
       takeoverSources: ['tx'], volumeStep: 10,
-      // 等回答窗口与"像整曲"门槛也要有默认：缺键读成 undefined 会让判据拿到 NaN
-      takeoverAnswerWaitSec: 6, takeoverMinTrackSec: 90,
+      // "像整曲"门槛也要有默认：缺键读成 undefined 会让判据拿到 NaN
+      takeoverMinTrackSec: 90,
     })
     expect(c.controlRules.length).toBe(DEFAULT_CONTROL_RULES.length)
     // 点歌触发词表也要有默认（空表会让第②层永远不接，配了开关却没反应最难查）
@@ -358,24 +358,40 @@ describe('接管那些新键：老库里缺键必须补默认，不能把 undefi
     expect(c.volumeStep).toBe(50)
   })
 
-  it('等回答窗口 0~10、像整曲门槛 0~600：越界钳住，填 0 要原样留着（0 = 关掉那层，不是回落默认）', async () => {
-    await setSpeakerTakeover({ answerWaitSec: 99, minTrackSec: 9999 })
-    expect(await readSpeakerConfig()).toMatchObject({ takeoverAnswerWaitSec: 10, takeoverMinTrackSec: 600 })
-
-    await setSpeakerTakeover({ answerWaitSec: 0, minTrackSec: 0 })
-    expect(await readSpeakerConfig()).toMatchObject({ takeoverAnswerWaitSec: 0, takeoverMinTrackSec: 0 })
+  it('像整曲门槛 0~600：越界钳住，填 0 要原样留着（0 = 关掉那层，不是回落默认）', async () => {
+    await setSpeakerTakeover({ minTrackSec: 9999 })
+    expect(await readSpeakerConfig()).toMatchObject({ takeoverMinTrackSec: 600 })
+    await setSpeakerTakeover({ minTrackSec: 0 })
+    expect(await readSpeakerConfig()).toMatchObject({ takeoverMinTrackSec: 0 })
   })
 
-  it('这两个键存坏了（非数字 / 负数）不许把 NaN 发进判据', async () => {
-    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({ takeoverAnswerWaitSec: '不是数', takeoverMinTrackSec: -50 }))
-    expect(await readSpeakerConfig()).toMatchObject({ takeoverAnswerWaitSec: 6, takeoverMinTrackSec: 0 })
+  it('这个键存坏了（非数字 / 负数）不许把 NaN 发进判据', async () => {
+    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({ takeoverMinTrackSec: '不是数' }))
+    expect(await readSpeakerConfig()).toMatchObject({ takeoverMinTrackSec: 90 })
+    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({ takeoverMinTrackSec: -50 }))
+    expect(await readSpeakerConfig()).toMatchObject({ takeoverMinTrackSec: 0 })
   })
 
-  it('接管那七项写进去能读回来，且视图里带的是同一套（面板读的就是视图）', async () => {
-    await setSpeakerTakeover({ enabled: true, withoutEvidence: true, cutoff: 0.75, sources: ['kg', 'tx', 'kw', 'mg'], volumeStep: 5 })
+  // 判据不看回答之后这两项没有对应的判据了（撤掉那一次留的清单，照转码那一期的同一口径）
+  it('库里存着已废弃的 takeoverWithoutEvidence / takeoverAnswerWaitSec 时，读一次就抹掉，不许再被写回带上', async () => {
+    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({
+      takeoverEnabled: true, takeoverWithoutEvidence: true, takeoverAnswerWaitSec: 6, takeoverMinTrackSec: 120,
+    }))
+    const c = await readSpeakerConfig()
+    expect(c).not.toHaveProperty('takeoverWithoutEvidence')
+    expect(c).not.toHaveProperty('takeoverAnswerWaitSec')
+    expect(c.takeoverMinTrackSec).toBe(120)
+    // 面板读的是视图那份，两边都不许有
+    const v = await getSpeakerView()
+    expect(v).not.toHaveProperty('takeoverWithoutEvidence')
+    expect(v).not.toHaveProperty('takeoverAnswerWaitSec')
+  })
+
+  it('接管那六项写进去能读回来，且视图里带的是同一套（面板读的就是视图）', async () => {
+    await setSpeakerTakeover({ enabled: true, cutoff: 0.75, sources: ['kg', 'tx', 'kw', 'mg'], volumeStep: 5 })
     const v = await getSpeakerView()
     expect(v).toMatchObject({
-      takeoverEnabled: true, takeoverWithoutEvidence: true, fuzzyMatchCutoff: 0.75,
+      takeoverEnabled: true, fuzzyMatchCutoff: 0.75,
       takeoverSources: ['kg', 'tx', 'kw'], volumeStep: 5,
     })
   })

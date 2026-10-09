@@ -130,14 +130,12 @@ export async function POST(request: NextRequest) {
     if (action === 'askSet') {
       const view = await setSpeakerTakeover({
         enabled: typeof body?.enabled === 'boolean' ? body.enabled : undefined,
-        withoutEvidence: typeof body?.withoutEvidence === 'boolean' ? body.withoutEvidence : undefined,
         cutoff: body?.cutoff,
         sources: Array.isArray(body?.sources) ? body.sources : undefined,
         controlRules: body?.controlRulesText !== undefined
           ? parseControlRules(String(body.controlRulesText)) : undefined,
         volumeStep: body?.volumeStep,
         triggers: Array.isArray(body?.triggers) ? body.triggers : undefined,
-        answerWaitSec: body?.answerWaitSec,
         minTrackSec: body?.minTrackSec,
       })
       return createSuccessResponse({ view })

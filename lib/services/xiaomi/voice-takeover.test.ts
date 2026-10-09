@@ -1,11 +1,11 @@
 /**
- * 第②层（读小爱的回答判成败）的测试。
+ * 第②层（点歌判据）的测试。
  *
  * 这一层的价值全在"什么时候不动"上，所以用例基本都是反向的：
- * 1. **答上了不许抢**（抢了两边同时出声，是 G2 那轮已经踩过一次的同类事故）；
- * 2. **拿不到证据 ≠ 答砸了** —— 默认立场必须是不动（今天实测对话接口回 0 条，
- *    把"没有证据"当"它失败了"会让接管在毫无依据时乱投歌）；
- * 3. **启动时那批历史一条都不许吃**（面板重放昨天的话，音箱半夜自己唱起来）；
+ * 1. **回答不参与判据**（2026-10-09 用户拍的：这台没会员，小爱点歌必回试听版，答得越顺越是片段）
+ *    —— 唯一的闸门是触发词，所以"不含触发词"那一格必须钉死；
+ * 2. **启动时那批历史一条都不许吃**（面板重放昨天的话，音箱半夜自己唱起来）；
+ * 3. **旧话不许打断现在的播放**；
  * 4. 控制词只在"这台正被我们投放"时动。
  */
 
@@ -34,7 +34,7 @@ vi.mock('@/lib/services/xiaomi/speaker-play', () => ({
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource: h.searchOneSource }))
 
 const mod = await import('@/lib/services/xiaomi/voice-takeover')
-const { decideTakeover, handleAskNow, answeredOk, getTakeoverLog, submitAsk, _resetVoiceTakeoverForTest, STALE_ASK_SEC } = mod
+const { decideTakeover, handleAskNow, getTakeoverLog, submitAsk, _resetVoiceTakeoverForTest, STALE_ASK_SEC } = mod
 const { DEFAULT_MUSIC_TRIGGERS } = await import('@/lib/services/xiaomi/voice-control')
 
 const now = Date.now()
@@ -44,9 +44,9 @@ const row = (over: Record<string, unknown> = {}) => ({
 }) as never
 
 const config = (over: Record<string, unknown> = {}) => ({
-  takeoverEnabled: true, takeoverWithoutEvidence: false, fuzzyMatchCutoff: 0.6,
+  takeoverEnabled: true, fuzzyMatchCutoff: 0.6,
   takeoverSources: ['tx'], controlRules: [], volumeStep: 10,
-  takeoverTriggers: DEFAULT_MUSIC_TRIGGERS,
+  takeoverTriggers: DEFAULT_MUSIC_TRIGGERS, takeoverMinTrackSec: 0,
   failedAnswerHints: ['没有找到', '没听清'], ...over,
 }) as never
 
@@ -58,34 +58,26 @@ beforeEach(() => {
   _resetVoiceTakeoverForTest()
 })
 
-describe('判"小爱答上了没"：三态里必须有"没有证据"这一格', () => {
-  it('空回答 = 没证据(null)，命中失败话术 = 没答上(false)，其余 = 答上了(true)', () => {
-    expect(answeredOk(row({ answer: '' }), ['没有找到'])).toBeNull()
-    expect(answeredOk(row({ answer: '   ' }), ['没有找到'])).toBeNull()
-    expect(answeredOk(row({ answer: '抱歉，没有找到你说的歌曲' }), ['没有找到'])).toBe(false)
-    expect(answeredOk(row({ answer: '好的，为你播放稻香' }), ['没有找到'])).toBe(true)
+describe('判据不看小爱答了什么（2026-10-09 用户拍的）', () => {
+  // 这台没音乐会员，点歌口令小爱总是接走并回「请欣赏X 试听版…开通音乐会员听全曲」——
+  // 回答越顺越是片段（实测设备 duration=30024ms，整曲是 04:59），所以"它答上了"根本不该拦事
+  it('同一句点歌：没回答、答砸了、答得很顺 —— 三种回答都照样顶上', async () => {
+    h.searchOneSource.mockResolvedValue({ list: [{ name: '稻香', singer: '周杰伦', uid: 'tx-S1', interval: '223' }] })
+    for (const answer of ['', '抱歉，没有找到你说的歌曲', '好的，请欣赏稻香 试听版，开通音乐会员听全曲']) {
+      const d = await decideTakeover(row({ query: '播放稻香', answer }), config())
+      expect(d).toMatchObject({ verdict: 'takeover', uid: 'tx-S1' })
+    }
+  })
+
+  it('回答里带不带失败话术也不影响（那条词表只剩回显那一格在用）', async () => {
+    h.searchOneSource.mockResolvedValue({ list: [] })
+    await decideTakeover(row({ query: '播放稻香', answer: '好的' }), config())
+    await decideTakeover(row({ query: '播放稻香', answer: '没有找到' }), config())
+    expect(h.searchOneSource).toHaveBeenCalledTimes(2)
   })
 })
 
 describe('判据矩阵', () => {
-  it('它答上了 ⇒ 不抢（reason 里要看得见那句回答）', async () => {
-    const d = await decideTakeover(row({ answer: '好的，为你播放稻香' }), config())
-    expect(d.verdict).toBe('answered')
-    expect(d.reason).toContain('为你播放稻香')
-  })
-
-  it('拿不到回答 + 默认立场 ⇒ standby（不许折算成"它答砸了"）', async () => {
-    const d = await decideTakeover(row({ answer: '' }), config())
-    expect(d.verdict).toBe('standby')
-    expect(h.searchOneSource).not.toHaveBeenCalled()
-  })
-
-  it('同一句在"没证据也接管"打开时才继续往下找（而且仍要像个点歌的说法）', async () => {
-    h.searchOneSource.mockResolvedValue({ list: [{ name: '稻香', singer: '周杰伦', uid: 'tx-S1', interval: '223' }] })
-    const d = await decideTakeover(row({ query: '播放稻香', answer: '' }), config({ takeoverWithoutEvidence: true }))
-    expect(d.verdict).toBe('takeover')
-  })
-
   it('控制词命中优先于一切（零网络，第①层不该去打搜索）', async () => {
     const d = await decideTakeover(row({ query: '下一首', answer: '好的' }), config())
     expect(d).toMatchObject({ verdict: 'control', op: 'next' })
@@ -105,14 +97,14 @@ describe('判据矩阵', () => {
     expect((await decideTakeover(nearly, config())).verdict).toBe('control')
   })
 
-  it('像没答上但搜不到 ⇒ no-hit，不动', async () => {
+  it('有触发词但搜不到 ⇒ no-hit，不动', async () => {
     const d = await decideTakeover(row({ query: '播放稻香', answer: '抱歉，没有找到' }), config())
     expect(d.verdict).toBe('no-hit')
   })
 
-  // 真机模拟里踩过的一条：曲库里真有一首就叫《今天天气怎么样》，小爱对天气问句答"没有找到"，
-  // 相似度立刻 100% ⇒ 把一句天气问答变成了放歌。"它没答上"必须再配上"这话像点歌"才接
-  it('问天气 + 它没答上 ⇒ not-music，一次搜索都不发（曲库里真有这么一首也不能抢）', async () => {
+  // 真机模拟里踩过的一条：曲库里真有一首就叫《今天天气怎么样》，一句天气问答配上它相似度 100%
+  // ⇒ 把问答变成了放歌。现在唯一的闸门就是触发词，所以这一格必须钉住：**没有触发词就一次搜索都不发**
+  it('问天气（不含触发词）⇒ not-music，一次搜索都不发（曲库里真有这么一首也不能抢）', async () => {
     h.searchOneSource.mockResolvedValue({ list: [{ name: '今天天气怎么样', singer: '某歌手', uid: 'kw-9', interval: '200' }] })
     const d = await decideTakeover(row({ query: '今天天气怎么样', answer: '抱歉，没有找到你说的歌曲' }), config())
     expect(d.verdict).toBe('not-music')

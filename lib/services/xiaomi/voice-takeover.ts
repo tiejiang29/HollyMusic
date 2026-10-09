@@ -1,20 +1,24 @@
 /**
- * 语音接管（G3）：第②层——读小爱的回答判"它到底答上了没"，答砸了才由我们顶上。
+ * 语音接管（G3）：第②层——**句子里有「播放 / 我想听」这类点歌触发词就直接由我们顶上，不看小爱答了什么**。
  *
- * 三层短路（顺序是有意的，越靠前越便宜、越确定）：
+ * 为什么不看回答（2026-10-09 用户拍的）：这台音箱没有音乐会员，小爱接住点歌口令后回的永远是
+ * 「请欣赏X 试听版，手机打开小米音箱APP，开通音乐会员听全曲」那一套 —— **它答得越顺，端上来的越是
+ * 30 秒片段**（实测设备 `duration=30024ms`，而我们搜到的《七里香》整曲是 04:59）。
+ * 所以"它答上了没"这一格根本不该拦事：它是"它把口令接走了"的证据，不是"它办成了"的证据。
+ *
+ * 两层短路（顺序是有意的，越靠前越便宜、越确定）：
  *  ① 本地控制词表命中 ⇒ 直接执行（零网络零 LLM，见 `voice-control.ts`）；
- *  ② 播放类意图 ⇒ **先问小爱答上了没**，只有"像没答上"才去搜我们的曲库并顶上；
- *  ③ 其余一律不动（可选的 LLM 那层还没接：AI 凭据现在只在浏览器 localStorage，
+ *  ② 命中点歌触发词 ⇒ 去我们的曲库搜，够像、且是整曲，就顶上；
+ *  ③ 都对不上就什么都不做（可选的 LLM 那层还没接：AI 凭据现在只在浏览器 localStorage，
  *     服务端拿不到，要做得先把凭据落 AppSetting —— 那是另一件事，不在这儿偷偷加）。
  *
  * 第②层为什么要有：小爱自己的音乐检索覆盖不到我们的曲库（我们聚合的歌、我们自己转码的文件），
- * 但它**会先接住那句口令**。所以判据不是"这句话像不像点歌"，而是"这句它有没有办成"——
- * 办成了我们闭嘴，办砸了我们补上，这样两边不会同时出声。
+ * 但它**会先接住那句口令**，所以我们不抢，它就只放片段。
  *
- * **今天必须先记下的一条前提**（2026-10-08 实测）：对话接口鉴权、报文形状、二次 parse 全都通，
- * 但 `limit` 开到 120 拿回来还是 `records=0` —— 也就是"真实的一条口令"我们至今没看到过。
- * 所以这一层的判据只能用面板上那条**模拟口令**验证（它把合成的一行喂进同一条链路，
- * 日志里明确标 `合成`），**不等于端到端已验**。拿不到证据时的默认立场也据此定成"不动"。
+ * **这条路的代价要记清**：不看回答，就没有任何东西替你判"这句话到底是不是点歌"。所以剩下三道闸
+ * 一道都不许松 —— 触发词（面板可改，默认表刻意不收单个"放"字）、相似度门槛 0.75、"像整曲"的时长门槛。
+ * 已知挡不住的一类：「我想听你说个笑话」这种**含触发词但不是点歌**的句子会去搜歌（然后大多 no-hit）；
+ * 真撞上就靠把那个词从面板词表里摘掉，不靠在这里堆黑名单。
  */
 import { logger } from '@/lib/logger'
 import { searchOneSource } from '@/lib/services/song-search-service'
@@ -30,7 +34,7 @@ import type { AskRow } from '@/lib/services/xiaomi/conversation-monitor'
 import type { SourceType } from '@/lib/types/music'
 
 export type Verdict =
-  | 'control' | 'takeover' | 'standby' | 'no-hit' | 'answered' | 'stale' | 'rejected' | 'not-music'
+  | 'control' | 'takeover' | 'no-hit' | 'stale' | 'rejected' | 'not-music'
 
 export interface TakeoverDecision {
   verdict: Verdict
@@ -50,24 +54,7 @@ export const STALE_ASK_SEC = 90
 export const CONTAINS_WINDOW_CHARS = 4
 
 /**
- * 判"小爱这句答砸了没"。
- *
- * 三态里**只有 `false` 才允许接管**：`null` 是"我们没有证据"（回答是空的、或者这一条根本没拉回来），
- * 按面板那项 `takeoverWithoutEvidence` 决定（默认不动）。把"拿不到证据"折算成"它答砸了"是
- * 这一期最容易犯的错——今天实测的 0 条记录就是活例子。
- */
-export function answeredOk(row: AskRow, hints: string[]): boolean | null {
-  const text = (row.answer ?? '').trim()
-  if (!text) return null
-  if (hints.some(h => h && text.includes(h))) return false
-  return true
-}
-
-/**
- * 决定要不要接管。纯函数：不查库、不打网络，好让这三层的判据能钉在测试里。
- *
- * `search` 由调用方注入（真实实现是拿候选去我们的曲库搜一遍）——这样判据与取数分离，
- * 也挡住"为了测试把网络塞进决策里"那种写法。
+ * 决定要不要接管。纯函数：不查库、不打网络，好让这几层判据能钉在测试里。
  */
 export async function decideTakeover(
   row: AskRow, config: SpeakerConfig, nowMs = Date.now(),
@@ -83,16 +70,10 @@ export async function decideTakeover(
   const hit = matchControl(query, rules)
   if (hit) return { verdict: 'control', reason: `控制词「${hit.matched}」命中`, op: hit.op, volumeTo: hit.volumeTo }
 
-  const ok = answeredOk(row, config.failedAnswerHints)
-  if (ok === true) return { verdict: 'answered', reason: `小爱答上了（「${row.answer.slice(0, 24)}」），不抢` }
-  if (ok === null && !config.takeoverWithoutEvidence) {
-    return { verdict: 'standby', reason: '没拿到它的回答，按默认立场不动（面板可改成"没证据也接"）' }
-  }
-
-  // **"它没答上"推不出"他要听歌"**：先要像个点歌的说法，才去搜、才谈得上抢
+  // 只看这句话，不看小爱答了什么（理由见文件头）
   const triggers = (config.takeoverTriggers?.length ? config.takeoverTriggers : DEFAULT_MUSIC_TRIGGERS)
   const trigger = matchMusicTrigger(query, triggers)
-  if (!trigger) return { verdict: 'not-music', reason: `不像点歌（没命中触发词），不动：「${query.slice(0, 20)}」` }
+  if (!trigger) return { verdict: 'not-music', reason: `没命中点歌触发词，不动：「${query.slice(0, 20)}」` }
 
   // 拿去掉触发词的那半句去搜：整句「播放稻香」会让匹配度被多出来的两个字拖低
   const { best: cand, skippedShort } = await pickCandidate(query.replace(trigger, '') || query, config)
@@ -102,7 +83,11 @@ export async function decideTakeover(
   if (cand.score < config.fuzzyMatchCutoff) {
     return { verdict: 'no-hit', reason: `最像的是「${cand.name}」但只有 ${(cand.score * 100).toFixed(0)}%，低于 ${(config.fuzzyMatchCutoff * 100).toFixed(0)}%` }
   }
-  return { verdict: 'takeover', reason: `它没答上，我们这有「${cand.name}」(${(cand.score * 100).toFixed(0)}%)`, uid: cand.uid, name: cand.name, score: cand.score }
+  return {
+    verdict: 'takeover',
+    reason: `说了点歌（「${trigger}」），顶上整曲「${cand.name}」(${(cand.score * 100).toFixed(0)}%)`,
+    uid: cand.uid, name: cand.name, score: cand.score,
+  }
 }
 
 export interface Candidate { uid: string; name: string; singer: string; durSec: number; score: number }
@@ -252,12 +237,8 @@ export async function handleAskNow(
         await startCast({ current: { uid: d.uid!, durSec: 0 }, rest: [], deviceID: row.deviceID })
         acted = `顶上来了：《${d.name}》（${((d.score ?? 0) * 100).toFixed(0)}% 像「${row.query.slice(0, 16)}」）`
       }
-    } else if (d.verdict === 'answered') {
-      acted = '没动（它办成了）'
-    } else if (d.verdict === 'standby') {
-      acted = '没动（默认立场：没证据不抢）'
     } else if (d.verdict === 'not-music') {
-      acted = '没动（不像点歌）'
+      acted = '没动（没命中点歌触发词）'
     } else if (d.verdict === 'no-hit') {
       acted = '没动（我们这边也没有这条）'
     } else {

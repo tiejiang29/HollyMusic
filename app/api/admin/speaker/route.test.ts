@@ -319,8 +319,8 @@ next=下一首` }))
     ])
   })
 
-  it('面板新加的两格（等回答 / 像整曲）要原样交到服务层：漏一个键就是面板上填了没落库', async () => {
-    await POST(req({ action: 'askSet', answerWaitSec: 3, minTrackSec: 120 }))
-    expect(h.setSpeakerTakeover.mock.calls[0][0]).toMatchObject({ answerWaitSec: 3, minTrackSec: 120 })
+  it('面板那格「像整曲」要原样交到服务层：漏一个键就是面板上填了没落库', async () => {
+    await POST(req({ action: 'askSet', minTrackSec: 120 }))
+    expect(h.setSpeakerTakeover.mock.calls[0][0]).toMatchObject({ minTrackSec: 120 })
   })
 })
