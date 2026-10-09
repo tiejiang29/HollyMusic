@@ -99,26 +99,29 @@ interface PickResult { best: Candidate | null; skippedShort: number }
 /**
  * 拿口令去我们的曲库搜一遍，取最像的那条。
  *
- * 只搜 `takeoverSources` 那几台（面板可改），单源一次取 10 条：口令是短句，
- * 排在前面的本来就相关，我们要的是"第一条像不像这句话"，不是翻页找冷门。
+ * `takeoverSources` 那几台**并行搜**（列表在写入时就按 `MAX_TAKEOVER_SOURCES` 截过，这里不再截），
+ * 单源一次取 10 条：口令是短句，排在前面的本来就相关，我们要的是"第一条像不像这句话"，不是翻页找冷门。
+ * 并行是因为串行会把首包按台数叠加（实测一台约 0.4 秒），而"哪台有这首歌"本来就该一起问。
+ * 平分时按列表顺序取前者（`score > best.score` 是严格大于），所以**顺序仍然是管理员的决定**。
  *
  * 顺带数一下"被整曲门槛挡掉几条"（`skippedShort`）：这个数字是给面板看的，
  * 门槛填高了却没有别的候选时，管理员要能看出来是门槛干的，而不是"搜不到"。
  */
 async function pickCandidate(query: string, config: SpeakerConfig): Promise<PickResult> {
-  const sources = (config.takeoverSources?.length ? config.takeoverSources : ['tx']) as SourceType[]
+  const sources = (config.takeoverSources ?? []) as SourceType[]
   const minTrack = Number(config.takeoverMinTrackSec) || 0
-  let skippedShort = 0
-  let best: Candidate | null = null
-  for (const source of sources.slice(0, 3)) {
-    let list
+  const perSource = await Promise.all(sources.map(async source => {
     try {
-      list = (await searchOneSource(source, query, 1, 10)).list
+      return { source, list: (await searchOneSource(source, query, 1, 10)).list ?? [] }
     } catch (err) {
       // 一台挂了不算搜不到：还有别台。但这条要留日志，否则面板只会说"没搜到"
       logger.warn('[voice-takeover] 单源搜索失败:', `${source} ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`)
-      continue
+      return { source, list: [] as never[] }
     }
+  }))
+  let skippedShort = 0
+  let best: Candidate | null = null
+  for (const { source, list } of perSource) {
     for (const s of list) {
       const durSec = intervalToSeconds(s.interval) || 0
       // 整曲门槛只挡"明显是片段"的那类（30 秒铃声/剪辑版），**不做"与谁相等"的判断** ——

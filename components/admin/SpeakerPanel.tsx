@@ -965,8 +965,8 @@ export function SpeakerPanel() {
               type="text"
               defaultValue={view.takeoverSources.join(', ')}
               onChange={e => setAskSourcesDraft(e.target.value)}
-              className="w-28 rounded border border-border bg-background px-2 py-1 font-mono text-[11px]"
-              title="去哪几台源搜候选，逗号分隔，最多三台"
+              className="w-40 rounded border border-border bg-background px-2 py-1 font-mono text-[11px]"
+              title="去哪几台源搜候选，逗号分隔（并行搜，填几台搜几台，最多五台）。默认不含 tx：这台音源在 tx 取回的 320k 实测不是音频，选中它音箱会一声不出"
             />
             <button
               onClick={() => void saveTakeover({})}

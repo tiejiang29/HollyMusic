@@ -76,7 +76,7 @@ export interface SpeakerConfig {
   takeoverMinTrackSec: number
   /** 曲名相似度门槛（0~1）：低于它就算搜到了也不认（防"今天几号"被硬配上一首歌） */
   fuzzyMatchCutoff: number
-  /** 接管时去哪几台源搜候选（按顺序试，最多用前三台） */
+  /** 接管时去哪几台源搜候选（**并行搜**，列表里几台就搜几台，上限见 `MAX_TAKEOVER_SOURCES`） */
   takeoverSources: string[]
   /** 第①层那张控制词表（面板可改；空则回落到代码里的默认表） */
   controlRules: ControlRule[]
@@ -135,6 +135,21 @@ export function clampVolumeStep(raw: unknown): number {
 /** "像整曲"的门槛上限取 10 分钟，防止填成 999 之类把候选清光 */
 export const MIN_TRACK_SEC_MAX = 600
 
+/**
+ * 接管候选最多搜几台。`SourceType` 一共就五个平台，所以这格不是用来省延迟的（搜索已改成**并行**，
+ * 台数不再按首包叠加），它只防管理员把垃圾词粘进列表 —— 每台一次上游搜索 + 一次落库。
+ */
+export const MAX_TAKEOVER_SOURCES = 5
+
+/**
+ * 默认搜索平台。**不含 tx**：2026-10-09 抽样实测（各平台各 3 条走同一条产品通路取 320k），
+ * tx 三条拿回来的都是**非音频载荷**（前 64 字节可打印率 80~88% 的字母数字，账本
+ * `contentType=application/octet-stream`），其余十二台/条全是真 MP3（ID3v2）；而音箱口只认 MP3，
+ * 选中 tx 那条的结果就是"接管判成功、音箱一声不出"（真机撞过一次：《我怀念的》tx 版连拉五次 415）。
+ * 管理员照旧可以在面板里把 tx 填回去。
+ */
+export const DEFAULT_TAKEOVER_SOURCES = ['kw', 'mg', 'wy', 'kg']
+
 export function clampMinTrackSec(raw: unknown): number {
   const n = Number(raw)
   if (!Number.isFinite(n)) return 90
@@ -156,7 +171,7 @@ const DEFAULT_CONFIG: SpeakerConfig = {
   takeoverEnabled: false,
   takeoverMinTrackSec: 90,
   fuzzyMatchCutoff: FUZZY_CUTOFF_DEFAULT,
-  takeoverSources: ['tx'],
+  takeoverSources: DEFAULT_TAKEOVER_SOURCES,
   controlRules: DEFAULT_CONTROL_RULES,
   volumeStep: 10,
   takeoverTriggers: DEFAULT_MUSIC_TRIGGERS,
@@ -290,7 +305,9 @@ export async function setSpeakerTakeover(input: {
   if (input.cutoff !== undefined) config.fuzzyMatchCutoff = clampCutoff(input.cutoff)
   if (input.minTrackSec !== undefined) config.takeoverMinTrackSec = clampMinTrackSec(input.minTrackSec)
   if (Array.isArray(input.sources)) {
-    const list = input.sources.map(x => String(x).trim()).filter(Boolean).slice(0, 3)
+    // 截断上限用 MAX_TAKEOVER_SOURCES：以前写死 3，管理员在面板填四台，第三台以后**静默丢掉**，
+    // 面板回显也只剩三台，看不出是被截的还是自己没存上
+    const list = input.sources.map(x => String(x).trim()).filter(Boolean).slice(0, MAX_TAKEOVER_SOURCES)
     if (list.length) config.takeoverSources = list
   }
   if (Array.isArray(input.controlRules) && input.controlRules.length) config.controlRules = input.controlRules

@@ -159,9 +159,27 @@ describe('判据矩阵', () => {
     expect(d.uid).toBe('kg-S9')
   })
 
-  it('最多用前三台（口令是短句，翻页找冷门只会把首包拖慢）', async () => {
-    await decideTakeover(row({ query: '播放稻香', answer: '没听清' }), config({ takeoverSources: ['tx', 'kg', 'kw', 'mg', 'wy'] }))
-    expect(h.searchOneSource.mock.calls.length).toBeLessThanOrEqual(3)
+  it('列表里几台就搜几台，而且是并行搜（串行会把首包按台数叠加）', async () => {
+    let inflight = 0
+    let peak = 0
+    h.searchOneSource.mockImplementation(async () => {
+      inflight += 1
+      peak = Math.max(peak, inflight)
+      await new Promise(r => setTimeout(r, 5))
+      inflight -= 1
+      return { list: [] }
+    })
+    await decideTakeover(row({ query: '播放稻香', answer: '没听清' }), config({ takeoverSources: ['kw', 'mg', 'wy', 'kg'] }))
+    expect(h.searchOneSource.mock.calls.length).toBe(4)
+    expect(peak).toBe(4)
+  })
+
+  it('平分时候选取列表里靠前的那台：顺序就是管理员的决定', async () => {
+    h.searchOneSource.mockImplementation(async (source: string) => ({
+      list: [{ name: '稻香', singer: '周杰伦', uid: `${source}-S1`, interval: '223' }],
+    }))
+    const d = await decideTakeover(row({ query: '播放稻香', answer: '' }), config({ takeoverSources: ['mg', 'kw'] }))
+    expect(d.uid).toBe('mg-S1')
   })
 })
 

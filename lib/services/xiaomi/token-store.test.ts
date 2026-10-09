@@ -323,7 +323,8 @@ describe('接管那些新键：老库里缺键必须补默认，不能把 undefi
     const c = await readSpeakerConfig()
     expect(c).toMatchObject({
       takeoverEnabled: false, fuzzyMatchCutoff: 0.75,
-      takeoverSources: ['tx'], volumeStep: 10,
+      // 默认不含 tx：这台音源在 tx 平台取回的 320k 不是音频（实测），选中它=接管成功但不出声
+      takeoverSources: ['kw', 'mg', 'wy', 'kg'], volumeStep: 10,
       // "像整曲"门槛也要有默认：缺键读成 undefined 会让判据拿到 NaN
       takeoverMinTrackSec: 90,
     })
@@ -392,7 +393,14 @@ describe('接管那些新键：老库里缺键必须补默认，不能把 undefi
     const v = await getSpeakerView()
     expect(v).toMatchObject({
       takeoverEnabled: true, fuzzyMatchCutoff: 0.75,
-      takeoverSources: ['kg', 'tx', 'kw'], volumeStep: 5,
+      // 四台**全留**：以前写死截到三台，管理员填第四台是静默丢掉
+      takeoverSources: ['kg', 'tx', 'kw', 'mg'], volumeStep: 5,
     })
+  })
+
+  it('搜索平台列表按 MAX_TAKEOVER_SOURCES 截（防止把垃圾词粘进去白撞上游）', async () => {
+    await setSpeakerTakeover({ sources: ['kw', 'mg', 'wy', 'kg', 'tx', 'kw', '垃圾'] })
+    const v = await getSpeakerView()
+    expect(v?.takeoverSources).toEqual(['kw', 'mg', 'wy', 'kg', 'tx'])
   })
 })
