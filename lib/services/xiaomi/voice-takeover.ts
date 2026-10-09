@@ -46,6 +46,8 @@ export interface TakeoverDecision {
   uid?: string
   name?: string
   score?: number
+  /** 搜到那条的时长（秒，0=不知道）：投放的收口要靠它算边界 */
+  durSec?: number
 }
 
 /** 口令最多老几秒还接（超过就当没听见：轮询卡了一下回来的旧话不该打断现在正在放的歌） */
@@ -86,7 +88,7 @@ export async function decideTakeover(
   return {
     verdict: 'takeover',
     reason: `说了点歌（「${trigger}」），顶上整曲「${cand.name}」(${(cand.score * 100).toFixed(0)}%)`,
-    uid: cand.uid, name: cand.name, score: cand.score,
+    uid: cand.uid, name: cand.name, score: cand.score, durSec: cand.durSec,
   }
 }
 
@@ -244,7 +246,7 @@ export async function handleAskNow(
     } else if (d.verdict === 'takeover') {
       if (!config.takeoverEnabled) acted = '没动（接管开关关着）'
       else {
-        await startCast({ current: { uid: d.uid!, durSec: 0 }, rest: [], deviceID: row.deviceID })
+        await startCast({ current: { uid: d.uid!, durSec: d.durSec ?? 0 }, rest: [], deviceID: row.deviceID })
         acted = `顶上来了：《${d.name}》（${((d.score ?? 0) * 100).toFixed(0)}% 像「${row.query.slice(0, 16)}」）`
       }
     } else if (d.verdict === 'not-music') {

@@ -254,7 +254,8 @@ describe('执行：动之前要先确认这台归我们管', () => {
     h.startCast.mockResolvedValue({})
     const r = await handleAskNow(row({ query: '播放稻香', answer: '没有找到' }))
     expect(h.startCast).toHaveBeenCalledWith(expect.objectContaining({
-      current: { uid: 'tx-S1', durSec: 0 }, rest: [], deviceID: 'D1',
+      // durSec 必须带上：接管只投这一首，看门狗要靠这个时长算出"什么时候该收口"
+      current: { uid: 'tx-S1', durSec: 223 }, rest: [], deviceID: 'D1',
     }))
     expect(r.acted).toContain('稻香')
   })

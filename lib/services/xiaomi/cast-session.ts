@@ -9,11 +9,13 @@
  * 于是分工：**连播交给设备，尾巴交给我们**。一次推一窗（10 首），看门狗只在这窗最后一项快放完时动手 ——
  * 补推下一窗，或者整条队列见底就 stop。
  *
- * 三条实测口径决定了实现的形状：
+ * 四条实测口径决定了实现的形状：
  * - **重推会让那一项从 0 起播** ⇒ 补推只能卡边界；拖动位置靠"带 `seek` 偏移重推"，
  *   而且**剩余项必须一起重排**，否则重推一次就把连播丢了。
  * - `play_song_detail.audio_id` **原样回显我们填的值** ⇒ 它就是"播到窗里第几项"的游标。
  * - 设备报的 `duration` 是**当前项**的时长，不是整窗的。
+ * - **动手那 0.5 秒靠"定点睡到边界"命中，不靠快轮询去撞**（2026-10-09 真机：接管那一首放完
+ *   从头循环 —— 只投一首时没有下一窗来盖它，错过一次边界就等于多响一整首）。
  *
  * 会话是内存态：进程一重启就没了（音箱会一直循环最后一窗）。这是有意接受的代价 ——
  * 持久化会引出"重启后该从哪首接上"的更难问题，而这台 NAS 只有单容器。
@@ -36,6 +38,18 @@ const POLL_MS = 5000
 const TAIL_POLL_MS = 1000
 /** 剩余不足这么多秒就动手：宁可让下一首前奏多重一点，也不掐掉当前这首的尾巴 */
 const TAIL_GUARD_SEC = 0.5
+/**
+ * 还剩这么多秒以上照常轮询，进了这一段就**一次睡到边界前**（不再用固定间隔去撞）。
+ * 治的是真机看到的"接管那一首放完从头循环"：`remaining` 是外推的，所以每一拍算出的数都准，
+ * 坏在**两拍之间**设备已经放完转回头、下一读位置变成小值 ⇒ 剩余重新涨回去，从此再也撞不中，
+ * 而只投一首时没有下一窗来盖它 —— 一首 4 分钟的歌要多响 4 分钟。
+ */
+const TAIL_ARM_SEC = 8
+/**
+ * "位置回跳"至少要已经播了这么久才算"从头循环"。定在 30 秒的依据是那条 5.1 秒挂断重拉：
+ * 设备在**起播那阵子**拉不到字节会自己重拉、位置同样归零，可那时候绝不可能已经播了 30 秒。
+ */
+const LOOP_MIN_PLAYED_MS = 30_000
 /** 刚推完的宽限期：设备起播有延迟，这期间读到"停了"不算停 */
 const PUSH_GRACE_MS = 8000
 /** 连续推失败这么多次就收手（设备拉不到流时无限重推只会把小米打爆） */
@@ -358,6 +372,24 @@ async function stopDevice(s: Session): Promise<void> {
 /** 推完之后另起一次"起播确认"的等待：不等到下一拍，界面尽快有音量与在播状态 */
 const PRIME_READ_MS = 1200
 
+/**
+ * 这一拍的读数是不是"同一个播放项里位置大段回跳"= 它已经从头循环了。
+ *
+ * 两种回跳要分开：**起播那阵子**设备拉不到字节会自己挂断重拉（实测 5.1 秒挂断、0.1 秒后重拉，
+ * 位置同样从 0 起），那种该等它继续；**已经播了半首**之后再归零只剩"放完自己从头循环"一种解释。
+ * 闸门因此取"上一拍至少已经播了 `LOOP_MIN_PLAYED_MS`"，不取"离（我们以为的）结尾多近"——
+ * 后者在元数据时长撒谎时（现成例子：`kw:440613 实际=224s 期望=304s`）正好失效，而那类歌真会停不下来。
+ * （换窗/重推都会把 `lastStatus` 清成 null、设备自己在窗内换项则 `audio_id` 会变，
+ * 这两种都比不出回跳；这条判据又只在 `mustAct` 那一拍被采纳，误判的爆炸半径限于窗里最后一项。）
+ */
+function sawLoopRestart(s: Session, st: PlayStatus): boolean {
+  const prev = s.lastStatus
+  const idx = s.window.findIndex(x => x.audioId === st.audioId)
+  return idx === s.playingIdx && idx >= 0
+    && !!prev && prev.position >= LOOP_MIN_PLAYED_MS
+    && st.position >= 0 && st.position <= prev.position - 3000
+}
+
 /** 把一次状态回读落进会话（看门狗与起播确认共用这一份口径） */
 function applyStatus(s: Session, st: PlayStatus): void {
   s.lastStatus = st
@@ -408,6 +440,15 @@ function scheduleTick(s: Session, delayMs: number): void {
 }
 
 /**
+ * 窗里最后一项的排程：离边界还远照常轮询，进了 `TAIL_ARM_SEC` 以内就**一次睡到边界前 0.3 秒**。
+ * 下限取快轮询那一档（`TAIL_POLL_MS`），免得剩余已经很小却算出几十毫秒把自己变成忙等。
+ */
+function tailDelayMs(remaining: number): number {
+  if (remaining > TAIL_ARM_SEC) return POLL_MS
+  return Math.max(TAIL_POLL_MS, Math.round((remaining - 0.3) * 1000))
+}
+
+/**
  * 看门狗一拍：读状态 → 认游标 → 判边界 → 安排下一次。
  *
  * 排程只在函数末尾做一次（**包括补推之后**）：早先这里写成"补推完就 return"，
@@ -427,6 +468,8 @@ async function tick(s: Session): Promise<void> {
     }
     const creds = await ensureFreshCredentials()
     const st = await getPlayStatus(creds, s.deviceID)
+    // 回跳要在落账之前判：applyStatus 会把 lastStatus 换成这一拍的读数，之后就比不出"掉回 0 了"
+    const looped = sawLoopRestart(s, st)
     applyStatus(s, st)
 
     const remaining = remainingSec(s)
@@ -438,10 +481,15 @@ async function tick(s: Session): Promise<void> {
     if (st.status === 0 && Date.now() - s.pushedAt >= PUSH_GRACE_MS) {
       logger.info('[xiaomi] 音箱停了但队列没放完，补推下一窗', { 音箱: s.deviceName, 剩余秒: Math.round(remaining) })
       await advance(s)
-    } else if (mustAct && remaining <= TAIL_GUARD_SEC) {
+    } else if (mustAct && (remaining <= TAIL_GUARD_SEC || looped)) {
+      // looped 那条是兜底：读到"同一项里位置大段回退"说明它已经从头循环了（睡过边界，或元数据
+      // 时长比真实文件长 ⇒ 定点根本不会发生），再等一圈就是"接管的那首歌怎么停不下来"
+      logger.info(looped ? '[xiaomi] 音箱把这一首从头循环了，立即收口' : '[xiaomi] 到边界了，补下一窗或收口', {
+        音箱: s.deviceName, 剩余秒: Math.round(remaining),
+      })
       await advance(s)
     } else {
-      nextDelay = mustAct && remaining <= POLL_MS / 1000 ? TAIL_POLL_MS : POLL_MS
+      nextDelay = mustAct ? tailDelayMs(remaining) : POLL_MS
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)

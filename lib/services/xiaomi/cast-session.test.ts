@@ -7,7 +7,9 @@
  * 3. **重推会让那一项从 0 起播** ⇒ 补推只能卡边界，中途改队列要等边界生效。
  *
  * 所以这里最值钱的不是"推了几次"，而是这几条：
- * 边界前 0.5 秒内才动手 / 暂停期间进度不许按墙钟跑 / 补推失败不许把歌从时间线上抹掉 /
+ * 尾巴是**按剩余秒数定点睡到边界**的（不是拿快轮询去撞那个窗口）/ 位置大段回跳就立即收口，
+ * 但**起播那阵子（30 秒以内）的归零不算**（设备拉不到字节会自己重拉）、单曲循环也不算 /
+ * 暂停期间进度不许按墙钟跑 / 补推失败不许把歌从时间线上抹掉 /
  * seek 必须带着剩余项一起重排（否则连播丢了）/ 设备回显的 audio_id 就是游标。
  */
 
@@ -362,6 +364,68 @@ describe('退出投放', () => {
     const calls = h.getPlayStatus.mock.calls.length
     await vi.advanceTimersByTimeAsync(30_000)
     expect(h.getPlayStatus.mock.calls.length).toBe(calls)
+  })
+})
+
+describe('尾巴排程：睡到边界上，不是拿快轮询去撞', () => {
+  it('一首 300 秒的歌：到点就停，不靠运气撞那 0.5 秒的窗口', async () => {
+    let startMs = 0
+    let stoppedAt = 0
+    h.playerOperation.mockImplementation(async () => { stoppedAt = Date.now(); return true })
+    h.getPlayStatus.mockImplementation(async () => {
+      if (!startMs) startMs = Date.now()
+      // 设备按墙钟走位，并且**放完自己从头循环**（位置取模回绕）—— 真机就是这两个行为
+      return { ...h.status, status: 1, audioId: pushed(0)[0].audioId, position: (Date.now() - startMs) % 300_000, duration: 300_000 }
+    })
+    await cast.startCast({ current: track('整曲', 300), rest: [] })
+    await vi.advanceTimersByTimeAsync(310_000)
+    // 必须在它转回头之前停下：定点睡到边界前 0.3 秒 ⇒ 这一条把"排程方式"也钉住了
+    // （换成 5 秒一次的轮询就必然撞不中，只能等位置回跳那条兜底 —— 那时候已经多响了一截）
+    expect(stoppedAt).toBeGreaterThan(0)
+    expect(stoppedAt - startMs).toBeLessThanOrEqual(300_500)
+    expect(await cast.castView()).toBeNull()
+  })
+
+  it('睡过了边界（读到位置掉回开头）：立刻收口，不陪它再响一圈', async () => {
+    await cast.startCast({ current: track('整曲', 300), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 293)   // 还剩 7 秒 ⇒ 看门狗这一拍定点睡到边界前
+    await vi.advanceTimersByTimeAsync(6000)
+    deviceAt(pushed(0)[0].audioId, 3)     // 事件循环卡了一下，醒来时它已经从头循环
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    expect(await cast.castView()).toBeNull()
+  })
+
+  it('起播那阵子的位置归零不算"从头循环"：设备拉不到字节会自己重拉，那种时候该等它继续', async () => {
+    await cast.startCast({ current: track('整曲', 300), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 5)     // 只读到第 5 秒（还没过 30 秒那道闸）
+    await vi.advanceTimersByTimeAsync(5000)
+    deviceAt(pushed(0)[0].audioId, 1)     // 5.1 秒挂断后自己重拉，位置回到开头
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    expect(await cast.castView()).not.toBeNull()
+  })
+
+  it('元数据时长撒谎（比真实文件长）时也靠位置回跳收口：定点根本不会发生', async () => {
+    // 现成例子 kw:440613 实际=224s 期望=304s —— 按 304 秒算剩余永远等不到边界，只能认"它放完转回了开头"
+    await cast.startCast({ current: track('整曲', 300), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 220)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    deviceAt(pushed(0)[0].audioId, 4)     // 真实长度 224 秒，它已经转回开头
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    expect(await cast.castView()).toBeNull()
+  })
+
+  it('单曲循环里读到位置回跳也不许停：那种"从头再来"正是要的效果', async () => {
+    await cast.startCast({ current: track('整曲', 300), rest: [], loopOne: true })
+    deviceAt(pushed(0)[0].audioId, 293)
+    await vi.advanceTimersByTimeAsync(6000)
+    deviceAt(pushed(0)[0].audioId, 3)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    expect(await cast.castView()).not.toBeNull()
   })
 })
 
