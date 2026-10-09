@@ -34,7 +34,7 @@ vi.mock('@/lib/services/xiaomi/speaker-play', () => ({
 vi.mock('@/lib/services/song-search-service', () => ({ searchOneSource: h.searchOneSource }))
 
 const mod = await import('@/lib/services/xiaomi/voice-takeover')
-const { decideTakeover, handleAskNow, answeredOk, getTakeoverLog, _resetVoiceTakeoverForTest, STALE_ASK_SEC } = mod
+const { decideTakeover, handleAskNow, answeredOk, getTakeoverLog, submitAsk, _resetVoiceTakeoverForTest, STALE_ASK_SEC } = mod
 const { DEFAULT_MUSIC_TRIGGERS } = await import('@/lib/services/xiaomi/voice-control')
 
 const now = Date.now()
@@ -284,5 +284,27 @@ describe('执行：动之前要先确认这台归我们管', () => {
     // 最后一条是 i=44（偶数 ⇒ 合成），顺序与来源标记都要对得上
     expect(log[0].synthetic).toBe(true)
     expect(log[0].query).toBe('第 44 句')
+  })
+
+  // 排队是有意不 await 的（别把轮询那一拍拖长），所以测试要排干：一次 macrotask 把挂着的
+  // microtask（`readSpeakerConfig`/`castView` 这些 mock 的 promise）全冲掉
+  const drain = async () => { for (let i = 0; i < 4; i++) await new Promise(r => setTimeout(r, 0)) }
+
+  it('submitAsk 的回调拿到的是同一条判定：回显那一行靠它显示「处置」，不用两张表对齐', async () => {
+    const r = row({ query: '下一首', answer: '好的' })
+    const done = vi.fn()
+    submitAsk(r, done)
+    await drain()
+    expect(done).toHaveBeenCalledTimes(1)
+    expect(done.mock.calls[0][0]).toMatchObject({ verdict: 'control', query: '下一首' })
+  })
+
+  it('回调里炸了不许把队打断：后面那条照常处理', async () => {
+    submitAsk(row({ query: '下一首', answer: '好的' }), () => { throw new Error('回填炸了') })
+    const second = vi.fn()
+    submitAsk(row({ query: '暂停播放', answer: '好的' }), second)
+    await drain()
+    expect(second).toHaveBeenCalledTimes(1)
+    expect(getTakeoverLog().map(l => l.query)).toEqual(['暂停播放', '下一首'])
   })
 })

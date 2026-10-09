@@ -163,7 +163,16 @@ export interface SpeakerAskRow {
   answerWaitUntil?: number
   /** 等满了还是空：判据按"没证据"走，面板要能看出我们真等过 */
   answerTimedOut?: boolean
+  /**
+   * 这一句的处置结果，判完回填到**同一行**（省得在两张表之间对齐同一句话）。
+   * 没进过接管链的行（历史、接管关着、被更新的一句超过）这里是空的。
+   */
+  takeover?: { at: number; verdict: TakeoverVerdict; reason: string; acted: string }
 }
+
+/** 判据的结论（与服务层 `Verdict` 同一套） */
+export type TakeoverVerdict =
+  | 'control' | 'takeover' | 'standby' | 'no-hit' | 'answered' | 'stale' | 'rejected' | 'not-music'
 
 export interface ConversationState {
   running: boolean
@@ -176,6 +185,11 @@ export interface ConversationState {
    * `polls` 不涨才是"压根没在拉"。G0.5 要的就是这个分辨。
    */
   devices: Array<{ deviceID: string; name: string; primed: boolean; lastTs: number; polls: number; seen: number }>
+  /**
+   * 平台最新一条的时间戳减本机此刻（毫秒），**只在超前 >5 分钟时非空**。
+   * 纯诊断、不参与任何判据：它的用处是让"读早了"和"本机时钟偏了"这两种解释在面板上分得开。
+   */
+  clockSkewMs: number | null
 }
 
 export interface ConversationFeed {
@@ -201,7 +215,7 @@ export interface TakeoverLogRow {
   deviceName: string
   query: string
   answer: string
-  verdict: 'control' | 'takeover' | 'standby' | 'no-hit' | 'answered' | 'stale' | 'rejected'
+  verdict: TakeoverVerdict
   reason: string
   acted: string
   /** 面板"模拟口令"喂的那条，不是真话 */

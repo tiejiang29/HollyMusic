@@ -146,9 +146,10 @@ export async function POST(request: NextRequest) {
       return createSuccessResponse({ rows: getTakeoverLog() })
     }
     if (action === 'askSimulate') {
-      // **喂一条合成口令走同一条链路**（不是真话，日志里标 synthetic）。
-      // 为什么要它：今天实测到对话接口回的是 0 条记录，也就是说"真实一条口令"我们
-      // 还没拿到过 —— 没有这个入口，第①②层的判据就只能停在单元测试里。
+      // **喂一条合成口令走同一条链路**（不是真话，账目里标 synthetic）。
+      // 为什么还留着：真记录 2026-10-09 才通（此前是 Cookie deviceId 填错导致的假 0 条），
+      // 而"判据换一种说法还成不成立"这种对照实验只有能任意造句子才做得动 —— 比如"回答留空"
+      // 这一格在真话里等满窗口就再也复现不出来。
       const query = typeof body?.query === 'string' ? body.query : ''
       if (!query.trim()) return createErrorResponse('INVALID_PARAMS', '要说一句什么口令？', 400)
       const config = await readSpeakerConfig()

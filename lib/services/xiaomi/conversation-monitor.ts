@@ -22,6 +22,7 @@ import {
 import type { SpeakerConfig } from '@/lib/services/xiaomi/token-store'
 import { XiaomiAuthError, fetchConversations } from '@/lib/services/xiaomi/mina-client'
 import { submitAsk } from '@/lib/services/xiaomi/voice-takeover'
+import type { Verdict } from '@/lib/services/xiaomi/voice-takeover'
 
 /** 面板上的一行 */
 export interface AskRow {
@@ -44,6 +45,20 @@ export interface AskRow {
   answerWaitUntil?: number
   /** 等满了还是没有回答：判据照旧按"没证据"处理，但面板要能看出我们真等过 */
   answerTimedOut?: boolean
+  /**
+   * 这一句的处置结果，判完由接管那边回填到**同一行**。
+   * 有了它，"这句话"和"我们对它做了什么"不用管理员在两张表之间对齐（今晚读回显、读账目时各踩一次）。
+   * 没递进接管链的行（历史、接管关着、已被改口超过）这里是空的。
+   */
+  takeover?: TakeoverMark
+}
+
+/** 判定结果里回显那一行要显示的四个字段（其余留在接管账目那张表） */
+export interface TakeoverMark {
+  at: number
+  verdict: Verdict
+  reason: string
+  acted: string
 }
 
 export interface MonitorState {
@@ -57,7 +72,17 @@ export interface MonitorState {
    * "拉了但平台真没有"（polls 在涨、seen 是 0）和"根本没在拉"（polls 不动）。
    */
   devices: Array<{ deviceID: string; name: string; primed: boolean; lastTs: number; polls: number; seen: number }>
+  /**
+   * 平台最新一条的时间戳减去本机此刻（毫秒），**只在超前超过 5 分钟时才有值**，否则 null。
+   *
+   * 这条纯粹是诊断：基线我们一直用平台时间戳（对的），但"本机时钟差多少"过去没有任何一处能看见，
+   * 于是"读早了"和"时钟偏了"两种解释分不开（2026-10-09 就差点归错）。**不参与任何判据。**
+   */
+  clockSkewMs: number | null
 }
+
+/** 报时钟偏移的门槛：几秒的差是网络往返与写库延迟，不值得在面板上喊 */
+export const CLOCK_SKEW_ALARM_MS = 300_000
 
 const FEED_MAX = 60
 /**
@@ -106,7 +131,7 @@ let timer: ReturnType<typeof setTimeout> | null = null
 let ticking = false
 let state: MonitorState = {
   running: false, pollSec: 2, enabled: false,
-  lastPollAt: null, lastError: null, devices: [],
+  lastPollAt: null, lastError: null, devices: [], clockSkewMs: null,
 }
 
 /** 话术片段命中即算"疑似没答上"。空答案也算 —— 小爱光响灯不出话是同一类失败 */
@@ -177,6 +202,7 @@ async function tick(): Promise<void> {
       // 单台失败不阻断别台，但**要留在 lastError 上**：早先这里收尾时把 lastError 一律清成 null，
       // 于是一台设备每次都失败、面板却显示一切正常（测试抓到过）
       let softError: string | null = null
+      let maxSkew = 0
       for (const device of targets) {
         account(device.deviceID, device.name, device.hardware)
         let records
@@ -193,6 +219,12 @@ async function tick(): Promise<void> {
           continue
         }
         const fresh = absorb(device.deviceID, device.name, records, config.failedAnswerHints)
+        // 时钟偏移：只报不判。取这批里最新的时间戳跟本机此刻比（基线一直用平台时间戳是对的，
+        // 但"本机差多少"看不见，就会把"读早了"和"时钟偏了"混成一团 —— 2026-10-09 差点归错）
+        for (const r of records) {
+          const skew = r.timestampMs - Date.now()
+          if (skew > maxSkew) maxSkew = skew
+        }
         // 先记下"这台最新说到哪句"，**再**去结算挂着的那几行：用户已经改口时，
         // 旧句的回答这一拍就算回来了也不该再动设备（判据在 submitNow 里）
         if (fresh.length) {
@@ -217,7 +249,11 @@ async function tick(): Promise<void> {
           }
         }
       }
-      state = { ...state, lastPollAt: Date.now(), lastError: softError, devices: snapshotDevices(targets) }
+      state = {
+        ...state, lastPollAt: Date.now(), lastError: softError,
+        devices: snapshotDevices(targets),
+        clockSkewMs: maxSkew > CLOCK_SKEW_ALARM_MS ? maxSkew : null,
+      }
     }
   } catch (err) {
     failedHard = true
@@ -261,7 +297,9 @@ function submitNow(deviceID: string, row: AskRow, config: SpeakerConfig): void {
     logger.info('[xiaomi] 这条已被更新的一句超过，不动设备', { 说了: row.query.slice(0, 30) })
     return
   }
-  submitAsk(row)
+  submitAsk(row, entry => {
+    row.takeover = { at: entry.at, verdict: entry.verdict, reason: entry.reason, acted: entry.acted }
+  })
 }
 
 /**
@@ -356,5 +394,5 @@ export function _resetConversationMonitorForTest(): void {
   stopConversationMonitor()
   feed.length = 0
   baselines.clear()
-  state = { running: false, pollSec: 2, enabled: false, lastPollAt: null, lastError: null, devices: [] }
+  state = { running: false, pollSec: 2, enabled: false, lastPollAt: null, lastError: null, devices: [], clockSkewMs: null }
 }

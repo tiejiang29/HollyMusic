@@ -280,9 +280,21 @@ export async function handleAskNow(
   return entry
 }
 
-/** 轮询那边调这个：不 await，排队做，别把一拍拖长（处理期间也不许插进下一条） */
-export function submitAsk(row: AskRow): void {
-  chain = chain.then(() => handleAskNow(row)).catch(err => {
+/**
+ * 轮询那边调这个：不 await，排队做，别把一拍拖长（处理期间也不许插进下一条）。
+ *
+ * `done` 拿到的是**同一条判定记录对象**（对话回显那一行靠它把"处置"就地显示出来，
+ * 省得管理员在两张表之间对齐同一句话）。异常不许冒出去：口令处理失败最坏就是"这句没接住"。
+ */
+export function submitAsk(row: AskRow, done?: (entry: TakeoverLogRow) => void): void {
+  chain = chain.then(async () => {
+    const entry = await handleAskNow(row)
+    try {
+      done?.(entry)
+    } catch (err) {
+      logger.warn('[voice-takeover] 判定回填失败:', err instanceof Error ? err.message : String(err))
+    }
+  }).catch(err => {
     logger.warn('[voice-takeover] 排队的一条处理异常:', err instanceof Error ? err.message : String(err))
   })
 }

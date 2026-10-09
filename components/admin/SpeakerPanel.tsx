@@ -193,9 +193,12 @@ export function SpeakerPanel() {
     if (!view?.takeoverEnabled) return
     const timer = setInterval(() => {
       readTakeoverLog().then(r => setAskLog(r.rows)).catch(() => {})
+      // 判定结果现在也回填到回显那一行（「处置」列），所以这一张表要跟着刷：
+      // 只刷账目不刷回显，那列会一直显示"没进判据"，看着像坏了
+      if (view.conversationEnabled) readConversationFeed().then(setConv).catch(() => {})
     }, 4000)
     return () => clearInterval(timer)
-  }, [view?.takeoverEnabled])
+  }, [view?.takeoverEnabled, view?.conversationEnabled])
 
   const saveTakeover = async (patch: { enabled?: boolean; withoutEvidence?: boolean }) => {
     try {
@@ -834,6 +837,13 @@ export function SpeakerPanel() {
               {conv.state.lastError}
             </p>
           ) : null}
+          {conv?.state.clockSkewMs ? (
+            <p className="mt-2 text-xs text-destructive">
+              平台最新一条记录的时间戳比本机此刻还晚 {Math.round(conv.state.clockSkewMs / 60000)} 分钟 ⇒
+              <b> 本机时钟慢了 </b>（或那台音箱的时钟快）。基线用的一直是平台时间戳，所以这条
+              <b>不影响判据</b>，只是"隔了几秒才看得见"那一列会被算歪，看到它就先去核对系统时间。
+            </p>
+          ) : null}
           {conv && conv.rows.length > 0 ? (
             <div className="mt-3 max-h-64 overflow-auto rounded border border-border">
               <table className="w-full text-xs">
@@ -844,6 +854,7 @@ export function SpeakerPanel() {
                     <th className="px-2 py-1.5 font-medium">小爱答</th>
                     <th className="px-2 py-1.5 font-medium">延迟</th>
                     <th className="px-2 py-1.5 font-medium">疑似没答上</th>
+                    <th className="px-2 py-1.5 font-medium">处置</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -854,11 +865,36 @@ export function SpeakerPanel() {
                         {r.fromBaseline ? <span className="ml-1 opacity-60">（历史）</span> : null}
                       </td>
                       <td className="px-2 py-1.5">{r.query || '—'}</td>
-                      <td className="px-2 py-1.5">{r.answer || '—'}</td>
+                      <td className="px-2 py-1.5">
+                        {r.answer || '—'}
+                        {/* 回答是后补进同一条记录的：等满之前别急着显示"没答上"，那是我们的读早 */}
+                        {!r.answer && r.answerWaitUntil ? (
+                          <span className="ml-1 opacity-60">（等它的回答…）</span>
+                        ) : null}
+                        {!r.answer && r.answerTimedOut ? (
+                          <span className="ml-1 opacity-60">（等满了还是空）</span>
+                        ) : null}
+                      </td>
                       <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px]">
                         {Math.max(0, Math.round((r.receivedAt - r.timestampMs) / 1000))}s
                       </td>
                       <td className="px-2 py-1.5">{r.looksFailed ? '是' : ''}</td>
+                      <td className="px-2 py-1.5">
+                        {r.takeover ? (
+                          <span title={r.takeover.reason}>
+                            <span className="font-mono text-[11px] text-muted-foreground">{r.takeover.verdict}</span>
+                            {' · '}
+                            {r.takeover.acted}
+                          </span>
+                        ) : (
+                          <span
+                            className="opacity-60"
+                            title="没递进判据的三种情况：启动时那批历史、接管开关关着、等回答期间被更新的一句超过"
+                          >
+                            没递进判据
+                          </span>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

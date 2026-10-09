@@ -325,6 +325,38 @@ describe('接管（G3）的进料口', () => {
   })
 })
 
+describe('判定结果回填到那一行（③）与时钟偏移告警（②）', () => {
+  it('submitAsk 的第二个参数就是回填回调：调用它，那一行立刻带上「处置」', async () => {
+    h.config.takeoverEnabled = true
+    h.fetchConversations.mockResolvedValue([])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    h.fetchConversations.mockResolvedValue([rec(5000, '下一首', '好的')])
+    await vi.advanceTimersByTimeAsync(2100)
+
+    expect(h.submitAsk).toHaveBeenCalledTimes(1)
+    const [sentRow, done] = h.submitAsk.mock.calls[0] as unknown as [Return<typeof getConversationFeed>['rows'][number], (e: never) => void]
+    expect(typeof done).toBe('function')
+    expect(sentRow.takeover).toBeUndefined()
+    done({ at: 1, deviceID: 'D1', deviceName: '小爱音箱Play', query: '下一首', answer: '好的', verdict: 'control', reason: '控制词「下一首」命中', acted: '切下一首', synthetic: false } as never)
+    // 面板读的是 feed 里那个对象 ⇒ 不用重新拉接口就能看到
+    expect(getConversationFeed().rows.find(r => r.timestampMs === 5000)!.takeover)
+      .toMatchObject({ verdict: 'control', acted: '切下一首' })
+  })
+
+  it('平台时间戳比本机超前 5 分钟以上才报，且只是报出来（不影响任何判据）', async () => {
+    const future = Date.now() + 20 * 60_000
+    h.fetchConversations.mockResolvedValue([rec(future, '来自未来的一句')])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(getConversationFeed().state.clockSkewMs).toBeGreaterThan(19 * 60_000)
+
+    // 5 分钟以内（网络往返那点差）不该在面板上喊
+    h.fetchConversations.mockResolvedValue([rec(Date.now() + 30_000, '正常的一句')])
+    await vi.advanceTimersByTimeAsync(2100)
+    expect(getConversationFeed().state.clockSkewMs).toBeNull()
+  })
+})
 describe('等回答窗口（回答是后补进同一条记录的，读早了不等于小爱没答）', () => {
   it('空回答先挂起：面板当拍到就有这一行，下一拍带回回答才递，且只递一次', async () => {
     h.config.takeoverEnabled = true
