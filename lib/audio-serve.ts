@@ -27,7 +27,7 @@ import { EventEmitter } from 'events'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { checkTrialAudio } from '@/lib/server/audio-integrity'
-import { judgeUpstreamPayload, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
+import { judgeUpstreamPayload, classifyContentType, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
 import { sourceHealth, isLikelyLocalNetworkFault, type ByteOutcome } from '@/lib/server/source-health'
 import {
   getLyricSidecarPath,
@@ -431,6 +431,19 @@ class AudioServe {
 
       void this.touchAccess(cacheKey)
 
+      // 存量自愈（跟上面那批"缓存了试听片段"同一套路）：写入侧闸门加之前，认不出容器、
+      // Content-Type 又没声明音频的载荷也会被落盘（dev 遗留 6 行，其中 1 行盘上真有 1077 万字节，
+      // 另外 5 行的文件早被容量淘汰、只剩账本行）。命中就原样发出去 ⇒ 网页转圈、音箱口 415，
+      // 而账本看着像"这首歌已经缓存好了"，没有任何自愈路径。
+      // 只判"声明明确存在又不是音频"的行：`contentType` 为 null 是那列写下来之前的老数据，
+      // 下面一直按 audio/mpeg 发得好好的，拿它当坏证据会把能播的缓存删掉重下。
+      if (record.contentType && classifyContentType(record.contentType) === 'other') {
+        logger.warn(`[AudioServe] 缓存里这份不是音频（${record.contentType || '空'}），删除缓存: ${cacheKey}`)
+        await prisma.audioCache.delete({ where: { cacheKey } }).catch(() => {})
+        await removeAudioCacheFiles(filePath)
+        return null
+      }
+
       const size = record.size
       const contentType = record.contentType || 'audio/mpeg'
       const range = parseRange(rangeHeader, size)
@@ -656,8 +669,10 @@ class AudioServe {
    * 在此阶段被识别并排除该音源重新解析——因为客户端响应要等 waitForReadiness
    * （size 非空）才构造，换源对客户端完全无感知，也不会交付错误字节。
    *
-   * 判定为 `unverified`（未知容器但非文本）时按可交付处理：可能是罕见容器，
-   * 交给播放器判断；但这类文件不会进永久音乐库（见 music-library 的入库门槛）。
+   * 判定为 `unverified` 时分两种：**上游连声明都不是音频/视频**（`application/octet-stream`
+   * 那类）⇒ 与假地址同路，排除该音源重试，全部用尽就失败，**一个字节都不落盘**；
+   * 声明是音频/视频却认不出容器 ⇒ 可能是罕见容器，照常交付并进缓存，但不进永久音乐库
+   * （见 music-library 的入库门槛）。
    */
   private async openUpstream(
     cacheKey: string,
@@ -774,8 +789,32 @@ class AudioServe {
         throw new Error(`上游返回非音频内容：${judgment.reason}`)
       }
 
+      // **字节和声明两边都不认**才算坏载荷：认不出容器，Content-Type 又不是 audio/video
+      // （实测那批 `application/octet-stream` 的高熵载荷就是这一档 —— 加密流伪装成音频）。
+      // 拦在写盘之前是因为一旦落进缓存，以后每次命中都原样发出去：网页点了转圈、
+      // 音箱口更直接 415，而账本上看着像"这首歌已经缓存好了"，没有任何自愈路径。
+      if (judgment.verdict === 'unverified' && classifyContentType(judgment.contentType) === 'other') {
+        await reader.cancel().catch(() => {})
+        clearTimeout(stallTimer)
+        // 记成 `fake` 而不是 `unverified`：账本里 `unverified` 只计数、不进坏样本窗口（那是给
+        // "声明 audio 的罕见容器"留的余地），而这一档我们既然已经拒绝交付，就该让这个 `源×平台`
+        // 进冷却、下次瀑布直接绕开它，别每首歌都再烧一次"取址＋拉首块"。
+        recordByte('fake', `字节与声明都不像音频：${judgment.reason}`)
+        if (provider && attempt < this.maxFakeRetries) {
+          attempt++
+          excluded.add(provider)
+          logger.warn(
+            `[AudioServe] 载荷认不出是音频，换源重试（排除 ${provider}）: ${cacheKey} — ${judgment.reason}`
+          )
+          continue
+        }
+        logger.warn(`[AudioServe] 载荷认不出是音频（无可换音源）: ${cacheKey} — ${judgment.reason}`)
+        throw new Error(`上游给的不是音频（${judgment.reason}）`)
+      }
+
       if (judgment.verdict === 'unverified') {
-        // 可交付但不可信：可能是罕见容器，也可能是伪装成音频的垃圾数据
+        // 认不出容器但**上游确实声明了 audio/video**：可能是罕见容器，交给播放器判断；
+        // 这类文件不会进永久音乐库（见 music-library 的入库门槛）
         recordByte('unverified', judgment.reason)
         logger.warn(
           `[AudioServe] 上游载荷无法识别（按可交付处理，不落永久库）: ${cacheKey} — ${judgment.reason}`

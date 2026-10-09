@@ -406,6 +406,58 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1) // 仍进缓存
     expect(onCached).not.toHaveBeenCalled() // 但不入永久库
   })
+
+  it('字节认不出容器**且**声明也不是音频（octet-stream 那类加密载荷）→ 不落缓存，换源重试', async () => {
+    // 2026-10-10 真机形状：tx 的 320k 回了 1077 万字节高熵载荷，声明 application/octet-stream。
+    // 闸门必须在**写盘之前**：一旦落进缓存，以后每次命中都原样发出去（网页转圈、音箱口 415），
+    // 账本上还写着"这首歌已缓存"，没有任何自愈路径。
+    const junk = Buffer.concat([
+      Buffer.from('z52gdv4xS25dM0vms|x40o', 'latin1'),
+      Buffer.from('\x00\x01\x02', 'latin1'), // 含控制字符 ⇒ 连"整段可打印"那条文本判据也不触发
+      Buffer.alloc(4096, 0x7f),
+    ])
+    const fetchSpy = vi.fn(async (input: unknown) =>
+      String(input).includes('junk.example')
+        ? payloadResponse(junk, 'application/octet-stream')
+        : payloadResponse(Buffer.from('ID3\x03\x00' + 'x'.repeat(4093), 'latin1'), 'audio/mpeg')
+    )
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:junk1:320k',
+      upstreamUrlResolver: async excludeProviders =>
+        excludeProviders.has('垃圾源')
+          ? { url: 'https://good.example/j1.mp3', provider: '好源B' }
+          : { url: 'https://junk.example/j1.mp3', provider: '垃圾源' },
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    // 坏载荷一行都没落盘（旧行为是照样 upsert 一条 octet-stream）
+    const saved = vi.mocked(prisma.audioCache.upsert).mock.calls.map(c => c[0].create as { contentType?: string | null })
+    expect(saved.every(s => s.contentType === 'audio/mpeg')).toBe(true)
+    expect(sourceHealth.view('垃圾源', 'tx')?.badKinds['byte:fake']).toBe(1)
+  })
+
+  it('所有源都给不出可辨音频 → 502 且不落缓存（不再留下会永久 415 的坏行）', async () => {
+    const junk = Buffer.from('z52gdv4x\x00\x01\x02', 'latin1')
+    const fetchSpy = vi.fn(async () => payloadResponse(junk, 'application/octet-stream'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:junk2:320k',
+      upstreamUrlResolver: async () => ({ url: 'https://junk.example/j2.mp3', provider: '垃圾源' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(resp.status).toBe(502)
+    expect(prisma.audioCache.upsert).not.toHaveBeenCalled()
+  })
 })
 
 // ===========================================================================
@@ -536,4 +588,67 @@ describe('AudioServe.serve() 命中磁盘缓存（回归保护）', () => {
     expect(resp.headers.get('content-range')).toBe(`bytes 5-9/${data.length}`)
     expect(Buffer.from(await resp.arrayBuffer()).equals(data.subarray(5, 10))).toBe(true)
   })
+
+  it('账本里那份声明不是音频（历史遗留的 octet-stream 行）→ 删行删文件、当 miss 重解析', async () => {
+    // 写入侧加闸门之前，这类行是真被缓存下来的（dev 实测 6 行、178MB）。命中时旧行为是照样发出去
+    // ⇒ 网页转圈、音箱口 415，而且账本看着像"已经缓存好"永远不会再试。所以读侧也要自愈一次。
+    const junk = Buffer.from('z52gdv4xS25dM0vms', 'latin1')
+    const relative = 'ab/cdef0789.mp3'
+    const filePath = path.join(cacheDir, relative)
+    await fsp.mkdir(path.dirname(filePath), { recursive: true })
+    await fsp.writeFile(filePath, junk)
+    vi.mocked(prisma.audioCache.findUnique).mockImplementation(async () => ({
+      cacheKey: 'tx:poison1:320k', filePath: relative, size: junk.length,
+      contentType: 'application/octet-stream',
+    }) as never)
+    const good = Buffer.from('ID3\x03\x00' + 'y'.repeat(200), 'latin1')
+    const fetchSpy = vi.fn(async () => payloadResponseStatic(good, 'audio/mpeg'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:poison1:320k',
+      upstreamUrlResolver: async () => ({ url: 'https://good.example/p1.mp3', provider: '好源B' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(prisma.audioCache.delete).toHaveBeenCalledWith({ where: { cacheKey: 'tx:poison1:320k' } })
+    expect(await fsp.readFile(filePath, 'utf-8').catch(() => null)).toBeNull()
+    expect(resp.status).toBe(200)
+    expect(resp.headers.get('content-type')).toContain('audio/mpeg')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('老数据里 contentType 是空的行为什么不能一起删：它过去就是按 audio/mpeg 发的', async () => {
+    // 闸门只认"声明明确存在又不是音频"。空声明是历史数据（写这列之前的行），
+    // 拿它当坏证据会把好好的 MP3 缓存删掉重下。
+    const data = Buffer.from('legacy-cached-mp3-bytes')
+    const relative = 'ab/cdef0abc.mp3'
+    const filePath = path.join(cacheDir, relative)
+    await fsp.mkdir(path.dirname(filePath), { recursive: true })
+    await fsp.writeFile(filePath, data)
+    vi.mocked(prisma.audioCache.findUnique).mockImplementation(async () => ({
+      cacheKey: 'kw:legacy1:320k', filePath: relative, size: data.length, contentType: null,
+    }) as never)
+
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:legacy1:320k',
+      upstreamUrlResolver: resolver(),
+      rangeHeader: null,
+      isHead: false,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(prisma.audioCache.delete).not.toHaveBeenCalled()
+    expect(Buffer.from(await resp.arrayBuffer()).equals(data)).toBe(true)
+  })
 })
+
+/** 给"命中磁盘缓存"那一组用的响应构造器（与上面几组的同名函数各自独立） */
+function payloadResponseStatic(data: Buffer, ct: string): Response {
+  return new Response(new Uint8Array(data), {
+    status: 200,
+    headers: { 'content-type': ct, 'content-length': String(data.length) },
+  })
+}
