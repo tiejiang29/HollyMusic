@@ -19,6 +19,7 @@ import { logger } from '@/lib/logger'
 import {
   ensureFreshCredentials, readSpeakerConfig, clampPollSec,
 } from '@/lib/services/xiaomi/token-store'
+import type { SpeakerConfig } from '@/lib/services/xiaomi/token-store'
 import { XiaomiAuthError, fetchConversations } from '@/lib/services/xiaomi/mina-client'
 import { submitAsk } from '@/lib/services/xiaomi/voice-takeover'
 
@@ -36,6 +37,13 @@ export interface AskRow {
   looksFailed: boolean
   /** 启动那一轮读到的历史（不是刚说的），G3 的接管不许吃它 */
   fromBaseline: boolean
+  /**
+   * 回答是**后补进同一条记录**的（2026-10-09 实测：同一行先是空、下一拍带回 50 字回答）。
+   * 有值 = 这一行还在等它的回答，到期时刻（毫秒）。到点仍空 ⇒ 标 `answerTimedOut` 再判。
+   */
+  answerWaitUntil?: number
+  /** 等满了还是没有回答：判据照旧按"没证据"处理，但面板要能看出我们真等过 */
+  answerTimedOut?: boolean
 }
 
 export interface MonitorState {
@@ -59,13 +67,19 @@ const FEED_MAX = 60
 const REWIND_TOLERANCE_MS = 10_000
 
 const feed: AskRow[] = []
-const baselines = new Map<string, { name: string; hardware: string; lastTs: number; primed: boolean; seen: Set<string>; polls: number }>()
+const baselines = new Map<string, { name: string; hardware: string; lastTs: number; primed: boolean; seen: Set<string>; polls: number; lastFreshTs: number }>()
+
+/**
+ * 挂着等回答的行（按设备）。键值里存的是**喂进 feed 的同一个对象**，所以补到回答时
+ * 面板那一行会跟着变，不会多出一条重复记录。
+ */
+const pendingAnswers = new Map<string, AskRow[]>()
 
 /** 拿到（或建出）这台设备的账目 */
 function ensureAccount(deviceID: string, name: string, hardware: string) {
   let b = baselines.get(deviceID)
   if (!b) {
-    b = { name, hardware, lastTs: 0, primed: false, seen: new Set<string>(), polls: 0 }
+    b = { name, hardware, lastTs: 0, primed: false, seen: new Set<string>(), polls: 0, lastFreshTs: 0 }
     baselines.set(deviceID, b)
   }
   return b
@@ -109,6 +123,9 @@ export function getConversationFeed(): { rows: AskRow[]; state: MonitorState } {
 export function stopConversationMonitor(): void {
   if (timer) clearTimeout(timer)
   timer = null
+  // 挂着等回答的那几行跟着作废：开关都关了还不许动设备，而句柄留在 Map 里等于把"已作废的口令"
+  // 留给下一轮去判（重新打开轮询时它们早就不是"刚说的话"了）
+  pendingAnswers.clear()
   state = { ...state, running: false }
 }
 
@@ -176,8 +193,29 @@ async function tick(): Promise<void> {
           continue
         }
         const fresh = absorb(device.deviceID, device.name, records, config.failedAnswerHints)
+        // 先记下"这台最新说到哪句"，**再**去结算挂着的那几行：用户已经改口时，
+        // 旧句的回答这一拍就算回来了也不该再动设备（判据在 submitNow 里）
+        if (fresh.length) {
+          const b = ensureAccount(device.deviceID, device.name, device.hardware)
+          for (const row of fresh) if (row.timestampMs > b.lastFreshTs) b.lastFreshTs = row.timestampMs
+        }
+        // 挂着等回答的那几行**每拍都要过一遍**：补上回答的那一批常常不含新口令（`fresh` 是空的），
+        // 只在新行到达时才 settle 就会让它们永远挂着。
+        settleWaiting(device.deviceID, records, config)
         // 接管（G3）只吃"刚说的话"那批，历史一条都不许动别人的播放
-        if (config.takeoverEnabled && fresh.length) for (const row of fresh) submitAsk(row)
+        if (fresh.length) {
+          const waitSec = answerWaitSec(config)
+          for (const row of fresh) {
+            if (row.answer || waitSec <= 0) {
+              submitNow(device.deviceID, row, config)
+              continue
+            }
+            row.answerWaitUntil = Date.now() + waitSec * 1000
+            const waiting = pendingAnswers.get(device.deviceID) ?? []
+            waiting.push(row)
+            pendingAnswers.set(device.deviceID, waiting)
+          }
+        }
       }
       state = { ...state, lastPollAt: Date.now(), lastError: softError, devices: snapshotDevices(targets) }
     }
@@ -197,14 +235,93 @@ async function tick(): Promise<void> {
   }
 }
 
-/** 把拉到的记录按基线规则收成进 feed，并返回"这轮新增的非历史行"（给 G3 的接管用） */
+/**
+ * 这一拍要不要为"等回答"挂起（秒）。
+ *
+ * 挂起**只为接管服务**：面板那一行当拍到就进了 feed，不会因为等回答而晚出现或消失。
+ * 接管关着、或这个键没配（旧数据 / 测试夹具）都返回 0 = 不挂起，直接走 submitNow 那道闸。
+ */
+function answerWaitSec(config: SpeakerConfig): number {
+  if (!config.takeoverEnabled) return 0
+  const sec = Number(config.takeoverAnswerWaitSec)
+  return Number.isFinite(sec) && sec > 0 ? sec : 0
+}
+
+/**
+ * 把一条口令交给接管链。
+ *
+ * 两道闸都在这儿：① 接管开关可能是在挂着等回答期间被关掉的 ⇒ 关着就一句都不发；
+ * ② 等回答期间用户又说了更新的一句 ⇒ 旧句不许再动设备（他已经改口了，照旧话抢播就是打扰）。
+ */
+function submitNow(deviceID: string, row: AskRow, config: SpeakerConfig): void {
+  row.answerWaitUntil = undefined
+  if (!config.takeoverEnabled) return
+  const b = baselines.get(deviceID)
+  if (b && row.timestampMs < b.lastFreshTs) {
+    logger.info('[xiaomi] 这条已被更新的一句超过，不动设备', { 说了: row.query.slice(0, 30) })
+    return
+  }
+  submitAsk(row)
+}
+
+/**
+ * 给挂着等回答的行补回答。
+ *
+ * 依据是 2026-10-09 的实测：同一行先是空、下一拍带回 50 字回答 —— 记录会被平台原地补全，
+ * 所以"读到空"不等于"小爱没答"。等满 `takeoverAnswerWaitSec` 还空，才按"没证据"去判。
+ */
+function settleWaiting(
+  deviceID: string, records: { timestampMs: number; query: string; answer: string }[], config: SpeakerConfig,
+): void {
+  const waiting = pendingAnswers.get(deviceID)
+  if (!waiting || waiting.length === 0) return
+  const now = Date.now()
+  const rest: AskRow[] = []
+  for (const row of waiting) {
+    // absorb 已经把同一行的回答原地补全了；补不上的（平台改写了时间戳）再按 10 秒内的
+    // 偏移找一次，但**必须同一句 query** —— 不然会把下一句的回答安到这一句头上（那比读早了更糟）
+    const hit = row.answer
+      ? null
+      : records.find(r => !!r.answer && Math.abs(r.timestampMs - row.timestampMs) <= REWIND_TOLERANCE_MS && r.query === row.query)
+    if (hit) {
+      row.answer = hit.answer
+      row.looksFailed = looksLikeFailedAnswer(hit.answer, config.failedAnswerHints)
+    } else if (!row.answer && now < (row.answerWaitUntil ?? 0)) {
+      // 还在窗口内且这一拍没带回回答 ⇒ 继续挂到下一拍
+      rest.push(row)
+      continue
+    } else if (!row.answer) {
+      // 等满了还是空：判据照旧按"没证据"走，但行上留个记号，面板能看出我们真等过
+      row.answerTimedOut = true
+    }
+    submitNow(deviceID, row, config)
+  }
+  if (rest.length) pendingAnswers.set(deviceID, rest)
+  else pendingAnswers.delete(deviceID)
+}
+
+/**
+ * 把拉到的记录按基线规则收成进 feed，并返回"这轮新增的非历史行"（给 G3 的接管用）。
+ *
+ * 去重键是 `时间戳|说了什么`，**不含回答** —— 因为实测回答是后补进同一条记录的（2026-10-09）：
+ * 把回答算进键会让同一句话在面板上出现两行（先空后有），接管也会收到两次。
+ * 现在的做法是同一行**原地补全**：`pendingAnswers` 里存的就是 feed 里那个对象，所以补上回答
+ * 面板那一行跟着变，一行不多。
+ */
 function absorb(deviceID: string, deviceName: string, records: { timestampMs: number; query: string; answer: string }[], hints: string[]): AskRow[] {
   const b = ensureAccount(deviceID, deviceName, '')
   const now = Date.now()
   const rows: AskRow[] = []
   for (const r of records) {
-    const key = `${r.timestampMs}|${r.query}|${r.answer}`
-    if (b.seen.has(key)) continue
+    const key = `${r.timestampMs}|${r.query}`
+    if (b.seen.has(key)) {
+      const prior = feed.find(x => x.deviceID === deviceID && x.timestampMs === r.timestampMs && x.query === r.query)
+      if (prior && !prior.answer && r.answer) {
+        prior.answer = r.answer
+        prior.looksFailed = looksLikeFailedAnswer(r.answer, hints)
+      }
+      continue
+    }
     b.seen.add(key)
     if (b.seen.size > 200) {
       // 只留最近的一部分，长跑不漏内存（Set 保持插入序，删最旧）

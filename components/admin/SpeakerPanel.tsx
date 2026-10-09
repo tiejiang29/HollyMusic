@@ -162,6 +162,8 @@ export function SpeakerPanel() {
   const [askCutoffDraft, setAskCutoffDraft] = useState<string | null>(null)
   const [askStepDraft, setAskStepDraft] = useState<string | null>(null)
   const [askTriggersDraft, setAskTriggersDraft] = useState<string | null>(null)
+  const [askWaitDraft, setAskWaitDraft] = useState<string | null>(null)
+  const [minTrackDraft, setMinTrackDraft] = useState<string | null>(null)
   const [simQuery, setSimQuery] = useState('')
   const [simAnswer, setSimAnswer] = useState('')
   const [simResult, setSimResult] = useState<TakeoverLogRow | null>(null)
@@ -204,6 +206,8 @@ export function SpeakerPanel() {
         ...(askCutoffDraft !== null ? { cutoff: Number(askCutoffDraft) } : {}),
         ...(askStepDraft !== null ? { volumeStep: Number(askStepDraft) } : {}),
         ...(askTriggersDraft !== null ? { triggers: askTriggersDraft.split(/[,，\s]+/).filter(Boolean) } : {}),
+        ...(askWaitDraft !== null ? { answerWaitSec: Number(askWaitDraft) } : {}),
+        ...(minTrackDraft !== null ? { minTrackSec: Number(minTrackDraft) } : {}),
       })
       setView(r.view)
       setAskRulesDraft(null)
@@ -211,6 +215,8 @@ export function SpeakerPanel() {
       setAskCutoffDraft(null)
       setAskStepDraft(null)
       setAskTriggersDraft(null)
+      setAskWaitDraft(null)
+      setMinTrackDraft(null)
       setAskLog((await readTakeoverLog()).rows)
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存接管设置失败')
@@ -919,6 +925,29 @@ export function SpeakerPanel() {
               defaultValue={view.volumeStep}
               onChange={e => setAskStepDraft(e.target.value)}
               className="w-16 rounded border border-border bg-background px-2 py-1"
+              title="说「大声点」时一次加/减多少"
+            />
+            <span className="text-muted-foreground">等回答</span>
+            <input
+              type="number"
+              min={0}
+              max={10}
+              step={1}
+              defaultValue={view.takeoverAnswerWaitSec}
+              onChange={e => setAskWaitDraft(e.target.value)}
+              className="w-14 rounded border border-border bg-background px-2 py-1"
+              title="一句口令先空着不等于小爱没答上——回答是后补进同一条记录的（实测）。这里填最多等几秒，0=读到空就立刻判"
+            />
+            <span className="text-muted-foreground">像整曲</span>
+            <input
+              type="number"
+              min={0}
+              max={600}
+              step={5}
+              defaultValue={view.takeoverMinTrackSec}
+              onChange={e => setMinTrackDraft(e.target.value)}
+              className="w-16 rounded border border-border bg-background px-2 py-1"
+              title="抢播候选的时长下限（秒）：短于它的当试听版/铃声跳过。填 0 = 不筛（试听版也会被端上来）"
             />
             <input
               type="text"

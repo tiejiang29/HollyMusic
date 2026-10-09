@@ -95,8 +95,10 @@ export async function decideTakeover(
   if (!trigger) return { verdict: 'not-music', reason: `不像点歌（没命中触发词），不动：「${query.slice(0, 20)}」` }
 
   // 拿去掉触发词的那半句去搜：整句「播放稻香」会让匹配度被多出来的两个字拖低
-  const cand = await pickCandidate(query.replace(trigger, '') || query, config)
-  if (!cand) return { verdict: 'no-hit', reason: `我们这边也没搜到像「${query.slice(0, 20)}」的歌，不动` }
+  const { best: cand, skippedShort } = await pickCandidate(query.replace(trigger, '') || query, config)
+  // 门槛挡掉几条要写在理由里：不然面板上只显示"没搜到"，管理员分不清是真没有还是被自己填高的门槛清了
+  const shortNote = skippedShort > 0 ? `（另有 ${skippedShort} 条被"像整曲"的门槛挡掉，那格填 0 可关）` : ''
+  if (!cand) return { verdict: 'no-hit', reason: `我们这边也没搜到像「${query.slice(0, 20)}」的歌，不动${shortNote}` }
   if (cand.score < config.fuzzyMatchCutoff) {
     return { verdict: 'no-hit', reason: `最像的是「${cand.name}」但只有 ${(cand.score * 100).toFixed(0)}%，低于 ${(config.fuzzyMatchCutoff * 100).toFixed(0)}%` }
   }
@@ -105,14 +107,21 @@ export async function decideTakeover(
 
 export interface Candidate { uid: string; name: string; singer: string; durSec: number; score: number }
 
+interface PickResult { best: Candidate | null; skippedShort: number }
+
 /**
  * 拿口令去我们的曲库搜一遍，取最像的那条。
  *
  * 只搜 `takeoverSources` 那几台（面板可改），单源一次取 10 条：口令是短句，
  * 排在前面的本来就相关，我们要的是"第一条像不像这句话"，不是翻页找冷门。
+ *
+ * 顺带数一下"被整曲门槛挡掉几条"（`skippedShort`）：这个数字是给面板看的，
+ * 门槛填高了却没有别的候选时，管理员要能看出来是门槛干的，而不是"搜不到"。
  */
-async function pickCandidate(query: string, config: SpeakerConfig): Promise<Candidate | null> {
+async function pickCandidate(query: string, config: SpeakerConfig): Promise<PickResult> {
   const sources = (config.takeoverSources?.length ? config.takeoverSources : ['tx']) as SourceType[]
+  const minTrack = Number(config.takeoverMinTrackSec) || 0
+  let skippedShort = 0
   let best: Candidate | null = null
   for (const source of sources.slice(0, 3)) {
     let list
@@ -124,6 +133,10 @@ async function pickCandidate(query: string, config: SpeakerConfig): Promise<Cand
       continue
     }
     for (const s of list) {
+      const durSec = intervalToSeconds(s.interval) || 0
+      // 整曲门槛只挡"明显是片段"的那类（30 秒铃声/剪辑版），**不做"与谁相等"的判断** ——
+      // 元数据时长本身也会错。拿不到时长（0）不算过短，宁可放过也不清空候选。
+      if (minTrack > 0 && durSec > 0 && durSec < minTrack) { skippedShort++; continue }
       const name = similarity(query, s.name ?? '')
       const bySinger = s.singer ? similarity(query, s.singer) * 0.2 : 0
       // 互相包含就算同一首：口令是"放稻香"而曲名是"稻香"时，编辑距离会被那两个字拖到阈值以下；
@@ -140,12 +153,12 @@ async function pickCandidate(query: string, config: SpeakerConfig): Promise<Cand
       if (!best || score > best.score) {
         best = {
           uid: s.uid ?? `${source}-${s.songmid}`, name: s.name ?? '', singer: s.singer ?? '',
-          durSec: intervalToSeconds(s.interval) || 0, score,
+          durSec, score,
         }
       }
     }
   }
-  return best
+  return { best, skippedShort }
 }
 
 /** 面板上那行"接管账目"的一条：判了什么、动没动、为什么 */

@@ -36,11 +36,11 @@ export interface SpeakerView {
   serverHost: string
   playQuality: '320k' | '128k'
   musicApiDisabledModels: string[]
-  /** 对话轮询（G0.5）那三项 + 语音接管（G3）那七项，服务端视图里都有，面板直接读 */
+  /** 对话轮询（G0.5）那三项 + 语音接管（G3）那九项，服务端视图里都有，面板直接读 */
   conversationEnabled: boolean
   conversationPollSec: number
   failedAnswerHints: string[]
-  /** 语音接管（G3）那六项 */
+  /** 语音接管（G3）那八项 */
   takeoverEnabled: boolean
   takeoverWithoutEvidence: boolean
   fuzzyMatchCutoff: number
@@ -48,6 +48,10 @@ export interface SpeakerView {
   controlRules: Array<{ op: string; words: string[] }>
   volumeStep: number
   takeoverTriggers: string[]
+  /** 一句口令最多等小爱自己把回答补进记录这么多秒（0 = 不等，读到空就立刻判） */
+  takeoverAnswerWaitSec: number
+  /** 抢播候选至少要像整曲（秒）；0 = 不筛，试听版也会被端上去 */
+  takeoverMinTrackSec: number
 }
 
 export interface QrStartResult {
@@ -155,6 +159,10 @@ export interface SpeakerAskRow {
   looksFailed: boolean
   /** 启动那一轮读到的历史，不是刚说的话 */
   fromBaseline: boolean
+  /** 这一行还在等小爱把回答补进记录（有值 = 到期时刻，毫秒） */
+  answerWaitUntil?: number
+  /** 等满了还是空：判据按"没证据"走，面板要能看出我们真等过 */
+  answerTimedOut?: boolean
 }
 
 export interface ConversationState {
@@ -203,6 +211,7 @@ export interface TakeoverLogRow {
 export function setSpeakerTakeover(input: {
   enabled?: boolean; withoutEvidence?: boolean; cutoff?: number;
   sources?: string[]; controlRulesText?: string; volumeStep?: number; triggers?: string[];
+  answerWaitSec?: number; minTrackSec?: number;
 }): Promise<{ view: SpeakerView }> {
   return apiPost<{ view: SpeakerView }>('admin/speaker', { action: 'askSet', ...input })
 }

@@ -137,6 +137,8 @@ export async function POST(request: NextRequest) {
           ? parseControlRules(String(body.controlRulesText)) : undefined,
         volumeStep: body?.volumeStep,
         triggers: Array.isArray(body?.triggers) ? body.triggers : undefined,
+        answerWaitSec: body?.answerWaitSec,
+        minTrackSec: body?.minTrackSec,
       })
       return createSuccessResponse({ view })
     }

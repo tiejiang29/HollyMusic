@@ -324,6 +324,8 @@ describe('接管那些新键：老库里缺键必须补默认，不能把 undefi
     expect(c).toMatchObject({
       takeoverEnabled: false, takeoverWithoutEvidence: false, fuzzyMatchCutoff: 0.75,
       takeoverSources: ['tx'], volumeStep: 10,
+      // 等回答窗口与"像整曲"门槛也要有默认：缺键读成 undefined 会让判据拿到 NaN
+      takeoverAnswerWaitSec: 6, takeoverMinTrackSec: 90,
     })
     expect(c.controlRules.length).toBe(DEFAULT_CONTROL_RULES.length)
     // 点歌触发词表也要有默认（空表会让第②层永远不接，配了开关却没反应最难查）
@@ -354,6 +356,19 @@ describe('接管那些新键：老库里缺键必须补默认，不能把 undefi
     const c = await readSpeakerConfig()
     expect(c.fuzzyMatchCutoff).toBe(0.2)
     expect(c.volumeStep).toBe(50)
+  })
+
+  it('等回答窗口 0~10、像整曲门槛 0~600：越界钳住，填 0 要原样留着（0 = 关掉那层，不是回落默认）', async () => {
+    await setSpeakerTakeover({ answerWaitSec: 99, minTrackSec: 9999 })
+    expect(await readSpeakerConfig()).toMatchObject({ takeoverAnswerWaitSec: 10, takeoverMinTrackSec: 600 })
+
+    await setSpeakerTakeover({ answerWaitSec: 0, minTrackSec: 0 })
+    expect(await readSpeakerConfig()).toMatchObject({ takeoverAnswerWaitSec: 0, takeoverMinTrackSec: 0 })
+  })
+
+  it('这两个键存坏了（非数字 / 负数）不许把 NaN 发进判据', async () => {
+    db.setting.set(SPEAKER_SETTING_KEY, JSON.stringify({ takeoverAnswerWaitSec: '不是数', takeoverMinTrackSec: -50 }))
+    expect(await readSpeakerConfig()).toMatchObject({ takeoverAnswerWaitSec: 6, takeoverMinTrackSec: 0 })
   })
 
   it('接管那七项写进去能读回来，且视图里带的是同一套（面板读的就是视图）', async () => {

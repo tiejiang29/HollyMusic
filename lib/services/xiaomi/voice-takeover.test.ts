@@ -173,6 +173,42 @@ describe('判据矩阵', () => {
   })
 })
 
+describe('整曲门槛（候选要像整曲，别让我们自己也端上 30 秒片段）', () => {
+  // 2026-10-09 真机：小爱给的是 30024ms 的《你不知道》试听版，而我们搜到的整曲是 03:45。
+  // 同名剪辑版/铃声版在我们候选里同样会出现，所以先保证"手里这条是整曲"。
+  const twoVersions = {
+    list: [
+      { name: '稻香', singer: '周杰伦', uid: 'tx-short', interval: '30' },
+      { name: '稻香', singer: '周杰伦', uid: 'tx-full', interval: '223' },
+    ],
+  }
+
+  it('同名两条：短的被判过短跳过，投的是整曲那条', async () => {
+    h.searchOneSource.mockResolvedValue(twoVersions)
+    const d = await decideTakeover(row({ query: '播放稻香', answer: '没有找到' }), config({ takeoverMinTrackSec: 90 }))
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'tx-full' })
+  })
+
+  it('门槛填 0 = 关掉这层 ⇒ 同一份候选退回投短的那条（反证：上面那条真是门槛挡的）', async () => {
+    h.searchOneSource.mockResolvedValue(twoVersions)
+    const d = await decideTakeover(row({ query: '播放稻香', answer: '没有找到' }), config({ takeoverMinTrackSec: 0 }))
+    expect(d.uid).toBe('tx-short')
+  })
+
+  it('只剩过短的那条 ⇒ no-hit，且理由里要说清是被门槛挡的（不然管理员会以为曲库里没有）', async () => {
+    h.searchOneSource.mockResolvedValue({ list: [{ name: '稻香', singer: '周杰伦', uid: 'tx-short', interval: '30' }] })
+    const d = await decideTakeover(row({ query: '播放稻香', answer: '没有找到' }), config({ takeoverMinTrackSec: 90 }))
+    expect(d.verdict).toBe('no-hit')
+    expect(d.reason).toMatch(/1 条被"像整曲"的门槛挡掉/)
+  })
+
+  it('拿不到时长不算过短（元数据本身也会错，宁可放过也不清空候选）', async () => {
+    h.searchOneSource.mockResolvedValue({ list: [{ name: '稻香', singer: '周杰伦', uid: 'tx-noDur', interval: '' }] })
+    const d = await decideTakeover(row({ query: '播放稻香', answer: '没有找到' }), config({ takeoverMinTrackSec: 90 }))
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'tx-noDur' })
+  })
+})
+
 describe('执行：动之前要先确认这台归我们管', () => {
   it('控制词命中但没有投放会话 ⇒ 一句"交回小爱"，一条指令都不发', async () => {
     h.castView.mockResolvedValue(null)
