@@ -72,6 +72,15 @@ function seekOf(url: string): string | null {
 function deviceAt(audioId: string, playedSec: number, extra: Partial<typeof h.status> = {}) {
   h.status = { ...h.status, status: 1, audioId, position: Math.round(playedSec * 1000), duration: 60_000, ...extra }
 }
+/**
+ * 收口的回读确认：`CLOSE_GAP_MS` 是产品里那个复核间隔（改了那边要同步这里）。
+ * 把设备读数改成"停了"再走一拍，会话才应该被清掉。
+ */
+const CLOSE_GAP = 2000
+async function confirmStopped() {
+  h.status = { ...h.status, status: 0, position: 0 }
+  await vi.advanceTimersByTimeAsync(CLOSE_GAP)
+}
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -186,12 +195,16 @@ it('刚推完还没读到状态时按"在播"报，免得客户端把乐观态�
     expect(v2 === null || v2.playing === false || v2.status === -1).toBe(true)
   })
 
-  it('整条队列放完：收口 stop 并清会话（不许留给设备去从头循环）', async () => {
+  it('整条队列放完：先 stop、回读确认停了才清会话（不许留给设备去从头循环）', async () => {
     await cast.startCast({ current: track('cur'), rest: rest(9) })
     // 第一窗就是 cur + r0..r8（共 9 首，rest 用尽），到边界就没有下一窗了
     deviceAt(pushed(0)[9].audioId, 59.7)
     await vi.advanceTimersByTimeAsync(5000)
     expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    // 2026-10-10 真机：那一声 stop 之后 0.26 秒它又重拉了新一轮，而我们会话已经清了 ⇒ 没人再管。
+    // 所以发完 stop 不算完，会话要留着等一次回读。
+    expect(await cast.castView()).not.toBeNull()
+    await confirmStopped()
     expect(await cast.castView()).toBeNull()
   })
 
@@ -311,6 +324,9 @@ describe('切歌与投放期间改队列', () => {
     await vi.advanceTimersByTimeAsync(5000)
     await expect(cast.skipCast(1)).rejects.toThrow(/放完/)
     expect(h.playerOperation).toHaveBeenLastCalledWith(expect.anything(), 'D1', 'stop')
+    // 收口不是一次 stop 就完：回读到停了才清会话（真机那次就是漏了这一步，之后它自己重拉了新一轮）
+    expect(await cast.castView()).not.toBeNull()
+    await confirmStopped()
     expect(await cast.castView()).toBeNull()
     await expect(cast.skipCast(1)).rejects.toThrow(/没有投放会话/)
   })
@@ -370,8 +386,8 @@ describe('退出投放', () => {
 describe('尾巴排程：睡到边界上，不是拿快轮询去撞', () => {
   it('一首 300 秒的歌：到点就停，不靠运气撞那 0.5 秒的窗口', async () => {
     let startMs = 0
-    let stoppedAt = 0
-    h.playerOperation.mockImplementation(async () => { stoppedAt = Date.now(); return true })
+    let firstStopAt = 0
+    h.playerOperation.mockImplementation(async () => { if (!firstStopAt) firstStopAt = Date.now(); return true })
     h.getPlayStatus.mockImplementation(async () => {
       if (!startMs) startMs = Date.now()
       // 设备按墙钟走位，并且**放完自己从头循环**（位置取模回绕）—— 真机就是这两个行为
@@ -379,10 +395,12 @@ describe('尾巴排程：睡到边界上，不是拿快轮询去撞', () => {
     })
     await cast.startCast({ current: track('整曲', 300), rest: [] })
     await vi.advanceTimersByTimeAsync(310_000)
-    // 必须在它转回头之前停下：定点睡到边界前 0.3 秒 ⇒ 这一条把"排程方式"也钉住了
+    // 第一声 stop 必须在它转回头之前发出：定点睡到边界前 0.3 秒 ⇒ 这一条把"排程方式"也钉住了
     // （换成 5 秒一次的轮询就必然撞不中，只能等位置回跳那条兜底 —— 那时候已经多响了一截）
-    expect(stoppedAt).toBeGreaterThan(0)
-    expect(stoppedAt - startMs).toBeLessThanOrEqual(300_500)
+    expect(firstStopAt).toBeGreaterThan(0)
+    expect(firstStopAt - startMs).toBeLessThanOrEqual(300_500)
+    // 这台"怎么都不肯停"：收尾要补发到上限再撤，不能把会话永久挂着（挂着 = 面板一直显示投放中）
+    expect(h.playerOperation).toHaveBeenCalledTimes(3)
     expect(await cast.castView()).toBeNull()
   })
 
@@ -393,6 +411,7 @@ describe('尾巴排程：睡到边界上，不是拿快轮询去撞', () => {
     deviceAt(pushed(0)[0].audioId, 3)     // 事件循环卡了一下，醒来时它已经从头循环
     await vi.advanceTimersByTimeAsync(6000)
     expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    await confirmStopped()
     expect(await cast.castView()).toBeNull()
   })
 
@@ -415,6 +434,7 @@ describe('尾巴排程：睡到边界上，不是拿快轮询去撞', () => {
     deviceAt(pushed(0)[0].audioId, 4)     // 真实长度 224 秒，它已经转回开头
     await vi.advanceTimersByTimeAsync(5000)
     expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    await confirmStopped()
     expect(await cast.castView()).toBeNull()
   })
 
@@ -425,6 +445,52 @@ describe('尾巴排程：睡到边界上，不是拿快轮询去撞', () => {
     deviceAt(pushed(0)[0].audioId, 3)
     await vi.advanceTimersByTimeAsync(6000)
     expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    expect(await cast.castView()).not.toBeNull()
+  })
+})
+
+describe('收口要回读确认（2026-10-10 真机：一次 stop 拦不住它重拉新一轮）', () => {
+  it('第一声 stop 没压住就补第二声，确认停了才清会话', async () => {
+    await cast.startCast({ current: track('整曲', 300), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 299.8)   // 到边界
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(h.playerOperation).toHaveBeenCalledTimes(1)
+    expect(await cast.castView()).not.toBeNull()   // 发完 stop 不算完，会话先留着
+
+    deviceAt(pushed(0)[0].audioId, 2)             // 真机形状：stop 之后它把新一轮拉起来了
+    await vi.advanceTimersByTimeAsync(CLOSE_GAP)
+    expect(h.playerOperation).toHaveBeenCalledTimes(2)
+    expect(await cast.castView()).not.toBeNull()
+
+    await confirmStopped()
+    expect(await cast.castView()).toBeNull()
+    // 收尾那几拍读到"停了"不能被当成"音箱停了但队列没放完"去补推 —— 那样等于把刚停的东西又放起来
+    expect(h.playItems).toHaveBeenCalledTimes(1)
+  })
+
+  it('补到上限就撤：它怎么都不肯停，也不能把会话永久挂在面板上', async () => {
+    await cast.startCast({ current: track('整曲', 300), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 299.8)
+    await vi.advanceTimersByTimeAsync(5000)
+    for (let i = 0; i < 5; i++) {
+      deviceAt(pushed(0)[0].audioId, 3)         // 每一拍都还"在播"
+      await vi.advanceTimersByTimeAsync(CLOSE_GAP)
+    }
+    expect(h.playerOperation).toHaveBeenCalledTimes(3)   // 只补到 CLOSE_MAX_TRIES，不再无限重试
+    expect(await cast.castView()).toBeNull()
+  })
+
+  it('收尾途中用户又拖了进度条：新一窗作数，收尾状态要撤掉（否则下一拍会被当成"它又自己播起来了"）', async () => {
+    await cast.startCast({ current: track('整曲', 300), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 299.8)
+    await vi.advanceTimersByTimeAsync(5000)          // 到边界 ⇒ 开始收尾（第一声 stop）
+    expect(h.playerOperation).toHaveBeenCalledTimes(1)
+    await cast.seekCast(120)                          // 用户这时把进度条拖回去：又推了一窗
+    const stops = h.playerOperation.mock.calls.length
+    expect(h.playItems).toHaveBeenCalledTimes(2)
+    h.status = { ...h.status, status: 1, audioId: pushed(1)[0].audioId, position: 125_000, duration: 300_000 }
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation.mock.calls.length).toBe(stops)   // 收尾不能把刚推的这窗又停掉
     expect(await cast.castView()).not.toBeNull()
   })
 })
@@ -450,6 +516,7 @@ describe('单曲循环：只推一首并让设备自己转', () => {
     deviceAt(pushed(1)[2].audioId, 59.9)
     await vi.advanceTimersByTimeAsync(5000)
     expect(h.playerOperation).toHaveBeenLastCalledWith(expect.anything(), 'D1', 'stop')
+    await confirmStopped()
     expect(await cast.castView()).toBeNull()
   })
 })

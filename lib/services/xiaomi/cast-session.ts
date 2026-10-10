@@ -52,6 +52,19 @@ const TAIL_ARM_SEC = 8
 const LOOP_MIN_PLAYED_MS = 30_000
 /** 刚推完的宽限期：设备起播有延迟，这期间读到"停了"不算停 */
 const PUSH_GRACE_MS = 8000
+/**
+ * 收口要**复核**，不能发完 stop 就算完（2026-10-10 真机）。
+ *
+ * 原来 `advance()` 见底就是「stop + 清会话」一气呵成，结果那一次 stop 打在
+ * "批放完 ⇒ 设备自己重拉开新一轮"的缝里：日志发了 stop，**0.26 秒后它又来拉了一次流**，
+ * 之后每约 4.8 分钟一次 —— 而我们已经把会话清了，看门狗连同"位置回跳"那条兜底一起消失，
+ * 再没人回头看一眼，用户听到的就是"一直重播"。
+ *
+ * 现在收口是个小状态机：发一声 stop，隔 `CLOSE_GAP_MS` 读一次状态，**还在播就补发**，
+ * 最多 `CLOSE_MAX_TRIES` 次；确认停了（或次数用尽）才清会话。
+ */
+const CLOSE_GAP_MS = 2000
+const CLOSE_MAX_TRIES = 3
 /** 连续推失败这么多次就收手（设备拉不到流时无限重推只会把小米打爆） */
 const MAX_PUSH_FAILS = 3
 /** 元数据和设备都没给时长时的兜底（只影响"何时算到边界"，不影响听感） */
@@ -116,6 +129,13 @@ interface Session {
   pendingRest: CastTrack[] | null
   /** 单曲循环：窗里只有这一首，**让它自己循环**，我们既不补窗也不收口 */
   loopOne: boolean
+  /**
+   * 收口中：已经发过 stop，正在"回读确认它真的停了"这几拍里。
+   * 这期间不补窗、不判边界，只做"还在播就补发 stop / 确认停了就清会话"。
+   */
+  closing: boolean
+  /** 这次收口一共发过几声 stop（含第一声） */
+  stopTries: number
   pushedAt: number
   lastStatus: PlayStatus | null
   lastStatusAt: number
@@ -264,6 +284,10 @@ async function pushWindow(s: Session, slots: WindowSlot[]): Promise<boolean> {
   s.window = slots
   s.playingIdx = 0
   s.recordedIdx = 0
+  // 肯推新一窗就是"要继续播"，收尾状态得跟着撤 —— 否则用户在收口那两秒里按了下一首，
+  // 下一拍会被收尾分支当成"它又自己播起来了"，把我们刚推的东西又停掉
+  s.closing = false
+  s.stopTries = 0
   s.pushedAt = Date.now()
   s.pausedWithinItem = null
   s.pushFails = 0
@@ -333,9 +357,11 @@ async function replayFrom(
  *
  * cursor 与 history **只在推成功之后才动** —— 提前挪的话，一次被设备拒掉的补推
  * 就会把这 10 首从时间线上抹掉（表现是"跳过了一段歌"，很难查）。
+ *
+ * 返回值给 `skipCast` 用：它按"用户点了下一首"调这里，切不出东西时要如实回 409。
  */
-async function advance(s: Session): Promise<void> {
-  if (s.loopOne && s.pendingRest === null) return   // 让它自己转，不收口也不补窗
+async function advance(s: Session): Promise<'closing' | 'moved' | 'noop'> {
+  if (s.loopOne && s.pendingRest === null) return 'noop'   // 让它自己转，不收口也不补窗
   if (s.pendingRest) {
     s.rest = s.pendingRest
     s.cursor = 0
@@ -345,19 +371,36 @@ async function advance(s: Session): Promise<void> {
   }
   const take = s.rest.slice(s.cursor, s.cursor + CAST_WINDOW_SIZE)
   if (take.length === 0) {
-    logger.info('[xiaomi] 队列放完，停掉音箱', { 音箱: s.deviceName })
-    await stopDevice(s)
-    clearSession(s.deviceID)
-    return
+    await beginClose(s)
+    return 'closing'
   }
   const config = await readSpeakerConfig()
   const base = buildStreamBase(config.serverHost)
   const oldWindow = s.window.slice(0)
   const recordFrom = s.recordedIdx
   const playedTo = s.playingIdx + 1   // 到边界了，当前这首也算播完
-  if (!(await pushWindow(s, await signSlots(config, base, take)))) return
+  if (!(await pushWindow(s, await signSlots(config, base, take)))) return 'noop'
   s.cursor += take.length
   recordPlayed(s, oldWindow, recordFrom, playedTo)
+  return 'moved'
+}
+
+/**
+ * 队列放完：发**第一声** stop，然后进"收尾"状态 —— 会话先不清。
+ *
+ * 为什么不发完就清：真机实测一次 stop 会打在"批放完 ⇒ 设备自己重拉开新一轮"那条缝里
+ * （日志发了 stop，0.26 秒后它又拉了一次流），而会话一清，看门狗和"位置回跳"兜底就一起
+ * 消失了，再没人回头看 —— 用户听到的就是"一直重播"。确认交给 tick 里那几拍做。
+ */
+async function beginClose(s: Session): Promise<void> {
+  logger.info('[xiaomi] 队列放完，停掉音箱（开始收尾，要回读确认）', { 音箱: s.deviceName })
+  s.closing = true
+  s.stopTries = 1
+  await stopDevice(s)
+  // 确认读在这儿排，不交给调用方：走到这里的有两条路 —— 看门狗自己到边界（它末尾会排程），
+  // 以及**用户按下一首而队列已空**（`skipCast` 直接调 `advance`，手上根本没有那枚定时器）。
+  // 只靠前一条，后一种收尾就永远等不到回读，直到客户端下次来问才被动复活。
+  scheduleTick(s, CLOSE_GAP_MS)
 }
 
 async function stopDevice(s: Session): Promise<void> {
@@ -472,24 +515,47 @@ async function tick(s: Session): Promise<void> {
     const looped = sawLoopRestart(s, st)
     applyStatus(s, st)
 
-    const remaining = remainingSec(s)
-    // 动手的时机有两种：① 播到了窗里最后一项（不补它就会从头循环）；
-    // ② 投放期间改过队列 —— 不必等整窗见底，当前这首放完就生效，
-    //    而"当前这首放完"正是设备本来要换歌的时刻，重推落在这个静默点上不额外打断什么。
-    // 单曲循环是**故意**留给它自己循环的：那种"从头再来"正是要的效果，所以①在这条上不成立。
-    const mustAct = s.pendingRest !== null || (!s.loopOne && s.playingIdx >= s.window.length - 1)
-    if (st.status === 0 && Date.now() - s.pushedAt >= PUSH_GRACE_MS) {
-      logger.info('[xiaomi] 音箱停了但队列没放完，补推下一窗', { 音箱: s.deviceName, 剩余秒: Math.round(remaining) })
-      await advance(s)
-    } else if (mustAct && (remaining <= TAIL_GUARD_SEC || looped)) {
-      // looped 那条是兜底：读到"同一项里位置大段回退"说明它已经从头循环了（睡过边界，或元数据
-      // 时长比真实文件长 ⇒ 定点根本不会发生），再等一圈就是"接管的那首歌怎么停不下来"
-      logger.info(looped ? '[xiaomi] 音箱把这一首从头循环了，立即收口' : '[xiaomi] 到边界了，补下一窗或收口', {
-        音箱: s.deviceName, 剩余秒: Math.round(remaining),
-      })
-      await advance(s)
+    // 收尾那几拍不参与边界判断，只回答一个问题：**它是不是真的停了**。
+    // 还在播就补发 stop（`s.stopTries` 封顶），确认停了才清会话 —— 详见 CLOSE_GAP_MS 那段实测。
+    if (s.closing) {
+      if (st.status === PLAY_STATUS_PLAYING && s.stopTries < CLOSE_MAX_TRIES) {
+        s.stopTries += 1
+        logger.info('[xiaomi] 收口回读：它又自己播起来了，补发 stop', { 音箱: s.deviceName, 第几声: s.stopTries })
+        await stopDevice(s)
+        nextDelay = CLOSE_GAP_MS
+      } else {
+        logger.info(
+          st.status === PLAY_STATUS_PLAYING
+            ? '[xiaomi] 补发到上限它还在播，先撤（这一窗多半还在它手里循环）'
+            : '[xiaomi] 收口确认：音箱停了',
+          { 音箱: s.deviceName, 发过: s.stopTries },
+        )
+        // 清了会话 ⇒ 函数末尾那次排程自己会因为"不在表里"而跳过
+        clearSession(s.deviceID)
+      }
     } else {
-      nextDelay = mustAct ? tailDelayMs(remaining) : POLL_MS
+      const remaining = remainingSec(s)
+      // 动手的时机有两种：① 播到了窗里最后一项（不补它就会从头循环）；
+      // ② 投放期间改过队列 —— 不必等整窗见底，当前这首放完就生效，
+      //    而"当前这首放完"正是设备本来要换歌的时刻，重推落在这个静默点上不额外打断什么。
+      // 单曲循环是**故意**留给它自己循环的：那种"从头再来"正是要的效果，所以①在这条上不成立。
+      const mustAct = s.pendingRest !== null || (!s.loopOne && s.playingIdx >= s.window.length - 1)
+      if (st.status === 0 && Date.now() - s.pushedAt >= PUSH_GRACE_MS) {
+        logger.info('[xiaomi] 音箱停了但队列没放完，补推下一窗', { 音箱: s.deviceName, 剩余秒: Math.round(remaining) })
+        await advance(s)
+      } else if (mustAct && (remaining <= TAIL_GUARD_SEC || looped)) {
+        // looped 那条是兜底：读到"同一项里位置大段回退"说明它已经从头循环了（睡过边界，或元数据
+        // 时长比真实文件长 ⇒ 定点根本不会发生），再等一圈就是"接管的那首歌怎么停不下来"
+        logger.info(looped ? '[xiaomi] 音箱把这一首从头循环了，立即收口' : '[xiaomi] 到边界了，补下一窗或收口', {
+          音箱: s.deviceName, 剩余秒: Math.round(remaining),
+        })
+        await advance(s)
+      } else {
+        nextDelay = mustAct ? tailDelayMs(remaining) : POLL_MS
+      }
+      // 这一拍把会话推进了"收尾"（advance 见底 ⇒ beginClose）：下一拍要按收尾的节奏去回读，
+      // 沿用 5 秒等于把确认推迟一整拍
+      if (s.closing) nextDelay = CLOSE_GAP_MS
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
@@ -550,6 +616,8 @@ export async function startCast(input: StartCastInput): Promise<CastView> {
     recordedIdx: 0,
     pendingRest: null,
     loopOne: input.loopOne === true,
+    closing: false,
+    stopTries: 0,
     pushedAt: 0,
     lastStatus: null,
     lastStatusAt: 0,
@@ -586,10 +654,9 @@ export async function skipCast(delta: number, deviceID?: string): Promise<CastVi
       if (!(await replayFrom(s, next))) throw new SpeakerError(s.lastError ?? '音箱没认这条切歌指令', 502)
       return buildView(s)
     }
-    // 窗里没了：从 rest 切下一窗。切不出来时 advance 会收口（停音箱 + 清会话），
-    // 这里不能假装还在投放 —— 会话已不在表里，如实报错让前端退出投放态
-    await advance(s)
-    if (!rt.sessions.has(s.deviceID)) throw new SpeakerError('队列已经放完，音箱停了', 409)
+    // 窗里没了：从 rest 切下一窗。切不出来时 advance 会开始收口（发 stop，之后几拍回读确认），
+    // 这一下是用户要"下一首"而我们已经没东西可给 —— 不能假装还在投放，如实报错让前端退出投放态
+    if ((await advance(s)) === 'closing') throw new SpeakerError('队列已经放完，音箱停了', 409)
     return buildView(s)
   }
   // 先回本窗里的前一格（设备自己往后播的那些也算"刚听过"，它们不在 history 里就是回不去）
