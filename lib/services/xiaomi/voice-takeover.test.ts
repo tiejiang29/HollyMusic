@@ -219,6 +219,88 @@ describe('整曲门槛（候选要像整曲，别让我们自己也端上 30 秒
   })
 })
 
+describe('报了歌手又报歌名（「播放孙燕姿我怀念的」那一类）', () => {
+  // 老判据只比歌名，靠 +4 字窗口硬撑：三字歌手名 + 「的」+ 两字歌名（「五月天的倔强」）就已经把
+  // 窗口用满，歌手名再长一点或带英文就破。下面 ②③ 两条形状改之前都是 no-hit，是这次要救的对象。
+  const one = (name: string, singer: string, uid: string) => ({ list: [{ name, singer, uid, interval: '223' }] })
+
+  it('中文歌手名 + 的 + 歌名：剥掉歌手剩下的那半句去配歌名 ⇒ 满分，理由里要写"歌手对上了"', async () => {
+    h.searchOneSource.mockResolvedValue(one('我怀念的', '孙燕姿', 'kw-231323'))
+    const d = await decideTakeover(row({ query: '播放孙燕姿的我怀念的', answer: '好的，为你播放' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'kw-231323', score: 1 })
+    expect(d.reason).toContain('歌手对上了「孙燕姿」')
+  })
+
+  it('长歌手名（「G.E.M.邓紫棋」这种）：歌名那一半撑不进 +4 字窗口，靠剥歌手命中', async () => {
+    h.searchOneSource.mockResolvedValue(one('天空没有极限', 'G.E.M.邓紫棋', 'kw-1'))
+    // 反证：歌手名归一后 7 字 + 歌名 6 字 = 13 字，比窗口上限（6+4=10）长，老那条路必然配不上
+    const d = await decideTakeover(row({ query: '播放G.E.M.邓紫棋的天空没有极限', answer: '没有找到' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'kw-1', score: 1 })
+  })
+
+  it('纯英文歌手名也一样：「Taylor Swift的Love Story」不该因为句子长就点不着', async () => {
+    h.searchOneSource.mockResolvedValue(one('Love Story', 'Taylor Swift', 'mg-7'))
+    const d = await decideTakeover(row({ query: '播放Taylor Swift的Love Story', answer: '没有找到' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'mg-7' })
+  })
+
+  it('反证：只报人不报歌名（「播放孙燕姿」）不许抢 —— 剥完必须还剩 ≥2 字', async () => {
+    h.searchOneSource.mockResolvedValue(one('遇见', '孙燕姿', 'kw-9'))
+    const d = await decideTakeover(row({ query: '播放孙燕姿', answer: '好的，为你播放孙燕姿的歌' }), config())
+    expect(d.verdict).toBe('no-hit')
+    // 也不许瞎补第二搜：这句话没有任何分隔可拆
+    expect(h.searchOneSource).toHaveBeenCalledTimes(1)
+  })
+
+  it('反证：剥掉歌手只剩一个碎字也不给配（曲库里真有单字歌名时那是抢播）', async () => {
+    h.searchOneSource.mockResolvedValue(one('无', '孙燕姿', 'kw-1'))
+    const d = await decideTakeover(row({ query: '播放孙燕姿无', answer: '好的' }), config())
+    expect(d.verdict).toBe('no-hit')
+  })
+
+  it('同分两条（正版与同名翻唱）：点了歌手的那条赢，哪怕它排在后面', async () => {
+    h.searchOneSource.mockResolvedValue({
+      list: [
+        { name: '遇见', singer: '某翻唱', uid: 'kg-1', interval: '223' },
+        { name: '遇见', singer: '孙燕姿', uid: 'kw-2', interval: '223' },
+      ],
+    })
+    const d = await decideTakeover(row({ query: '播放孙燕姿的遇见', answer: '没有找到' }), config())
+    expect(d.uid).toBe('kw-2')
+  })
+
+  it('但歌手不做硬闸门：点了孙燕姿而曲库里只有翻唱版，照样顶上（有声音 > 点对歌手）', async () => {
+    h.searchOneSource.mockResolvedValue(one('遇见', '某翻唱', 'kg-1'))
+    const d = await decideTakeover(row({ query: '播放孙燕姿的遇见', answer: '没有找到' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'kg-1' })
+  })
+
+  it('兜底二次搜索：整串那一轮空手，才按分隔把歌名再搜一次（判据仍然拿原句量）', async () => {
+    h.searchOneSource.mockImplementation(async (_s: never, keyword: string) => (
+      keyword === 'Taylor Swift的Love Story'
+        ? { list: [] }
+        : { list: [{ name: 'Love Story', singer: 'Taylor Swift', uid: 'mg-7', interval: '245' }] }
+    ))
+    const d = await decideTakeover(row({ query: '播放Taylor Swift的Love Story', answer: '没有找到' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'mg-7' })
+    expect(h.searchOneSource.mock.calls.map(c => c[1])).toEqual(['Taylor Swift的Love Story', 'Love Story'])
+  })
+
+  it('歌名自己以「的」结尾时不许切：「播放我怀念的」只搜整串那一次', async () => {
+    h.searchOneSource.mockResolvedValue(one('我怀念的', '孙燕姿', 'kw-231323'))
+    const d = await decideTakeover(row({ query: '播放我怀念的', answer: '好的' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'kw-231323' })
+    // 切成「我怀念」会把歌名弄坏，所以右半边不足两字的那种切法必须放弃
+    expect(h.searchOneSource.mock.calls.map(c => c[1])).toEqual(['我怀念的'])
+  })
+
+  it('整串那一轮已经够像 ⇒ 不多打一次搜索（兜底只走失败路径）', async () => {
+    h.searchOneSource.mockResolvedValue(one('稻香', '周杰伦', 'kw-1'))
+    await decideTakeover(row({ query: '播放周杰伦的稻香', answer: '好的' }), config())
+    expect(h.searchOneSource).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('执行：动之前要先确认这台归我们管', () => {
   it('控制词命中但没有投放会话 ⇒ 一句"交回小爱"，一条指令都不发', async () => {
     h.castView.mockResolvedValue(null)

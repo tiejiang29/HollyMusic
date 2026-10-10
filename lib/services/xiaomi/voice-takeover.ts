@@ -31,7 +31,7 @@ import { readSpeakerConfig, type SpeakerConfig } from '@/lib/services/xiaomi/tok
 import { castView, refreshCast, skipCast, startCast, stopCast } from '@/lib/services/xiaomi/cast-session'
 import { controlSpeaker, setSpeakerVolume } from '@/lib/services/xiaomi/speaker-play'
 import type { AskRow } from '@/lib/services/xiaomi/conversation-monitor'
-import type { SourceType } from '@/lib/types/music'
+import type { SourceType, Song } from '@/lib/types/music'
 
 export type Verdict =
   | 'control' | 'takeover' | 'no-hit' | 'stale' | 'rejected' | 'not-music'
@@ -87,14 +87,94 @@ export async function decideTakeover(
   }
   return {
     verdict: 'takeover',
-    reason: `说了点歌（「${trigger}」），顶上整曲「${cand.name}」(${(cand.score * 100).toFixed(0)}%)`,
+    // 点了歌手要在理由里看得见：耳验时"选中的是不是我点的那个人的版本"全靠这行分辨
+    reason: `说了点歌（「${trigger}」），顶上整曲「${cand.name}」(${(cand.score * 100).toFixed(0)}%${cand.singerHit ? `·歌手对上了「${cand.singer}」` : ''})`,
     uid: cand.uid, name: cand.name, score: cand.score, durSec: cand.durSec,
   }
 }
 
-export interface Candidate { uid: string; name: string; singer: string; durSec: number; score: number }
+export interface Candidate {
+  uid: string; name: string; singer: string; durSec: number; score: number
+  /** 这句话里确实点了这个候选的歌手（同分时它优先，见 `pickCandidate` 的比较） */
+  singerHit: boolean
+}
 
 interface PickResult { best: Candidate | null; skippedShort: number }
+
+/**
+ * 歌名那一半的打分：编辑距离，加上"互相包含就算同一首"直接判 1。
+ *
+ * 包含只认长度 ≥2 的那一方（单字互相包含纯属巧合，会把"今天几号"配上任意一首带"天"的歌），
+ * **还要卡一个长度窗口**：口令是一整句话，句子里随便嵌着两个字的词就"互相包含"了 ——
+ * 实测过「播放 一首绝对不存在的歌名QQZXTY」配上真歌名《不存在的》打出 100%（那是抢播，不是点歌）。
+ * 窗口取 +4 字：够放"稻香这首歌"这类说法，又拦得住整句闲聊。
+ */
+function pairScore(qn: string, nn: string, bySinger: number): number {
+  const sim = similarity(qn, nn)
+  const longer = Math.max(qn.length, nn.length)
+  const shorter = Math.min(qn.length, nn.length)
+  const contains = shorter >= 2 && (nn.includes(qn) || qn.includes(nn)) && longer <= shorter + CONTAINS_WINDOW_CHARS
+  return contains ? 1 : Math.max(sim, sim * 0.7 + bySinger)
+}
+
+/** 歌手字段常是多值（「周杰伦/温岚」那种），拆成能被单独点名的几段 */
+function singerVariants(singer: string): string[] {
+  return normalizeUtterance(singer)
+    .split(/[/&+]+/)
+    .map(v => v.trim())
+    .filter(v => v.length >= 2)
+}
+
+/**
+ * 一个候选对这句话打多少分，两条路取高的那个：
+ *
+ * ① **只比歌名**（老路，判据一字未动）；
+ * ② **报了歌手又报歌名**：先要求这句话里真出现那个歌手名，然后把歌手那一截剥掉，
+ *    拿剩下的半句单独和歌名比。这样「孙燕姿我怀念的」不再靠 +4 字窗口硬撑（三字歌手名配两字
+ *    歌名就已经把窗口用满，歌手名再长/带英文就破），「Taylor Swift的Love Story」也能命中。
+ *
+ * ②**必须剥完还剩 ≥2 字**才算数：不然「播放孙燕姿」这种只报人不报歌名的会被当成"点了一首空歌名"
+ * 直接抢播（2026-10-10 用户拍的反证用例，这道闸门就是为它立的）。
+ * ②命中还记一个 `singerHit`：同名翻唱与正版都是 100% 时，让点了歌手那条赢。
+ * **但不做硬过滤** —— 歌手对不上的翻唱照样能顶上（2026-10-10 用户拍的：有声音 > 点对歌手）。
+ */
+function scoreCandidate(query: string, name: string, singer: string): { score: number; singerHit: boolean } {
+  const qn = normalizeUtterance(query)
+  const nn = normalizeUtterance(name)
+  const sn = normalizeUtterance(singer)
+  let best = pairScore(qn, nn, sn ? similarity(qn, sn) * 0.2 : 0)
+  let singerHit = false
+  for (const part of singerVariants(singer)) {
+    // 只剥第一处：「孙燕姿的遇见」剥完剩「的遇见」，那截与《遇见》在窗口内互相包含 ⇒ 判 1
+    if (!qn.includes(part)) continue
+    const rest = qn.replace(part, '')
+    if (rest.length < 2) continue
+    singerHit = true
+    const restScore = pairScore(rest, nn, 0)
+    if (restScore > best) best = restScore
+  }
+  return { score: best, singerHit }
+}
+
+/**
+ * 整串搜不到时按分隔再拆一次，拿后半段当歌名重搜（2026-10-10 用户拍的兜底）。
+ *
+ * 先按「的 / - / ，」切，再按空格切，两种都要求左右各 ≥2 字 —— 因为《我怀念的》《她的睫毛》这类
+ * 歌名本身就带/以「的」结尾，右半边为空的那种切法必须放弃（切了会把歌名切坏）。
+ * 拆出来的那一半**只当搜索关键词，不参与判据**：判据始终拿原句量，拆歪了搜回来的东西照样过
+ * `scoreCandidate`，最坏就是和今天一样 `no-hit`。也**不拿歌手那一半去搜** ——
+ * 只报人不报歌名（「播放孙燕姿」）本来就不该抢。
+ */
+function splitForSecondSearch(query: string): string | null {
+  const raw = query.trim()
+  // 左半边放到 16 字：中文歌手名用不到这么长，但「Taylor Swift的Love Story」那种 `的` 前面
+  // 挂着 12 个字符的，卡 6 字就切不出来 —— 而它只当搜索关键词，切歪的代价见上面那段
+  for (const re of [/^(.{2,16}?)\s*(?:的|-|—|，|,)\s*(.{2,})$/, /^(.{2,16})\s+(.{2,})$/]) {
+    const m = re.exec(raw)
+    if (m) return m[2].trim()
+  }
+  return null
+}
 
 /**
  * 拿口令去我们的曲库搜一遍，取最像的那条。
@@ -102,52 +182,55 @@ interface PickResult { best: Candidate | null; skippedShort: number }
  * `takeoverSources` 那几台**并行搜**（列表在写入时就按 `MAX_TAKEOVER_SOURCES` 截过，这里不再截），
  * 单源一次取 10 条：口令是短句，排在前面的本来就相关，我们要的是"第一条像不像这句话"，不是翻页找冷门。
  * 并行是因为串行会把首包按台数叠加（实测一台约 0.4 秒），而"哪台有这首歌"本来就该一起问。
- * 平分时按列表顺序取前者（`score > best.score` 是严格大于），所以**顺序仍然是管理员的决定**。
+ * 平分时先看"这句话有没有点它的歌手"，再按列表顺序取前者（`score > best.score` 是严格大于），
+ * 所以**平台顺序仍然是管理员的决定**。
  *
  * 顺带数一下"被整曲门槛挡掉几条"（`skippedShort`）：这个数字是给面板看的，
  * 门槛填高了却没有别的候选时，管理员要能看出来是门槛干的，而不是"搜不到"。
+ * **只数第一轮**：第二轮的关键词是拆出来的歌名，同一批行会重复计入，那个数就不诚实了。
  */
 async function pickCandidate(query: string, config: SpeakerConfig): Promise<PickResult> {
   const sources = (config.takeoverSources ?? []) as SourceType[]
   const minTrack = Number(config.takeoverMinTrackSec) || 0
-  const perSource = await Promise.all(sources.map(async source => {
-    try {
-      return { source, list: (await searchOneSource(source, query, 1, 10)).list ?? [] }
-    } catch (err) {
-      // 一台挂了不算搜不到：还有别台。但这条要留日志，否则面板只会说"没搜到"
-      logger.warn('[voice-takeover] 单源搜索失败:', `${source} ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`)
-      return { source, list: [] as never[] }
-    }
-  }))
   let skippedShort = 0
   let best: Candidate | null = null
-  for (const { source, list } of perSource) {
-    for (const s of list) {
-      const durSec = intervalToSeconds(s.interval) || 0
-      // 整曲门槛只挡"明显是片段"的那类（30 秒铃声/剪辑版），**不做"与谁相等"的判断** ——
-      // 元数据时长本身也会错。拿不到时长（0）不算过短，宁可放过也不清空候选。
-      if (minTrack > 0 && durSec > 0 && durSec < minTrack) { skippedShort++; continue }
-      const name = similarity(query, s.name ?? '')
-      const bySinger = s.singer ? similarity(query, s.singer) * 0.2 : 0
-      // 互相包含就算同一首：口令是"放稻香"而曲名是"稻香"时，编辑距离会被那两个字拖到阈值以下；
-      // 但只认长度 ≥2 的那一方（单字互相包含纯属巧合，会把"今天几号"配上任意一首带"天"的歌）。
-      // **还要卡一个长度窗口**：口令是一整句话，句子里随便嵌着两个字的词就"互相包含"了 ——
-      // 实测过「播放 一首绝对不存在的歌名QQZXTY」配上真歌名《不存在的》打出 100%（那是抢播，不是点歌）。
-      // 窗口取 +4 字：够放"稻香这首歌"这类说法，又拦得住整句闲聊。
-      const qn = normalizeUtterance(query)
-      const nn = normalizeUtterance(s.name ?? '')
-      const longer = Math.max(qn.length, nn.length)
-      const shorter = Math.min(qn.length, nn.length)
-      const contains = shorter >= 2 && (nn.includes(qn) || qn.includes(nn)) && longer <= shorter + CONTAINS_WINDOW_CHARS
-      const score = contains ? 1 : Math.max(name, name * 0.7 + bySinger)
-      if (!best || score > best.score) {
-        best = {
-          uid: s.uid ?? `${source}-${s.songmid}`, name: s.name ?? '', singer: s.singer ?? '',
-          durSec, score,
+
+  const searchAll = (keyword: string): Promise<Array<{ source: SourceType; list: Song[] }>> =>
+    Promise.all(sources.map(async source => {
+      try {
+        return { source, list: (await searchOneSource(source, keyword, 1, 10)).list ?? [] }
+      } catch (err) {
+        // 一台挂了不算搜不到：还有别台。但这条要留日志，否则面板只会说"没搜到"
+        logger.warn('[voice-takeover] 单源搜索失败:', `${source} ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`)
+        return { source, list: [] as Song[] }
+      }
+    }))
+
+  /** 一轮搜索结果进账：`countShort` 只第一轮 true（理由见函数头） */
+  const consume = (rows: Array<{ source: SourceType; list: Song[] }>, countShort: boolean) => {
+    for (const { source, list } of rows) {
+      for (const s of list) {
+        const durSec = intervalToSeconds(s.interval) || 0
+        // 整曲门槛只挡"明显是片段"的那类（30 秒铃声/剪辑版），**不做"与谁相等"的判断** ——
+        // 元数据时长本身也会错。拿不到时长（0）不算过短，宁可放过也不清空候选。
+        if (minTrack > 0 && durSec > 0 && durSec < minTrack) { if (countShort) skippedShort++; continue }
+        const { score, singerHit } = scoreCandidate(query, s.name ?? '', s.singer ?? '')
+        if (!best || score > best.score || (score === best.score && singerHit && !best.singerHit)) {
+          best = {
+            uid: s.uid ?? `${source}-${s.songmid}`, name: s.name ?? '', singer: s.singer ?? '',
+            durSec, score, singerHit,
+          }
         }
       }
     }
   }
+
+  const belowCutoff = (c: Candidate | null): boolean => !c || c.score < config.fuzzyMatchCutoff
+
+  consume(await searchAll(query), true)
+  // 第一轮什么都没捞着、或像到不够门槛，才补这一发（多一次网络，只在失败路径上付）
+  const title = splitForSecondSearch(query)
+  if (title && belowCutoff(best)) consume(await searchAll(title), false)
   return { best, skippedShort }
 }
 
