@@ -139,6 +139,8 @@ interface Session {
   pushedAt: number
   lastStatus: PlayStatus | null
   lastStatusAt: number
+  /** 上面那一拍读到的**是不是我们的流**（audio_id 认得出来）—— 认不出来时它的位置不是我们的进度 */
+  lastStatusIsOurs: boolean
   /** 暂停时定住的位置（这一项内已播秒数） */
   pausedWithinItem: number | null
   timer: ReturnType<typeof setTimeout> | null
@@ -186,14 +188,29 @@ function playingSlot(s: Session): WindowSlot {
 function itemDurSec(s: Session, slot: WindowSlot): number {
   if (slot.durSec > 0) return slot.durSec
   if (slot.deviceDurSec && slot.deviceDurSec > 0) return slot.deviceDurSec
-  if (slot === playingSlot(s) && s.lastStatus && s.lastStatus.duration > 0) return s.lastStatus.duration / 1000
+  if (slot === playingSlot(s) && s.lastStatus && s.lastStatusIsOurs && s.lastStatus.duration > 0) return s.lastStatus.duration / 1000
   return UNKNOWN_DUR_SEC
+}
+
+/**
+ * 这一拍读到的到底是不是**我们的流**。设备回显的 audio_id 就是游标（真机 2026-10-08 验过），
+ * 所以"认不出这是哪一格"的那一拍，位置一律**不许当成我们的进度**。
+ *
+ * 这条是 2026-10-10 22:20 真机打出来的：推「播放邓紫棋的龙卷风」下去 **5.3 秒**，第一拍读到
+ * position=**279 秒**，而那一格时长 248 秒（`interval="04:08"`，事后从 kw 真搜回来逐条核过）
+ * ⇒ `剩余 = 248 - 279 = -31` ⇒ 判成"已经放完"、当场掐掉刚要点开的那首
+ * （日志对得上：58.245 收口，**58.417 设备才开始拉我们的流**）。那 279 秒是设备当时还挂着的
+ * **别的内容**（小爱回了「请欣赏龙卷风 试听版」，它自己那条）。
+ */
+function statusIsOurs(s: Session, st: PlayStatus): boolean {
+  return s.window.some(x => x.audioId === st.audioId)
 }
 
 /**
  * 这一项**从它的流起点算**已经播了多少秒。
  * 设备每次读到都带绝对位置，两次轮询之间按墙钟外推（暂停期间不外推）；
- * 这台不报位置时（`position < 0`）只能整个按推入时刻起算。
+ * 这台不报位置时（`position < 0`）、以及**这一拍读到的不是我们的流**时，只能整个按推入时刻起算
+ * —— 走的是本来就有那条兜底路，不新增机制（理由见 `statusIsOurs`）。
  */
 function playedWithinStream(s: Session): number {
   const st = s.lastStatus
@@ -201,6 +218,7 @@ function playedWithinStream(s: Session): number {
     if (st && st.status !== PLAY_STATUS_PLAYING) return s.pausedWithinItem ?? 0
     return Math.max(0, (Date.now() - s.pushedAt) / 1000)
   }
+  if (!s.lastStatusIsOurs) return Math.max(0, (Date.now() - s.pushedAt) / 1000)
   if (st.status !== PLAY_STATUS_PLAYING) return s.pausedWithinItem ?? st.position / 1000
   return st.position / 1000 + (Date.now() - s.lastStatusAt) / 1000
 }
@@ -294,6 +312,7 @@ async function pushWindow(s: Session, slots: WindowSlot[]): Promise<boolean> {
   s.lastError = null
   s.lastStatus = null
   s.lastStatusAt = 0
+  s.lastStatusIsOurs = false
   logger.info('[xiaomi] 投放窗口已推给音箱', {
     音箱: s.deviceName, 首数: slots.length, 当前: slots[0].uid,
     起点秒: Math.round(slots[0].seekSec), 批量: r.batched,
@@ -428,8 +447,12 @@ const PRIME_READ_MS = 1200
 function sawLoopRestart(s: Session, st: PlayStatus): boolean {
   const prev = s.lastStatus
   const idx = s.window.findIndex(x => x.audioId === st.audioId)
+  // `s.lastStatusIsOurs` 在这一刻还是**上一拍**的判断（tick 先比回跳、后 applyStatus）：
+  // 上一拍要是读到的是别人家的内容（279 秒那种），拿它的位置一比，"已经播了至少 30 秒"这关
+  // 会被别人的进度替我们过掉 ⇒ 下一拍读回我们自己的起点就"看起来像大段回跳"⇒ 又是一次把好歌当场掐掉
   return idx === s.playingIdx && idx >= 0
-    && !!prev && prev.position >= LOOP_MIN_PLAYED_MS
+    && !!prev && s.lastStatusIsOurs
+    && prev.position >= LOOP_MIN_PLAYED_MS
     && st.position >= 0 && st.position <= prev.position - 3000
 }
 
@@ -437,8 +460,10 @@ function sawLoopRestart(s: Session, st: PlayStatus): boolean {
 function applyStatus(s: Session, st: PlayStatus): void {
   s.lastStatus = st
   s.lastStatusAt = Date.now()
+  // 先定"这一拍是不是我们的流"，再动位置相关的账：认不出来的那一拍，它报的位置/时长都是**别的内容**的
+  s.lastStatusIsOurs = statusIsOurs(s, st)
   if (st.status !== PLAY_STATUS_PLAYING) {
-    s.pausedWithinItem = st.position >= 0 ? st.position / 1000 : playedWithinStream(s)
+    s.pausedWithinItem = st.position >= 0 && s.lastStatusIsOurs ? st.position / 1000 : playedWithinStream(s)
   } else {
     s.pausedWithinItem = null
   }
@@ -452,7 +477,7 @@ function applyStatus(s: Session, st: PlayStatus): void {
     }
     s.playingIdx = idx
   }
-  if (st.duration > 0) {
+  if (st.duration > 0 && s.lastStatusIsOurs) {
     const slot = playingSlot(s)
     if (!slot.deviceDurSec) slot.deviceDurSec = st.duration / 1000
   }
@@ -548,6 +573,12 @@ async function tick(s: Session): Promise<void> {
         // 时长比真实文件长 ⇒ 定点根本不会发生），再等一圈就是"接管的那首歌怎么停不下来"
         logger.info(looped ? '[xiaomi] 音箱把这一首从头循环了，立即收口' : '[xiaomi] 到边界了，补下一窗或收口', {
           音箱: s.deviceName, 剩余秒: Math.round(remaining),
+          // 这三个数是 2026-10-10 那次"5 秒就掐"之后补的：光有 `剩余秒:-31` 反推不出是谁的位置，
+          // 靠 248-279 手算才算出那 279 秒根本不是我们的流。下次一眼就能看出来。
+          位置秒: st.position >= 0 ? Math.round(st.position / 1000) : -1,
+          可信位置秒: Math.round(playedWithinStream(s)),
+          时长秒: Math.round(itemDurSec(s, playingSlot(s))),
+          是我们的读数: s.window.some(x => x.audioId === st.audioId),
         })
         await advance(s)
       } else {
@@ -621,6 +652,7 @@ export async function startCast(input: StartCastInput): Promise<CastView> {
     pushedAt: 0,
     lastStatus: null,
     lastStatusAt: 0,
+    lastStatusIsOurs: false,
     pausedWithinItem: null,
     timer: null,
     ticking: false,
@@ -715,7 +747,9 @@ export async function refreshCast(deviceID?: string): Promise<CastView> {
   const st = await getPlayStatus(creds, s.deviceID)
   s.lastStatus = st
   s.lastStatusAt = Date.now()
-  s.pausedWithinItem = st.status === PLAY_STATUS_PLAYING ? null : (st.position >= 0 ? st.position / 1000 : 0)
+  s.lastStatusIsOurs = statusIsOurs(s, st)
+  // 这一路也要过同一道"是不是我们的流"的关：认不出来时那份位置是别的内容的，定住它等于把别人的进度当成我们的
+  s.pausedWithinItem = st.status === PLAY_STATUS_PLAYING ? null : (st.position >= 0 && s.lastStatusIsOurs ? st.position / 1000 : 0)
   const idx = s.window.findIndex(x => x.audioId === st.audioId)
   if (idx >= 0) s.playingIdx = idx
   if (!s.timer && rt.sessions.has(s.deviceID)) scheduleTick(s, POLL_MS)

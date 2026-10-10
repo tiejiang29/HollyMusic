@@ -266,6 +266,57 @@ it('刚推完还没读到状态时按"在播"报，免得客户端把乐观态�
   })
 })
 
+describe('设备还挂在别的内容上时，那一拍的读数不算我们的进度（2026-10-10 22:20 真机）', () => {
+  // 真机那一发：「播放邓紫棋的龙卷风」推下去 **5.3 秒**，第一拍读到 position=**279 秒**，而那一格
+  // 时长 248 秒（kw `interval="04:08"`）⇒ `剩余 = 248 - 279 = -31` ⇒ 判成"已经放完"、当场掐掉
+  // 刚要点开的那首（日志：58.245 收口，**58.417 设备才开始拉我们的流**）。那是小爱自己那条的内容。
+  const LONG = 248
+  /** 把设备摆在"还在放别的东西"上：audio_id 不在窗里，位置随便多大 */
+  function foreignAt(positionMs: number, durationMs = 30_000) {
+    h.status = { ...h.status, status: 1, audioId: 'xiaomi-自己那条-999', position: positionMs, duration: durationMs }
+  }
+
+  it('第一拍是外来读数：不收口、会话留着，进度按墙钟走而不是跳到 4:39', async () => {
+    await cast.startCast({ current: track('cur', LONG), rest: [] })
+    foreignAt(279_000)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    const v = await cast.castView()
+    expect(v).not.toBeNull()
+    expect(v!.posSec).toBeLessThanOrEqual(6)
+  })
+
+  it('一直读不到我们那条也仍然会收口：边界按推入以来的墙钟到点（别把闸门改成"永远不停"）', async () => {
+    await cast.startCast({ current: track('cur', LONG), rest: [] })
+    foreignAt(279_000)
+    await vi.advanceTimersByTimeAsync(LONG * 1000 + 6000)
+    expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+  })
+
+  it('外来读数之后才切到我们的流、从开头起：那不算"大段回跳"，不许立即收口', async () => {
+    await cast.startCast({ current: track('cur', LONG), rest: [] })
+    const ours = pushed(0)[0].audioId
+    foreignAt(279_000)
+    await vi.advanceTimersByTimeAsync(6000)     // 上一拍可信进度只有几秒（不是别人的 279）
+    deviceAt(ours, 6)                            // 这一拍才真正在我们的流上
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    expect(await cast.castView()).not.toBeNull()
+  })
+
+  it('反证：读数认得出是我们的那一格时，位置照旧全信 —— 撒谎的元数据仍然靠回跳收口', async () => {
+    // 这条是既有那条「元数据时长撒谎」用例的正向替身：新闸门不许把"是我们的读数"也一起降级掉
+    await cast.startCast({ current: track('cur', LONG), rest: [] })
+    const ours = pushed(0)[0].audioId
+    deviceAt(ours, 220)                          // 比墙钟"应该"的位置大得多，但 id 是我们的 ⇒ 信
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    deviceAt(ours, 4)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+  })
+})
+
 describe('拖动进度条：带偏移重推，且剩余项一起排', () => {
   it('seek 之后窗没被砍短（只重推当前项就等于把连播丢了）', async () => {
     await cast.startCast({ current: track('cur'), rest: rest(15) })
