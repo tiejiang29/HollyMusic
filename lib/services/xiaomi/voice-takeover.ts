@@ -151,13 +151,12 @@ async function pickCandidate(query: string, config: SpeakerConfig): Promise<Pick
   return { best, skippedShort }
 }
 
-/** 面板上那行"接管账目"的一条：判了什么、动没动、为什么 */
+/** 面板"接管账目"那一条：只留合成行与异常行（见下面 `LOG_MAX` 那段） */
 export interface TakeoverLogRow {
   at: number
   deviceID: string
   deviceName: string
   query: string
-  answer: string
   verdict: Verdict
   reason: string
   /** 真做了什么（"投了《稻香》"、"没动"）；一行字，直接显示 */
@@ -166,11 +165,26 @@ export interface TakeoverLogRow {
   synthetic: boolean
 }
 
-const LOG_MAX = 40
+/**
+ * 这张表只留"对话回显那一行看不到"的东西（2026-10-10 瘦身，用户拍的）。
+ *
+ * 原先每条口令都进账，等于把家庭成员说过的话在内存里再抄一份 40 条 —— 而真话的判定结果
+ * 早就回填到回显那一列了（「处置」= verdict · acted，reason 在悬停提示里），两张表内容重复。
+ * 留下三类：① 合成行（模拟口令压根不进对话记录，只有这儿有）；② 执行炸了行
+ * （"想动但失败了"，这是唯一能发现"我们本该动却没动起来"的地方）；③ 被丢掉的旧话与历史
+ * （`stale` / `rejected`，排查"我说了它为啥没接"全靠它）。
+ */
+export const LOG_MAX = 20
+
+/** 这条值不值得留在账上（不值得的照样回填到回显那一行，只是不进这张表） */
+function worthKeeping(e: TakeoverLogRow): boolean {
+  return e.synthetic || e.acted.startsWith('想动但失败了') || e.verdict === 'stale' || e.verdict === 'rejected'
+}
+
 /**
  * 账本与队列同样挂 `globalThis`：模块被热重载复制成几份时，**串行队列必须是同一条** ——
  * 两份各有各的 `chain`，等于两句话并发去抢同一条 ubus 队（这正是它当初要串行的理由）。
- * 同一进程内的同一份账也才拼得出最近 40 条这个上限。
+ * 同一进程内的同一份账也才拼得出那个上限。
  */
 interface TakeoverRuntime { log: TakeoverLogRow[]; chain: Promise<unknown> }
 const globalWithRt = globalThis as typeof globalThis & { __xiaomiVoiceTakeover?: TakeoverRuntime }
@@ -266,10 +280,11 @@ export async function handleAskNow(
   }
   const entry: TakeoverLogRow = {
     at: Date.now(), deviceID: row.deviceID, deviceName: row.deviceName,
-    query: row.query, answer: row.answer, verdict: d.verdict, reason: d.reason,
+    query: row.query, verdict: d.verdict, reason: d.reason,
     acted, synthetic: !!opts.synthetic,
   }
-  pushLog(entry)
+  // 每条都回填到对话那一行（`done`），但只有 `worthKeeping` 那几类进这张表 —— 见那里的注释
+  if (worthKeeping(entry)) pushLog(entry)
   logger.info('[voice-takeover] 判了一条口令', {
     判定: d.verdict, 说了: row.query.slice(0, 30), 答了: row.answer.slice(0, 30), 做了: acted, 合成: !!opts.synthetic,
     判据ms: decideMs, 执行ms: Date.now() - actStart,

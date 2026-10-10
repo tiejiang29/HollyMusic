@@ -1027,14 +1027,18 @@ export function SpeakerPanel() {
             </p>
           ) : null}
           {askLog.length > 0 ? (
-            <div className="mt-3 max-h-56 overflow-auto rounded border border-border">
+            <>
+            <p className="mt-2 text-[11px] text-muted-foreground">
+              这里只留<b className="text-foreground">模拟口令</b>和<b className="text-foreground">异常那几条</b>（想动但失败了 / 旧话 / 启动时的历史）；
+              真话的处置在上面的对话回显「处置」列，不在这儿重复抄一份。
+            </p>
+            <div className="mt-2 max-h-56 overflow-auto rounded border border-border">
               <table className="w-full text-xs">
                 <thead className="sticky top-0 bg-accent/40 text-left text-[11px] uppercase text-muted-foreground">
                   <tr>
                     <th className="px-2 py-1.5 font-medium">时刻</th>
                     <th className="px-2 py-1.5 font-medium">来源</th>
                     <th className="px-2 py-1.5 font-medium">你说</th>
-                    <th className="px-2 py-1.5 font-medium">小爱答</th>
                     <th className="px-2 py-1.5 font-medium">判定</th>
                     <th className="px-2 py-1.5 font-medium">做了什么</th>
                   </tr>
@@ -1047,7 +1051,6 @@ export function SpeakerPanel() {
                       </td>
                       <td className="px-2 py-1.5 text-[11px] text-muted-foreground">{r.synthetic ? '合成' : '真话'}</td>
                       <td className="px-2 py-1.5">{r.query || '—'}</td>
-                      <td className="px-2 py-1.5">{r.answer || '—'}</td>
                       <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px]">{r.verdict}</td>
                       <td className="px-2 py-1.5">
                         {r.acted}
@@ -1058,8 +1061,9 @@ export function SpeakerPanel() {
                 </tbody>
               </table>
             </div>
+            </>
           ) : (
-            <p className="mt-2 text-xs text-muted-foreground">还没有判过任何一条口令</p>
+            <p className="mt-2 text-xs text-muted-foreground">没有要看的：模拟口令没打过，真话也没出过「该动没动起来」</p>
           )}
         </div>
       ) : null}

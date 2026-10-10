@@ -206,7 +206,6 @@ export interface TakeoverLogRow {
   deviceID: string
   deviceName: string
   query: string
-  answer: string
   verdict: TakeoverVerdict
   reason: string
   acted: string

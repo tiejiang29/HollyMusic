@@ -286,15 +286,36 @@ describe('执行：动之前要先确认这台归我们管', () => {
     expect(getTakeoverLog()[0].query).toBe('下一首')
   })
 
-  it('账目只留最近 40 条，且合成与真话分得开', async () => {
-    for (let i = 0; i < 45; i++) {
-      await handleAskNow(row({ query: `第 ${i} 句`, answer: '好的，为你播放' }), { synthetic: i % 2 === 0 })
+  it('账目只留合成行与异常行：真话正常判定不进账（2026-10-10 瘦身）', async () => {
+    // 真话 + 正常处置：verdict/acted 已经回填到对话回显那一行，这张表再抄一遍没有新信息
+    await handleAskNow(row({ query: '下一首', answer: '好的' }))
+    await handleAskNow(row({ query: '播放稻香', answer: '好的，为你播放' }))
+    await handleAskNow(row({ query: '今天天气怎么样', answer: '晴' }))
+    expect(getTakeoverLog()).toHaveLength(0)
+
+    // 三类要留的：① 合成行（模拟口令压根不进对话记录）② 想动但失败了 ③ stale / rejected
+    await handleAskNow(row({ query: '模拟的那句', answer: '好的' }), { synthetic: true })
+    h.castView.mockResolvedValue({ volume: 30 })
+    h.skipCast.mockRejectedValueOnce(new Error('切歌没认这条指令'))
+    await handleAskNow(row({ query: '上一首', answer: '好的' }))
+    await handleAskNow(row({ query: '很久之前那句', answer: '好的', timestampMs: now - (STALE_ASK_SEC + 30) * 1000 }))
+    await handleAskNow(row({ query: '启动时的历史', answer: '好的', fromBaseline: true }))
+
+    // 新的在前，且真话那三条确实没混进来
+    expect(getTakeoverLog().map(l => l.query)).toEqual([
+      '启动时的历史', '很久之前那句', '上一首', '模拟的那句',
+    ])
+    expect(getTakeoverLog().every(l => l.synthetic || l.verdict === 'stale' || l.verdict === 'rejected'
+      || l.acted.startsWith('想动但失败了'))).toBe(true)
+  })
+
+  it('账目只留最近 20 条（瘦身之后进来的都是要看的，更长的属于回显那张表）', async () => {
+    for (let i = 0; i < 25; i++) {
+      await handleAskNow(row({ query: `第 ${i} 句` }), { synthetic: true })
     }
     const log = getTakeoverLog()
-    expect(log.length).toBeLessThanOrEqual(40)
-    // 最后一条是 i=44（偶数 ⇒ 合成），顺序与来源标记都要对得上
-    expect(log[0].synthetic).toBe(true)
-    expect(log[0].query).toBe('第 44 句')
+    expect(log.length).toBeLessThanOrEqual(20)
+    expect(log[0].query).toBe('第 24 句')
   })
 
   // 排队是有意不 await 的（别把轮询那一拍拖长），所以测试要排干：一次 macrotask 把挂着的
@@ -316,6 +337,8 @@ describe('执行：动之前要先确认这台归我们管', () => {
     submitAsk(row({ query: '暂停播放', answer: '好的' }), second)
     await drain()
     expect(second).toHaveBeenCalledTimes(1)
-    expect(getTakeoverLog().map(l => l.query)).toEqual(['暂停播放', '下一首'])
+    // 两条都是"真话 + 正常处置"：照样回填、照样不进账
+    expect(second.mock.calls[0][0]).toMatchObject({ verdict: 'control', query: '暂停播放' })
+    expect(getTakeoverLog()).toHaveLength(0)
   })
 })
