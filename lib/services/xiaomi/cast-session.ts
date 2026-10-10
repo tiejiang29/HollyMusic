@@ -439,21 +439,24 @@ const PRIME_READ_MS = 1200
  *
  * 两种回跳要分开：**起播那阵子**设备拉不到字节会自己挂断重拉（实测 5.1 秒挂断、0.1 秒后重拉，
  * 位置同样从 0 起），那种该等它继续；**已经播了半首**之后再归零只剩"放完自己从头循环"一种解释。
- * 闸门因此取"上一拍至少已经播了 `LOOP_MIN_PLAYED_MS`"，不取"离（我们以为的）结尾多近"——
- * 后者在元数据时长撒谎时（现成例子：`kw:440613 实际=224s 期望=304s`）正好失效，而那类歌真会停不下来。
+ * 闸门取"上一拍至少走完这一项的一半（且不短于 `LOOP_MIN_PLAYED_MS`）"，**不取"离结尾多近"**——
+ * 后者在元数据时长撒谎时（现成例子：`kw:440613 实际=224s 期望=304s`）正好失效，而那类歌真会停不下来；
+ * "过半"这一档撒谎的例子仍然过得了（224/304 = 74%）。
+ *
+ * 为什么从"至少 30 秒"抬到"至少过半"（2026-10-10 23:07 真机）：「播放邓紫棋的天空没有极限」推下去
+ * **11 秒**就被判成从头循环 —— 上一拍那份 `30 秒` 是**小爱试听版留在同一个 audio_id 上的残留位置**
+ * （`是我们的读数` 已经是 true，所以 §4.7.2 那道"外来读数"闸门拦不住它），而这一项 279 秒。
+ * 30 秒对 279 秒来说是刚接上，不是快放完。
+ * ⚠ 残余的洞要认：真实长度**不到声明一半**的那种元数据撒谎，这道闸门会认不出、只能等定点或人来停。
  * （换窗/重推都会把 `lastStatus` 清成 null、设备自己在窗内换项则 `audio_id` 会变，
  * 这两种都比不出回跳；这条判据又只在 `mustAct` 那一拍被采纳，误判的爆炸半径限于窗里最后一项。）
  */
 function sawLoopRestart(s: Session, st: PlayStatus): boolean {
   const prev = s.lastStatus
   const idx = s.window.findIndex(x => x.audioId === st.audioId)
-  // `s.lastStatusIsOurs` 在这一刻还是**上一拍**的判断（tick 先比回跳、后 applyStatus）：
-  // 上一拍要是读到的是别人家的内容（279 秒那种），拿它的位置一比，"已经播了至少 30 秒"这关
-  // 会被别人的进度替我们过掉 ⇒ 下一拍读回我们自己的起点就"看起来像大段回跳"⇒ 又是一次把好歌当场掐掉
-  return idx === s.playingIdx && idx >= 0
-    && !!prev && s.lastStatusIsOurs
-    && prev.position >= LOOP_MIN_PLAYED_MS
-    && st.position >= 0 && st.position <= prev.position - 3000
+  if (!(idx === s.playingIdx && idx >= 0 && prev && s.lastStatusIsOurs)) return false
+  const floor = Math.max(LOOP_MIN_PLAYED_MS, itemDurSec(s, playingSlot(s)) * 1000 / 2)
+  return prev.position >= floor && st.position >= 0 && st.position <= prev.position - 3000
 }
 
 /** 把一次状态回读落进会话（看门狗与起播确认共用这一份口径） */

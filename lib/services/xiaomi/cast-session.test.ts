@@ -308,10 +308,33 @@ describe('设备还挂在别的内容上时，那一拍的读数不算我们的�
     // 这条是既有那条「元数据时长撒谎」用例的正向替身：新闸门不许把"是我们的读数"也一起降级掉
     await cast.startCast({ current: track('cur', LONG), rest: [] })
     const ours = pushed(0)[0].audioId
-    deviceAt(ours, 220)                          // 比墙钟"应该"的位置大得多，但 id 是我们的 ⇒ 信
+    deviceAt(ours, 220)                          // 248 秒的一首播到 220 秒（过半）—— 还没回跳 ⇒ 不许停
     await vi.advanceTimersByTimeAsync(6000)
     expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
     deviceAt(ours, 4)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+  })
+
+  it('刚接上流时同一个 audio_id 上还挂着上一条的残留位置（30 秒）：那不算"从头循环"（23:07 真机）', async () => {
+    // 那一发是「播放邓紫棋的天空没有极限」：279 秒的一首，推下去 11 秒就被判成"转回头"掐掉 ——
+    // 上一拍那份 30 秒是小爱试听版留在**我们这个 audio_id** 上的残留（所以"外来读数"那道闸拦不到它）
+    await cast.startCast({ current: track('cur', 279), rest: [] })
+    const ours = pushed(0)[0].audioId
+    deviceAt(ours, 30)
+    await vi.advanceTimersByTimeAsync(6000)
+    deviceAt(ours, 1)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(h.playerOperation).not.toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
+    expect(await cast.castView()).not.toBeNull()
+  })
+
+  it('反证：位置过半之后再归零，仍然立即收口（别把上面那条改成"什么回跳都不认"）', async () => {
+    await cast.startCast({ current: track('cur', 279), rest: [] })
+    const ours = pushed(0)[0].audioId
+    deviceAt(ours, 150)                          // 过半（279/2 = 139.5）⇒ 这一拍才算"播过一大截"
+    await vi.advanceTimersByTimeAsync(6000)
+    deviceAt(ours, 2)
     await vi.advanceTimersByTimeAsync(6000)
     expect(h.playerOperation).toHaveBeenCalledWith(expect.anything(), 'D1', 'stop')
   })
