@@ -390,6 +390,8 @@ UA 不必冒充客户端（实测我们那串老 UA 同样出 20 条）。tx 的
 
 **真机验到哪一步**：早先这里写的"真实的一条口令至今没进过这条链"**已作废** —— 那是 Cookie `deviceId` 填错导致的假 0 条（§4.7.3）。修好后真口令走到了判据并落了账目：他连着说了两次「播放七里香」，两行都判 `answered`、"没动（它办成了）"，而设备当时正在放 `duration=30024ms` 的片段 —— **这一类旧判据看不见，也正是这次撤掉"看回答"的理由**。用它在他真机上验过的其余几条：控制词但无会话 ⇒ 判 `control`、"没动（交回小爱）"、一条指令都不发；有会话时"小声一点" ⇒ 音量 43→33、"音量调到 25" ⇒ 25（**起点是现读的**，音量会漂）；「稻香」+ 回答"没有找到" ⇒ 搜到 `kw-440613`、100% ⇒ `startCast` 顶上，设备 `status=1`、`posSec` 从 10 走到 13；「今天天气怎么样」⇒ `not-music`，一次搜索都不发。**「命中就抢」这一版真机验通了**（2026-10-10 20:07 本地，用户耳朵 + 日志）：「播放邓紫棋的天空没有极限」⇒ 判 `takeover`、顶上 **kw-233274166**（多平台搜索生效，不再撞 tx），出口走"库内 FLAC ⇒ 在线取 320k"、全程零 415；放到结尾 279 秒（≈ 元数据）时 `到边界了…{剩余秒:0}` → `队列放完，停掉音箱（开始收尾）` → **2.7 秒后 `收口确认：音箱停了{发过:1}`**。⚠ 一句就够，但**"够不够"只有回读才知道**：上一版同样是一声就够，只是发完就清了会话、没人回头看，于是我把"日志里没出现第二轮"当成了"没有第二轮"，而他听到的是"一直重播"（那条兜底判据当时挂在已被清掉的会话上，结构上就没机会触发）。教训写在 §4.7.2 收口那两条里。
 
+**2026-10-11 11:00 本地：长歌手名那句终于有真机正证（走面板「走一遍判据」，绕开 ASR）**。语音那两次都不算数 —— ASR 把「G.E.M.」吞了、还把句尾"极限"听成"边界"（`no-hit`，那是判据守住了，不是缺陷）。他用 `合成:true` 那条入口喂进 `播放G.E.M.邓紫棋的天空没有极限` ⇒ 四台都回（kw 9 / kg 8 / wy 10 / mg 1）、`takeover`、投 **kw-233274166**，然后：推下去 **279.86 秒**才 `到边界了{剩余秒:0, 位置秒:279, 可信位置秒:279, 时长秒:279, 是我们的读数:true}` → `开始收尾` → 2.7 秒后 `收口确认：音箱停了{发过:1}`。**这一句在旧判据下必破**（归一后 13 字 vs 曲名 6 字：既超 +4 窗口，编辑距离又只有 46%），所以"报了歌手也能点上"这一格从"只有脚本 + 单测"升级成真机验过。⚠ **但同一次没能证明"过半闸门挡住了那次误发"** —— 这一发设备 0.72 秒就接上了我们的流，很可能压根没出现"同一 `audio_id` 上挂着上一条残留位置"那一拍，而**非边界那几拍是哑的（只有动手那一拍打日志）**，所以"没误发"与"没撞上"分不开。要把这一格坐实，得先在 `tick` 里补一行临时的每拍读数再撞几次。同理，`是我们的读数:false` 那一拍**至今一次都没出现过**，它仍然只有单测（探针 D）。
+
 另外记两条**实测到的设备事实**（④B 要用）：小爱自己播歌那条路径上 `getPlayStatus` 回来的 **`title` 是空的**（两次读都空，所以"看标题里带不带试听版"这条便宜路不成立），而 `duration` 报得准（30024 / 221753 毫秒，位置 6 秒走 6.7 秒是实时的）、`audio_id` 是小米自己的长数字（能认"是不是我们推的那条"，判不了整曲）。
 
 面板仍带**模拟口令**入口（`askSimulate`，只 admin）：把合成的"你说/小爱答"喂进同一条判据与执行链，账目里明确标 `合成`，开关关着时照样只判不动（模拟不是后门）。留着的理由不是"真话拉不到"，而是**"回答留空"这类形状在真话里再也复现不出来**，对照实验要做得靠它。
@@ -684,7 +686,9 @@ Android / Subsonic 客户端走完全相同的 `/api/audio` 入口（Subsonic �
 
 ## 11. 部署
 
-- **Docker**：多阶段构建 —— backend-builder 跑 `next build`（standalone），frontend-builder 跑 Vite build，产物进运行时镜像；入口是 `scripts/start-spa.sh`：先以镜像内捆绑的 prisma CLI 执行 `migrate deploy`（失败即终止启动，不带缺失 schema 静默运行）→ 后台起 Next standalone（:3001，`HOSTNAME=0.0.0.0`）→ 探活就绪后 nginx 前台运行（:3000）作为容器主进程。另有 HEALTHCHECK 打 `:3000/api/health`。对外映射建议 3099:3000（NAS 实例）。
+- **Docker**：多阶段构建 —— backend-builder 跑 `next build`（standalone），frontend-builder 跑 Vite build，产物进运行时镜像；入口是 `scripts/s
+- **CI 有两套构建路径，"绿"要分开看**：`check` job 跑的是 `pnpm build`，**镜像 job 跑的是 `pnpm build --webpack`** —— 2026-10-11 run #61 就是 `check` 全绿而 `build-and-push` 红（类型检查只在 webpack 那条路上把 Next 生成的路由类型跑出来）。所以**部署前要看的是 `build-and-push` 这条 check run 的结论**，不是整条 workflow 有没有红叉。
+- **route 文件里不许导出工具函数**：Next 为每个 `app/**/route.ts` 生成一份"只许导出 HTTP 处理器 + `config` 等少数键"的类型校验，多导一个函数就 `Type '…' is not assignable to type 'never'`、**镜像构建当场失败**（`readParams`/`readSeekSec` 那次就是这样，已挪进 `lib/server/speaker-stream-params.ts`）。推之前自查一条命令就够：在 `app/**/route.ts` 里列出不在 `{GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS,config,revalidate,dynamic,runtime,maxDuration,fetchCache,generateStaticParams,…}` 里的 `export`，**应当为 0**。tart-spa.sh`：先以镜像内捆绑的 prisma CLI 执行 `migrate deploy`（失败即终止启动，不带缺失 schema 静默运行）→ 后台起 Next standalone（:3001，`HOSTNAME=0.0.0.0`）→ 探活就绪后 nginx 前台运行（:3000）作为容器主进程。另有 HEALTHCHECK 打 `:3000/api/health`。对外映射建议 3099:3000（NAS 实例）。
 - **持久化**：`data/`（music.db + audio-cache + library + logs）与 `config/`、`custom-sources/` 挂载卷。
 - **nginx 要点**：SPA fallback、`/assets` 一年强缓存、`/sw.js` `/manifest.json` no-cache、`/api` `/rest` 反代 3001。
 - **升级**：镜像替换 + 自动迁移；音源脚本与配置在挂载卷中不随镜像丢失。
