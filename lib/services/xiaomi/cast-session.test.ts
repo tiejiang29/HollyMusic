@@ -271,11 +271,20 @@ describe('收口的总长取"我们那份"与"设备那份"里大的那个（202
   // 设备报 199549ms（看着更像"我们推下去那段的剩余"）。边界算式是 `剩余 = 总长 − 起点 − 已播`，
   // 而"已播"是从**这次推流**起算的 ⇒ 拿偏小的那份会在带起点的重推上把偏移减两遍 = **提前收口掐尾巴**，
   // 那是用户明确不能忍的一侧（"宁可下一首前奏多重约 1 秒"）。取大值则在两种空间下都不会提前。
-  it('设备报得比元数据长 ⇒ 用设备那份（就是那发 205 vs 213.7 的真数据）', async () => {
+  it('设备报得比元数据长 ⇒ 用设备那份（就是那发 205 vs 213.7 的真数据，出口取整成 214）', async () => {
     await cast.startCast({ current: track('cur', 205), rest: [] })
     deviceAt(pushed(0)[0].audioId, 20, { duration: 213_656 })
     await vi.advanceTimersByTimeAsync(6000)
-    expect((await cast.castView())!.durSec).toBeCloseTo(213.656, 2)
+    expect((await cast.castView())!.durSec).toBe(214)
+  })
+
+  it('下发的 `posSec`/`durSec` 必须是整数秒（安卓手写 `"146.263".toIntOrNull() ?: 0` 会把小数静默成 0）', async () => {
+    await cast.startCast({ current: track('cur', 205), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 146.263, { duration: 213_656 })
+    await vi.advanceTimersByTimeAsync(6000)
+    const v = await cast.castView()
+    expect(Number.isInteger(v!.posSec)).toBe(true)
+    expect(Number.isInteger(v!.durSec)).toBe(true)
   })
 
   it('设备报得比元数据短 ⇒ 仍用元数据那份，不许提前收口（宁晚勿早）', async () => {
