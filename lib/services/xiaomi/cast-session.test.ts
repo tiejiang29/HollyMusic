@@ -266,6 +266,40 @@ it('刚推完还没读到状态时按"在播"报，免得客户端把乐观态�
   })
 })
 
+describe('收口的总长取"我们那份"与"设备那份"里大的那个（2026-10-11 两份真读数空间不一致）', () => {
+  // 同一首：库里 205 秒，设备报 `duration=213656ms`（整曲）；另一首 tx 那条：库里 246 秒，
+  // 设备报 199549ms（看着更像"我们推下去那段的剩余"）。边界算式是 `剩余 = 总长 − 起点 − 已播`，
+  // 而"已播"是从**这次推流**起算的 ⇒ 拿偏小的那份会在带起点的重推上把偏移减两遍 = **提前收口掐尾巴**，
+  // 那是用户明确不能忍的一侧（"宁可下一首前奏多重约 1 秒"）。取大值则在两种空间下都不会提前。
+  it('设备报得比元数据长 ⇒ 用设备那份（就是那发 205 vs 213.7 的真数据）', async () => {
+    await cast.startCast({ current: track('cur', 205), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 20, { duration: 213_656 })
+    await vi.advanceTimersByTimeAsync(6000)
+    expect((await cast.castView())!.durSec).toBeCloseTo(213.656, 2)
+  })
+
+  it('设备报得比元数据短 ⇒ 仍用元数据那份，不许提前收口（宁晚勿早）', async () => {
+    await cast.startCast({ current: track('cur', 246), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 20, { duration: 199_549 })
+    await vi.advanceTimersByTimeAsync(6000)
+    expect((await cast.castView())!.durSec).toBe(246)
+  })
+
+  it('反证：这一拍认不出是我们的流时，设备那份时长一律不算（22:20 外来 duration 污染那道闸）', async () => {
+    await cast.startCast({ current: track('cur', 205), rest: [] })
+    h.status = { ...h.status, status: 1, audioId: 'xiaomi-自己那条-999', position: 30_000, duration: 999_000 }
+    await vi.advanceTimersByTimeAsync(6000)
+    expect((await cast.castView())!.durSec).toBe(205)
+  })
+
+  it('设备不报时长（-1）⇒ 退回我们那份，而不是兜底 240', async () => {
+    await cast.startCast({ current: track('cur', 205), rest: [] })
+    deviceAt(pushed(0)[0].audioId, 20, { duration: -1 })
+    await vi.advanceTimersByTimeAsync(6000)
+    expect((await cast.castView())!.durSec).toBe(205)
+  })
+})
+
 describe('设备还挂在别的内容上时，那一拍的读数不算我们的进度（2026-10-10 22:20 真机）', () => {
   // 真机那一发：「播放邓紫棋的龙卷风」推下去 **5.3 秒**，第一拍读到 position=**279 秒**，而那一格
   // 时长 248 秒（kw `interval="04:08"`）⇒ `剩余 = 248 - 279 = -31` ⇒ 判成"已经放完"、当场掐掉

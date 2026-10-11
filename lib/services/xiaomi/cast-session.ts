@@ -185,11 +185,25 @@ function playingSlot(s: Session): WindowSlot {
 }
 
 /** 这一项多长：元数据 > 设备报过的 > 当前实时读到的 > 兜底 */
+/**
+ * 这一项的总长（收口边界要用）。**取"我们传的那份"与"设备报的那份"里大的那个**。
+ *
+ * 为什么不是"直接信设备那份"（2026-10-11 我自己一度这么判，前端那发干净数据把它否了）：
+ * 设备的 `duration` 到底在哪个坐标空间里**并不固定** —— 同一首（库里 205）它报 **213.7**（整曲），
+ * 另一首 tx 那条（库里 246）它报 **199.5**（看着就像"我们推下去那段的剩余"）。
+ * 而边界算式是 `剩余 = 总长 − 起点 − 已播`，`已播` 是从**这次推流**起算的：
+ * 一旦设备那份是"剩余"，拿它当总长就等于把起点减了两遍 ⇒ **提前收口、掐掉尾巴**，
+ * 那是用户明确不能忍的一侧（"宁可下一首前奏多重约 1 秒，也不掐当前这首"）。
+ * 取大值则两种空间下都不会提前；设备报 0/不报（-1）时退回我们那份。
+ * 只信"这一拍是我们的流"的那份设备时长 —— 22:20 那次提前 243 秒收口就是外来的 duration 污染。
+ */
 function itemDurSec(s: Session, slot: WindowSlot): number {
-  if (slot.durSec > 0) return slot.durSec
-  if (slot.deviceDurSec && slot.deviceDurSec > 0) return slot.deviceDurSec
-  if (slot === playingSlot(s) && s.lastStatus && s.lastStatusIsOurs && s.lastStatus.duration > 0) return s.lastStatus.duration / 1000
-  return UNKNOWN_DUR_SEC
+  let device = slot.deviceDurSec && slot.deviceDurSec > 0 ? slot.deviceDurSec : 0
+  if (s.lastStatusIsOurs && slot === playingSlot(s) && s.lastStatus && s.lastStatus.duration > 0) {
+    device = Math.max(device, s.lastStatus.duration / 1000)
+  }
+  const both = Math.max(slot.durSec, device)
+  return both > 0 ? both : UNKNOWN_DUR_SEC
 }
 
 /**
@@ -542,6 +556,13 @@ async function tick(s: Session): Promise<void> {
     // 回跳要在落账之前判：applyStatus 会把 lastStatus 换成这一拍的读数，之后就比不出"掉回 0 了"
     const looped = sawLoopRestart(s, st)
     applyStatus(s, st)
+    // TEMP-CAST-READ（临时探针，posSec 那件事定完就撤）：非边界这几拍一直是哑的，
+    // 已经第三次让我们只能靠推 —— 先把设备原始读数钉在日志里。
+    logger.info('[xiaomi] TEMP-CAST-READ 每拍', {
+      音箱: s.deviceName, 位置毫秒: st.position, 时长毫秒: st.duration, 状态: st.status,
+      是我们的: s.lastStatusIsOurs, 第几项: s.playingIdx, 窗长: s.window.length,
+      起点秒: playingSlot(s).seekSec, 剩余秒: Math.round(remainingSec(s)),
+    })
 
     // 收尾那几拍不参与边界判断，只回答一个问题：**它是不是真的停了**。
     // 还在播就补发 stop（`s.stopTries` 封顶），确认停了才清会话 —— 详见 CLOSE_GAP_MS 那段实测。
@@ -767,7 +788,17 @@ export async function castView(deviceID?: string): Promise<CastView | null> {
   const s = deviceID ? rt.sessions.get(deviceID) : rt.sessions.values().next().value
   if (!s) return null
   if (!s.timer && !s.ticking) scheduleTick(s, 0)
-  return buildView(s)
+  const view = buildView(s)
+  // TEMP-CAST-READ（同上，定完就撤）：这一条打的是**客户端真正拿到的那个数**，
+  // 顺带把"看门狗是不是根本没在跑"一起钉掉 —— posSec 恒 0 现在只有两种可能，这份读数能分开它们。
+  logger.info('[xiaomi] TEMP-CAST-READ 视图', {
+    音箱: s.deviceName, posSec: Math.round(view.posSec * 10) / 10,
+    设备位置毫秒: s.lastStatus ? s.lastStatus.position : null,
+    外推秒: Math.round((Date.now() - s.lastStatusAt) / 100) / 10,
+    是我们的: s.lastStatusIsOurs, 有读数: !!s.lastStatus,
+    距推秒: Math.round((Date.now() - s.pushedAt) / 1000), 排程中: !!s.timer, 正在读: s.ticking,
+  })
+  return view
 }
 
 /** 退出投放：停掉音箱并清会话 */
