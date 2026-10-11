@@ -40,7 +40,8 @@ vi.mock('@/lib/audio-serve', () => ({
 }))
 vi.mock('fs/promises', () => ({ default: { stat: h.stat } }))
 
-const { GET, readParams } = await import('@/app/api/speaker/stream/route')
+const { GET } = await import('@/app/api/speaker/stream/route')
+const { readParams } = await import('@/lib/server/speaker-stream-params')
 
 const MUSIC_INFO = { name: '稻香', singer: '周杰伦', source: 'tx', songmid: 'S1', interval: '223', types: [] }
 const TOKEN = 'eyJ1IjoidHgtUzEifQ.deadbeef'

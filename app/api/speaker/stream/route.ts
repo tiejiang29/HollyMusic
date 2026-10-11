@@ -28,6 +28,7 @@ import { parseIntervalToSeconds } from '@/lib/types/player'
 import { findLibrarySong } from '@/lib/services/music-library'
 import { detectContainer, readHeadBytes, readBytesAt, mimeFromContainer } from '@/lib/server/audio-sniff'
 import { planMp3Seek, alignToFrameStart, NOMINAL_BYTES_PER_SEC, MP3_HEAD_BYTES } from '@/lib/server/mp3-seek'
+import { readParams, readSeekSec } from '@/lib/server/speaker-stream-params'
 import type { QualityType } from '@/lib/types/music'
 
 /** 音箱只给 MP3 档。库里是 FLAC 时改走在线取 MP3 档；在线也给不出就明确 415（这一期不做转码） */
@@ -37,38 +38,6 @@ function fail(status: number, code: string, message: string, headers?: Record<st
   return new Response(JSON.stringify({ success: false, error: { code, message } }), {
     status, headers: { 'Content-Type': 'application/json', 'cache-control': 'no-store', ...headers },
   })
-}
-
-/**
- * 读查询参数，顺手处理"固件把 & 换成空格"。
- *
- * 令牌在第一位，所以空格之后的内容一定是被吞掉的分隔符：`st=<jwt> uid=<x> quality=320k`。
- * JWT 自己不含空格（base64url + '.' + hex），可以按空格安全切开还原。
- */
-export function readParams(request: NextRequest): URLSearchParams {
-  const raw = new URL(request.url).searchParams
-  const token = raw.get('st')
-  if (!token || !token.includes(' ')) return raw
-  const pieces = token.split(/\s+/)
-  const fixed = new URLSearchParams(raw)
-  fixed.set('st', pieces[0])
-  for (const piece of pieces.slice(1)) {
-    const eq = piece.indexOf('=')
-    if (eq > 0) fixed.set(piece.slice(0, eq), piece.slice(eq + 1))
-  }
-  logger.info('[speaker/stream] 还原了被固件改写成分隔符的查询参数')
-  return fixed
-}
-
-/**
- * `seek=<秒>`：音箱侧没有设备端 seek（2026-10-08 真机实测：重推一条流会让它**从 0 起播**），
- * 所以"拖进度条"只能重推一条从中间开始的地址。坏值一律当 0（不改位置），不做"猜一个"的事。
- */
-export function readSeekSec(params: URLSearchParams): number {
-  const raw = params.get('seek')
-  if (!raw) return 0
-  const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : 0
 }
 
 /** 名义每秒字节数：只有帧头读不出来时才用（音质档是标签，标签可能撒谎） */
