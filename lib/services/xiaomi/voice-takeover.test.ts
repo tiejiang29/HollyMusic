@@ -352,6 +352,36 @@ describe('生产那批真行：仿唱挂名不许反超正版（2026-10-11 真�
     const d = await decideTakeover(row({ query: '播放邓紫棋的泡沫' }), config())
     expect(d.uid).toBe('wy-233931')
   })
+
+  it('歌名里本身就挂着那个人的名字也不许加分：判据只比曲名，那段"人"是从**艺名字段**里认的', async () => {
+    // 这两条是真上游回的（kw/wy 那 10 条里的仿唱标题）：曲名里带「邓紫棋」，但艺名根本不是她。
+    // 双向命中只认"句子里那段落在**候选的艺名**里"，所以它们仍然是 0 档，赢不了独名的正版。
+    feed([
+      { name: '邓紫棋-泡沫', singer: '王宝鑫', uid: 'wy-1993474630', interval: '135' },
+      { name: '泡沫(流行版)(cover邓紫棋)', singer: '皮皮的钹', uid: 'mg-1144179860', interval: '239' },
+      { name: '泡沫', singer: 'G.E.M.邓紫棋', uid: 'kw-1245657', interval: '258' },
+    ])
+    const d = await decideTakeover(row({ query: '播放邓紫棋的泡沫' }), config())
+    expect(d.uid).toBe('kw-1245657')
+  })
+
+  it('连曲名都整句撞上《邓紫棋的泡沫》时，靠"艺名干不干净"分：卡拉OK版降到 0 档', async () => {
+    feed([
+      { name: '邓紫棋的泡沫', singer: '星光影音乐队', uid: 'kw-900001', interval: '250' },
+      { name: '泡沫', singer: 'G.E.M.邓紫棋', uid: 'kw-1245657', interval: '258' },
+    ])
+    const d = await decideTakeover(row({ query: '播放邓紫棋的泡沫' }), config())
+    expect(d.uid).toBe('kw-1245657')
+  })
+
+  it('倒过来说「泡沫的邓紫棋」也投得对：歌名那一半照旧拿整句量，mention 只是"人"那一侧的判据', async () => {
+    feed([
+      { name: '邓紫棋-泡沫', singer: '王宝鑫', uid: 'wy-1993474630', interval: '135' },
+      { name: '泡沫', singer: 'G.E.M.邓紫棋', uid: 'kw-1245657', interval: '258' },
+    ])
+    const d = await decideTakeover(row({ query: '播放泡沫的邓紫棋' }), config())
+    expect(d.uid).toBe('kw-1245657')
+  })
 })
 
 describe('执行：动之前要先确认这台归我们管', () => {
