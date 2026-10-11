@@ -301,6 +301,59 @@ describe('报了歌手又报歌名（「播放孙燕姿我怀念的」那一类�
   })
 })
 
+describe('生产那批真行：仿唱挂名不许反超正版（2026-10-11 真机选错了）', () => {
+  // 这份候选是 2026-10-11 生产上「播放邓紫棋的泡沫」那一发**逐字抄下来的真数据**
+  // （kw 搜「邓紫棋的泡沫」前 10 条里进账的那几条，见 my/paomo-probe.out.txt）。
+  // 改之前的判据会把 `kw-300085735`「泡沫」／「张新航&邓 紫 棋」顶上来：它的歌手字段拆得出「邓紫棋」
+  // ⇒ 命中，而正版「G.E.M.邓紫棋」只认整名所以判不出命中 ⇒ 同分时反倒输给挂名的仿唱。
+  const KW_真行 = [
+    { name: '泡沫 (3D环绕版)', singer: 'G.E.M.邓紫棋', uid: 'kw-157537198', interval: '251' },
+    { name: '泡沫', singer: '张新航&邓 紫 棋', uid: 'kw-300085735', interval: '259' },
+    { name: '句号', singer: '张新航&邓紫棋', uid: 'kw-346719460', interval: '231' },
+    { name: '泡沫', singer: 'G.E.M.邓紫棋', uid: 'kw-1245657', interval: '258' },
+    { name: '泡沫 (G.E.M.重生版)', singer: 'G.E.M.邓紫棋', uid: 'kw-478175182', interval: '258' },
+  ]
+  const feed = (list: typeof KW_真行) => h.searchOneSource.mockResolvedValue({ list })
+
+  it('仿唱排在前、正版排在后 ⇒ 取正版，理由里不许写"歌手对上了"给仿唱', async () => {
+    feed(KW_真行)
+    const d = await decideTakeover(row({ query: '播放邓紫棋的泡沫', answer: '好呀，请听泡沫 试听版' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'kw-1245657', score: 1 })
+    expect(d.reason).toContain('歌手对上了「G.E.M.邓紫棋」')
+    expect(d.reason).not.toContain('张新航')
+  })
+
+  it('正版排在前 ⇒ 还是它（这一档不该把已经赢的那条换下去）', async () => {
+    feed([KW_真行[3], ...KW_真行.slice(0, 3)])
+    const d = await decideTakeover(row({ query: '播放邓紫棋的泡沫' }), config())
+    expect(d.uid).toBe('kw-1245657')
+  })
+
+  it('没带「的」的那句说法也认：剥掉拉丁前缀的「邓紫棋」照样是命中', async () => {
+    feed(KW_真行)
+    const d = await decideTakeover(row({ query: '播放邓紫棋泡沫' }), config())
+    expect(d.uid).toBe('kw-1245657')
+  })
+
+  it('合唱名单（挂着好几个人）降到弱一档，但只有它时也照样顶上（不做硬过滤）', async () => {
+    feed([
+      { name: '泡沫', singer: 'G.E.M.邓紫棋、余赛亚、戴斯琪、肖茗', uid: 'wy-486194120', interval: '239' },
+    ])
+    const d = await decideTakeover(row({ query: '播放邓紫棋的泡沫' }), config())
+    expect(d).toMatchObject({ verdict: 'takeover', uid: 'wy-486194120' })
+    expect(d.reason).toContain('名单里还挂着别人')
+  })
+
+  it('独名与合唱名单同时在场 ⇒ 取独名那条（正版是录音室版，不是活动合唱版）', async () => {
+    feed([
+      { name: '泡沫', singer: 'G.E.M.邓紫棋、余赛亚、戴斯琪、肖茗', uid: 'wy-486194120', interval: '239' },
+      { name: '泡沫', singer: 'G.E.M.邓紫棋', uid: 'wy-233931', interval: '258' },
+    ])
+    const d = await decideTakeover(row({ query: '播放邓紫棋的泡沫' }), config())
+    expect(d.uid).toBe('wy-233931')
+  })
+})
+
 describe('执行：动之前要先确认这台归我们管', () => {
   it('控制词命中但没有投放会话 ⇒ 一句"交回小爱"，一条指令都不发', async () => {
     h.castView.mockResolvedValue(null)

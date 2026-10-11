@@ -87,16 +87,23 @@ export async function decideTakeover(
   }
   return {
     verdict: 'takeover',
-    // 点了歌手要在理由里看得见：耳验时"选中的是不是我点的那个人的版本"全靠这行分辨
-    reason: `说了点歌（「${trigger}」），顶上整曲「${cand.name}」(${(cand.score * 100).toFixed(0)}%${cand.singerHit ? `·歌手对上了「${cand.singer}」` : ''})`,
+    // 点了歌手要在理由里看得见：耳验时"选中的是不是我点的那个人的版本"全靠这行分辨。
+    // 只命中在"名单里挂着好几个人"的那一条要标出来：2026-10-11 那次选错就是它冒充了正版
+    reason: `说了点歌（「${trigger}」），顶上整曲「${cand.name}」(${(cand.score * 100).toFixed(0)}%`
+      + (cand.singerHit === 2 ? `·歌手对上了「${cand.singer}」`
+        : cand.singerHit === 1 ? `·歌手对上了「${cand.singer}」（名单里还挂着别人）` : '')
+      + ')',
     uid: cand.uid, name: cand.name, score: cand.score, durSec: cand.durSec,
   }
 }
 
 export interface Candidate {
   uid: string; name: string; singer: string; durSec: number; score: number
-  /** 这句话里确实点了这个候选的歌手（同分时它优先，见 `pickCandidate` 的比较） */
-  singerHit: boolean
+  /**
+   * 这句话点没点这个歌手，以及点得多干净：0=没点，1=点了但名单里还挂着别人，2=整份字段就一个人。
+   * 同分时它优先于平台顺序（2026-10-11 生产上仿唱挂名反超正版之后加的）。
+   */
+  singerHit: number
 }
 
 interface PickResult { best: Candidate | null; skippedShort: number }
@@ -117,39 +124,78 @@ function pairScore(qn: string, nn: string, bySinger: number): number {
   return contains ? 1 : Math.max(sim, sim * 0.7 + bySinger)
 }
 
-/** 歌手字段常是多值（「周杰伦/温岚」那种），拆成能被单独点名的几段 */
+/**
+ * 歌手字段常是多值（「周杰伦/温岚」、「G.E.M.邓紫棋、余赛亚、戴斯琪、肖茗」），拆成能被单独点名的几段。
+ *
+ * **要先按分隔拆、再归一**：`normalizeUtterance` 会把 `、` `，` 连同空白一起删掉，
+ * 反过来做（先归一再拆）就把整串合唱名单当成一个艺名了 —— 而"名单里有几个人"正是强弱那一档的判据。
+ * 分隔符按真数据补（2026-10-11 生产：酷我用 `&`，网易/酷狗用 `、`）。
+ */
 function singerVariants(singer: string): string[] {
-  return normalizeUtterance(singer)
-    .split(/[/&+]+/)
-    .map(v => v.trim())
+  return String(singer ?? '')
+    .split(/[/&+,，、]+/)
+    .map(v => normalizeUtterance(v))
     .filter(v => v.length >= 2)
+}
+
+/**
+ * 句子里"点的那个人"那一段：第一个「的」之前、≥2 字；没有「的」就 null。
+ *
+ * 为什么要这一截：歌手命中原先只认「整名是句子里的子串」，而 `G.E.M.邓紫棋` 归一后是 `gem邓紫棋`，
+ * 句子里说的是「邓紫棋」，包含不上 ⇒ **正版反而判不出命中**；偏偏仿唱那条的字段是「张新航&邓紫棋」，
+ * 拆出「邓紫棋」就命中 ⇒ 昨天的"同分让点了歌手那条赢"把仿唱反超到了正版前面（2026-10-11 生产实测）。
+ */
+function artistMention(qn: string): string | null {
+  const i = qn.indexOf('的')
+  return i >= 2 ? qn.slice(0, i) : null
+}
+
+/**
+ * 艺名挂在中文前面那段拉丁（`gem邓紫棋` 再给一个 `邓紫棋`）。
+ * 上游惯写「G.E.M.邓紫棋」而他嘴上只说「邓紫棋」，只认整名同样判不出命中；纯拉丁名（`taylorswift`）
+ * 剥完是空，那就还用整名那一档。
+ */
+function latinCore(v: string): string {
+  const core = v.replace(/[a-z0-9]+/g, '')
+  return core.length >= 2 ? core : ''
 }
 
 /**
  * 一个候选对这句话打多少分，两条路取高的那个：
  *
  * ① **只比歌名**（老路，判据一字未动）；
- * ② **报了歌手又报歌名**：先要求这句话里真出现那个歌手名，然后把歌手那一截剥掉，
+ * ② **报了歌手又报歌名**：先要求这句话真点了那个歌手，然后把歌手那一截剥掉，
  *    拿剩下的半句单独和歌名比。这样「孙燕姿我怀念的」不再靠 +4 字窗口硬撑（三字歌手名配两字
  *    歌名就已经把窗口用满，歌手名再长/带英文就破），「Taylor Swift的Love Story」也能命中。
  *
+ * ② 的命中**双向、且认剥掉拉丁前缀的那半**：整名（或 `gem邓紫棋` 剥出来的 `邓紫棋`）在句子里，
+ * 或者句子里「的」之前那段与艺名互相包含 —— 两条都是为了 `G.E.M.邓紫棋` 这种"外文前缀 + 中文名"，
+ * 见 `artistMention` 与 `latinCore`。
  * ②**必须剥完还剩 ≥2 字**才算数：不然「播放孙燕姿」这种只报人不报歌名的会被当成"点了一首空歌名"
  * 直接抢播（2026-10-10 用户拍的反证用例，这道闸门就是为它立的）。
- * ②命中还记一个 `singerHit`：同名翻唱与正版都是 100% 时，让点了歌手那条赢。
+ *
+ * 命中再分强弱一档（同分时它决定选谁，2026-10-11 用户拍的）：
+ * **整份歌手字段只有一个人** ⇒ 2（「G.E.M.邓紫棋」），**名单里还挂着别的艺名** ⇒ 1
+ * （「张新航&邓紫棋」那种仿唱挂名、以及合唱版）。这一档防的是"上游把挂名的排在正版前面"那种排序运气。
  * **但不做硬过滤** —— 歌手对不上的翻唱照样能顶上（2026-10-10 用户拍的：有声音 > 点对歌手）。
  */
-function scoreCandidate(query: string, name: string, singer: string): { score: number; singerHit: boolean } {
+function scoreCandidate(query: string, name: string, singer: string): { score: number; singerHit: number } {
   const qn = normalizeUtterance(query)
   const nn = normalizeUtterance(name)
   const sn = normalizeUtterance(singer)
+  const variants = singerVariants(singer)
+  const mention = artistMention(qn)
   let best = pairScore(qn, nn, sn ? similarity(qn, sn) * 0.2 : 0)
-  let singerHit = false
-  for (const part of singerVariants(singer)) {
-    // 只剥第一处：「孙燕姿的遇见」剥完剩「的遇见」，那截与《遇见》在窗口内互相包含 ⇒ 判 1
-    if (!qn.includes(part)) continue
-    const rest = qn.replace(part, '')
+  let singerHit = 0
+  for (const part of variants) {
+    // 命中三个口径：整名在句子里 / 剥掉拉丁前缀的那半在句子里 / 句子里「的」之前那段与艺名互相包含
+    // （反向只在真有一段"人"可拿时才做 —— 没「的」就别拿整句去包含艺名）
+    const cut = [part, latinCore(part)].find(v => v && qn.includes(v)) ?? null
+    if (!cut && !(mention && (part.includes(mention) || mention.includes(part)))) continue
+    // 剥掉"人"那一截：正向剥命中的那段，反向剥句子里的那段（`gem邓紫棋` 不在句子里，剥不动它）
+    const rest = qn.replace(cut ?? mention!, '')
     if (rest.length < 2) continue
-    singerHit = true
+    singerHit = Math.max(singerHit, variants.length === 1 ? 2 : 1)
     const restScore = pairScore(rest, nn, 0)
     if (restScore > best) best = restScore
   }
@@ -182,8 +228,8 @@ function splitForSecondSearch(query: string): string | null {
  * `takeoverSources` 那几台**并行搜**（列表在写入时就按 `MAX_TAKEOVER_SOURCES` 截过，这里不再截），
  * 单源一次取 10 条：口令是短句，排在前面的本来就相关，我们要的是"第一条像不像这句话"，不是翻页找冷门。
  * 并行是因为串行会把首包按台数叠加（实测一台约 0.4 秒），而"哪台有这首歌"本来就该一起问。
- * 平分时先看"这句话有没有点它的歌手"，再按列表顺序取前者（`score > best.score` 是严格大于），
- * 所以**平台顺序仍然是管理员的决定**。
+ * 平分时先看"这句话点的那个歌手有多干净"（整份字段就一个人 > 名单里挂着别人，见 `scoreCandidate`），
+ * 同档再按列表顺序取前者（`score > best.score` 是严格大于），所以**同一档里平台顺序仍然是管理员的决定**。
  *
  * 顺带数一下"被整曲门槛挡掉几条"（`skippedShort`）：这个数字是给面板看的，
  * 门槛填高了却没有别的候选时，管理员要能看出来是门槛干的，而不是"搜不到"。
@@ -215,7 +261,8 @@ async function pickCandidate(query: string, config: SpeakerConfig): Promise<Pick
         // 元数据时长本身也会错。拿不到时长（0）不算过短，宁可放过也不清空候选。
         if (minTrack > 0 && durSec > 0 && durSec < minTrack) { if (countShort) skippedShort++; continue }
         const { score, singerHit } = scoreCandidate(query, s.name ?? '', s.singer ?? '')
-        if (!best || score > best.score || (score === best.score && singerHit && !best.singerHit)) {
+        // 同分时"点得干净"的那条赢：正版通常整份字段就一个人，仿唱挂名与合唱都挂着好几个
+        if (!best || score > best.score || (score === best.score && singerHit > best.singerHit)) {
           best = {
             uid: s.uid ?? `${source}-${s.songmid}`, name: s.name ?? '', singer: s.singer ?? '',
             durSec, score, singerHit,
