@@ -96,6 +96,33 @@ async function serveLocalMp3(
   return buildFullResponse(filePath, stat.size - seek.start, contentType, isHead, seek.start)
 }
 
+/**
+ * 把 audioServe 那份 206 换成与 `serveLocalMp3` 同形的 200 尾巴（只换信封，字节流原样接着用）。
+ *
+ * 在线那一路是借 `serve()` 的 Range 把字节定位到 seek 处的，它认了 Range 就一定回 206；
+ * 而这台固件把"206 且起点不是 0"当成应答错乱（2026-10-11 真机：拖一下进度，同一地址被拉
+ * 3 次就翻到同批次的下一首）。库内 MP3 那条 10-08 就改成 200 了，这里是补齐另一半。
+ *
+ * 只在真是 206 时换。非 206 有两种：整发的 200（字节本来就从 0 起，没信封可换）与 4xx，
+ * 都照原样交出去 —— 硬编一个 Content-Length 会把长度说瞎。
+ */
+function asFullTail(res: Response, start: number, isHead: boolean): Response {
+  if (res.status !== 206) return res
+  const total = Number(/\/(\d+)$/.exec(res.headers.get('content-range') ?? '')?.[1])
+  if (!Number.isFinite(total) || total <= start) {
+    logger.warn('[speaker/stream] 带 seek 却没拿到可读的 Content-Range，按原样发（位置会从 0 起）',
+      { 状态: res.status, 起点字节: start })
+    return res
+  }
+  const headers = new Headers({
+    'Content-Type': res.headers.get('content-type') ?? 'audio/mpeg',
+    'Content-Length': String(total - start),
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'public, max-age=3600',
+  })
+  return new Response(isHead ? null : res.body, { status: 200, headers })
+}
+
 async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promise<Response> {
   const params = readParams(request)
   const uid = params.get('uid') ?? ''
@@ -120,8 +147,11 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
   // 设备**约 5.1 秒**拿不到字节就断开、0.1 秒后重拉同一地址 —— 所以"它来拉到、我们备好响应"
   // 这段必须量出来才知道抢播慢在哪一段。起点取在这里：前面那些只是字符串活，量了会稀释数字
   const t0 = Date.now()
-  const logReady = (route: string) => logger.info('[speaker/stream] 响应准备好了', {
+  // `交付状态` 只有在线那一路给（它手上就有最终响应）；库内那条要等 serveLocalMp3 构造完才知道，
+  // 不在这里硬填一个还没定的数
+  const logReady = (route: string, 交付状态?: number) => logger.info('[speaker/stream] 响应准备好了', {
     歌曲: musicInfo.name, 走的路: route, 用时ms: Date.now() - t0, 起点秒: seekSec,
+    ...(交付状态 === undefined ? {} : { 交付状态 }),
   })
 
   // ① 库里有文件且**容器真是 MP3** 才走本地（扩展名不算证据，读头部字节嗅容器）
@@ -150,9 +180,11 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     // 在线这一路的秒→字节只能按音质档名义码率估（文件没落盘时读不到真实码率）；
     // 但缓存过的那份照样能做帧对齐 —— 首次播放就会缓存下来，所以第二次起是准的
     let effectiveRange = rangeHeader
+    let seekStart = 0
     if (seekSec > 0) {
       const rough = Math.round(seekSec * nominalBytesPerSec(quality))
       const seek = await alignSeekStart(resolvePaths(cacheKey, 'audio/mpeg').filePath, rough)
+      seekStart = seek.start
       logger.info('[speaker/stream] 在线档按 seek 重推', { 秒: seekSec, 粗字节: rough, 起字节: seek.start, 对齐: seek.aligned })
       effectiveRange = `bytes=${seek.start}-`
     }
@@ -167,12 +199,14 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
     })
     const served = res.headers.get('content-type') ?? ''
-    logReady(res.ok ? (cachedBefore ? '在线档（盘上已有缓存）' : '在线档（回源取）') : `在线档（上游 ${res.status}）`)
-    if (res.ok && !served.includes('audio/mpeg')) {
+    // 带 seek 的那份先换成 200 尾巴，之后的日志与返回都按**换完的**这条说
+    const out = seekSec > 0 ? asFullTail(res, seekStart, isHead) : res
+    logReady(out.ok ? (cachedBefore ? '在线档（盘上已有缓存）' : '在线档（回源取）') : `在线档（上游 ${out.status}）`, out.status)
+    if (out.ok && !served.includes('audio/mpeg')) {
       // 源把 flac 标成 320k 是发生过的（扩展名撒谎那一类）；给音箱这份必须是 MP3，宁可直接报错
       return fail(415, 'NOT_MP3', `这一档拿回来的不是 MP3（${served || '未知类型'}），音箱放不了`)
     }
-    return res
+    return out
   } catch (err) {
     const message = err instanceof Error ? err.message : '音箱流出口失败'
     logger.warn('[speaker/stream] 失败:', message.slice(0, 160))

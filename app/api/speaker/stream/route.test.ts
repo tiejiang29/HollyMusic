@@ -4,6 +4,8 @@
  * 这条口的全部意义是"**给音箱的那份必须是 MP3**"：它比 `/api/audio` 多一道容器闸门，
  * 而且令牌要能被固件那套"把 & 换成空格"的破写法还原回来。Range/构造响应那些
  * 复用 audio-serve 的现成实现，它自己的用例已经覆盖过，这里不重复测。
+ * **一个例外**（2026-10-11 被真机打过一次才加的）：带 `seek` 时出口的信封归这条口自己盯 ——
+ * audio-serve 的 `serve()` 认 Range 就回 206，而那台固件把"206 且起点非 0"当成应答错乱。
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -221,6 +223,32 @@ describe('seek：音箱侧没有设备 seek，只能重推一条从中间开始�
     h.serve.mockResolvedValue(new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/mpeg' }) }))
     await GET(req(okUrl() + '&seek=5'))
     expect(h.serve.mock.calls[0][0].rangeHeader).toBe('bytes=200000-')
+  })
+
+  it('在线那一档带 seek ⇒ 出口换成 200 整发尾巴（真机 2026-10-11：206 且起点非 0 会被固件当成应答错乱，实测拉 3 次就翻到同批次的下一首）', async () => {
+    h.findLibrarySong.mockResolvedValue(null)
+    // serve 认了我们给的 bytes=200000-，它自己会回 206 —— 信封得由这条口换掉
+    h.serve.mockResolvedValue(new Response('x', {
+      status: 206,
+      headers: new Headers({
+        'content-type': 'audio/mpeg', 'content-range': 'bytes 200000-11999999/12000000',
+        'content-length': '11800000', 'accept-ranges': 'bytes',
+      }),
+    }))
+    const res = await GET(req(okUrl() + '&seek=5'))
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-range')).toBeNull()
+    expect(res.headers.get('content-length')).toBe('11800000')
+  })
+
+  it('在线那一档 seek 但上游没认 Range（整发 200）⇒ 不改信封也不编长度，照原样透传', async () => {
+    h.findLibrarySong.mockResolvedValue(null)
+    h.serve.mockResolvedValue(new Response('x', {
+      status: 200, headers: new Headers({ 'content-type': 'audio/mpeg', 'content-length': '999' }),
+    }))
+    const res = await GET(req(okUrl() + '&seek=5'))
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-length')).toBe('999')
   })
 
   it('坏 seek（负数、非数字）当没填：照常给整文件，不猜一个位置', async () => {
