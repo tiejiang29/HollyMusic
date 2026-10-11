@@ -52,19 +52,37 @@ export function isAuthFailure(code: string, message: string): boolean {
   return AUTH_CODES.has(code) || message.includes('登录验证失败') || /auth/i.test(message)
 }
 
+/**
+ * 小米侧每一次出网都走这里：**地址校验/网络层的失败归一成"上游不可用（`XiaomiAuthError` + 502）"**。
+ *
+ * 为什么要归一（2026-10-11 生产）：NAS 的 DNS 抖了一分钟，`assertPublicHttpUrl` 抛的是裸 `Error`、
+ * `fetch` 抛的是 `TypeError`，冒到路由就变成 **500 `INTERNAL_ERROR`** —— 把"我们连不上小米"说成"我们崩了"；
+ * 而投放看门狗与对话监控都靠 `XiaomiAuthError.status` 分"能重试（≠401）"和"要重扫（=401）"，
+ * 拿到一个陌生异常就只能一律当硬错停摆（那次看门狗三条就是这么来的）。
+ * 401 那一支原样透出，不在这儿降级。
+ */
+async function minaFetch(url: string, init: RequestInit, label: string): Promise<Response> {
+  try {
+    await assertPublicHttpUrl(url)
+    return await fetch(url, { ...init, redirect: 'manual' })
+  } catch (e) {
+    if (e instanceof XiaomiAuthError) throw e
+    const why = e instanceof Error ? e.message : String(e)
+    throw new XiaomiAuthError(`连不上小爱的服务（${label}：${why.slice(0, 90)}）`, 502)
+  }
+}
+
 export async function fetchDevices(creds: XiaomiCredentials): Promise<SpeakerDevice[]> {
   const url = `${MINA_BASE}/admin/v2/device_list?master=1`
-  await assertPublicHttpUrl(url)
-  const res = await fetch(url, {
+  const res = await minaFetch(url, {
     headers: {
       // UA 与登录时那台"手机"保持一致，免得平台把请求当成新设备
       'User-Agent': `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${creds.deviceId} APP/xiaomi.smarthome APPV/62830`,
       Cookie: `userId=${creds.userId}; serviceToken=${creds.serviceToken}; channel=MI_APP_STORE`,
       Accept: 'application/json',
     },
-    redirect: 'manual',
     signal: AbortSignal.timeout(15000),
-  })
+  }, '设备列表')
   if (res.status === 401 || res.status === 403) throw new XiaomiAuthError('小爱音箱的票已失效，需要重新登录')
   const body = await res.text()
   if (!res.ok) {
@@ -188,7 +206,6 @@ async function ubus(
   message: Record<string, unknown>,
 ): Promise<UbusResponse> {
   const url = `${MINA_BASE}${UBUS_PATH}`
-  await assertPublicHttpUrl(url)
   const form: Record<string, string> = {
     deviceId,
     method,
@@ -196,7 +213,7 @@ async function ubus(
     message: JSON.stringify(message),
     requestId: `${deviceId.slice(-6)}-${Date.now()}`,
   }
-  const res = await fetch(url, {
+  const res = await minaFetch(url, {
     method: 'POST',
     headers: {
       'User-Agent': `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${creds.deviceId} APP/xiaomi.smarthome APPV/62830`,
@@ -205,9 +222,8 @@ async function ubus(
       Accept: 'application/json',
     },
     body: new URLSearchParams(form).toString(),
-    redirect: 'manual',
     signal: AbortSignal.timeout(UBUS_TIMEOUT_MS),
-  })
+  }, method)
   if (res.status === 401 || res.status === 403) {
     throw new XiaomiAuthError(`小爱的票已失效（${method} 回 HTTP ${res.status}），需要重新登录`)
   }
@@ -422,8 +438,7 @@ export async function fetchConversations(
   if (!device.deviceID) throw new XiaomiAuthError('这台设备没有 deviceID，拉不了对话记录', 400)
   // 重试要复用同一个 timestamp（miot 就是这么做的）：每次重算会让三次的结果对不上
   const url = `${CONV_URL}?source=dialogu&hardware=${encodeURIComponent(device.hardware)}&timestamp=${Date.now()}&limit=${limit}`
-  await assertPublicHttpUrl(url)
-  const res = await fetch(url, {
+  const res = await minaFetch(url, {
     headers: {
       'User-Agent': `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${creds.deviceId} APP/xiaomi.smarthome APPV/62830`,
       // **这里的 deviceId 必须是那台音箱的 deviceID**，不是登录时用的那台设备（creds.deviceId）。
@@ -432,9 +447,8 @@ export async function fetchConversations(
       Cookie: `userId=${creds.userId}; serviceToken=${creds.serviceToken}; channel=MI_APP_STORE; deviceId=${device.deviceID}`,
       Accept: 'application/json',
     },
-    redirect: 'manual',
     signal: AbortSignal.timeout(10000),
-  })
+  }, '对话记录')
   if (res.status === 401 || res.status === 403) throw new XiaomiAuthError('小爱的票已失效（对话记录，HTTP ' + res.status + '），需要重新登录')
   const body = await res.text()
   if (!res.ok) {

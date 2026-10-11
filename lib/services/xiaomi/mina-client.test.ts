@@ -11,11 +11,15 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const guards = vi.hoisted(() => ({ checked: [] as string[] }))
+const guards = vi.hoisted(() => ({ checked: [] as string[], rejectWith: '' }))
 const logSpy = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }))
 vi.mock('@/lib/logger', () => ({ logger: logSpy }))
 vi.mock('@/lib/server/url-guard', () => ({
-  assertPublicHttpUrl: vi.fn(async (url: string) => { guards.checked.push(url); return new URL(url) }),
+  assertPublicHttpUrl: vi.fn(async (url: string) => {
+    guards.checked.push(url)
+    if (guards.rejectWith) throw new Error(guards.rejectWith)
+    return new URL(url)
+  }),
 }))
 
 const {
@@ -48,6 +52,7 @@ function reply(body: unknown, status = 200) {
 
 beforeEach(() => {
   guards.checked = []
+  guards.rejectWith = ''
   lastRequest = null
   vi.unstubAllGlobals()
 })
@@ -435,5 +440,24 @@ describe('fetchConversations（G0.5 对话回显）', () => {
     const err = await fetchConversations(creds, { hardware: '', deviceID: 'spk-1' }).catch(e => e)
     expect(err).toBeInstanceOf(XiaomiAuthError)
     expect(lastRequest).toBeNull()
+  })
+})
+
+describe('出网失败要归一成 502，不许冒成 500（2026-10-11 NAS 的 DNS 抖了一分钟）', () => {
+  it('地址校验/网络层抛任何裸错 ⇒ `XiaomiAuthError` + 502，原文带在 message 里', async () => {
+    reply({ code: 0, data: '{}' })
+    guards.rejectWith = '域名解析失败：api2.mina.mi.com（本机 DNS 或出网有问题，不是被 SSRF 闸门拦的）'
+    const err = await getPlayStatus(creds, 'D1').catch(e => e)
+    expect(err).toBeInstanceOf(XiaomiAuthError)
+    expect(err.status).toBe(502)
+    expect(err.message).toContain('连不上小爱的服务')
+    expect(err.message).toContain('域名解析失败')
+  })
+
+  it('反证：401 那一支原样透出，不在归一时被降级成"可重试"', async () => {
+    reply('unauthorized', 401)
+    const err = await getPlayStatus(creds, 'D1').catch(e => e)
+    expect(err).toBeInstanceOf(XiaomiAuthError)
+    expect(err.status).toBe(401)
   })
 })

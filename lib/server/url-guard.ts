@@ -66,7 +66,14 @@ export async function assertPublicHttpUrl(value: string): Promise<URL> {
   const addresses = net.isIP(url.hostname)
     ? [{ address: url.hostname }]
     : await dns.lookup(url.hostname, { all: true, verbatim: true }).catch(() => [])
-  if (addresses.length === 0 || addresses.some(({ address }) => !isPublicIp(address))) {
+  // **解析失败与"地址是内网"必须分开说**（2026-10-11 生产上被这句话带错过方向）：
+  // 小米那条链的域名是我们自己拼的常量，解析不出=NAS 的 DNS/出网在抖（会自愈、该重试），
+  // 而"解析出来是私网"=hosts 被改/被污染，那是另一回事。两者以前共用一句"不允许访问本机、内网或无法解析"，
+  // 看日志的人会往"我们拦了自己"的方向查，实际是网络出去了。两支都仍然拒绝（fail-closed 不变）。
+  if (addresses.length === 0) {
+    throw new Error(`域名解析失败：${url.hostname}（本机 DNS 或出网有问题，不是被 SSRF 闸门拦的）`)
+  }
+  if (addresses.some(({ address }) => !isPublicIp(address))) {
     throw new Error('不允许访问本机、内网或无法解析的地址')
   }
   return url
