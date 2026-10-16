@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import http from 'node:http'
+import net from 'node:net'
 import type { AddressInfo } from 'node:net'
 
 /**
@@ -133,20 +134,32 @@ describe('LXEnvironmentSimulator 沙箱端到端', () => {
   })
 
   it('lx.request 错误分支：err 转沙箱 Error', async () => {
-    const sim = new LXEnvironmentSimulator()
-    await sim.executeScript(`
-      const { EVENT_NAMES, on, send, request } = globalThis.lx
-      on(EVENT_NAMES.request, () => new Promise((resolve, reject) => {
-        // 端口 1 上没有服务，必然连接失败
-        request('http://127.0.0.1:1/v1', { timeout: 2000 }, (err) => {
-          if (err && err instanceof Error) reject(new Error('got-error:' + err.message))
-          else reject(new Error('no-error'))
-        })
-      }))
-      ${INITED_KW}
-    `)
+    // 故意**不用**"连一个没人监听的端口"来制造错误：WSL mirrored 网络下 `127.0.0.1` 上没监听
+    // 的端口不回 RST、SYN 被静默丢弃（裸 TCP 实测 10 秒毫无结果），用例只会挂到超时——
+    // 它在 Windows 上是秒回 ECONNREFUSED，所以这条红是环境差异、不是回归。
+    // 换成"真的在听、但收到连接就立刻掐断"：两侧都必然拿到 ECONNRESET / socket hang up。
+    const srv = net.createServer(sock => sock.destroy())
+    await new Promise<void>(resolve => srv.listen(0, '127.0.0.1', () => resolve()))
+    const port = (srv.address() as AddressInfo).port
+    try {
+      const sim = new LXEnvironmentSimulator()
+      await sim.executeScript(`
+        const { EVENT_NAMES, on, send, request } = globalThis.lx
+        on(EVENT_NAMES.request, () => new Promise((resolve, reject) => {
+          request('http://127.0.0.1:${port}/v1', { timeout: 3000 }, (err) => {
+            if (err && err instanceof Error) reject(new Error('got-error:' + err.message))
+            else reject(new Error('no-error'))
+          })
+        }))
+        ${INITED_KW}
+      `)
 
-    await expect(sim.getMusicUrl('kw', { songmid: 'x' }, '128k')).rejects.toThrow(/got-error:.*(ECONNREFUSED|EADDRNOTAVAIL|HPE_INVALID)/)
+      // 只断言"错误分支被走到、且跨界后仍是沙箱 Error"；具体码（ECONNRESET/socket hang up）
+      // 按平台与实现版本会变，钉死它就是在制造下一条环境红
+      await expect(sim.getMusicUrl('kw', { songmid: 'x' }, '128k')).rejects.toThrow(/got-error:/)
+    } finally {
+      await new Promise<void>(resolve => srv.close(() => resolve()))
+    }
   })
 
   it('lx.utils：md5/buffer/randomBytes 跨界字节', async () => {

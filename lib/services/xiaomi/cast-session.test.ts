@@ -307,6 +307,27 @@ describe('收口的总长取"我们那份"与"设备那份"里大的那个（202
     await vi.advanceTimersByTimeAsync(6000)
     expect((await cast.castView())!.durSec).toBe(205)
   })
+
+  it('带起点的重推：设备那份连"起点"都装不下 ⇒ 不许当总长（23:15 那发拖完 5 秒被收口的直接推手）', async () => {
+    // 对端把 durSec 传成了 0（咪咕的 interval 是 hh:mm:ss 那一类），我们手里没有总长；
+    // 设备又在同一个 audio_id 上报 duration=10000ms 且"是我们的读数"为真 ⇒ 旧口径下
+    // max(0,10)=10 顶掉了合理兜底，`剩余 = 10 − 99 − 4` 翻负 ⇒ 当场判"放完"、停箱收口。
+    await cast.startCast({ current: track('cur', 0), rest: [] })
+    await cast.seekCast(99)                                     // 拖一下进度：窗里只剩这一项 ⇒ mustAct 成立
+    deviceAt(pushed(1)[0].audioId, 4, { duration: 10_000 })
+    await vi.advanceTimersByTimeAsync(6000)
+    const v = await cast.castView()
+    expect(v!.durSec).toBe(240)                                 // 退回兜底，而不是被那份 10 秒顶掉
+    expect(h.playerOperation.mock.calls.filter(c => c[2] === 'stop').length).toBe(0)   // 没被误判成"放完"
+  })
+
+  it('反证：设备那份只要装得下起点就照旧进账（"剩余"190 与整曲 213.7 两种空间都不被下界误伤）', async () => {
+    await cast.startCast({ current: track('cur', 0), rest: [] })
+    await cast.seekCast(99)
+    deviceAt(pushed(1)[0].audioId, 4, { duration: 190_000 })
+    await vi.advanceTimersByTimeAsync(6000)
+    expect((await cast.castView())!.durSec).toBe(190)
+  })
 })
 
 describe('设备还挂在别的内容上时，那一拍的读数不算我们的进度（2026-10-10 22:20 真机）', () => {

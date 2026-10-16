@@ -184,7 +184,6 @@ function playingSlot(s: Session): WindowSlot {
   return s.window[i]
 }
 
-/** 这一项多长：元数据 > 设备报过的 > 当前实时读到的 > 兜底 */
 /**
  * 这一项的总长（收口边界要用）。**取"我们传的那份"与"设备报的那份"里大的那个**。
  *
@@ -196,12 +195,19 @@ function playingSlot(s: Session): WindowSlot {
  * 那是用户明确不能忍的一侧（"宁可下一首前奏多重约 1 秒，也不掐当前这首"）。
  * 取大值则两种空间下都不会提前；设备报 0/不报（-1）时退回我们那份。
  * 只信"这一拍是我们的流"的那份设备时长 —— 22:20 那次提前 243 秒收口就是外来的 duration 污染。
+ *
+ * **设备那份还必须有物理下界：装得下"这一格从第几秒开始推"才许进账**（2026-10-11 23:15 真机）。
+ * 那一发客户端把 `durSec` 传成了 0（咪咕的 `interval` 是 `hh:mm:ss`，被对端按整数读成 0），
+ * 设备又在**同一个 audio_id** 上报 `duration=10000ms`（`是我们的读数:true`，所以上面那道
+ * "外来读数"闸门结构上拦不到它）⇒ `max(0,10)=10` 把本来合理的 `UNKNOWN_DUR_SEC` 兜底顶掉，
+ * `剩余 = 10 − 起点99 − 已播4` 翻负 ⇒ 拖完 5 秒就判"放完"、整个会话收口停箱。
+ * 这份下界不区分"整曲"和"剩余"两种空间（那靠取大值兜），只挡"连起点都装不下"的谎。
  */
 function itemDurSec(s: Session, slot: WindowSlot): number {
-  let device = slot.deviceDurSec && slot.deviceDurSec > 0 ? slot.deviceDurSec : 0
-  if (s.lastStatusIsOurs && slot === playingSlot(s) && s.lastStatus && s.lastStatus.duration > 0) {
-    device = Math.max(device, s.lastStatus.duration / 1000)
-  }
+  const live = s.lastStatus && s.lastStatus.duration > 0 ? s.lastStatus.duration / 1000 : 0
+  const usable = (n: number) => (n >= slot.seekSec ? n : 0)
+  let device = usable(slot.deviceDurSec ?? 0)
+  if (s.lastStatusIsOurs && slot === playingSlot(s) && live > 0) device = Math.max(device, usable(live))
   const both = Math.max(slot.durSec, device)
   return both > 0 ? both : UNKNOWN_DUR_SEC
 }
