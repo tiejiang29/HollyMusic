@@ -97,7 +97,9 @@ export function HomePage() {
     setLoadingPlaylists(true)
     setPlaylistsError(null)
     try {
-      const playlistData = await getRecommendedPlaylists(source, PLAYLIST_PAGE_SIZE, playlistPage, { tag: category || undefined, sort: playlistSort, keyword: keyword || undefined })
+      // 关键词只在本地筛（见下面 playlists.filter）：歌单接口五个渠道都不吃 keyword，
+      // 现在会明确回 400 UNSUPPORTED_FILTER，把它发出去等于一输入就把整列弄没。
+      const playlistData = await getRecommendedPlaylists(source, PLAYLIST_PAGE_SIZE, playlistPage, { tag: category || undefined, sort: playlistSort })
       if (requestId === playlistRequestId.current) setPlaylists(playlistData)
     } catch (err) {
       if (requestId === playlistRequestId.current) setPlaylistsError(err instanceof Error ? err.message : '加载失败')
