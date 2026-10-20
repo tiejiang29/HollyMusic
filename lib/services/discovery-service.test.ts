@@ -14,7 +14,9 @@ vi.mock('@/lib/logger', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: 
 // kw 标签树走原生 http 模块（绕开 undici fetch），测试中替换为受控 mock
 vi.mock('./upstream-http', () => ({ nativeGetJson, httpsPostForm: vi.fn() }))
 
-const { getPlaylistTags, getRecommendedPlaylists, getRecommendedPlaylistDetail, PlaylistUnavailableError } = await import('./discovery-service')
+const { getPlaylistTags, getRecommendedPlaylists, getRecommendedPlaylistDetail, getPlaylistGroups, PlaylistUnavailableError } = await import('./discovery-service')
+// wy 列表走原生 https（绕开 undici fetch），要统计它的调用次数必须拿这个导出的 mock
+const { httpsPostForm } = await import('./upstream-http')
 
 describe('getRecommendedPlaylistDetail', () => {
   afterEach(() => {
@@ -262,5 +264,123 @@ describe('getRecommendedPlaylists kw 排序档位', () => {
 
     expect(new URL(fetchMock.mock.calls[0][0] as string).searchParams.get('order')).toBe('hot')
     expect(new URL(fetchMock.mock.calls[1][0] as string).searchParams.get('order')).toBe('new')
+  })
+})
+
+describe('getPlaylistGroups 的 QQ 那份改取新建流水', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // 只让"标签树"这一类键命中缓存：其余一律 miss，逼 fetcher 真发请求。
+    // tx 只给一个可解析类目（流行→3152），其余七类解析不到 ⇒ 直接跳过，好把断言收紧。
+    get.mockImplementation((key: string) => {
+      if (!key.endsWith(':playlist-tags')) return undefined
+      return key.startsWith('discovery:v1:tx:')
+        ? { hotTag: [{ id: '3152', name: '流行' }], tags: [] }
+        : { hotTag: [], tags: [] }
+    })
+  })
+
+  const txPayload = (pool: number[], size: number) => ({
+    ok: true,
+    json: async () => ({
+      playlist: {
+        code: 0,
+        data: {
+          content: {
+            v_item: pool.slice(0, size).map(tid => ({
+              basic: { tid, title: `歌单 ${tid}`, creator: { nick: '作者' }, desc: '', cover: { medium_url: 'http://c/1.jpg' }, play_cnt: 1, song_cnt: 2 },
+            })),
+          },
+        },
+      },
+    }),
+  })
+
+  /**
+   * 上游只认 page（实测）：page=0 是置顶混合位、page>=1 才是新建流水。
+   * 这里按 body 里的 page 回不同批 tid，并把每次的 page/size 记下来。
+   */
+  function stubTx(pageSeen: Array<{ page: number; size: number }>) {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
+      const body = String(init?.body ?? '')
+      if (body.includes('get_category_content')) {
+        const param = JSON.parse(body).playlist.param
+        pageSeen.push({ page: param.page, size: param.size })
+        return txPayload(param.page === 0 ? [111, 112, 113] : [221, 222, 223], param.size) as never
+      }
+      return { ok: true, json: async () => ({}) } as never
+    }))
+  }
+
+  it('tx 每类目问两页，新建的在前、只留 1 张置顶混合位', async () => {
+    const pageSeen: Array<{ page: number; size: number }> = []
+    stubTx(pageSeen)
+
+    const groups = await getPlaylistGroups(3)
+    const pop = groups.find(g => g.tag.name === '流行')
+
+    // 上游 page 0（混合位）与 1（新流水）各被问到一次
+    expect(pageSeen.map(p => p.page).sort()).toEqual([0, 1])
+    expect(pop?.playlists.map(p => p.id)).toEqual(['221', '222', '111'])
+  })
+
+  it('两页给出同一张歌单时不重复入格', async () => {
+    const pageSeen: Array<{ page: number; size: number }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
+      const body = String(init?.body ?? '')
+      if (body.includes('get_category_content')) {
+        const param = JSON.parse(body).playlist.param
+        pageSeen.push({ page: param.page })
+        return txPayload([777, 888], param.size) as never
+      }
+      return { ok: true, json: async () => ({}) } as never
+    }))
+
+    const groups = await getPlaylistGroups(3)
+    const ids = groups.find(g => g.tag.name === '流行')?.playlists.map(p => p.id)
+    expect(ids).toEqual(['777', '888'])
+    expect(new Set(ids).size).toBe(ids?.length)
+  })
+
+  it('反证：新流水那页给空时退回置顶混合位，不能把整格弄空', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
+      const body = String(init?.body ?? '')
+      if (body.includes('get_category_content')) {
+        const param = JSON.parse(body).playlist.param
+        return txPayload(param.page === 0 ? [111, 112] : [], param.size) as never
+      }
+      return { ok: true, json: async () => ({}) } as never
+    }))
+
+    const groups = await getPlaylistGroups(3)
+    expect(groups.find(g => g.tag.name === '流行')?.playlists.map(p => p.id)).toEqual(['111'])
+  })
+
+  it('不误伤：只有 tx 被多问一页，其余平台每类目仍各一次请求', async () => {
+    const calls: Array<{ tx: boolean }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
+      const body = String(init?.body ?? '')
+      const isTxCategory = body.includes('get_category_content')
+      calls.push({ tx: isTxCategory })
+      if (isTxCategory) {
+        const param = JSON.parse(body).playlist.param
+        return txPayload(param.page === 0 ? [111] : [221], param.size) as never
+      }
+      return { ok: true, json: async () => ({}) } as never
+    }))
+
+    await getPlaylistGroups(3)
+    // tx：1 个可解析类目 × 2 页
+    expect(calls.filter(c => c.tx).length).toBe(2)
+    // kw/kg/mg 这轮解析不到 tag ⇒ 压根不发（`if (!tagId) return []` 那道门），
+    // wy 走原生 https 所以不出现在 global fetch 里
+    expect(calls.filter(c => !c.tx).length).toBe(0)
+    // wy 按类目名兜底解析，8 个类目各发一次；页位改动没有外溢到其他平台
+    // （若跟着挪页，这里会变成 16）
+    expect(httpsPostForm.mock.calls.length).toBe(8)
   })
 })

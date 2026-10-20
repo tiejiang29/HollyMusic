@@ -1442,6 +1442,31 @@ function resolvePlaylistTagId(tags: PlaylistTagsResult, category: string): strin
 }
 
 /**
+ * 首页分区的 QQ 那一份：以"新建流水"为主，留 1 张置顶混合位垫底。
+ *
+ * 2026-10-17 实测（判据全文见 my/discovery-verify-backend-20261017.md）：`get_category_content`
+ * **不认 `order`/`sort`，也不认 `cur_page`**（同一 body 只改 cur_page，返回与基线同一批 tid），
+ * 只认 `page`；而新内容从 `page=1` 起才按创建时间倒序给（同类目 page=0 是 2019~2026 的混合置顶位，
+ * page=1 全是当月新建，隔 40 分钟再打 tid 还在往后推）。首页此前永远传 1，经上面 `page: safePage - 1`
+ * 变成上游 0 ⇒ 八个类目全钉在混合位上，这就是"常年不更新"的成因。
+ *
+ * 只留 1 张混合位、不整格换成新流水：新建单的播放量级低，整格塌成"没人听过"是另一种难看。
+ * 只作用于 tx —— 其余四平台没有可比的年龄字段（create_time 是 tx 独有），一页未动。
+ */
+async function fetchTxFreshFirst(tagId: string, per: number): Promise<DiscoveryPlaylist[]> {
+  const fresh = await getRecommendedPlaylists('tx', Math.max(1, per - 1), 2, { tag: tagId })
+  const curated = per > 1 ? await getRecommendedPlaylists('tx', 1, 1, { tag: tagId }) : []
+  const seen = new Set<string>()
+  const merged: DiscoveryPlaylist[] = []
+  for (const item of [...fresh, ...curated]) {
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    merged.push(item)
+  }
+  return merged
+}
+
+/**
  * 推荐歌单按类型聚合（跨平台版）：每个类目从五平台各拉 perPlatform 张歌单
  * 合并为一个分区（歌单自带 source 字段可标来源），供移动端首页"分区卡片"
  * 一次成型。单平台/单类失败跳过；缓存与标签同周期。
@@ -1469,7 +1494,9 @@ export async function getPlaylistGroups(perPlatform = 3): Promise<PlaylistGroup[
         if (!tagId && source === 'wy') tagId = category // wy tag 参数即类目名
         if (!tagId) return [] as DiscoveryPlaylist[]
         try {
-          return await getRecommendedPlaylists(source, safePer, 1, { tag: tagId })
+          return source === 'tx'
+            ? await fetchTxFreshFirst(tagId, safePer)
+            : await getRecommendedPlaylists(source, safePer, 1, { tag: tagId })
         } catch {
           return [] as DiscoveryPlaylist[]
         }

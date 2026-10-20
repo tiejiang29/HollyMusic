@@ -258,7 +258,7 @@ UA 不必冒充客户端（实测我们那串老 UA 同样出 20 条）。tx 的
 |---|---|---|---|
 | 音频磁盘缓存 | `data/audio-cache/` + audioCache 表 | 10GB LRU | 按 `${source}:${songmid}:${quality}` 键；命中 0 次上游调用 |
 | 本地音乐库 | `data/library/` + LibrarySong 表 | 20GB 配额 | 永久正本，播放最高优先级 |
-| searchCache（内存） | 进程内 | 分键不同：tx 专辑 1h / kw、mg 专辑 24h / discovery 10min / Subsonic 搜索 210min | 容量 2000，FIFO 淘汰 |
+| searchCache（内存） | 进程内 | 分键不同：tx 专辑 1h / kw、mg 专辑 24h / discovery 10min / Subsonic 搜索 210min | 容量 2000，**LRU 淘汰**（`0f9c061` 起；图片不再与搜索抢额度，走独立的 `imageCache`＝500 条 + 24MB 双上限） |
 | urlCache（内存） | 进程内 | 210 分钟 | 仅 `/api/music-url` 使用 |
 | 换源结果缓存 | 进程内 | 命中 10min / 未命中 60s，300 条 | 抑制同首歌密集重复搜索 |
 | 歌词/封面缓存 | 进程内 | 1h / 10min | 歌词另有磁盘边车（.lrc 随音频缓存同目录） |
@@ -450,15 +450,23 @@ UA 不必冒充客户端（实测我们那串老 UA 同样出 20 条）。tx 的
 | GET | `/api/search?source=&keyword=&page=&limit=` | 音乐搜索；`source=all` 五源并发汇聚，结果去重入库并附 uid。失败口径分两半：**上游把某个平台拒了 ⇒ 502 `SEARCH_FAILED`**（`source=all` 部分源失败仍是 200，另带 `failedSources`），**我们这边的基础故障（入库/参数/程序错）⇒ 500** | user |
 | GET | `/api/search/suggest?keyword=` | 搜索联想（网易 + 本地库 + TX 专辑三路并行，1.2s 截断） | user |
 | GET | `/api/search-sources` | 当前启用的搜索平台列表 | user |
-| GET | `/api/discover/playlists` | 歌单广场（分页/标签/排序/关键词） | user |
+| GET | `/api/discover/playlists` | 歌单广场（分页/标签/排序/关键词；**tx 的 `sort` 与 `keyword` 在上游不生效**，见 5.2 末实测注） | user |
 | GET | `/api/discover/playlists/[id]` | 歌单详情 | user |
-| GET | `/api/discover/playlists/groups` | 推荐歌单按类目跨平台聚合 | user |
+| GET | `/api/discover/playlists/groups` | 推荐歌单按类目跨平台聚合（**tx 那份合并两页：新建流水在前 + 1 张置顶混合位垫底**，见 5.2 末实测注） | user |
 | GET | `/api/discover/playlists/tags?source=` | 歌单广场标签 | user |
 | GET | `/api/discover/toplists?source=&scope=` | 排行榜列表 | user |
 | GET | `/api/discover/toplists/[id]` | 榜单详情 | user |
 | GET | `/api/discover/trending` | 大家都在听（五平台热歌去重合成） | user |
 | GET | `/api/recommend/guess?size=&page=` | 猜我喜欢（本地画像推荐，同日结果稳定） | user |
 | GET | `/api/music/alternatives` | 换源候选（其他平台同款歌） | user |
+
+> **QQ 歌单上游的实测能力**（2026-10-17，逐参数对照；完整判据与读数在 gitignored 的 `my/discovery-verify-backend-20261017.md`）
+>
+> - 类目路径 `get_category_content` **只认 `page`**：同一份 body 把 `order`/`sort` 取 0~7（含非法值）返回**同一批 tid**；单独改 `cur_page` 也返回同一批。所以 tx 的 `sort` 档位在这条路径上是**假参数**，别再试图映射它。
+> - 新内容从上游 `page=1` 起才按创建时间倒序给：同类目 `page=0` 是 2019~2026 的混合置顶位，`page≥1` 全是当月新建，隔 40 分钟再打 tid 仍在往后推。首页此前永远传 `page=1`（经 `page: safePage - 1` 变成上游 0）⇒ 八个类目全钉在置顶位上，这就是"首页歌单常年不更新"的成因。修法见 `fetchTxFreshFirst`：**只改 tx 那一份，合并两页**（新流水在前 + 1 张置顶位垫底，避免整格塌成"没人听过的新建单"），其余四平台一页未动（它们没有可比的年龄字段）。
+> - 广场默认那条 `get_playlist_by_tag` + 硬编码 `id=10000000` 是**一口 2017~2021 的死井**：翻页只换批、不换年龄；有数据的 `order` 档只有 2 与 5（0/1/3/4/6/7 上游给空）。tag 池龄实测——活：`95 现场音乐`(12/12 近半年)、`59 经典老歌`(10)、`107 背景音乐`(6)、`71 情歌`(6)、`64 KTV金曲`(5)；死：`3317 官方歌单`、`3200 儿歌`、`3202 ACG`、`3418 免费热歌`（12 张全在 2020-03 同一月）。**`hotTag[0]` 恰好是死的 `3317` ⇒ 换默认 tag 必须按实测名单挑，别取第一个。**
+> - 判池子年龄**只能用 `create_time`**：`modify_time` 会被平台编辑刷到当月（那批 2018~2019 的老歌单 `modify_time` 能跨到 2026 年），拿它判会得出"池子是活的"的错误结论。
+> - `keyword` 目前五个 fetcher 都没读（只进缓存键）⇒ 广场搜任何词返回同一批。**要么接 QQ 歌单搜索接口实现，要么在路由上明确拒绝**，别继续沉默。另：`/api/discover/toplists` 的榜单名字与顺序来自 `toplist-boards.ts` 的硬编码清单（榜单**内容**实时、**列表**固定），这不是故障。
 
 ### 5.3 歌曲信息（曲目/歌词/封面/专辑/歌手）
 
