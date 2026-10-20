@@ -2,8 +2,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ChevronDown, ChevronLeft, ChevronRight, ListFilter, Link2, Music, RefreshCw, X } from 'lucide-react'
-import { getPlaylistTags, getRecommendedPlaylists } from '@/lib/api/discovery'
-import type { DiscoveryPlaylist, DiscoveryPlaylistSort, DiscoverySource, PlaylistTagsResult } from '@/lib/services/discovery-service'
+import { getPlaylistCapabilities, getPlaylistTags, getRecommendedPlaylists } from '@/lib/api/discovery'
+import type { DiscoveryPlaylist, DiscoveryPlaylistSort, DiscoverySource, PlaylistCapabilities, PlaylistTagsResult } from '@/lib/services/discovery-service'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RemoteCoverImage } from '@/components/shared/RemoteCoverImage'
@@ -16,33 +16,17 @@ const SOURCES: { value: DiscoverySource; label: string }[] = [
   { value: 'mg', label: '咪咕' },
 ]
 
-/** 各源支持的排序（与洛雪 sortList 对齐：kw 三档 默认/最新/最热；kg/mg 上游档位不同） */
-const SORTS: Partial<Record<DiscoverySource, { value: DiscoveryPlaylistSort; label: string }[]>> = {
-  tx: [
-    { value: 'hot', label: '最热' },
-    { value: 'new', label: '最新' },
-  ],
-  wy: [
-    { value: 'hot', label: '最热' },
-    { value: 'new', label: '最新' },
-  ],
-  kw: [
-    { value: 'recommend', label: '默认' },
-    { value: 'new', label: '最新' },
-    { value: 'hot', label: '最热' },
-  ],
-  kg: [
-    { value: 'recommend', label: '推荐' },
-    { value: 'hot', label: '最热' },
-    { value: 'new', label: '最新' },
-    { value: 'collect', label: '热藏' },
-    { value: 'soar', label: '飙升' },
-  ],
-  mg: [
-    { value: 'recommend', label: '推荐' },
-    { value: 'hot', label: '最热' },
-    { value: 'new', label: '最新' },
-  ],
+/**
+ * 档位文案。哪些档位**存在**由服务端 `/api/discover/playlists/capabilities` 决定 ——
+ * 这里以前也硬编了一张 per-source 的表，结果和上游能力漂开两次（tx 的"最新"其实不生效、
+ * mg 完全不读 sort），所以能力数据只留服务端一份，前端只留文案。
+ */
+const SORT_LABELS: Record<DiscoveryPlaylistSort, string> = {
+  recommend: '推荐',
+  hot: '最热',
+  new: '最新',
+  collect: '热藏',
+  soar: '飙升',
 }
 
 function formatPlayCount(n: number): string {
@@ -66,6 +50,26 @@ export function RecommendedMusicPage() {
   const [openListOpen, setOpenListOpen] = useState(false)
   const [tagPanelOpen, setTagPanelOpen] = useState(false)
   const reqId = useRef(0)
+  const [caps, setCaps] = useState<Record<DiscoverySource, PlaylistCapabilities> | null>(null)
+
+  /** 这个源有哪些档位：只认服务端的能力表，没到手前先不显示档位 */
+  const sortsFor = (src: DiscoverySource) =>
+    (caps?.[src]?.sorts ?? []).map(value => ({ value, label: SORT_LABELS[value] }))
+
+  // 能力表拉一次就够（失败静默：列表本身还能用，只是这一程没有档位可切）
+  useEffect(() => {
+    let alive = true
+    getPlaylistCapabilities()
+      .then(r => { if (alive) setCaps(r) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  // 能力到手后，当前档位若不在该源支持里（旧书签 ?sort= 之类带进来的）就收到它支持的第一档
+  useEffect(() => {
+    const allowed = caps?.[source]?.sorts
+    if (allowed?.length && !allowed.includes(sort)) setSort(allowed[0])
+  }, [caps, source, sort])
 
   const load = useCallback(async (src: DiscoverySource, s: DiscoveryPlaylistSort, t: string | null, p: number) => {
     const id = ++reqId.current
@@ -101,7 +105,7 @@ export function RecommendedMusicPage() {
 
   const switchSource = (next: DiscoverySource) => {
     if (next === source) return
-    setSort((SORTS[next] || [])[0]?.value ?? 'hot')
+    setSort(caps?.[next]?.sorts?.[0] ?? 'hot')
     setTag(null)
     setPage(1)
     setSource(next)
@@ -160,7 +164,7 @@ export function RecommendedMusicPage() {
       {/* 排序 tab + 分类面板开关（对齐洛雪：排序左、分类右） */}
       <div className="mb-3 flex items-center justify-between gap-2">
         <div className="flex gap-4 border-b border-border pb-2">
-          {(SORTS[source] || []).map(s => (
+          {sortsFor(source).map(s => (
             <button
               key={s.value}
               onClick={() => { if (sort !== s.value) { setSort(s.value); setPage(1) } }}

@@ -1,5 +1,10 @@
 import { apiGet } from './client'
-import type { DiscoveryCollectionDetail, DiscoveryPlaylist, DiscoveryPlaylistFilter, DiscoverySource, DiscoveryToplist, PlaylistTagsResult } from '@/lib/services/discovery-service'
+import type { DiscoveryCollectionDetail, DiscoveryPlaylist, DiscoveryPlaylistFilter, DiscoverySource, DiscoveryToplist, PlaylistCapabilities, PlaylistTagsResult } from '@/lib/services/discovery-service'
+
+/** 各渠道歌单广场真实支持的档位与筛选能力（服务端声明，客户端照它显示） */
+export function getPlaylistCapabilities(): Promise<Record<DiscoverySource, PlaylistCapabilities>> {
+  return apiGet('discover/playlists/capabilities')
+}
 
 export function getToplists(source: DiscoverySource = 'tx', scope: 'common' | 'full' = 'common'): Promise<DiscoveryToplist[]> {
   return apiGet('discover/toplists', { source, scope })

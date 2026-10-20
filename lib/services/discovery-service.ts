@@ -32,11 +32,44 @@ export interface DiscoveryPlaylist {
   playCount: number
   /** 音源列表直接返回的曲目数；未返回时保持为空，避免把未知数显示成 0。 */
   songCount?: number
+  /** 上游给的歌单创建时间（秒）。目前只有 tx 的类目路径回这个字段，别的源没有可比的新鲜度依据。 */
+  createdAtSec?: number
   source: DiscoverySource
 }
 
 export type DiscoveryPlaylistSort = 'recommend' | 'hot' | 'new' | 'collect' | 'soar'
 export interface DiscoveryPlaylistFilter { tag?: string; sort?: DiscoveryPlaylistSort; keyword?: string }
+
+/** 歌单筛选里"上游根本没有这项能力"的字段：明确拒绝，不再静默返回同一批 */
+export class UnsupportedPlaylistFilterError extends Error {
+  readonly field: 'keyword'
+  constructor(field: 'keyword') {
+    super(`不支持的歌单筛选条件: ${field}`)
+    this.name = 'UnsupportedPlaylistFilterError'
+    this.field = field
+  }
+}
+
+export interface PlaylistCapabilities { sorts: DiscoveryPlaylistSort[]; keyword: boolean }
+
+/**
+ * 歌单广场各源的真实能力 —— 客户端照这份显示档位，别自己再记一份（两端各记一定会漂）。
+ * 依据（我 2026-10-20 逐参数实测 + 读码；原判据由前端会话 2026-10-17 首报）：
+ * - tx：`recommend` 是上游的置顶精选；`hot`/`new` 是我们在大窗口里**自己排**的
+ *   （上游 `order`/`sort` 取 0~7 返回同一批 tid，实测无效），`collect`/`soar` 没有任何依据，不声明。
+ * - wy：`order=new` 上游恒返回空（2026-09-06 实测；列表取数那段回退就是为此），所以只声明 `hot`。
+ * - kw：只有 `hot`/`new` 会进 `order` 参数，默认档是不传 `order`。
+ * - kg：`getSpecial` 的 `t=` 五档映射齐全，但除推荐/最热外未逐档实测过内容差异。
+ * - mg：取数函数完全不读 `sort` ⇒ 只能声明默认档。
+ * - 五个取数函数没有一个读 `keyword`（它只进缓存键）⇒ 全部 `keyword: false`，并在服务端明确拒绝。
+ */
+export const PLAYLIST_CAPABILITIES: Record<DiscoverySource, PlaylistCapabilities> = {
+  tx: { sorts: ['recommend', 'hot', 'new'], keyword: false },
+  wy: { sorts: ['hot'], keyword: false },
+  kw: { sorts: ['recommend', 'hot', 'new'], keyword: false },
+  kg: { sorts: ['recommend', 'hot', 'new', 'collect', 'soar'], keyword: false },
+  mg: { sorts: ['recommend'], keyword: false },
+}
 
 /** 歌单不可访问（如 QQ 隐私歌单：作者设为私有，匿名/他人账号均不可见）——路由层转 404 + 明确文案 */
 export class PlaylistUnavailableError extends Error {
@@ -712,49 +745,55 @@ async function getSongsByIds(ids: number[]): Promise<Song[]> {
   return songs.sort((a, b) => (order.get(Number(a.songId)) ?? 999) - (order.get(Number(b.songId)) ?? 999))
 }
 
+/**
+ * 广场无 tag 时落到的类目。
+ *
+ * 原来钉在 `get_playlist_by_tag` 的 `id=10000000`，2026-10-20 复核实测那是一口**死井**：
+ * `order=2` 的 20 张建于 2018-03~2019-07、`order=5` 的在 2017-07~2021-09，
+ * 翻四页（`cur_page`/`sin`）只换批、不换年龄 —— 换页救不了它。
+ * 换成的这个 tag 同样是量出来的（每类 12 张里"近半年新建"的张数）：
+ * `59 经典老歌` 10 张、`95 现场音乐` 12 张、`107 背景音乐`/`71 情歌` 各 6 张、`64 KTV金曲` 5 张；
+ * 而 `3317 官方歌单`（它就是 `hotTag[0]`）、`3200 儿歌`、`3202 ACG`、`3418 免费热歌` 全是 0 张。
+ * ⇒ 想换口味就改这个常量，**但别改成"取 hotTag 第一个"**，那正好落在死的上面。
+ */
+const TX_PLAZA_DEFAULT_TAG_ID = '59'
+
+/**
+ * "最新/最热"要开多大的窗口再本地排。实测上游把新建的、高播放量的都排在**窗口尾部**，
+ * 而且顺序不保证：同类目 `page=1` 下 size=3 只碰到 1 张近半年、size>=6 才整窗新鲜、
+ * `儿歌`/`电子` 要 size=20 才浮出来。窗口开小了等于没改。
+ */
+const TX_SORT_WINDOW_MIN = 15
+
 async function getTxRecommendedPlaylists(limit: number, page = 1, filter: DiscoveryPlaylistFilter = {}): Promise<DiscoveryPlaylist[]> {
   const safeLimit = Math.max(1, Math.min(limit, 30))
   const safePage = Math.max(1, Math.floor(page))
+  const tagId = filter.tag || TX_PLAZA_DEFAULT_TAG_ID
+  const sortedLocally = filter.sort === 'new' || filter.sort === 'hot'
+  const windowSize = sortedLocally ? Math.min(30, Math.max(TX_SORT_WINDOW_MIN, safeLimit * 2)) : safeLimit
 
-  if (filter.tag) {
-    const payload = await requestMusicu<{ playlist?: { code?: number; data?: { content?: { v_item?: Array<{ basic?: { tid?: number; title?: string; creator?: { nick?: string }; desc?: string; cover?: { medium_url?: string; default_url?: string }; play_cnt?: number; song_cnt?: number } }> } } } }>({
-      comm: { cv: 1602, ct: 20 },
-      playlist: { module: 'playlist.PlayListCategoryServer', method: 'get_category_content', param: { titleid: Number(filter.tag), category_id: Number(filter.tag), caller: '0', size: safeLimit, page: safePage - 1, use_page: 1, order: filter.sort === 'hot' ? 5 : 2, sort: filter.sort === 'hot' ? 5 : 2 } },
-    })
-    const records = payload.playlist?.data?.content?.v_item?.map(item => ({
-      id: String(item.basic?.tid || ''), name: item.basic?.title || '', author: item.basic?.creator?.nick || 'QQ 音乐', description: item.basic?.desc || '', cover: normalizeCover(item.basic?.cover?.medium_url || item.basic?.cover?.default_url), playCount: item.basic?.play_cnt || 0, songCount: item.basic?.song_cnt || 0, source: 'tx' as const,
-    })).filter(item => item.id && item.name) || []
-    return records
-  }
-  const payload = await requestMusicu<{
-    playlist?: { code?: number; data?: { v_playlist?: Array<{
-      tid?: number; title?: string; cover_url_medium?: string; creator_info?: { nick?: string }
-      access_num?: number; desc?: string; song_ids?: number[]
-    }> } }
-  }>({
+  // `order`/`sort` 实测在这条路径上是死参数（同一 body 取 0~7 返回同一批 tid），所以不再按 sort 改它，
+  // 只作为上游习惯字段原样保留 —— 删掉它属于未验证的行为改动，等单独量过再清。
+  const payload = await requestMusicu<{ playlist?: { code?: number; data?: { content?: { v_item?: Array<{ basic?: { tid?: number; title?: string; creator?: { nick?: string }; desc?: string; cover?: { medium_url?: string; default_url?: string }; play_cnt?: number; song_cnt?: number; create_time?: number } }> } } } }>({
     comm: { cv: 1602, ct: 20 },
-    playlist: {
-      module: 'playlist.PlayListPlazaServer',
-      method: 'get_playlist_by_tag',
-      param: { id: 10000000, sin: (safePage - 1) * safeLimit, size: safeLimit, order: filter.sort === 'hot' ? 5 : 2, cur_page: safePage },
-    },
+    playlist: { module: 'playlist.PlayListCategoryServer', method: 'get_category_content', param: { titleid: Number(tagId), category_id: Number(tagId), caller: '0', size: windowSize, page: safePage - 1, use_page: 1, order: 2, sort: 2 } },
   })
-  const entries = payload.playlist?.data?.v_playlist
-  if (payload.playlist?.code !== 0 || !Array.isArray(entries)) throw new Error('QQ 音乐未返回推荐歌单')
+  if (payload.playlist?.code !== 0) throw new Error('QQ 音乐未返回推荐歌单')
+  const records = payload.playlist?.data?.content?.v_item?.map(item => ({
+    id: String(item.basic?.tid || ''), name: item.basic?.title || '', author: item.basic?.creator?.nick || 'QQ 音乐', description: item.basic?.desc || '', cover: normalizeCover(item.basic?.cover?.medium_url || item.basic?.cover?.default_url), playCount: item.basic?.play_cnt || 0, songCount: item.basic?.song_cnt || 0, createdAtSec: typeof item.basic?.create_time === 'number' ? item.basic.create_time : undefined, source: 'tx' as const,
+  })).filter(item => item.id && item.name) || []
 
-  const records = entries
-    .filter(item => item.tid && item.title)
-    .map(item => ({
-      id: String(item.tid),
-      name: item.title || '',
-      author: item.creator_info?.nick || 'QQ 音乐',
-      description: item.desc || '',
-      cover: normalizeCover(item.cover_url_medium),
-      playCount: item.access_num || 0,
-      songCount: item.song_ids?.length || 0,
-      source: 'tx' as const,
-    }))
-  return records
+  // "最新/最热"是自己在大窗口里排的（上游不给热度/时间序）：字段缺失时排到末尾，不会把整页弄空。
+  // 因此这里的翻页粒度是"一个窗口"，不是一条。
+  // 局限要写明：`hot` 是"本窗口内最热"，不是全站热度序；置顶精选位本来就是最热那几张，
+  // 所以第一页的 `hot` 与 `recommend` 高度重合，差别从第二页才开始显出来（2026-10-20 真上游实测）。
+  if (filter.sort === 'new') {
+    return [...records].sort((a, b) => (b.createdAtSec ?? 0) - (a.createdAtSec ?? 0)).slice(0, safeLimit)
+  }
+  if (filter.sort === 'hot') {
+    return [...records].sort((a, b) => b.playCount - a.playCount).slice(0, safeLimit)
+  }
+  return records.slice(0, safeLimit)
 }
 
 /** 与 lx-music tx/songList.js 同一歌单详情端点：按 disstid 直取，不依赖列表页缓存。 */
@@ -1162,6 +1201,9 @@ export async function getToplistDetail(source: DiscoverySource, id: string): Pro
 export async function getRecommendedPlaylists(source: DiscoverySource = 'tx', limit = 12, page = 1, filter: DiscoveryPlaylistFilter = {}): Promise<DiscoveryPlaylist[]> {
   const safeLimit = Math.max(1, Math.min(limit, 30))
   const safePage = Math.max(1, Math.floor(page))
+  // 五个取数函数都不吃关键词，以前它只进缓存键 ⇒ 搜任何词返回同一批。现在明确拒绝，
+  // 让"这个口不支持"变成看得见的错误，而不是让用户以为广场坏了。
+  if (filter.keyword?.trim()) throw new UnsupportedPlaylistFilterError('keyword')
   // v7：所有渠道的歌单列表均不再逐项请求详情，避免首页产生 N+1 请求。
   const cacheKey = `discovery:v7:${source}:playlist-list:${safeLimit}:${safePage}:${filter.tag || ''}:${filter.sort || 'recommend'}:${filter.keyword || ''}`
   const cached = getCached<DiscoveryPlaylist[]>(cacheKey)
@@ -1444,17 +1486,19 @@ function resolvePlaylistTagId(tags: PlaylistTagsResult, category: string): strin
 /**
  * 首页分区的 QQ 那一份：以"新建流水"为主，留 1 张置顶混合位垫底。
  *
- * 2026-10-17 实测（判据全文见 my/discovery-verify-backend-20261017.md）：`get_category_content`
- * **不认 `order`/`sort`，也不认 `cur_page`**（同一 body 只改 cur_page，返回与基线同一批 tid），
- * 只认 `page`；而新内容从 `page=1` 起才按创建时间倒序给（同类目 page=0 是 2019~2026 的混合置顶位，
- * page=1 全是当月新建，隔 40 分钟再打 tid 还在往后推）。首页此前永远传 1，经上面 `page: safePage - 1`
- * 变成上游 0 ⇒ 八个类目全钉在混合位上，这就是"常年不更新"的成因。
+ * 2026-10-20 复核实测（前端会话 2026-10-17 首报；判据全文见 my/discovery-verify-backend-20261017.md）：
+ * - `get_category_content` **不认 `order`/`sort`，也不认 `cur_page`**，只认 `page` 与 `size`；
+ * - `page=0` 的头部三张与 `size` 无关 —— 那永远是置顶/精选位（实测 tid 一字不差）；
+ * - 新建的单排在窗口**尾部**，所以"能不能碰到新的"取决于窗口开多大：`page=1` 下 size=3 只有 1 张近半年、
+ *   size=6 起整窗都是几天内的新单；`儿歌(3200)`、`电子(45)` 这类埋得更深，要 size≥20 才浮出来。
+ * ⇒ 所以这里取 `page=2`（= 上游 `page=1`）并交给 tx 的 `sort: 'new'` 去开大窗口、按 `create_time` 挑；
+ *   窗口与排序的规则只写在 `getTxRecommendedPlaylists` 一处，免得两份口径漂开。
  *
- * 只留 1 张混合位、不整格换成新流水：新建单的播放量级低，整格塌成"没人听过"是另一种难看。
- * 只作用于 tx —— 其余四平台没有可比的年龄字段（create_time 是 tx 独有），一页未动。
+ * 只留 1 张置顶位、不整格换成新流水：新建单播放量级低，整格塌成"没人听过"是另一种难看。
+ * 只作用于 tx —— 其余四平台没有可比的新鲜度字段（`create_time` 是 tx 独有），一页未动。
  */
 async function fetchTxFreshFirst(tagId: string, per: number): Promise<DiscoveryPlaylist[]> {
-  const fresh = await getRecommendedPlaylists('tx', Math.max(1, per - 1), 2, { tag: tagId })
+  const fresh = await getRecommendedPlaylists('tx', Math.max(1, per - 1), 2, { tag: tagId, sort: 'new' })
   const curated = per > 1 ? await getRecommendedPlaylists('tx', 1, 1, { tag: tagId }) : []
   const seen = new Set<string>()
   const merged: DiscoveryPlaylist[] = []

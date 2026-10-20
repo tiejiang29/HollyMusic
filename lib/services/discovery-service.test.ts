@@ -284,15 +284,18 @@ describe('getPlaylistGroups 的 QQ 那份改取新建流水', () => {
     })
   })
 
-  const txPayload = (pool: number[], size: number) => ({
+  const DAY = 86400
+  const nowSec = () => Math.floor(Date.now() / 1000)
+
+  const txPayload = (pool: Array<{ tid: number; ct: number }>, size: number) => ({
     ok: true,
     json: async () => ({
       playlist: {
         code: 0,
         data: {
           content: {
-            v_item: pool.slice(0, size).map(tid => ({
-              basic: { tid, title: `歌单 ${tid}`, creator: { nick: '作者' }, desc: '', cover: { medium_url: 'http://c/1.jpg' }, play_cnt: 1, song_cnt: 2 },
+            v_item: pool.slice(0, size).map(({ tid, ct }) => ({
+              basic: { tid, title: `歌单 ${tid}`, creator: { nick: '作者' }, desc: '', cover: { medium_url: 'http://c/1.jpg' }, play_cnt: 1, song_cnt: 2, create_time: ct },
             })),
           },
         },
@@ -300,61 +303,69 @@ describe('getPlaylistGroups 的 QQ 那份改取新建流水', () => {
     }),
   })
 
-  /**
-   * 上游只认 page（实测）：page=0 是置顶混合位、page>=1 才是新建流水。
-   * 这里按 body 里的 page 回不同批 tid，并把每次的 page/size 记下来。
-   */
-  function stubTx(pageSeen: Array<{ page: number; size: number }>) {
+  /** 置顶位那一页永远给这张 2000 天前的老单 */
+  const TOP_ONLY = [{ tid: 111, ct: nowSec() - 2000 * DAY }]
+  /** 上游实测把新建的单排在窗口尾部且顺序不保证 ⇒ 故意给一个乱序、混年龄的大窗口 */
+  const MIXED_WINDOW = [
+    { tid: 500, ct: nowSec() - 900 * DAY },
+    { tid: 600, ct: nowSec() - 1 * DAY },
+    { tid: 700, ct: nowSec() - 3 * DAY },
+    { tid: 800, ct: nowSec() - 400 * DAY },
+  ]
+
+  function stubPages(pageSeen: Array<{ page: number; size: number }>, freshWindow = MIXED_WINDOW) {
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
       const body = String(init?.body ?? '')
       if (body.includes('get_category_content')) {
         const param = JSON.parse(body).playlist.param
         pageSeen.push({ page: param.page, size: param.size })
-        return txPayload(param.page === 0 ? [111, 112, 113] : [221, 222, 223], param.size) as never
+        return txPayload(param.page === 0 ? TOP_ONLY : freshWindow, param.size) as never
       }
       return { ok: true, json: async () => ({}) } as never
     }))
   }
 
-  it('tx 每类目问两页，新建的在前、只留 1 张置顶混合位', async () => {
+  it('新流水那页要开大窗口（size>=15）：窗口开小了，近半年的单压根不在这一页里', async () => {
     const pageSeen: Array<{ page: number; size: number }> = []
-    stubTx(pageSeen)
+    stubPages(pageSeen)
+
+    await getPlaylistGroups(3)
+    // 实测依据：同类目 page=1 时 size=3 只碰到 1 张近半年、size>=6 才整窗新鲜，儿歌/电子要 size=20 才浮出来
+    expect(pageSeen.find(p => p.page === 1)?.size).toBeGreaterThanOrEqual(15)
+    expect(pageSeen.find(p => p.page === 0)?.size).toBe(1)
+  })
+
+  it('大窗口内自己按创建时间从新到旧挑 per-1 张，再补 1 张置顶位', async () => {
+    const pageSeen: Array<{ page: number; size: number }> = []
+    stubPages(pageSeen)
 
     const groups = await getPlaylistGroups(3)
-    const pop = groups.find(g => g.tag.name === '流行')
-
-    // 上游 page 0（混合位）与 1（新流水）各被问到一次
+    // per=3 ⇒ 取窗口里最新的两张（600、700）+ 置顶 111；500/800 那种老的不该进格
     expect(pageSeen.map(p => p.page).sort()).toEqual([0, 1])
-    expect(pop?.playlists.map(p => p.id)).toEqual(['221', '222', '111'])
+    expect(groups.find(g => g.tag.name === '流行')?.playlists.map(p => p.id)).toEqual(['600', '700', '111'])
+  })
+
+  it('上游没给 create_time 时退回原序，既不瞎排也不把格子弄空', async () => {
+    const pageSeen: Array<{ page: number; size: number }> = []
+    stubPages(pageSeen, [{ tid: 221, ct: 0 }, { tid: 222, ct: 0 }])
+
+    const groups = await getPlaylistGroups(3)
+    expect(groups.find(g => g.tag.name === '流行')?.playlists.map(p => p.id)).toEqual(['221', '222', '111'])
   })
 
   it('两页给出同一张歌单时不重复入格', async () => {
     const pageSeen: Array<{ page: number; size: number }> = []
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
-      const body = String(init?.body ?? '')
-      if (body.includes('get_category_content')) {
-        const param = JSON.parse(body).playlist.param
-        pageSeen.push({ page: param.page })
-        return txPayload([777, 888], param.size) as never
-      }
-      return { ok: true, json: async () => ({}) } as never
-    }))
+    stubPages(pageSeen, [{ tid: 777, ct: nowSec() - DAY }, { tid: 111, ct: nowSec() - 2 * DAY }])
 
     const groups = await getPlaylistGroups(3)
     const ids = groups.find(g => g.tag.name === '流行')?.playlists.map(p => p.id)
-    expect(ids).toEqual(['777', '888'])
+    expect(ids).toEqual(['777', '111'])
     expect(new Set(ids).size).toBe(ids?.length)
   })
 
   it('反证：新流水那页给空时退回置顶混合位，不能把整格弄空', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
-      const body = String(init?.body ?? '')
-      if (body.includes('get_category_content')) {
-        const param = JSON.parse(body).playlist.param
-        return txPayload(param.page === 0 ? [111, 112] : [], param.size) as never
-      }
-      return { ok: true, json: async () => ({}) } as never
-    }))
+    const pageSeen: Array<{ page: number; size: number }> = []
+    stubPages(pageSeen, [])
 
     const groups = await getPlaylistGroups(3)
     expect(groups.find(g => g.tag.name === '流行')?.playlists.map(p => p.id)).toEqual(['111'])
@@ -362,13 +373,13 @@ describe('getPlaylistGroups 的 QQ 那份改取新建流水', () => {
 
   it('不误伤：只有 tx 被多问一页，其余平台每类目仍各一次请求', async () => {
     const calls: Array<{ tx: boolean }> = []
-    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
       const body = String(init?.body ?? '')
       const isTxCategory = body.includes('get_category_content')
       calls.push({ tx: isTxCategory })
       if (isTxCategory) {
         const param = JSON.parse(body).playlist.param
-        return txPayload(param.page === 0 ? [111] : [221], param.size) as never
+        return txPayload(param.page === 0 ? TOP_ONLY : [{ tid: 221, ct: nowSec() }], param.size) as never
       }
       return { ok: true, json: async () => ({}) } as never
     }))
@@ -376,11 +387,93 @@ describe('getPlaylistGroups 的 QQ 那份改取新建流水', () => {
     await getPlaylistGroups(3)
     // tx：1 个可解析类目 × 2 页
     expect(calls.filter(c => c.tx).length).toBe(2)
-    // kw/kg/mg 这轮解析不到 tag ⇒ 压根不发（`if (!tagId) return []` 那道门），
-    // wy 走原生 https 所以不出现在 global fetch 里
+    // kw/kg/mg 这轮解析不到 tag ⇒ 压根不发（`if (!tagId) return []` 那道门）；
+    // wy 走原生 https，不经过 global fetch，所以这里也是 0
     expect(calls.filter(c => !c.tx).length).toBe(0)
-    // wy 按类目名兜底解析，8 个类目各发一次；页位改动没有外溢到其他平台
-    // （若跟着挪页，这里会变成 16）
+    // wy 按类目名兜底解析，8 个类目各发一次 ⇒ 页位改动没有外溢到其他平台（若跟着挪页会变成 16）
     expect(httpsPostForm.mock.calls.length).toBe(8)
+  })
+})
+
+const { UnsupportedPlaylistFilterError, PLAYLIST_CAPABILITIES } = await import('./discovery-service')
+
+describe('tx 歌单广场：默认落活类目、档位自己排、关键词明确拒绝', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    get.mockReturnValue(undefined)
+  })
+
+  const DAY = 86400
+  const nowSec = () => Math.floor(Date.now() / 1000)
+  /** 上游给的顺序就是"老的在前"，用来证明排序是我们做的、不是照抄上游 */
+  const WINDOW = [
+    { tid: 10, ct: nowSec() - 900 * DAY, play: 1 },
+    { tid: 11, ct: nowSec() - 1 * DAY, play: 9 },
+    { tid: 12, ct: nowSec() - 3 * DAY, play: 5 },
+  ]
+
+  /** 按 param.page 回不同批，并把每次发出去的 titleid/size/page 记下来 */
+  function stubCategory(pages: Record<string, Array<{ tid: number; ct: number; play: number }>>) {
+    const sent: Array<{ titleid: number; size: number; page: number }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { body?: string }) => {
+      const body = String(init?.body ?? '')
+      if (!body.includes('get_category_content')) return { ok: true, json: async () => ({}) } as never
+      const param = JSON.parse(body).playlist.param
+      sent.push({ titleid: param.titleid, size: param.size, page: param.page })
+      const items = (pages[String(param.page)] ?? []).slice(0, param.size)
+      return {
+        ok: true,
+        json: async () => ({
+          playlist: {
+            code: 0,
+            data: { content: { v_item: items.map(x => ({ basic: { tid: x.tid, title: `歌单 ${x.tid}`, creator: { nick: 'n' }, desc: '', cover: { medium_url: 'http://c/1.jpg' }, play_cnt: x.play, song_cnt: 3, create_time: x.ct } })) } },
+          },
+        }),
+      } as never
+    }))
+    return sent
+  }
+
+  it('无 tag 时不再打那条死井，落到实测活的类目 59', async () => {
+    const sent = stubCategory({ '0': [{ tid: 1, ct: nowSec() - DAY, play: 5 }] })
+    await getRecommendedPlaylists('tx', 3, 1, {})
+    expect(sent[0]?.titleid).toBe(59)
+  })
+
+  it('sort=new 开大窗口并按创建时间倒序，只回 limit 张', async () => {
+    const sent = stubCategory({ '0': WINDOW })
+    const list = await getRecommendedPlaylists('tx', 2, 1, { sort: 'new' })
+    expect(sent[0]?.size).toBeGreaterThanOrEqual(15)
+    expect(list.map(x => x.id)).toEqual(['11', '12'])
+  })
+
+  it('sort=hot 用播放量在同一窗口里排', async () => {
+    stubCategory({ '0': WINDOW })
+    const list = await getRecommendedPlaylists('tx', 3, 1, { sort: 'hot' })
+    expect(list.map(x => x.id)).toEqual(['11', '12', '10'])
+  })
+
+  it('默认档保持上游置顶顺序，不重排也不开大窗口', async () => {
+    const sent = stubCategory({ '0': WINDOW })
+    const list = await getRecommendedPlaylists('tx', 2, 1, { sort: 'recommend' })
+    expect(sent[0]?.size).toBe(2)
+    expect(list.map(x => x.id)).toEqual(['10', '11'])
+  })
+
+  it('keyword 一律拒绝（取数函数都不读它，不能继续假装搜索有效）', async () => {
+    stubCategory({ '0': [] })
+    await expect(getRecommendedPlaylists('tx', 3, 1, { keyword: '周杰伦' }))
+      .rejects.toBeInstanceOf(UnsupportedPlaylistFilterError)
+  })
+
+  it('能力表钉住实测结论：tx 有 new、wy 没 new、mg 只有 recommend、五源都不支持 keyword', () => {
+    expect(PLAYLIST_CAPABILITIES.tx.sorts).toContain('new')
+    expect(PLAYLIST_CAPABILITIES.wy.sorts).not.toContain('new')
+    expect(PLAYLIST_CAPABILITIES.mg.sorts).toEqual(['recommend'])
+    expect(Object.values(PLAYLIST_CAPABILITIES).every(c => c.keyword === false)).toBe(true)
   })
 })

@@ -454,19 +454,28 @@ UA 不必冒充客户端（实测我们那串老 UA 同样出 20 条）。tx 的
 | GET | `/api/discover/playlists/[id]` | 歌单详情 | user |
 | GET | `/api/discover/playlists/groups` | 推荐歌单按类目跨平台聚合（**tx 那份合并两页：新建流水在前 + 1 张置顶混合位垫底**，见 5.2 末实测注） | user |
 | GET | `/api/discover/playlists/tags?source=` | 歌单广场标签 | user |
+| GET | `/api/discover/playlists/capabilities` | 各源**真实支持**的档位与是否支持关键词；客户端照它显示，别再各记一份 | user |
 | GET | `/api/discover/toplists?source=&scope=` | 排行榜列表 | user |
 | GET | `/api/discover/toplists/[id]` | 榜单详情 | user |
 | GET | `/api/discover/trending` | 大家都在听（五平台热歌去重合成） | user |
 | GET | `/api/recommend/guess?size=&page=` | 猜我喜欢（本地画像推荐，同日结果稳定） | user |
 | GET | `/api/music/alternatives` | 换源候选（其他平台同款歌） | user |
 
-> **QQ 歌单上游的实测能力**（2026-10-17，逐参数对照；完整判据与读数在 gitignored 的 `my/discovery-verify-backend-20261017.md`）
+> **QQ 歌单上游的实测能力**（前端会话 2026-10-17 首报，我 2026-10-20 逐参数复核并扩展；完整判据与读数在 gitignored 的 `my/discovery-verify-backend-20261017.md`）
 >
 > - 类目路径 `get_category_content` **只认 `page`**：同一份 body 把 `order`/`sort` 取 0~7（含非法值）返回**同一批 tid**；单独改 `cur_page` 也返回同一批。所以 tx 的 `sort` 档位在这条路径上是**假参数**，别再试图映射它。
-> - 新内容从上游 `page=1` 起才按创建时间倒序给：同类目 `page=0` 是 2019~2026 的混合置顶位，`page≥1` 全是当月新建，隔 40 分钟再打 tid 仍在往后推。首页此前永远传 `page=1`（经 `page: safePage - 1` 变成上游 0）⇒ 八个类目全钉在置顶位上，这就是"首页歌单常年不更新"的成因。修法见 `fetchTxFreshFirst`：**只改 tx 那一份，合并两页**（新流水在前 + 1 张置顶位垫底，避免整格塌成"没人听过的新建单"），其余四平台一页未动（它们没有可比的年龄字段）。
+> - 新内容在 `page=1` 起的窗口里，但**能不能碰到取决于窗口开多大**（实测同类目 `page=1`：size=3 只有 1 张近半年、size≥6 整窗新鲜、`儿歌`/`电子` 要 size=20 才浮出来）；而 `page=0` 的头部三张与 size 无关，永远是置顶精选位。同一参数隔 40 分钟再打，tid 还在往后推 ⇒ 这确实是一条活的流水。首页此前永远传 `page=1`（经 `page: safePage - 1` 变成上游 0）⇒ 八个类目全钉在置顶位上，这就是"首页歌单常年不更新"的成因。修法见 `fetchTxFreshFirst`：**只改 tx 那一份，合并两页**（新流水在前 + 1 张置顶位垫底，避免整格塌成"没人听过的新建单"），其余四平台一页未动（它们没有可比的年龄字段）。
 > - 广场默认那条 `get_playlist_by_tag` + 硬编码 `id=10000000` 是**一口 2017~2021 的死井**：翻页只换批、不换年龄；有数据的 `order` 档只有 2 与 5（0/1/3/4/6/7 上游给空）。tag 池龄实测——活：`95 现场音乐`(12/12 近半年)、`59 经典老歌`(10)、`107 背景音乐`(6)、`71 情歌`(6)、`64 KTV金曲`(5)；死：`3317 官方歌单`、`3200 儿歌`、`3202 ACG`、`3418 免费热歌`（12 张全在 2020-03 同一月）。**`hotTag[0]` 恰好是死的 `3317` ⇒ 换默认 tag 必须按实测名单挑，别取第一个。**
 > - 判池子年龄**只能用 `create_time`**：`modify_time` 会被平台编辑刷到当月（那批 2018~2019 的老歌单 `modify_time` 能跨到 2026 年），拿它判会得出"池子是活的"的错误结论。
-> - `keyword` 目前五个 fetcher 都没读（只进缓存键）⇒ 广场搜任何词返回同一批。**要么接 QQ 歌单搜索接口实现，要么在路由上明确拒绝**，别继续沉默。另：`/api/discover/toplists` 的榜单名字与顺序来自 `toplist-boards.ts` 的硬编码清单（榜单**内容**实时、**列表**固定），这不是故障。
+> - `keyword` 五个 fetcher 都没读（只进缓存键）⇒ 广场搜任何词返回同一批。**服务端已改为明确拒绝**：`/api/discover/playlists` 带 `keyword` ⇒ 400 `UNSUPPORTED_FILTER`。真要做关键词搜索得另接 QQ 的歌单搜索接口（那才是需要照 HAR 抄一次 body 的地方）。
+> - 首页"热门榜单"的名字与顺序来自 `toplist-boards.ts` 的硬编码清单（榜单**内容**实时、**列表**固定），这不是故障。
+>
+> **已按上面这些改掉的（2026-10-20，本地已验、生产未部署）**：
+>
+> - 首页分区 tx 那份：`fetchTxFreshFirst` 取 `page=2`（= 上游 `page=1`）的新流水在前 + 1 张置顶位垫底。真上游对照：八个类目 24 张里，改前只有 1 张近半年新建，改后 16 张（各格新单年龄 4~45 天）。
+> - 广场无 tag 不再钉 `id=10000000`（`TX_PLAZA_DEFAULT_TAG_ID = '59'`）。真上游对照：老井 12 张全在 2647~3010 天前（近半年 0 张），换后 12 张里 10 张近半年、最新 0 天。要换口味改这个常量，**别改成取 `hotTag[0]`**（那正是死的 `3317`）。
+> - tx 的 `new`/`hot` 不再指望上游 `order`（实测无效），改为我们在大窗口里按 `create_time` / `play_cnt` 排：`new` 第一页 12/12 在 22 天内、`page=2` 40~61 天，翻页有后续。`hot` 是"本窗口内最热"，第一页与 `recommend` 高度重合（置顶位本就是最热的几张），差别从第二页才开始显出来。
+> - 能力声明集中在 `PLAYLIST_CAPABILITIES`（`tx` 有 recommend/hot/new；`wy` 只 hot；`kw` 三档；`kg` 五档但除推荐/最热外未逐档实测；`mg` 只 recommend；`keyword` 全 false），经 `/api/discover/playlists/capabilities` 出。路由对**不支持的档位降级成 recommend**而不是报错——已经装在手机上的旧包还会发"最新"，不能把能用的一屏变成 400；显示上少一档由 capabilities 收敛。
 
 ### 5.3 歌曲信息（曲目/歌词/封面/专辑/歌手）
 
