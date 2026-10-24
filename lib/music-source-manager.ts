@@ -109,6 +109,9 @@ function extractLyric(result: unknown): { lyric: string; tlyric: string | null }
  * 累计花完它就换下一个源。
  *
  * urlMs 只是单次调用的上限，实际取值会被夹到"本源/全程剩余预算"以内，允许大于 perSourceMs。
+ *
+ * 这三档是"手机/网页能用就行"的口径。对端耐心比这短得多的那条路（音箱）可以用
+ * `ResolveBudgets` 按调用覆盖，见 readSpeakerUrlBudgets。
  */
 export interface UrlBudgets {
   /** 单次 getMusicUrl 调用的上限 */
@@ -117,6 +120,26 @@ export interface UrlBudgets {
   perSourceMs: number
   /** 整条瀑布（所有源×所有音质）的总上限 */
   totalMs: number
+}
+
+/**
+ * 按调用路径覆盖那三级预算：只在这次调用内生效，不写回 `this.budgets`。
+ * 缺省的字段沿用全局值；`perSourceMs >= totalMs` 会被夹紧并告警。
+ */
+export interface ResolveBudgets extends Partial<UrlBudgets> {
+  /**
+   * 「到预算才换源」要不要记成健康账本里的坏样本，默认 true（原有行为）。
+   * 把预算收紧的那条路必须传 false：账本按 `源×平台` 共享、两连坏就冷却，而
+   * "2 秒没出货"对音箱是失败、对手机只是一次慢——照着记，音箱就能替手机把源冷却掉。
+   */
+  countBudgetTimeoutAsBad?: boolean
+}
+
+/**
+ * 一次取址实际用的预算：全局值叠加调用路径的覆盖，并保证三级关系仍然成立。
+ */
+interface EffectiveBudgets extends UrlBudgets {
+  countBudgetTimeoutAsBad: boolean
 }
 
 /**
@@ -175,6 +198,25 @@ export function readUrlBudgets(): UrlBudgets {
   return budgets
 }
 
+/**
+ * 音箱（小爱那条路）用的取址预算。
+ *
+ * 判据是设备侧的行为：**约 5.1 秒拿不到字节就挂断，0.1 秒后重拉同一个地址**。默认的
+ * 8s 单源预算对它完全无效——一个挂起的头源能让每一次重拉都等到设备先走，排在后面的
+ * 源一次都轮不到，用户看到的是"投过去没声音"。收到 2s 后，同样四秒里至少能过两个源。
+ *
+ * 收紧的那一档不许写健康账本（`countBudgetTimeoutAsBad: false`）：账本是 `源×平台`
+ * 共享的，两连坏就冷却，而"2 秒没出货"对音箱是失败、对手机只是慢。让音箱替手机冷却
+ * 一个源，等于投放功能反过来砸本机播放。
+ */
+export function readSpeakerUrlBudgets(): ResolveBudgets {
+  return {
+    perSourceMs: readBudget('SPEAKER_SOURCE_URL_PER_SOURCE_TIMEOUT_MS', 2_000),
+    totalMs: readBudget('SPEAKER_SOURCE_URL_TOTAL_TIMEOUT_MS', 4_000),
+    countBudgetTimeoutAsBad: false,
+  }
+}
+
 export class MusicSourceManager {
   private instances: SimulatorInstance[] = []
   private initialized: boolean = false
@@ -186,6 +228,38 @@ export class MusicSourceManager {
   private defaultCacheTtl = 60 * 60 * 1000 // 1 hour
   /** 取址瀑布预算（见 UrlBudgets 的三级关系） */
   private budgets: UrlBudgets = readUrlBudgets()
+
+  /**
+   * 把调用路径的覆盖并进全局预算。只在这次调用里有效，不碰 `this.budgets`。
+   * 覆盖可以把预算配歪（单源 ≥ 总预算）——那等于一条瀑布只够试一个源，降级链静默失效，
+   * 所以这里夹紧并留下告警，判据与 `readUrlBudgets` 那条一致。
+   */
+  private budgetsFor(override?: ResolveBudgets): EffectiveBudgets {
+    const merged: EffectiveBudgets = {
+      urlMs: override?.urlMs ?? this.budgets.urlMs,
+      perSourceMs: override?.perSourceMs ?? this.budgets.perSourceMs,
+      totalMs: override?.totalMs ?? this.budgets.totalMs,
+      countBudgetTimeoutAsBad: override?.countBudgetTimeoutAsBad ?? true,
+    }
+    if (merged.perSourceMs >= merged.totalMs) {
+      logger.warn(
+        `[source-budget] 覆盖后单源预算 ${merged.perSourceMs}ms ≥ 总预算 ${merged.totalMs}ms，` +
+        '已把单源预算收到总预算的一半，否则这条瀑布只够试一个音源'
+      )
+      merged.perSourceMs = Math.max(MIN_USEFUL_ATTEMPT_MS, Math.floor(merged.totalMs / 2))
+    }
+    // 单源预算低于"一次尝试的最小价值"会让每个源在第一次调用前就被判成"没时间了"，
+    // 整条瀑布一次脚本都不调就报"所有音源均失败"——配错的环境变量会静默变成全平台哑火，
+    // 所以抬到这条下限，至少保证每个源被真的试过一次。
+    if (merged.perSourceMs < MIN_USEFUL_ATTEMPT_MS) {
+      logger.warn(
+        `[source-budget] 单源预算 ${merged.perSourceMs}ms 低于一次尝试的下限 ${MIN_USEFUL_ATTEMPT_MS}ms，` +
+        '照这个数每个源都会在出手前被跳过，已抬到下限'
+      )
+      merged.perSourceMs = MIN_USEFUL_ATTEMPT_MS
+    }
+    return merged
+  }
 
   /** 给 Promise 加超时的通用辅助（超时后 reject，定时器清理） */
   private async withTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -399,17 +473,19 @@ export class MusicSourceManager {
    *
    * 用途：调用方（audio-serve）在下载阶段发现上游返回的是 HTML/JSON 假地址时，
    * 需要知道「是哪个音源给的」，才能把它排除后重新解析（见 excludeProviders）。
+   * @param ctx.budgets 按调用路径覆盖取址预算（音箱那条要收紧，见 readSpeakerUrlBudgets）
    */
   async getMusicUrlWithProvider(
     musicInfo: MusicInfo,
     requestedQuality: QualityType = '320k',
-    ctx?: { toggle?: SourceToggleInfo | null; excludeProviders?: ReadonlySet<string> }
+    ctx?: { toggle?: SourceToggleInfo | null; excludeProviders?: ReadonlySet<string>; budgets?: ResolveBudgets }
   ): Promise<{ url: string; provider: string | null; platform: string | null }> {
     try {
       return await this._getMusicUrlSamePlatform(
         musicInfo,
         requestedQuality,
-        ctx?.excludeProviders
+        ctx?.excludeProviders,
+        ctx?.budgets
       )
     } catch (err) {
       // 同平台全部失败 → 尝试跨平台换源（仅一次，替代版本失败不再递归）
@@ -422,7 +498,8 @@ export class MusicSourceManager {
       const result = await this._getMusicUrlSamePlatform(
         alternative,
         requestedQuality,
-        ctx?.excludeProviders
+        ctx?.excludeProviders,
+        ctx?.budgets
       )
       if (ctx) {
         ctx.toggle = {
@@ -498,12 +575,15 @@ export class MusicSourceManager {
    * 依次尝试所有音源，支持音质降级
    * 支持配置文件热重载
    * @param excludeProviders 需跳过的音源名（上层已证实其返回假地址，见 audio-serve）
+   * @param budgetOverride 调用路径的预算覆盖；不传就是全局预算，行为与改动前完全一致
    */
   private async _getMusicUrlSamePlatform(
     musicInfo: MusicInfo,
     requestedQuality: QualityType = '320k',
-    excludeProviders?: ReadonlySet<string>
+    excludeProviders?: ReadonlySet<string>,
+    budgetOverride?: ResolveBudgets
   ): Promise<{ url: string; provider: string | null; platform: string | null }> {
+    const budgets = this.budgetsFor(budgetOverride)
     // 在获取 URL 时检查配置是否变更
     if (this.initialized && this.checkConfigChanged()) {
       logger.info('配置文件已变更，重新加载音源...')
@@ -539,7 +619,7 @@ export class MusicSourceManager {
     logger.debug(`音源: ${musicInfo.source}, 请求音质: ${requestedQuality}`)
 
     // 总预算：全音源×音质尝试不无限串行（上游全挂时限制客户端等待时间）
-    const deadline = Date.now() + this.budgets.totalMs
+    const deadline = Date.now() + budgets.totalMs
 
     // 候选源：pt 白名单 + 脚本声明 + musicUrl 能力 + 上层排除，四道门槛一次过完。
     // 必须先拿到完整候选集，3c 才知道"跳掉冷却中的源之后还剩不剩人"。
@@ -571,13 +651,15 @@ export class MusicSourceManager {
       // 单源累计预算：这个源在一首歌上最多花这么多时间（跨音质档累加），到点就换
       // 下一个源。没有它，一个挂起的源能在多个音质档上各烧满单次超时，把整条瀑布
       // 的预算吃光——外层解析超时先到，结果是这首歌必然失败。
-      const sourceDeadline = Date.now() + this.budgets.perSourceMs
+      const sourceDeadline = Date.now() + budgets.perSourceMs
 
       // 一次播放里同一个源最多记一个坏样本：一首歌会在多个音质档上重试同一个源，
       // 全记进去会把 consecutiveBad 灌水成"一首歌=三次坏"，让分档虚高。
       let badRecorded = false
       const recordBad = (outcome: ResolveOutcome, ms: number | null, reason: string) => {
         if (badRecorded) return
+        // 收紧预算的那条路不配说"这个源坏了"：它只是"对我们的窗口太慢"（见 ResolveBudgets）
+        if (outcome === 'timeout' && !budgets.countBudgetTimeoutAsBad) return
         badRecorded = true
         sourceHealth.recordResolve(instance.config.name, musicInfo.source, outcome, ms, reason)
       }
@@ -590,14 +672,14 @@ export class MusicSourceManager {
         // 本源预算用尽：换下一个源，而不是终止瀑布
         if (sourceDeadline - now < MIN_USEFUL_ATTEMPT_MS) {
           logger.debug(
-            `音源 ${instance.config.name} 取址累计超过 ${this.budgets.perSourceMs}ms，跳过余下音质换下一个源`
+            `音源 ${instance.config.name} 取址累计超过 ${budgets.perSourceMs}ms，跳过余下音质换下一个源`
           )
           // 慢到用尽单源预算，本身就是一次"这个源这档太慢"的坏证据
-          recordBad('timeout', Date.now() - now, `超过单源预算 ${this.budgets.perSourceMs}ms`)
+          recordBad('timeout', Date.now() - now, `超过单源预算 ${budgets.perSourceMs}ms`)
           continue outer
         }
         // 单次调用的实际上限：不超过本源剩余预算，也不超过整条瀑布的剩余预算
-        const callTimeoutMs = Math.min(this.budgets.urlMs, sourceDeadline - now, deadline - now)
+        const callTimeoutMs = Math.min(budgets.urlMs, sourceDeadline - now, deadline - now)
 
         // 检查音源是否支持该音质
         if (!sourceConfig.qualitys.includes(quality)) {

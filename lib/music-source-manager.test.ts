@@ -19,8 +19,9 @@ vi.mock('./logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
 
-const { MusicSourceManager, readUrlBudgets, SourceTimeoutError } = await import('./music-source-manager')
+const { MusicSourceManager, readUrlBudgets, readSpeakerUrlBudgets, SourceTimeoutError } = await import('./music-source-manager')
 const { sourceHealth } = await import('./server/source-health')
+const { logger } = await import('./logger')
 import type { SimulatorInstance } from './music-source-manager'
 
 beforeEach(() => {
@@ -374,5 +375,146 @@ describe('周测取址不受 pt 拦（pt 只管派活，不能拿来筛题目）
     const kg = await manager().probeSourceUrl('摘了腾讯的源', { ...musicInfo, source: 'kg' } as never, '320k', 5000)
     expect(kg).toMatchObject({ ok: false, outcome: 'unsupported', latencyMs: 0 })
     expect(kg.reason).toContain('未声明')
+  })
+})
+
+/**
+ * 按调用路径覆盖取址预算（音箱那一条）。
+ *
+ * 动机是两条路的耐心差一个量级：手机/网页能等 18s，音箱那条设备**约 5.1 秒**拿不到字节
+ * 就挂断、0.1 秒后重拉同一个地址。默认的 8s 单源预算对音箱完全无效——挂起的头源每次
+ * 都把设备等到先走，后面的源一次轮不到，用户看到"投过去没声音"。
+ *
+ * 另一件必须钉住的事：收紧预算的那条路**不许把"到预算"记进健康账本**。账本按 `源×平台`
+ * 共享、两连坏就冷却，而"2 秒没出货"对音箱是失败、对手机只是慢；照记就是让投放功能
+ * 反过来替本机播放冷却音源。
+ */
+describe('按调用路径覆盖取址预算', () => {
+  /** 音箱那条路的真实默认值（env 未设置时） */
+  const GLOBAL = { urlMs: 15_000, perSourceMs: 8_000, totalMs: 18_000 }
+
+  function hungThenGood() {
+    let hangCalls = 0
+    const instances = [
+      fakeSource('挂起的头源', () => {
+        hangCalls++
+        return new Promise<string>(() => {})
+      }),
+      fakeSource('后面的好源', async () => 'https://ok/speaker.flac'),
+    ]
+    return { instances, hangCalls: () => hangCalls }
+  }
+
+  it('覆盖生效：挂起的头源只占一个收紧后的单源档，第二个源照常出货', async () => {
+    const { instances, hangCalls } = hungThenGood()
+    const m = managerWith(instances, GLOBAL)
+    const t = Date.now()
+
+    const r = await m.getMusicUrlWithProvider(musicInfo, 'flac', {
+      budgets: { perSourceMs: 300, totalMs: 600 },
+    })
+
+    expect(r.provider).toBe('后面的好源')
+    expect(hangCalls()).toBe(1)
+    // 全局单源预算是 8000ms：真要按它等，这里至少 8s
+    expect(Date.now() - t).toBeLessThan(1000)
+  })
+
+  it('收紧的那条路不写共享账本：同一次挂起，带覆盖不记坏、不带覆盖照旧记坏', async () => {
+    // 对照组先用一份独立账本状态跑"不带覆盖"（默认行为，改动前就是这样）
+    const a = hungThenGood()
+    const mA = managerWith(a.instances, { ...GLOBAL, perSourceMs: 300, totalMs: 5000 })
+    await mA.getMusicUrlWithProvider(musicInfo, 'flac')
+    const withoutOverride = sourceHealth.view('挂起的头源', 'kw')
+    expect(withoutOverride?.bad).toBe(1)
+    expect(withoutOverride?.badKinds).toEqual({ timeout: 1 })
+
+    sourceHealth.reset()
+
+    // 实验组：同样的预算数字，只多一个"到预算不计坏"
+    const b = hungThenGood()
+    const mB = managerWith(b.instances, { ...GLOBAL, perSourceMs: 300, totalMs: 5000 })
+    const r = await mB.getMusicUrlWithProvider(musicInfo, 'flac', {
+      budgets: { perSourceMs: 300, totalMs: 5000, countBudgetTimeoutAsBad: false },
+    })
+
+    expect(r.provider).toBe('后面的好源')
+    expect(sourceHealth.view('挂起的头源', 'kw')).toBeNull() // 一次都没入账
+    expect(sourceHealth.coolStatus('挂起的头源', 'kw').skip).toBe(false)
+    // 出货那一格照样入账：闸门只管"到预算"，不是把整条路的埋点关掉
+    expect(sourceHealth.view('后面的好源', 'kw')?.resolveOk).toBe(1)
+  })
+
+  it('覆盖不许把预算配歪：单源 ≥ 总预算时夹紧并告警（否则一条瀑布只够试一个源）', async () => {
+    const { instances, hangCalls } = hungThenGood()
+    const m = managerWith(instances, GLOBAL)
+    const t = Date.now()
+
+    // 1000 ≥ 800 会被夹成总预算的一半（400）。不夹的话单次会按 800 等满，总预算当场见底、
+    // 第二个源一次都轮不到——所以"第二个源出了货"本身就是夹紧的正证。
+    const r = await m.getMusicUrlWithProvider(musicInfo, 'flac', {
+      budgets: { perSourceMs: 1000, totalMs: 800, countBudgetTimeoutAsBad: false },
+    })
+
+    expect(r.provider).toBe('后面的好源')
+    expect(hangCalls()).toBe(1)
+    expect(Date.now() - t).toBeLessThan(750)
+    expect(vi.mocked(logger.warn).mock.calls.some(c => String(c[0]).includes('覆盖后单源预算'))).toBe(true)
+  })
+
+  it('音箱预设自洽：单源 < 总预算 < 设备的 5.1 秒耐心，且默认不计坏', () => {
+    const b = readSpeakerUrlBudgets()
+    expect(b.perSourceMs).toBeLessThan(b.totalMs!)
+    expect(b.totalMs!).toBeLessThan(5_100)
+    expect(b.countBudgetTimeoutAsBad).toBe(false)
+  })
+
+  it('音箱预设的两个数都能 env 覆盖（与 SOURCE_URL_* 同一口径）', () => {
+    const saved = { ...process.env }
+    try {
+      process.env.SPEAKER_SOURCE_URL_PER_SOURCE_TIMEOUT_MS = '1200'
+      process.env.SPEAKER_SOURCE_URL_TOTAL_TIMEOUT_MS = '3000'
+      expect(readSpeakerUrlBudgets()).toMatchObject({ perSourceMs: 1200, totalMs: 3000 })
+      // 非法值退回默认，不静默变成 0（0 预算等于整条瀑布不试就失败）
+      process.env.SPEAKER_SOURCE_URL_PER_SOURCE_TIMEOUT_MS = 'abc'
+      expect(readSpeakerUrlBudgets().perSourceMs).toBe(2_000)
+    } finally {
+      process.env = saved
+    }
+  })
+
+  it('手机那条路的默认预算没被动过：覆盖只在调用内生效，不写回实例', async () => {
+    // 用 urlMs 做探针（它不会被夹紧逻辑改动）：实例上是 8000 的单源预算、15000 的单次上限，
+    // 这一次调用把单次上限压到 200ms。若它漏进了实例，第二次就只会等 200ms。
+    const { instances, hangCalls } = hungThenGood()
+    const m = managerWith(instances, { ...GLOBAL, perSourceMs: 3000, totalMs: 5000 })
+
+    const first = await m.getMusicUrlWithProvider(musicInfo, 'flac', {
+      budgets: { urlMs: 200, perSourceMs: 300, totalMs: 5000, countBudgetTimeoutAsBad: false },
+    })
+    expect(first.provider).toBe('后面的好源')
+    expect(hangCalls()).toBe(1)
+
+    const t = Date.now()
+    const second = await m.getMusicUrlWithProvider({ ...musicInfo, songmid: 'sm-9' } as never, 'flac')
+    const took = Date.now() - t
+    expect(second.provider).toBe('后面的好源')
+    // 不带覆盖时按实例上的 perSourceMs=3000 等满那一次；漏进来的话这里只有 200ms
+    expect(took).toBeGreaterThanOrEqual(2900)
+  })
+
+  it('单源预算配得比一次尝试的下限还小，也不能让整条瀑布一次都不出手', async () => {
+    const { instances, hangCalls } = hungThenGood()
+    const m = managerWith(instances, GLOBAL)
+
+    // 100ms < MIN_USEFUL_ATTEMPT_MS：照原样会让每个源在第一次调用前就被判"没时间了"，
+    // 静默变成"所有音源均失败"（配错一个环境变量就能让这条路全哑）。
+    const r = await m.getMusicUrlWithProvider(musicInfo, 'flac', {
+      budgets: { perSourceMs: 100, totalMs: 5000 },
+    })
+
+    expect(r.provider).toBe('后面的好源')
+    expect(hangCalls()).toBe(1)
+    expect(vi.mocked(logger.warn).mock.calls.some(c => String(c[0]).includes('已抬到下限'))).toBe(true)
   })
 })

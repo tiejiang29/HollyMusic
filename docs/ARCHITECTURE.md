@@ -165,6 +165,17 @@ API 路由层（app/api/**）        —— 参数校验、鉴权、响应包装
 `MIN_USEFUL_ATTEMPT_MS`（250ms）时不再发起调用——给一次只剩 0-2ms 的"尘埃调用"既不可能出货，
 又会把一次真实脚本调用丢进 runner（promise 被放弃，slot 却还占着）。
 
+**按调用路径覆盖（2026-10-24 新增）**：那三个默认值是"手机/网页能等多久"的口径，对端耐心更短
+的路要能自己收。`getMusicUrlWithProvider(musicInfo, quality, { budgets })` 传 `ResolveBudgets`
+即只在这次调用内生效（不写回实例）；`readSpeakerUrlBudgets()` 是音箱那条路（`/api/speaker/stream`
+的在线分支）用的预设 `2s / 4s`，判据是设备约 5.1 秒拿不到字节就挂断重拉——默认 8s 的单源预算
+等于每次重拉都等到设备先走，排在后面的源一次轮不到。两条硬约束跟着一起落地：
+① `budgetsFor` 把覆盖夹回自洽（单源 ≥ 总预算 → 收到一半；单源 < 250ms → 抬到下限，否则每个源
+在出手前就被跳过、整条瀑布一次都不调就报"所有音源均失败"）；
+② `countBudgetTimeoutAsBad: false` 让"到预算而换源"不进健康账本——账本按 `源×平台` 共享、两连坏
+就冷却，而"2 秒没出货"对音箱是失败、对手机只是慢，照记就是让投放替本机播放冷却音源。
+出货/无版权/脚本报错这些与路径无关的结论照常入账。
+
 同时新增**内存健康账本** `lib/server/source-health.ts`：按 `音源 × 平台` 记滑动窗（50 样本）
 内的成/坏与耗时，随 `/api/health` 的 `sources[].health` 输出（`supported*` 是脚本自报的声明，
 `health` 是真跑出来的实测）。三条护栏都是实测换来的：**「没找到 / 不支持」不等于「坏了」**（pt 不含该平台、脚本没声明该
@@ -184,7 +195,9 @@ failed`、HTTP 4xx/5xx 这类**传输层**失败留在"坏"里）、**缓存与�
 摸底的关键事实决定了这套参数形态——62 格里 **0 次取址超时**，坏样 p50 1031ms / max 2224ms，
 而健康源取址 p50 0-1860ms、单次成功最大 4558ms。所以"坏"的主流是快速报错与死链，不是挂起，
 熔断只看连续坏次数、**不按延迟分位数**（那会砍掉全场最慢但确实出货的 gdstudio，而它是 mg 唯二来源
-之一）；`perSourceMs=8s` 保持在观测最大值之上，不要压。
+之一）；`perSourceMs=8s` 保持在观测最大值之上，不要压（这条说的是手机/网页那条路的默认值；
+音箱那条按路径覆盖到 2s，代价是"单次成功最大 4558ms"那批慢源在投放时会被放弃——那条路只有
+5.1 秒可花，等到它们也来不及）。
 
 注意账本天然只看得到"被轮到的源"：健康路径下 10 个源里通常只有 1-2 个有样本（实测面板上只有
 1/31 格有数据），这正是周测（主动全矩阵探测）不可省略的原因。管理端「健康」列据此把三种状态分开：
@@ -670,6 +683,8 @@ Android / Subsonic 客户端走完全相同的 `/api/audio` 入口（Subsonic �
 | `AUDIO_CACHE_DIR` | `data/audio-cache` | 磁盘缓存目录 |
 | `AUDIO_CACHE_QUOTA_GB` | `10` | 磁盘缓存配额（LRU 淘汰） |
 | `AUDIO_CACHE_READINESS_TIMEOUT_MS` | `20000` | 上游 URL 解析超时 |
+| `SOURCE_URL_TIMEOUT_MS` / `SOURCE_URL_PER_SOURCE_TIMEOUT_MS` / `SOURCE_URL_TOTAL_TIMEOUT_MS` | `15000` / `8000` / `18000` | 取址瀑布三级预算（手机/网页那条路，见 §"取址预算与健康度账本"） |
+| `SPEAKER_SOURCE_URL_PER_SOURCE_TIMEOUT_MS` / `SPEAKER_SOURCE_URL_TOTAL_TIMEOUT_MS` | `2000` / `4000` | 音箱那条路的按路径覆盖：设备约 5.1s 拿不到字节就挂断，预算必须在那之前自己出结论 |
 | `AUDIO_FAKE_URL_RETRIES` | `2` | 假地址换源重试次数上限 |
 | `AUDIO_LIBRARY_DIR` / `AUDIO_LIBRARY_QUOTA_GB` | `data/library` / `20` | 音乐库目录与配额 |
 | `SEARCH_CACHE_TTL_MS` | `12600000` | 搜索/URL 内存缓存 TTL |

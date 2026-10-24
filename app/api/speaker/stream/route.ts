@@ -20,7 +20,7 @@ import fsp from 'fs/promises'
 import { existsSync } from 'fs'
 import { logger } from '@/lib/logger'
 import { resolveMusicInfoById } from '@/lib/db'
-import { musicSourceManager } from '@/lib/music-source-manager'
+import { musicSourceManager, readSpeakerUrlBudgets } from '@/lib/music-source-manager'
 import { audioServe, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, resolvePaths } from '@/lib/audio-serve'
 import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { verifyShareAudioToken } from '@/lib/services/auth'
@@ -175,7 +175,11 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
     const cacheKey = `${musicInfo.source}:${musicInfo.songmid}:${quality}`
     const resolver: UpstreamUrlResolver = async excludeProviders => {
       if (!musicSourceManager.isInitialized()) await musicSourceManager.initialize()
-      return musicSourceManager.getMusicUrlWithProvider(musicInfo, quality, { excludeProviders })
+      return musicSourceManager.getMusicUrlWithProvider(musicInfo, quality, {
+        excludeProviders,
+        // 设备约 5.1s 拿不到字节就挂断重拉，8s 的单源预算对它无效（见 readSpeakerUrlBudgets）
+        budgets: readSpeakerUrlBudgets(),
+      })
     }
     // 在线这一路的秒→字节只能按音质档名义码率估（文件没落盘时读不到真实码率）；
     // 但缓存过的那份照样能做帧对齐 —— 首次播放就会缓存下来，所以第二次起是准的

@@ -22,6 +22,7 @@ const h = vi.hoisted(() => ({
   mimeFromContainer: vi.fn(() => 'audio/mpeg'),
   stat: vi.fn(async () => ({ size: 4321 })),
   serve: vi.fn(),
+  getMusicUrlWithProvider: vi.fn(async () => ({ url: 'https://up.example/x.mp3', provider: '测试源', platform: 'tx' })),
   full: vi.fn((p: string) => new Response('full:' + p, { status: 200, headers: new Headers({ 'content-type': 'audio/mpeg' }) })),
   partial: vi.fn(() => new Response('partial', { status: 206, headers: new Headers({ 'content-type': 'audio/mpeg' }) })),
   unsat: vi.fn(() => new Response('416', { status: 416 })),
@@ -41,8 +42,22 @@ vi.mock('@/lib/audio-serve', () => ({
   resolvePaths: h.resolvePaths,
 }))
 vi.mock('fs/promises', () => ({ default: { stat: h.stat } }))
+// 只换掉 manager 那个单例，`readSpeakerUrlBudgets` 要用**真实现**：这条测的就是"路由有没有把
+// 真的音箱预设传下去"，把它 mock 成一个常量就什么也没钉住
+vi.mock('@/lib/music-source-manager', async importOriginal => {
+  const real = await importOriginal<typeof import('@/lib/music-source-manager')>()
+  return {
+    ...real,
+    musicSourceManager: {
+      isInitialized: vi.fn(() => true),
+      initialize: vi.fn(async () => {}),
+      getMusicUrlWithProvider: h.getMusicUrlWithProvider,
+    },
+  }
+})
 
 const { GET } = await import('@/app/api/speaker/stream/route')
+const { readSpeakerUrlBudgets } = await import('@/lib/music-source-manager')
 const { readParams } = await import('@/lib/server/speaker-stream-params')
 
 const MUSIC_INFO = { name: '稻香', singer: '周杰伦', source: 'tx', songmid: 'S1', interval: '223', types: [] }
@@ -53,7 +68,9 @@ const okUrl = (uid = 'tx-S1', quality = '320k') => `?st=${TOKEN}&uid=${encodeURI
 
 beforeEach(() => {
   for (const f of [h.verifyShareAudioToken, h.resolveMusicInfoById, h.findLibrarySong, h.readHeadBytes,
-    h.detectContainer, h.mimeFromContainer, h.stat, h.serve, h.full, h.partial, h.unsat, h.parseRange]) f.mockReset()
+    h.detectContainer, h.mimeFromContainer, h.stat, h.serve, h.full, h.partial, h.unsat, h.parseRange,
+    h.getMusicUrlWithProvider]) f.mockReset()
+  h.getMusicUrlWithProvider.mockResolvedValue({ url: 'https://up.example/x.mp3', provider: '测试源', platform: 'tx' })
   h.verifyShareAudioToken.mockReturnValue(true)
   h.readBytesAt.mockResolvedValue(null)
   h.resolveMusicInfoById.mockResolvedValue(MUSIC_INFO)
@@ -266,5 +283,31 @@ describe('seek：音箱侧没有设备 seek，只能重推一条从中间开始�
     expect(p.get('st')).toBe(TOKEN)
     expect(p.get('uid')).toBe('tx-S1')
     expect(p.get('seek')).toBe('42')
+  })
+})
+
+/**
+ * 取址预算：这条路必须自己收紧。
+ * 设备约 5.1 秒拿不到字节就挂断重拉，而手机/网页那套默认是单源 8s / 全程 18s——
+ * 一个挂起的头源能把每次重拉都等到设备先走，后面的源一次轮不到。
+ * 同时"2 秒没出货"不许写进共享健康账本（两连坏就冷却，那等于音箱替手机冷却音源）。
+ */
+describe('音箱那一路带上收紧后的取址预算', () => {
+  it('解析器把音箱预设传给 manager：单源 2s、全程 4s、到预算不计坏', async () => {
+    h.serve.mockImplementation(async (opts: { upstreamUrlResolver: (ex: Set<string>) => Promise<unknown> }) => {
+      await opts.upstreamUrlResolver(new Set())
+      return new Response('x', { status: 200, headers: new Headers({ 'content-type': 'audio/mpeg' }) })
+    })
+
+    const res = await GET(req(okUrl()))
+    expect(res.status).toBe(200)
+
+    const ctx = h.getMusicUrlWithProvider.mock.calls[0]?.[2] as { budgets?: Record<string, unknown> }
+    expect(ctx?.budgets).toMatchObject({ countBudgetTimeoutAsBad: false })
+    // 用真读出来的预设值比对，避免把两个数抄成第二份真相
+    expect(ctx?.budgets).toMatchObject(readSpeakerUrlBudgets())
+    const p = readSpeakerUrlBudgets()
+    expect(p.perSourceMs!).toBeLessThan(p.totalMs!)
+    expect(p.totalMs!).toBeLessThan(5_100)
   })
 })
