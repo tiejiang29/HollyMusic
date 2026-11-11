@@ -40,6 +40,8 @@
     "prisma:generate": "prisma generate",
     "prisma:studio": "prisma studio",
     "prisma:migrate": "prisma migrate dev",
+    "release:prepare": "node scripts/prepare-release.mjs",
+    "release:check": "node scripts/check-release-metadata.mjs",
     "analyze": "ANALYZE=true next build"
   },
   "dependencies": {

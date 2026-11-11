@@ -14,7 +14,9 @@ WORKDIR /app
 # 安装 pnpm（走淘宝源加速）
 # 注：曾尝试 corepack + COREPACK_NPM_REGISTRY，但淘宝镜像对 corepack 的
 # fetchTarballURL 兼容性差（HTTP 404），改回 npm install -g 更稳
-RUN npm config set registry https://registry.npmmirror.com && npm install -g pnpm
+# 版本必须等于 package.json 的 packageManager（现在 CI 用 pnpm@10，装到 11 就可能
+# 在 --frozen-lockfile 上失败）；这一处由 pnpm release:check 在 CI 里核
+RUN npm config set registry https://registry.npmmirror.com && npm install -g pnpm@10.22.0
 
 # 先复制 package 文件（利用 docker layer cache：源码变动不会使依赖安装缓存失效）
 # .npmrc 必须在 install 之前到位：node-linker=hoisted 影响 needle/cheerio 等传递依赖的解析

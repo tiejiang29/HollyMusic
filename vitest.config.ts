@@ -21,7 +21,9 @@ export default defineConfig({
   },
   test: {
     // 只跑根目录下的测试；前端测试在 frontend/ 下独立运行
-    include: ['lib/**/*.test.ts', 'app/**/*.test.ts'],
+    // scripts/**/*.test.mjs：发布校验的纯函数层（release-utils.mjs）也走 vitest，
+    // 否则会掉进 "vitest run --passWithNoTests" 的盲区——脚本人工跑一遍就"看起来没事"
+    include: ['lib/**/*.test.ts', 'app/**/*.test.ts', 'scripts/**/*.test.mjs'],
     environment: 'node',
     globals: false,
   },

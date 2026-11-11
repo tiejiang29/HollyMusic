@@ -28,6 +28,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # release:check 要知道 HEAD 可达的最高正式 tag；默认的浅克隆看不到 tag，
+          # 那样门禁只会打印"跳过"，等于没装
+          fetch-depth: 0
+          fetch-tags: true
 
       # pnpm 版本锁定在 package.json 的 packageManager 字段，action 自动读取
       - name: Set up pnpm
@@ -45,6 +50,11 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm -C frontend install --frozen-lockfile
+
+      # 发布元数据门禁放在重活之前：它只读两个 package.json、Dockerfile、这份 yml 和 git tag，
+      # 装依赖/生成 Prisma 都不需要，红了就直接退
+      - name: Release metadata
+        run: pnpm release:check
 
       # @prisma/client 为生成式产物，typecheck / test / build 前必须先生成
       - name: Generate Prisma Client
