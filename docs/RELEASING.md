@@ -43,7 +43,8 @@ tag 相关断言需要能看到 tag：CI 的 checkout 因此带 `fetch-depth: 0`
 3. `vX` 不许已存在于**本地**，也不许存在于 **origin**（`ls-remote --tags`，只取引用列表）。
    我们本地和远端的 tag 是分叉的，只看一边会漏。已发布的版本不许重写。
 4. 版本必须严格高于基准，基准取「当前 version」与「HEAD 可达最高正式 tag」的较大者。
-5. 若目标夹在两个已有 tag 中间，还要低于它的后继 tag——那是 tag 分叉的现场信号，宁可不发。
+   低于任何已发布 tag 一律拒——包括"夹在 v2.1.3 和 v3.0.0 中间"这种补号场景：那会让
+   Docker 的 `:latest` 与 semver tag 语义倒挂（实测踩过：收紧前 `prepare 2.9.9` 能通过）。
 
 然后同时写根与 `frontend/package.json` 的 version（2 空格缩进 + 结尾换行，和 CI 那段回写
 同一个写法），并打印后续步骤。

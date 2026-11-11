@@ -71,18 +71,6 @@ export function listReleaseTags(tags) {
   return [...new Set(release)].sort(compareTag)
 }
 
-/** 在升序正式版数组里找 target 的前后邻居；pre 用于「必须递增」判断，next 用来提醒版本号跳跃。 */
-export function mergeTagNeighbours(sortedReleaseTags, target) {
-  let previous = null
-  let next = null
-  for (const tag of sortedReleaseTags) {
-    const cmp = compareTag(tag, target)
-    if (cmp < 0) previous = tag
-    else if (cmp > 0 && next === null) next = tag
-  }
-  return { previous, next }
-}
-
 /** packageManager 形如 pnpm@10.22.0+sha512... → 10.22.0 */
 export function pnpmVersionFromPackageManager(value) {
   const match = /^pnpm@(\d+\.\d+\.\d+)/.exec(String(value ?? '').trim())

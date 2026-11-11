@@ -12,7 +12,7 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { compareTag, listReleaseTags, mergeTagNeighbours, parseVersion } from './release-utils.mjs'
+import { compareTag, listReleaseTags, parseVersion } from './release-utils.mjs'
 
 // 人面向的脚本不该甩 Node 的断言堆栈：每条失败都直接说清「为什么」再退 1
 function fail(message) {
@@ -57,17 +57,18 @@ if (remoteRefs.trim() !== '') fail(`${target.tag} 已存在于 origin；已发�
 
 const root = JSON.parse(readFileSync('package.json', 'utf8'))
 const frontend = JSON.parse(readFileSync('frontend/package.json', 'utf8'))
-const sortedReleaseTags = listReleaseTags(git('tag', '--merged', 'HEAD').split('\n'))
-const { previous, next } = mergeTagNeighbours(sortedReleaseTags, target.tag)
+const releaseTags = listReleaseTags(git('tag', '--merged', 'HEAD').split('\n'))
+const newestTag = releaseTags.at(-1) ?? null
 
-// 基准取「当前 version」与「已发布最高正式 tag」的较大者：版本号不许倒退，
-// 也不能从 main 上的未发布状态里退回一个已发布的号。
-const baseline = previous && compareTag(previous, `v${root.version}`) > 0 ? previous : `v${root.version}`
+// 基准取「当前 version」与「已发布最高正式 tag」的较大者，低于它一律拒。
+// 之前只拦"撞上或高于已有 tag"，于是 v3.0.0 已发布时 prepare 2.9.9 能过——那不该过：
+// 发一个比已发布版本更低的号，Docker 的 :latest 与 semver tag 都会语义倒挂。
+const baseline = newestTag && compareTag(newestTag, `v${root.version}`) > 0 ? newestTag : `v${root.version}`
 if (compareTag(target.tag, baseline) <= 0) {
-  fail(`版本必须高于 ${baseline}（package.json 与已发布 tag 里的较大者），收到 ${target.tag}`)
-}
-if (next && compareTag(target.tag, next) >= 0) {
-  fail(`${next} 已存在于 tag 里，${target.tag} 会插到它前面或撞上它；先确认 tag 是否分叉：git tag --merged HEAD`)
+  fail(
+    `版本必须高于 ${baseline}（package.json 当前值与已发布最高 tag 的较大者），收到 ${target.tag}` +
+      (newestTag ? `；已发布最高是 ${newestTag}` : ''),
+  )
 }
 
 for (const [path, pkg] of [['package.json', root], ['frontend/package.json', frontend]]) {
@@ -78,7 +79,6 @@ for (const [path, pkg] of [['package.json', root], ['frontend/package.json', fro
 
 process.stdout.write(
   `已把根与 frontend 的 package.json 版本抬到 ${target.version}。\n` +
-  (next ? `注意：tag 里已有更高的 ${next}，本次是往上补号。\n` : '') +
   `下一步：\n` +
   `  1. git diff 复核这两个文件\n` +
   `  2. git commit -m "chore(release): 准备 ${target.tag}"\n` +

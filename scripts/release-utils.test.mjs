@@ -5,7 +5,6 @@ import {
   findToolchainIssues,
   findVersionIssues,
   listReleaseTags,
-  mergeTagNeighbours,
   parseVersion,
   pnpmVersionFromPackageManager,
 } from './release-utils.mjs'
@@ -58,23 +57,6 @@ describe('正式版 tag 清单', () => {
   it('全是垃圾或为空时给空数组（调用方据此提示，而不是误判通过）', () => {
     expect(listReleaseTags([])).toEqual([])
     expect(listReleaseTags(['v2.1', 'v2.1.3-beta.1'])).toEqual([])
-  })
-})
-
-describe('找目标版本的前后邻居', () => {
-  it('夹在中间时两头都有', () => {
-    const sorted = ['v2.1.2', 'v2.1.3', 'v2.1.5']
-    expect(mergeTagNeighbours(sorted, 'v2.1.4')).toEqual({ previous: 'v2.1.3', next: 'v2.1.5' })
-  })
-
-  it('最高/最低时另一头为 null', () => {
-    const sorted = ['v2.1.2', 'v2.1.3']
-    expect(mergeTagNeighbours(sorted, 'v2.2.0')).toEqual({ previous: 'v2.1.3', next: null })
-    expect(mergeTagNeighbours(sorted, 'v2.1.1')).toEqual({ previous: null, next: 'v2.1.2' })
-  })
-
-  it('等于已有 tag 时两边都不是它自己（由别的断言负责拒绝重号）', () => {
-    expect(mergeTagNeighbours(['v2.1.2', 'v2.1.3'], 'v2.1.3')).toEqual({ previous: 'v2.1.2', next: null })
   })
 })
 
