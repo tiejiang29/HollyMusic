@@ -43,9 +43,17 @@ vi.mock('@/lib/logger', () => ({
   },
 }))
 
+// 时长闸门（占位定性的第二个信号）由测试控制。默认"时长对得上"，与真实
+// checkTrialAudio 在合成字节上解析失败时的行为一致，所以其余用例行为不变。
+const { checkTrialAudioMock } = vi.hoisted(() => ({
+  checkTrialAudioMock: vi.fn(async () => ({ trial: false, actualSec: null as number | null })),
+}))
+vi.mock('@/lib/server/audio-integrity', () => ({ checkTrialAudio: checkTrialAudioMock }))
+
 const { audioServe, _resetAudioServeConfigForTest } = await import('@/lib/audio-serve')
 const { prisma } = await import('@/lib/db')
 const { sourceHealth } = await import('@/lib/server/source-health')
+const { fingerprintStats, resetFingerprintsForTest } = await import('@/lib/server/audio-fingerprint')
 type UpstreamUrlResolver = import('@/lib/audio-serve').UpstreamUrlResolver
 
 // --- 辅助 --------------------------------------------------------------------
@@ -111,6 +119,9 @@ beforeEach(async () => {
   process.env.AUDIO_CACHE_DIR = cacheDir
   _resetAudioServeConfigForTest()
   sourceHealth.reset()
+  resetFingerprintsForTest()
+  checkTrialAudioMock.mockReset()
+  checkTrialAudioMock.mockResolvedValue({ trial: false, actualSec: null })
   await fsp.mkdir(cacheDir, { recursive: true })
   vi.mocked(prisma.audioCache.findUnique).mockImplementation(async () => null)
   vi.mocked(prisma.audioCache.aggregate).mockImplementation(async () => ({ _sum: { size: 0 } }))
@@ -652,3 +663,102 @@ function payloadResponseStatic(data: Buffer, ct: string): Response {
     headers: { 'content-type': ct, 'content-length': String(data.length) },
   })
 }
+
+// ===========================================================================
+// 占位载荷指纹（2026-11-12 生产：某聚合源的上游对每首歌都回同一条 TTS 语音）
+// ===========================================================================
+
+describe('AudioServe.serve() 占位载荷指纹与换源', () => {
+  // 两份都超过 32KiB 且单块送达，保证首块头部可比
+  const PLACEHOLDER = Buffer.concat([Buffer.from('ID3\x03\x00', 'latin1'), Buffer.alloc(40_000, 0x42)])
+  const REAL_SONG = Buffer.concat([Buffer.from('ID3\x03\x00', 'latin1'), Buffer.alloc(40_000, 0x77)])
+
+  /** 坏源A 永远回同一份占位字节；好源B 回各自不同的真内容 */
+  function wire(args: { badUrl?: string }) {
+    const badUrl = args.badUrl ?? 'https://tts.example/p.mp3'
+    const fetchUrls: string[] = []
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      fetchUrls.push(url)
+      return url === badUrl
+        ? payloadResponseStatic(PLACEHOLDER, 'audio/mpeg')
+        : payloadResponseStatic(REAL_SONG, 'audio/mpeg')
+    }) as unknown as typeof fetch
+
+    const excludeHistory: string[][] = []
+    const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders => {
+      excludeHistory.push([...excludeProviders])
+      return excludeProviders.has('坏源A')
+        ? { url: 'https://good.example/song.mp3', provider: '好源B' }
+        : { url: badUrl, provider: '坏源A' }
+    }
+    return { fetchUrls, excludeHistory, upstreamUrlResolver }
+  }
+
+  const serveOne = (upstreamUrlResolver: UpstreamUrlResolver, cacheKey: string) => audioServe.serve({
+    cacheKey,
+    upstreamUrlResolver,
+    rangeHeader: null,
+    isHead: false,
+    intervalSec: 200,
+  })
+
+  it('同一份字节 + 时长对不上：前两首放行，第三首在首块阶段换源且不落库', async () => {
+    checkTrialAudioMock.mockResolvedValue({ trial: true, actualSec: 20 })
+
+    // 第 1 首：没有历史，只能放行并登记
+    const first = wire({})
+    const r1 = await serveOne(first.upstreamUrlResolver, 'tx:p1:flac')
+    expect(r1.status).toBe(200)
+    expect(first.fetchUrls).toEqual(['https://tts.example/p.mp3'])
+    expect(fingerprintStats()).toEqual({ entries: 1, placeholders: 0 })
+
+    // 第 2 首：撞上同一份字节 ⇒ 定性为占位，并给这个源记一条 fake 坏样本
+    const second = wire({})
+    const r2 = await serveOne(second.upstreamUrlResolver, 'tx:p2:flac')
+    expect(r2.status).toBe(200)
+    expect(second.fetchUrls).toEqual(['https://tts.example/p.mp3'])
+    expect(fingerprintStats()).toEqual({ entries: 1, placeholders: 1 })
+    expect(sourceHealth.view('坏源A', 'tx')?.badKinds['byte:fake']).toBe(1)
+    // 试听/占位都不写缓存行（占位这条是新加的第一道，先于试听判据命中）
+    expect(prisma.audioCache.upsert).not.toHaveBeenCalled()
+
+    // 第 3 首：此时字节尚未交付就被指纹识破 ⇒ 排除坏源A、换好源B，客户端无感知
+    const third = wire({})
+    const r3 = await serveOne(third.upstreamUrlResolver, 'tx:p3:flac')
+    expect(r3.status).toBe(200)
+    expect(Buffer.from(await r3.arrayBuffer()).equals(REAL_SONG)).toBe(true)
+    expect(third.fetchUrls).toEqual(['https://tts.example/p.mp3', 'https://good.example/song.mp3'])
+    expect(third.excludeHistory[1]).toContain('坏源A')
+    expect(sourceHealth.view('坏源A', 'tx')?.badKinds['byte:fake']).toBe(2)
+  })
+
+  it('只撞内容、时长对得上 ⇒ 合法重复录音：照样交付，不换源也不记坏', async () => {
+    checkTrialAudioMock.mockResolvedValue({ trial: false, actualSec: 200 })
+
+    const a = await serveOne(wire({}).upstreamUrlResolver, 'tx:d1:flac')
+    expect(a.status).toBe(200)
+    const bWire = wire({})
+    const b = await serveOne(bWire.upstreamUrlResolver, 'tx:d2:flac')
+    expect(b.status).toBe(200)
+    expect(Buffer.from(await b.arrayBuffer()).equals(PLACEHOLDER)).toBe(true)
+    expect(bWire.fetchUrls).toEqual(['https://tts.example/p.mp3'])
+    expect(fingerprintStats()).toEqual({ entries: 1, placeholders: 0 })
+    expect(sourceHealth.view('坏源A', 'tx')?.badKinds['byte:fake']).toBeUndefined()
+    // 两首都按正常完整载荷进缓存
+    expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(2)
+  })
+
+  it('同一首歌换音质档拿到同一个文件（源不认档位）⇒ 不算占位', async () => {
+    checkTrialAudioMock.mockResolvedValue({ trial: true, actualSec: 20 })
+
+    const w1 = wire({})
+    expect((await serveOne(w1.upstreamUrlResolver, 'tx:same:320k')).status).toBe(200)
+    const w2 = wire({})
+    expect((await serveOne(w2.upstreamUrlResolver, 'tx:same:flac')).status).toBe(200)
+
+    expect(fingerprintStats().placeholders).toBe(0)
+    expect(w2.fetchUrls).toEqual(['https://tts.example/p.mp3'])
+    expect(sourceHealth.view('坏源A', 'tx')?.badKinds['byte:fake']).toBeUndefined()
+  })
+})

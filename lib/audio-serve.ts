@@ -29,6 +29,7 @@ import { logger } from '@/lib/logger'
 import { checkTrialAudio } from '@/lib/server/audio-integrity'
 import { judgeUpstreamPayload, classifyContentType, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
 import { sourceHealth, isLikelyLocalNetworkFault, type ByteOutcome } from '@/lib/server/source-health'
+import { createHeadAccumulator, headFingerprint, matchKnownPlaceholder, observeCompleted } from '@/lib/server/audio-fingerprint'
 import {
   getLyricSidecarPath,
   getTranslationLyricSidecarPath,
@@ -535,9 +536,12 @@ class AudioServe {
       // 边下边写盘（错误路径销毁句柄并清半成品，避免 Windows 文件锁与孤儿文件删不掉）
       const writeStream = fs.createWriteStream(entry.paths.filePath)
 
-      // 写一块 + 推进进度（首块与后续块共用）
+      // 写一块 + 推进进度（首块与后续块共用）；顺手攒头部字节供占位指纹使用（同步，
+      // 不在完成后再开一次文件 —— 那会多一个 await 并把 entry.done 往后推）
+      const head = createHeadAccumulator()
       const writeChunk = async (chunk: Uint8Array): Promise<void> => {
         refreshTimer()
+        head.note(chunk)
         await new Promise<void>((resolve, reject) => {
           writeStream.write(chunk, err => (err ? reject(err) : resolve()))
         })
@@ -598,7 +602,32 @@ class AudioServe {
       // 读者冲突），自然成为孤儿交由孤儿扫描回收；下次播放 miss 重新拉取，
       // 后台换可用源后拿到完整版才会入库。
       const trialCheck = await checkTrialAudio(entry.paths.filePath, intervalSec)
-      if (trialCheck.trial) {
+      // 占位载荷定性：完成后用文件头部指纹登记。首次只登记，第二首撞上同一份字节才定性，
+      // 此后同类请求在 openUpstream 阶段就被拒（那一侧还能换源，这里字节已经发完了）。
+      const fingerprint = observeCompleted({
+        cacheKey,
+        size: entry.downloadedBytes,
+        headHash: head.hash(),
+        trial: trialCheck.trial,
+      })
+      // 合法重复录音（同一份字节、时长对得上）只留一条 debug，绝不参与落库分支
+      if (fingerprint.verdict === 'duplicate-ordinary') {
+        logger.debug(
+          `[AudioServe] 与 ${fingerprint.otherSong} 是同一份字节但时长相符，按合法重复处理: ${cacheKey}`
+        )
+      }
+      if (fingerprint.verdict === 'placeholder') {
+        // 记成 `fake`：这是"字节合法但内容是占位符"的唯一坏证据，要让它进冷却
+        if (entry.provider && entry.platform) {
+          sourceHealth.recordByte(
+            entry.provider, entry.platform, 'fake',
+            `占位载荷：与 ${fingerprint.otherSong} 是同一份字节`
+          )
+        }
+        logger.warn(
+          `[AudioServe] 占位载荷不落库: ${cacheKey} — 与 ${fingerprint.otherSong} 同一份字节（源 ${entry.provider ?? '未知'}）`
+        )
+      } else if (trialCheck.trial) {
         logger.warn(
           `[AudioServe] 试听片段不落库: ${cacheKey} ` +
             `实际=${trialCheck.actualSec?.toFixed(0)}s 期望=${intervalSec}s`
@@ -810,6 +839,28 @@ class AudioServe {
         }
         logger.warn(`[AudioServe] 载荷认不出是音频（无可换音源）: ${cacheKey} — ${judgment.reason}`)
         throw new Error(`上游给的不是音频（${judgment.reason}）`)
+      }
+
+      // 占位载荷：同一份头部字节 + 同一声明大小已经发给过**别的歌**。到这里字节已经是
+      // 合法音频，所以容器嗅探放得过、只有跨歌曲指纹能识破（成因见 audio-fingerprint 头注释）。
+      // 拦在这里是因为此时 entry.size 还没置位、客户端响应尚未构造，换源对调用方无感知。
+      {
+        const hit = matchKnownPlaceholder({ cacheKey, size, headHash: headFingerprint(firstChunk) })
+        if (hit) {
+          await reader.cancel().catch(() => {})
+          clearTimeout(stallTimer)
+          recordByte('fake', `占位载荷：与 ${hit.otherSong} 是同一份字节`)
+          if (provider && attempt < this.maxFakeRetries) {
+            attempt++
+            excluded.add(provider)
+            logger.warn(
+              `[AudioServe] 占位载荷换源重试（排除 ${provider}）: ${cacheKey} — 与 ${hit.otherSong} 同一份字节`
+            )
+            continue
+          }
+          logger.warn(`[AudioServe] 占位载荷（无可换音源）: ${cacheKey} — 与 ${hit.otherSong} 同一份字节`)
+          throw new Error('上游返回占位载荷（同一份字节已发给其他歌曲）')
+        }
       }
 
       if (judgment.verdict === 'unverified') {
