@@ -7,17 +7,23 @@
  * 结果返回并遮蔽后面真正可用的音源，垃圾字节还会被缓存、甚至被「边听边下」
  * 提升进永久音乐库（音乐库优先于在线源且无自愈路径，见 lib/services/music-library.ts）。
  *
- * 判定分三档（纯函数 + 一个小文件读取器；audio-serve 下载首块与 music-library
- * 入库门槛共用同一套判据）：
+ * 判定分三档（纯函数 + 一个小文件读取器；audio-serve 下载首块、缓存命中复核与
+ * music-library 入库门槛共用同一套判据）：
  * - `audio`      : 字节匹配已知媒体容器 → 正常交付 / 允许入库
- * - `reject`     : 字节或 Content-Type 证明不是音频（文本/HTML/JSON/图片/压缩包）
- *                  → 由调用方换源重试（audio-serve）或拒绝（入库门槛）
- * - `unverified` : 既不能证实也不能证伪（未知容器 + 非文本 Content-Type）
- *                  → 正常交付（可能是罕见容器），但不进永久库，留在缓存里仍可播放
+ * - `reject`     : 字节证明不是可辨识的音频——文本/HTML/JSON/图片/压缩包，**或拿到足够
+ *                  字节却匹配不上任何已知容器** → 由调用方换源重试（audio-serve）或拒绝（入库门槛）
+ * - `unverified` : 一个字节都没拿到（或首块太小、不足以下结论），只剩下的线索只有
+ *                  Content-Type → 既不能证实也不能证伪，交回调用方按旧行为处理
+ *
+ * 为什么"认不出容器"从 2026-11-14 起算坏证据而不是"罕见容器"：生产缓存里 7 份这类载荷
+ * 实测是同一条 `.../F0M…mflac?…` 的 QMC2 密文（声明 `audio/x-ogg`、整包 30,276,517 字节、
+ * 头 32KB sha 三次复放完全一致），ffmpeg 连容器都开不了 ⇒ 播放器报 UNSUPPORTED_FORMAT。
+ * 而同期缓存 67/74 + 库内 509 个文件全部命中魔数 ⇒ 这套表覆盖了我们实际会遇到的容器。
  *
  * 判据以「字节魔数」为主、「Content-Type」为辅：音源的 Content-Type 经常不可信
- * （如把 MP3 标成 `audio/mpeg; charset=UTF-8`），反过来也有把 MV/MP4 当音频链路
- * 返回的情况（见 music-library 的扩展名处理），故 Content-Type 只作兜底线索。
+ * （如把 MP3 标成 `audio/mpeg; charset=UTF-8`，也把 QMC 密文标成 `audio/x-ogg`），
+ * 反过来也有把 MV/MP4 当音频链路返回的情况（见 music-library 的扩展名处理），
+ * 故 Content-Type 只在拿不到字节时才作兜底线索。
  */
 
 import fsp from 'fs/promises'
@@ -36,6 +42,12 @@ export interface PayloadJudgment {
 
 /** 判定所需的最大头部字节数（超出部分不参与判定） */
 export const SNIFF_HEAD_BYTES = 64
+
+/**
+ * 能下"认不出容器"这个结论所需的最小字节数：表里最长的判据要看第 8~12 字节
+ * （RIFF/FORM + WAVE/AIFF/AVI 子类型）。首块短于此只说明"还没看清楚"，不能当坏证据。
+ */
+const MIN_JUDGABLE_BYTES = 12
 
 function startsWithAscii(head: Uint8Array, offset: number, ascii: string): boolean {
   if (head.length < offset + ascii.length) return false
@@ -297,23 +309,37 @@ export function judgeUpstreamPayload(input: {
     if (isTextLike(head)) {
       return { ...base, verdict: 'reject', reason: '响应是文本/HTML/JSON，不是音频' }
     }
+    // 拿到足够下结论的字节却认不出任何已知容器 ⇒ 这就是坏载荷，不再因为上游
+    // 声明了一个 `audio/*` 就放过（声明可信度为零：同一份 QMC2 密文今天被标成
+    // audio/x-ogg，另一条链路上真 flac 也被标成 audio/x-ogg）。
+    // 首块不足 MIN_JUDGABLE_BYTES 时不结论：魔数最长要看到第 12 字节（RIFF/FORM +
+    // 子类型），字节太少就判坏会把首块被切得很碎的正常文件冤枉掉。
+    if (head.length >= MIN_JUDGABLE_BYTES) {
+      return {
+        ...base,
+        verdict: 'reject',
+        reason: `字节未匹配已知容器（声明 ${ctMain ?? '缺失'}），按坏载荷拒绝`,
+      }
+    }
   }
 
-  // ② Content-Type 兜底
+  // ② 只在拿不到足够字节时才退回 Content-Type 兜底
   if (ctKind === 'text') {
     return { ...base, verdict: 'reject', reason: `Content-Type 是文本类型（${ctMain}）` }
   }
-  if (ctKind === 'audio' || ctKind === 'video') {
+  // 看不清字节、声明又明确不是音频/视频（`application/octet-stream` 那类）——维持 2026-10-10
+  // 那条拒绝交付的判据；声明缺失（ctMain 为 null）是老数据/裸响应，不当坏证据。
+  if (ctKind === 'other' && ctMain) {
     return {
       ...base,
-      verdict: 'unverified',
-      reason: `Content-Type 声明为 ${ctMain}，但字节未匹配已知容器`,
+      verdict: 'reject',
+      reason: `未取得足够头部字节，且声明也不是音频（${ctMain}）`,
     }
   }
   return {
     ...base,
     verdict: 'unverified',
-    reason: `容器无法识别（Content-Type=${ctMain ?? '缺失'}）`,
+    reason: `未取得足够头部字节，无法按字节判定（Content-Type=${ctMain ?? '缺失'}）`,
   }
 }
 

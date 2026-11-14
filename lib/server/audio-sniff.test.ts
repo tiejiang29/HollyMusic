@@ -4,7 +4,9 @@
  * 覆盖三档判定的边界：
  * - 已知容器（含各家源的奇葩 Content-Type）→ audio
  * - HTML/JSON/文本错误页 / 图片 / 压缩包 → reject（换源重试的依据）
- * - 未知容器 + 非文本 Content-Type → unverified（可交付但不进永久库）
+ * - 拿到足够字节却认不出任何已知容器 → reject（2026-11-14 改：实测这类是 QMC2 密文，
+ *   ffmpeg 连容器都开不了，留在缓存里只会让播放器每次报 UNSUPPORTED_FORMAT）
+ * - 一个字节都没拿到 / 首块短于 12 字节 → unverified（没有字节证据，交回调用方）
  *
  * 判据表必须「宁可放过不可误杀」：真实音源里 Content-Type 普遍不可信
  * （实测存在把 MP3 标成 `audio/mpeg; charset=UTF-8`、把 flac 标成
@@ -125,7 +127,7 @@ describe('isTextLike：文本特征识别', () => {
     expect(isTextLike(head('fLaC\x00\x00\x00"'))).toBe(false)
   })
 
-  it('高熵垃圾数据：多数判为非文本（这是 unverified 而非 reject 的来源）', () => {
+  it('高熵垃圾数据：多数判为非文本（所以坏载荷靠"认不出容器"这条识破，不靠文本判据）', () => {
     // 用多个种子统计，确认「随机数据被误判为文本」的比例很低
     let textLike = 0
     for (let seed = 1; seed <= 200; seed++) {
@@ -189,14 +191,43 @@ describe('judgeUpstreamPayload：三档判定', () => {
     expect(v.verdict).toBe('reject')
   })
 
-  it('高熵垃圾（实测的坏文件字节）→ unverified，不误判为 reject', () => {
+  it('高熵垃圾（实测的坏文件字节）→ reject，不再当罕见容器放过', () => {
     const v = judgeUpstreamPayload({ contentType: 'audio/mpeg', head: head('\x15W\n"N76ZqTHbxw') })
+    expect(v.verdict).toBe('reject')
+    expect(v.reason).toContain('字节未匹配已知容器')
+  })
+
+  /**
+   * 2026-11-14 生产那 7 份的形状：QMC2 密文被声明成 audio/x-ogg。旧判据给 unverified
+   * ⇒ 照样交付照样进缓存，此后每次命中原样重发、播放器每次报不支持；这里钉死它必须是 reject。
+   */
+  it('声明 audio/x-ogg 的 .mflac 密文头 → reject（生产实测字节）', () => {
+    const mflacHead = Buffer.from('0b7f1212343444617e552734384a57587c2b648215c86e855afd5b9af0c73b0f', 'hex')
+    const v = judgeUpstreamPayload({ contentType: 'audio/x-ogg', head: mflacHead })
+    expect(v.verdict).toBe('reject')
+    expect(v.container).toBeNull()
+  })
+
+  it('未知容器 + 非文本 Content-Type → 也是 reject（不再有"罕见容器"这一档余地）', () => {
+    const v = judgeUpstreamPayload({ contentType: 'audio/x-ms-wma', head: garbage(64) })
+    expect(v.verdict).toBe('reject')
+  })
+
+  // 首块不足 12 字节时不能下"认不出容器"的结论：那只是还没看清楚，
+  // 判坏会把首块被切碎的合法文件冤枉掉（表里最长的判据要看到第 12 字节）。
+  it('首块太短（不足 12 字节）→ unverified，不当坏载荷', () => {
+    const v = judgeUpstreamPayload({ contentType: 'audio/flac', head: head('\x15W\n"') })
     expect(v.verdict).toBe('unverified')
   })
 
-  it('未知容器 + 非文本 Content-Type → unverified（罕见容器，可交付）', () => {
-    const v = judgeUpstreamPayload({ contentType: 'audio/x-ms-wma', head: garbage(64) })
-    expect(v.verdict).toBe('unverified')
+  // 但"看不清字节"不等于"放过"：声明本身就不是音频的一律维持 2026-10-10 那条拒绝判据。
+  it('字节不足且声明是 octet-stream → 仍然 reject（声明侧的保护不撤）', () => {
+    expect(
+      judgeUpstreamPayload({ contentType: 'application/octet-stream', head: head('z52gdv4x\x00\x01\x02') }).verdict
+    ).toBe('reject')
+    expect(judgeUpstreamPayload({ contentType: 'application/octet-stream', head: null }).verdict).toBe('reject')
+    // 声明缺失是裸响应/老数据，不能当坏证据
+    expect(judgeUpstreamPayload({ contentType: null, head: null }).verdict).toBe('unverified')
   })
 
   it('无头部字节时仅凭 Content-Type 判定', () => {

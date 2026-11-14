@@ -80,6 +80,12 @@ function makeChunks(total: number, chunkCount: number): Buffer[] {
     chunks.push(buf)
     remaining -= n
   }
+  // 2026-11-14 起，"首块认不出已知容器"就是坏证据（生产那 7 份 QMC2 密文靠这条识破）。
+  // 纯伪随机字节会被直接拒，所以夹具也要带上真容器头：前 10 字节写成 ID3，其余保持伪随机
+  // ——容器嗅探只看前 64 字节，时长闸门又被 mock 掉了，后面的字节是什么不影响任何断言。
+  if (chunks.length > 0 && total >= 10) {
+    Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1').copy(chunks[0], 0)
+  }
   return chunks
 }
 
@@ -392,20 +398,29 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 
-  it('unverified 载荷（声称 audio 但字节是未知容器）→ 正常交付 + 进缓存，但不触发入库', async () => {
-    // 实测坏文件的首块特征：高熵、无控制字符外特征、非文本开头 → unverified
+  it('字节认不出已知容器（声明还写着 audio/mpeg）→ 不落缓存，换源重试', async () => {
+    // 2026-11-14 改：这类载荷不再"交给播放器判断"。生产实测它是 `.mflac` 的 QMC2 密文
+    // （声明 audio/x-ogg、整包 30,276,517 字节、ffmpeg 连容器都开不了），旧行为是照样交付
+    // 照样进缓存，于是以后每次命中原样重发、壳里报 UNSUPPORTED_FORMAT，且没有自愈路径。
     const body = Buffer.concat([
       Buffer.from('\x15W\n"N76ZqTHbxw\x9c\xd9\xdc', 'latin1'),
       Buffer.alloc(4096, 0x07),
     ])
-    globalThis.fetch = vi.fn(async () =>
-      payloadResponse(body, 'audio/mpeg')
-    ) as unknown as typeof fetch
+    const good = Buffer.concat([Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'), Buffer.alloc(4096, 0x21)])
+    const fetchSpy = vi.fn(async (input: unknown) =>
+      String(input).includes('weird.example')
+        ? payloadResponse(body, 'audio/mpeg')
+        : payloadResponse(good, 'audio/mpeg')
+    )
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
 
     const onCached = vi.fn(async () => {})
     const resp = await audioServe.serve({
       cacheKey: 'kw:suspect1:320k',
-      upstreamUrlResolver: async () => ({ url: 'https://weird.example/e.mp3', provider: '怪源' }),
+      upstreamUrlResolver: async excludeProviders =>
+        excludeProviders.has('怪源')
+          ? { url: 'https://good.example/e2.mp3', provider: '好源Z' }
+          : { url: 'https://weird.example/e.mp3', provider: '怪源' },
       rangeHeader: null,
       isHead: false,
       intervalSec: 0,
@@ -413,9 +428,12 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     })
 
     expect(resp.status).toBe(200)
-    expect(Buffer.from(await resp.arrayBuffer()).equals(body)).toBe(true)
-    expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1) // 仍进缓存
-    expect(onCached).not.toHaveBeenCalled() // 但不入永久库
+    expect(Buffer.from(await resp.arrayBuffer()).equals(good)).toBe(true)
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    const saved = vi.mocked(prisma.audioCache.upsert).mock.calls.map(c => c[0].create as { filePath?: string })
+    expect(saved).toHaveLength(1) // 密文一行都没落盘，落的是换源后的那份
+    expect(onCached).toHaveBeenCalledTimes(1)
+    expect(sourceHealth.view('怪源', 'kw')?.badKinds['byte:fake']).toBe(1)
   })
 
   it('字节认不出容器**且**声明也不是音频（octet-stream 那类加密载荷）→ 不落缓存，换源重试', async () => {
@@ -545,7 +563,10 @@ describe('AudioServe.serve() 容器与上游声明不符', () => {
 
 describe('AudioServe.serve() 命中磁盘缓存（回归保护）', () => {
   it('无 Range → 200 完整文件', async () => {
-    const data = Buffer.from('cached-audio-bytes-0123456789')
+    const data = Buffer.concat([
+      Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'),
+      Buffer.from('cached-audio-bytes-0123456789', 'latin1'),
+    ])
     const relative = 'ab/cdef0123.mp3'
     const filePath = path.join(cacheDir, relative)
     await fsp.mkdir(path.dirname(filePath), { recursive: true })
@@ -573,7 +594,10 @@ describe('AudioServe.serve() 命中磁盘缓存（回归保护）', () => {
   })
 
   it('Range: bytes=5-9 → 206 精确区间', async () => {
-    const data = Buffer.from('cached-audio-bytes-0123456789')
+    const data = Buffer.concat([
+      Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'),
+      Buffer.from('cached-audio-bytes-0123456789', 'latin1'),
+    ])
     const relative = 'ab/cdef0456.mp3'
     const filePath = path.join(cacheDir, relative)
     await fsp.mkdir(path.dirname(filePath), { recursive: true })
@@ -600,9 +624,9 @@ describe('AudioServe.serve() 命中磁盘缓存（回归保护）', () => {
     expect(Buffer.from(await resp.arrayBuffer()).equals(data.subarray(5, 10))).toBe(true)
   })
 
-  it('账本里那份声明不是音频（历史遗留的 octet-stream 行）→ 删行删文件、当 miss 重解析', async () => {
+  it('账本里那份字节认不出容器（历史遗留的 octet-stream 行）→ 删行删文件、当 miss 重解析', async () => {
     // 写入侧加闸门之前，这类行是真被缓存下来的（dev 实测 6 行、178MB）。命中时旧行为是照样发出去
-    // ⇒ 网页转圈、音箱口 415，而且账本看着像"已经缓存好"永远不会再试。所以读侧也要自愈一次。
+    // ⇒ 网页转圈、音箱口 415，而且账本看着像"已经缓存好"永远不会再试。所以读侧也要按字节自愈一次。
     const junk = Buffer.from('z52gdv4xS25dM0vms', 'latin1')
     const relative = 'ab/cdef0789.mp3'
     const filePath = path.join(cacheDir, relative)
@@ -631,10 +655,53 @@ describe('AudioServe.serve() 命中磁盘缓存（回归保护）', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 
+  /**
+   * 2026-11-14 生产形状：7 份 `tx:*:flac` 缓存行，声明写着 audio/x-ogg、文件名却是 .mp3，
+   * 字节是 `.mflac` 的 QMC2 密文（头 16 字节就是现场那份）。旧读侧闸门只看声明，
+   * `audio/*` 一律放行 ⇒ 每次点这首歌都原样重发同一份密文，播放器每次报不支持，
+   * 账本上还挂着"这首歌已缓存好"，没有任何自愈路径。改按字节复核后必须被删掉重解析。
+   */
+  it('缓存命中 .mflac 密文（声明 audio/x-ogg）→ 删行删文件、换源重取（生产存量形状）', async () => {
+    const cipher = Buffer.concat([
+      Buffer.from('0b7f1212343444617e552734384a57587c2b648215c86e855afd5b9af0c73b0f', 'hex'),
+      Buffer.alloc(4096, 0x5a),
+    ])
+    const relative = 'a8/8b2ed514f4a9b4ff495b43b64a61d89ad142c8c471c569fc9d236585c44be8.mp3'
+    const filePath = path.join(cacheDir, relative)
+    await fsp.mkdir(path.dirname(filePath), { recursive: true })
+    await fsp.writeFile(filePath, cipher)
+    vi.mocked(prisma.audioCache.findUnique).mockImplementation(async () => ({
+      cacheKey: 'tx:002B2EAA3brD5b:flac', filePath: relative, size: cipher.length,
+      contentType: 'audio/x-ogg',
+    }) as never)
+    const good = Buffer.concat([Buffer.from('fLaC\x00\x00\x00"', 'latin1'), Buffer.alloc(4096, 0x11)])
+    const fetchSpy = vi.fn(async () => payloadResponseStatic(good, 'audio/x-ogg'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:002B2EAA3brD5b:flac',
+      upstreamUrlResolver: async () => ({ url: 'https://good.example/qmc.flac', provider: '好源B' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 0,
+    })
+
+    expect(prisma.audioCache.delete).toHaveBeenCalledWith({ where: { cacheKey: 'tx:002B2EAA3brD5b:flac' } })
+    expect(await fsp.readFile(filePath, 'utf-8').catch(() => null)).toBeNull()
+    expect(resp.status).toBe(200)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(good)).toBe(true)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    // 交付头按字节走 audio/flac，不再沿用那句撒谎的 x-ogg
+    expect(resp.headers.get('content-type')).toContain('audio/flac')
+  })
+
   it('老数据里 contentType 是空的行为什么不能一起删：它过去就是按 audio/mpeg 发的', async () => {
-    // 闸门只认"声明明确存在又不是音频"。空声明是历史数据（写这列之前的行），
-    // 拿它当坏证据会把好好的 MP3 缓存删掉重下。
-    const data = Buffer.from('legacy-cached-mp3-bytes')
+    // 闸门看的是字节，不是声明有没有写过。空声明是历史数据（写这列之前的行），
+    // 只要字节认得出容器就照常交付；反过来声明写着 audio/* 但字节是密文照样删（上一条）。
+    const data = Buffer.concat([
+      Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'),
+      Buffer.from('legacy-cached-mp3-bytes', 'latin1'),
+    ])
     const relative = 'ab/cdef0abc.mp3'
     const filePath = path.join(cacheDir, relative)
     await fsp.mkdir(path.dirname(filePath), { recursive: true })
