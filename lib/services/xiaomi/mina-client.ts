@@ -422,22 +422,39 @@ export interface AskRecord {
   /** `answer` 出自哪一类：`TTS` / `LLM` / ''（没有） */
   answerType: string
   /**
-   * TTS/LLM 之外那些 answer 的原始 JSON（超长截断）。小爱接住点歌口令时会多给一项 `Audio`
-   * （参考实现 migpt-next 的 message.ts 注释："播放音乐时会有 TTS、Audio 两个 Answer"），
-   * 那里面才是它实际端上来的东西。**字段形状还没拿到真实读数**（2026-11-15 去取时库里那张
-   * Mi 票已过期 16 天），所以先原样留着看，不猜字段名。
+   * TTS/LLM 之外那些 answer 说了什么。小爱接住点歌口令时会多给一项 `AUDIO`，那里面才是它
+   * 实际端上来的东西。真机形状（2026-11-15 生产实测，L05B）：
+   * `{ type:'AUDIO', audio:{ audioInfoList:[{title,artist,cpName?}, …] } }` —— 一份曲目列表，
+   * **没有 duration / url / item_id**，而且列表里会有 title/artist 全空的项。
+   * 认识这个形状就渲染成曲目列表，不认识的原样留 JSON（超长截断），免得换了形状又看不见。
    */
   otherAnswers: string
 }
 
-/** 非语音项留多长：够看清形状，又不至于把面板一格撑爆 */
-const OTHER_ANSWERS_MAX = 600
+/** 留多长：真机一条 AUDIO 的原始 JSON 是 793~834 字节，渲染成曲目列表后通常几百字 */
+const OTHER_ANSWERS_MAX = 1200
 
 /** 一项 answer 里的回答文本：TTS 在 `tts.text`、LLM 在 `llm.text`，别的类型没有文本 */
 function answerText(a: Record<string, unknown>): string {
   const kind = text(a.type)
   const body = kind === 'TTS' ? a.tts : kind === 'LLM' ? a.llm : undefined
   return body && typeof body === 'object' ? text((body as Record<string, unknown>).text) : ''
+}
+
+/** 非语音项：认识的 `AUDIO` 渲染成曲目列表，其余原样 JSON（字段名不猜，留着下次看） */
+function describeOtherAnswer(a: Record<string, unknown>): string {
+  const audio = a.audio
+  const list = audio && typeof audio === 'object' ? (audio as Record<string, unknown>).audioInfoList : undefined
+  if (text(a.type) !== 'AUDIO' || !Array.isArray(list)) return JSON.stringify(a)
+  const items = list.map(x => (x && typeof x === 'object' ? x as Record<string, unknown> : {}))
+  const cp = items.map(it => text(it.cpName)).find(Boolean) ?? ''
+  const songs = items.map(it => {
+    const title = text(it.title)
+    const artist = text(it.artist)
+    if (!title && !artist) return '(空项)'
+    return artist ? `${title} - ${artist}` : title
+  })
+  return `AUDIO ${items.length} 首${cp ? `（${cp}）` : ''}：${songs.join('；')}`
 }
 
 /**
@@ -502,15 +519,15 @@ export async function fetchConversations(
     const spoken = answers.find(a => text(a.type) === 'TTS' && answerText(a).trim())
       ?? answers.find(a => text(a.type) === 'LLM' && answerText(a).trim())
     const others = answers.filter(a => text(a.type) !== 'TTS' && text(a.type) !== 'LLM')
-    const othersJson = others.length > 0 ? JSON.stringify(others) : ''
+    const othersText = others.map(describeOtherAnswer).join(' / ')
     return {
       timestampMs: Number(r.time) || 0,
       query: text(r.query),
       answer: spoken ? answerText(spoken) : '',
       answerType: spoken ? text(spoken.type) : '',
-      otherAnswers: othersJson.length > OTHER_ANSWERS_MAX
-        ? `${othersJson.slice(0, OTHER_ANSWERS_MAX)}…`
-        : othersJson,
+      otherAnswers: othersText.length > OTHER_ANSWERS_MAX
+        ? `${othersText.slice(0, OTHER_ANSWERS_MAX)}…`
+        : othersText,
     }
   }).filter(r => r.timestampMs > 0).sort((a, b) => a.timestampMs - b.timestampMs)
 }

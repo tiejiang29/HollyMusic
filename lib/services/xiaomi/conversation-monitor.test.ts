@@ -331,7 +331,7 @@ describe('接管（G3）的进料口', () => {
   })
 })
 
-describe('回答读全（LLM / Audio）：那一格别再误标', () => {
+describe('回答读全（LLM / AUDIO）：那一格别再误标', () => {
   it('小爱走大模型答的也要落到那一行，且不算没答上', async () => {
     h.fetchConversations.mockResolvedValue([rec(5000, '今天天气', '杭州今天晴', '', 'LLM')])
     await ensureConversationMonitor()
@@ -342,9 +342,9 @@ describe('回答读全（LLM / Audio）：那一格别再误标', () => {
     expect(row.looksFailed).toBe(false)
   })
 
-  it('接住点歌口令时那项 Audio 原样落到那一行（它实际端了什么，看得见）', async () => {
-    const audio = '[{"type":"Audio","audio":{"duration":30024}}]'
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '请欣赏稻香试听版', audio)])
+  it('接住点歌口令时那项 AUDIO 原样落到那一行（它实际端了什么，看得见）', async () => {
+    const audio = 'AUDIO 2 首（wangyiyun）：稻香 - 周杰伦；晴天 - 周杰伦'
+    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '好嘞，那我开始播放了', audio)])
     await ensureConversationMonitor()
     await vi.advanceTimersByTimeAsync(50)
     const row = getConversationFeed().rows.find(r => r.timestampMs === 5000)!
@@ -352,8 +352,8 @@ describe('回答读全（LLM / Audio）：那一格别再误标', () => {
     expect(row.looksFailed).toBe(false)
   })
 
-  it('只有 Audio、没有说话文本时也不算没答上（它去放音乐了，不是没听懂）', async () => {
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '', '[{"type":"Audio"}]')])
+  it('只有 AUDIO、没有说话文本时也不算没答上（它去放音乐了，不是没听懂）', async () => {
+    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '', 'AUDIO 1 首（wangyiyun）：稻香 - 周杰伦')])
     await ensureConversationMonitor()
     await vi.advanceTimersByTimeAsync(50)
     const row = getConversationFeed().rows.find(r => r.timestampMs === 5000)!
@@ -361,18 +361,18 @@ describe('回答读全（LLM / Audio）：那一格别再误标', () => {
     expect(row.looksFailed).toBe(false)
   })
 
-  it('Audio 那项也是后补的：同一行就地补上、标记跟着翻，不多出一条', async () => {
+  it('AUDIO 那项也是后补的：同一行就地补上、标记跟着翻，不多出一条', async () => {
     h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '')])
     await ensureConversationMonitor()
     await vi.advanceTimersByTimeAsync(50)
     // 先证明"补之前"确实是标着的，否则后面那条断言等于白过
     expect(getConversationFeed().rows.find(r => r.timestampMs === 5000)!.looksFailed).toBe(true)
 
-    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '', '[{"type":"Audio"}]')])
+    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '', 'AUDIO 1 首（wangyiyun）：稻香 - 周杰伦')])
     await vi.advanceTimersByTimeAsync(2100)
     const rows = getConversationFeed().rows.filter(r => r.timestampMs === 5000)
     expect(rows).toHaveLength(1)
-    expect(rows[0].otherAnswers).toBe('[{"type":"Audio"}]')
+    expect(rows[0].otherAnswers).toBe('AUDIO 1 首（wangyiyun）：稻香 - 周杰伦')
     expect(rows[0].looksFailed).toBe(false)
   })
 })

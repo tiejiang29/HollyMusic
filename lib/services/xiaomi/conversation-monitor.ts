@@ -35,7 +35,7 @@ export interface AskRow {
   answer: string
   /** `answer` 出自哪一类：`TTS` / `LLM` / ''（没有） */
   answerType: string
-  /** 小爱除说话之外还端了什么（`Audio` 那类的原始 JSON，截断）；没有就是 '' */
+  /** 小爱除说话之外还端了什么（`AUDIO` 渲染成曲目列表，不认识的形状原样 JSON）；没有就是 '' */
   otherAnswers: string
   /** 疑似"小爱没答上"（按面板上那份可配的话术片段判） */
   looksFailed: boolean
@@ -140,7 +140,7 @@ function snapshotDevices(targets: Array<{ deviceID: string }>): MonitorState['de
 
 /**
  * 话术片段命中即算"疑似没答上"。空答案也算 —— 小爱光响灯不出话是同一类失败。
- * 但**它另外端了东西（`Audio` 那类）就不算没答上**：那是它接住口令去放音乐了，不是没听懂。
+ * 但**它另外端了东西（`AUDIO` 那类）就不算没答上**：那是它接住口令去放音乐了，不是没听懂。
  * 这一格只用于回显，不参与接管判据（判据只看用户说的那句话）。
  */
 export function looksLikeFailedAnswer(answer: string, hints: string[], hasOtherAnswer = false): boolean {

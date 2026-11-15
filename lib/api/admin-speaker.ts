@@ -155,7 +155,7 @@ export interface SpeakerAskRow {
   answer: string
   /** `answer` 出自哪一类：`TTS` / `LLM` / ''（没有） */
   answerType: string
-  /** 小爱除说话之外还端了什么（`Audio` 那类的原始 JSON，截断）；没有就是 '' */
+  /** 小爱除说话之外还端了什么（`AUDIO` 渲染成曲目列表，不认识的形状原样 JSON）；没有就是 '' */
   otherAnswers: string
   looksFailed: boolean
   /** 启动那一轮读到的历史，不是刚说的话 */

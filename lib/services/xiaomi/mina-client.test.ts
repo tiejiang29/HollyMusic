@@ -410,7 +410,7 @@ describe('fetchConversations（G0.5 对话回显）', () => {
     expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([
       {
         timestampMs: 1000, query: '先说的', answer: '', answerType: '',
-        otherAnswers: '[{"type":"TEXT","text":"不算回答"}]',
+        otherAnswers: '{"type":"TEXT","text":"不算回答"}',
       },
       { timestampMs: 2000, query: '后说的', answer: '好的', answerType: 'TTS', otherAnswers: '' },
     ])
@@ -448,31 +448,67 @@ describe('fetchConversations（G0.5 对话回显）', () => {
     expect(got.map(r => [r.answer, r.answerType])).toEqual([['模型的', 'LLM'], ['说出口的', 'TTS']])
   })
 
-  it('小爱接住点歌口令时多给的那项 Audio 原样留下（字段形状还没拿到真实读数，先看得见再说）', async () => {
-    const audio = { type: 'Audio', audio: { item_id: 'x', duration: 30024, url: 'https://example.invalid/a.mp3' } }
+  it('小爱接住点歌口令时多给的那项 AUDIO 渲染成曲目列表（形状取自 2026-11-15 生产真机）', async () => {
+    // 真机形状：type 是大写 AUDIO，载荷在 audio.audioInfoList，只有 title/artist/cpName，
+    // 没有 duration/url/item_id（参考实现注释里写的 `Audio` 与那些字段都不对）
+    const audio = {
+      bitSet: [0, 1],
+      type: 'AUDIO',
+      audio: {
+        bitSet: [0, 1],
+        audioInfoList: [
+          { bitSet: [0, 1, 1], title: '可不可以（女生版）', artist: '灿烂', cpName: 'wangyiyun' },
+          { bitSet: [0, 1, 1, 1], title: '身骑白马', artist: '徐佳莹', cpName: 'wangyiyun' },
+        ],
+      },
+      illegalContent: '',
+    }
     reply({
       code: 0,
       data: JSON.stringify({
         records: [{
           time: 1000, query: '播放稻香',
-          answers: [{ type: 'TTS', tts: { text: '请欣赏稻香试听版' } }, audio],
+          answers: [{ type: 'TTS', tts: { text: '好嘞，那我开始播放了' } }, audio],
         }],
       }),
     })
     const [row] = await fetchConversations(creds, CONV_DEVICE)
-    expect(row.answer).toBe('请欣赏稻香试听版')
+    expect(row.answer).toBe('好嘞，那我开始播放了')
     expect(row.answerType).toBe('TTS')
-    expect(JSON.parse(row.otherAnswers)).toEqual([audio])
+    expect(row.otherAnswers).toBe('AUDIO 2 首（wangyiyun）：可不可以（女生版） - 灿烂；身骑白马 - 徐佳莹')
+  })
+
+  it('AUDIO 列表里的空项也要看得见（真机第一条就是 title/artist 全空、无 cpName）', async () => {
+    reply({
+      code: 0,
+      data: JSON.stringify({
+        records: [{
+          time: 1000, query: '放个风说',
+          answers: [{
+            type: 'AUDIO',
+            audio: {
+              audioInfoList: [
+                { bitSet: [0, 1] },
+                { title: '喜欢demo', artist: '陈默默', cpName: 'wangyiyun' },
+                { title: '只有歌名' },
+              ],
+            },
+          }],
+        }],
+      }),
+    })
+    const [row] = await fetchConversations(creds, CONV_DEVICE)
+    expect(row.otherAnswers).toBe('AUDIO 3 首（wangyiyun）：(空项)；喜欢demo - 陈默默；只有歌名')
   })
 
   it('非语音项超长要截断并留省略号（静默切一半会被读成完整形状）', async () => {
-    const audio = { type: 'Audio', blob: 'x'.repeat(2000) }
+    const unknown = { type: 'AUDIO', blob: 'x'.repeat(2000) }
     reply({
       code: 0,
-      data: JSON.stringify({ records: [{ time: 1000, query: '甲', answers: [audio] }] }),
+      data: JSON.stringify({ records: [{ time: 1000, query: '甲', answers: [unknown] }] }),
     })
     const [row] = await fetchConversations(creds, CONV_DEVICE)
-    expect(row.otherAnswers.length).toBe(601)
+    expect(row.otherAnswers.length).toBe(1201)
     expect(row.otherAnswers.endsWith('…')).toBe(true)
     expect(row.answer).toBe('')
   })
