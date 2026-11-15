@@ -19,7 +19,7 @@ import { logger } from '@/lib/logger'
 import {
   ensureFreshCredentials, readSpeakerConfig, clampPollSec,
 } from '@/lib/services/xiaomi/token-store'
-import { XiaomiAuthError, fetchConversations } from '@/lib/services/xiaomi/mina-client'
+import { XiaomiAuthError, fetchConversations, type AskRecord } from '@/lib/services/xiaomi/mina-client'
 import { submitAsk } from '@/lib/services/xiaomi/voice-takeover'
 import type { Verdict } from '@/lib/services/xiaomi/voice-takeover'
 
@@ -33,6 +33,10 @@ export interface AskRow {
   receivedAt: number
   query: string
   answer: string
+  /** `answer` 出自哪一类：`TTS` / `LLM` / ''（没有） */
+  answerType: string
+  /** 小爱除说话之外还端了什么（`Audio` 那类的原始 JSON，截断）；没有就是 '' */
+  otherAnswers: string
   /** 疑似"小爱没答上"（按面板上那份可配的话术片段判） */
   looksFailed: boolean
   /** 启动那一轮读到的历史（不是刚说的），G3 的接管不许吃它 */
@@ -134,8 +138,13 @@ function snapshotDevices(targets: Array<{ deviceID: string }>): MonitorState['de
 }
 
 
-/** 话术片段命中即算"疑似没答上"。空答案也算 —— 小爱光响灯不出话是同一类失败 */
-export function looksLikeFailedAnswer(answer: string, hints: string[]): boolean {
+/**
+ * 话术片段命中即算"疑似没答上"。空答案也算 —— 小爱光响灯不出话是同一类失败。
+ * 但**它另外端了东西（`Audio` 那类）就不算没答上**：那是它接住口令去放音乐了，不是没听懂。
+ * 这一格只用于回显，不参与接管判据（判据只看用户说的那句话）。
+ */
+export function looksLikeFailedAnswer(answer: string, hints: string[], hasOtherAnswer = false): boolean {
+  if (hasOtherAnswer) return false
   const text = (answer ?? '').trim()
   if (!text) return true
   return hints.some(h => h && text.includes(h))
@@ -261,7 +270,7 @@ async function tick(): Promise<void> {
  * 把回答算进键会让同一句话在面板上出现两行（先空后有），接管也会收到两次。
  * 现在的做法是同一行**原地补全**（feed 里那个对象就是唯一一份），补上回答时面板那一行跟着变，一行不多。
  */
-function absorb(deviceID: string, deviceName: string, records: { timestampMs: number; query: string; answer: string }[], hints: string[]): AskRow[] {
+function absorb(deviceID: string, deviceName: string, records: AskRecord[], hints: string[]): AskRow[] {
   const b = ensureAccount(deviceID, deviceName, '')
   const now = Date.now()
   const rows: AskRow[] = []
@@ -269,9 +278,11 @@ function absorb(deviceID: string, deviceName: string, records: { timestampMs: nu
     const key = `${r.timestampMs}|${r.query}`
     if (b.seen.has(key)) {
       const prior = rt.feed.find(x => x.deviceID === deviceID && x.timestampMs === r.timestampMs && x.query === r.query)
-      if (prior && !prior.answer && r.answer) {
-        prior.answer = r.answer
-        prior.looksFailed = looksLikeFailedAnswer(r.answer, hints)
+      // 回答和"另外端了什么"都是后补进同一条记录的，两样都得能就地补上
+      if (prior && ((!prior.answer && r.answer) || (!prior.otherAnswers && r.otherAnswers))) {
+        if (r.answer) { prior.answer = r.answer; prior.answerType = r.answerType }
+        if (r.otherAnswers) prior.otherAnswers = r.otherAnswers
+        prior.looksFailed = looksLikeFailedAnswer(prior.answer, hints, !!prior.otherAnswers)
       }
       continue
     }
@@ -288,7 +299,9 @@ function absorb(deviceID: string, deviceName: string, records: { timestampMs: nu
       receivedAt: now,
       query: r.query,
       answer: r.answer,
-      looksFailed: looksLikeFailedAnswer(r.answer, hints),
+      answerType: r.answerType,
+      otherAnswers: r.otherAnswers,
+      looksFailed: looksLikeFailedAnswer(r.answer, hints, !!r.otherAnswers),
       // 首轮那批只当历史看，不算"刚说的话"
       fromBaseline: !b.primed,
     })

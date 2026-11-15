@@ -417,8 +417,27 @@ const CONV_URL = 'https://userprofile.mina.mi.com/device_profile/v2/conversation
 export interface AskRecord {
   timestampMs: number
   query: string
-  /** 小爱的 TTS 回答原文；这条没回答就给 '' */
+  /** 小爱说出口的那句回答原文（TTS 优先，其次 LLM）；这条没回答就给 '' */
   answer: string
+  /** `answer` 出自哪一类：`TTS` / `LLM` / ''（没有） */
+  answerType: string
+  /**
+   * TTS/LLM 之外那些 answer 的原始 JSON（超长截断）。小爱接住点歌口令时会多给一项 `Audio`
+   * （参考实现 migpt-next 的 message.ts 注释："播放音乐时会有 TTS、Audio 两个 Answer"），
+   * 那里面才是它实际端上来的东西。**字段形状还没拿到真实读数**（2026-11-15 去取时库里那张
+   * Mi 票已过期 16 天），所以先原样留着看，不猜字段名。
+   */
+  otherAnswers: string
+}
+
+/** 非语音项留多长：够看清形状，又不至于把面板一格撑爆 */
+const OTHER_ANSWERS_MAX = 600
+
+/** 一项 answer 里的回答文本：TTS 在 `tts.text`、LLM 在 `llm.text`，别的类型没有文本 */
+function answerText(a: Record<string, unknown>): string {
+  const kind = text(a.type)
+  const body = kind === 'TTS' ? a.tts : kind === 'LLM' ? a.llm : undefined
+  return body && typeof body === 'object' ? text((body as Record<string, unknown>).text) : ''
 }
 
 /**
@@ -477,12 +496,21 @@ export async function fetchConversations(
   const records = Array.isArray(data.records) ? data.records as Record<string, unknown>[] : []
   return records.map(r => {
     const answers = Array.isArray(r.answers) ? r.answers as Record<string, unknown>[] : []
-    const tts = answers.find(a => text(a.type) === 'TTS')
-    const answer = tts && tts.tts && typeof tts.tts === 'object' ? text((tts.tts as Record<string, unknown>).text) : ''
+    // TTS 优先（那是真说出口的）；小爱走自己的大模型回答时只有 LLM 那一项，
+    // 漏读它会让面板把"其实答上了"标成"疑似没答上"。
+    // 判"说没说"按 trim：纯空格等于没说，口径要和回显那层的 looksLikeFailedAnswer 一致
+    const spoken = answers.find(a => text(a.type) === 'TTS' && answerText(a).trim())
+      ?? answers.find(a => text(a.type) === 'LLM' && answerText(a).trim())
+    const others = answers.filter(a => text(a.type) !== 'TTS' && text(a.type) !== 'LLM')
+    const othersJson = others.length > 0 ? JSON.stringify(others) : ''
     return {
       timestampMs: Number(r.time) || 0,
       query: text(r.query),
-      answer,
+      answer: spoken ? answerText(spoken) : '',
+      answerType: spoken ? text(spoken.type) : '',
+      otherAnswers: othersJson.length > OTHER_ANSWERS_MAX
+        ? `${othersJson.slice(0, OTHER_ANSWERS_MAX)}…`
+        : othersJson,
     }
   }).filter(r => r.timestampMs > 0).sort((a, b) => a.timestampMs - b.timestampMs)
 }

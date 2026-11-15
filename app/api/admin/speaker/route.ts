@@ -157,6 +157,7 @@ export async function POST(request: NextRequest) {
         deviceID: device.deviceID, deviceName: device.name,
         timestampMs: Date.now(), receivedAt: Date.now(),
         query, answer: typeof body?.answer === 'string' ? body.answer : '',
+        answerType: '', otherAnswers: '',
         looksFailed: false, fromBaseline: false,
       }
       // 执行与否**照面板那套判据走**（含 takeoverEnabled），模拟不是后门：关着就只判不动

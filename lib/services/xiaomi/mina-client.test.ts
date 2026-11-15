@@ -396,26 +396,92 @@ describe('fetchConversations（G0.5 对话回显）', () => {
     expect(cookie).not.toContain('deviceId=' + creds.deviceId)
   })
 
-  it('records 里 time/query/TTS 回答各自归位：非 TTS 不算回答，没时间戳的丢掉，按时间升序返回', async () => {
+  it('records 里 time/query/回答各自归位：TTS/LLM 之外的项原样留下，没时间戳的丢掉，按时间升序返回', async () => {
     reply({
       code: 0,
       data: JSON.stringify({
         records: [
           { time: 2000, query: '后说的', answers: [{ type: 'TTS', tts: { text: '好的' } }] },
-          { time: 1000, query: '先说的', answers: [{ type: 'TEXT', text: '不算这个' }] },
+          { time: 1000, query: '先说的', answers: [{ type: 'TEXT', text: '不算回答' }] },
           { time: 0, query: '没时间戳的丢掉', answers: [] },
         ],
       }),
     })
     expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([
-      { timestampMs: 1000, query: '先说的', answer: '' },
-      { timestampMs: 2000, query: '后说的', answer: '好的' },
+      {
+        timestampMs: 1000, query: '先说的', answer: '', answerType: '',
+        otherAnswers: '[{"type":"TEXT","text":"不算回答"}]',
+      },
+      { timestampMs: 2000, query: '后说的', answer: '好的', answerType: 'TTS', otherAnswers: '' },
     ])
+  })
+
+  it('小爱走自己的大模型回答时只有 LLM 那一项 —— 漏读它面板会把"答上了"标成"没答上"', async () => {
+    reply({
+      code: 0,
+      data: JSON.stringify({
+        records: [{ time: 1000, query: '今天天气', answers: [{ type: 'LLM', llm: { text: '杭州今天晴' } }] }],
+      }),
+    })
+    expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([
+      { timestampMs: 1000, query: '今天天气', answer: '杭州今天晴', answerType: 'LLM', otherAnswers: '' },
+    ])
+  })
+
+  it('TTS 与 LLM 都在时取 TTS（那是真说出口的）；TTS 文本为空则回落 LLM', async () => {
+    reply({
+      code: 0,
+      data: JSON.stringify({
+        records: [
+          {
+            time: 2000, query: '两个都有',
+            answers: [{ type: 'LLM', llm: { text: '模型的' } }, { type: 'TTS', tts: { text: '说出口的' } }],
+          },
+          {
+            time: 1000, query: 'TTS 是空的',
+            answers: [{ type: 'TTS', tts: { text: '  ' } }, { type: 'LLM', llm: { text: '模型的' } }],
+          },
+        ],
+      }),
+    })
+    const got = await fetchConversations(creds, CONV_DEVICE)
+    expect(got.map(r => [r.answer, r.answerType])).toEqual([['模型的', 'LLM'], ['说出口的', 'TTS']])
+  })
+
+  it('小爱接住点歌口令时多给的那项 Audio 原样留下（字段形状还没拿到真实读数，先看得见再说）', async () => {
+    const audio = { type: 'Audio', audio: { item_id: 'x', duration: 30024, url: 'https://example.invalid/a.mp3' } }
+    reply({
+      code: 0,
+      data: JSON.stringify({
+        records: [{
+          time: 1000, query: '播放稻香',
+          answers: [{ type: 'TTS', tts: { text: '请欣赏稻香试听版' } }, audio],
+        }],
+      }),
+    })
+    const [row] = await fetchConversations(creds, CONV_DEVICE)
+    expect(row.answer).toBe('请欣赏稻香试听版')
+    expect(row.answerType).toBe('TTS')
+    expect(JSON.parse(row.otherAnswers)).toEqual([audio])
+  })
+
+  it('非语音项超长要截断并留省略号（静默切一半会被读成完整形状）', async () => {
+    const audio = { type: 'Audio', blob: 'x'.repeat(2000) }
+    reply({
+      code: 0,
+      data: JSON.stringify({ records: [{ time: 1000, query: '甲', answers: [audio] }] }),
+    })
+    const [row] = await fetchConversations(creds, CONV_DEVICE)
+    expect(row.otherAnswers.length).toBe(601)
+    expect(row.otherAnswers.endsWith('…')).toBe(true)
+    expect(row.answer).toBe('')
   })
 
   it('外层 data 是对象时也认（平台两种都发过）', async () => {
     reply({ code: 0, data: { records: [{ time: 5000, query: '甲', answers: [] }] } })
-    expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([{ timestampMs: 5000, query: '甲', answer: '' }])
+    expect(await fetchConversations(creds, CONV_DEVICE)).toEqual([
+      { timestampMs: 5000, query: '甲', answer: '', answerType: '', otherAnswers: '' },
+    ])
   })
 
   it('data 二次 parse 坏了 ⇒ 空列表，不炸（面板要能继续轮下一次）', async () => {

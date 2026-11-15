@@ -51,7 +51,8 @@ const mod = await import('@/lib/services/xiaomi/conversation-monitor')
 const { ensureConversationMonitor, getConversationFeed, stopConversationMonitor, looksLikeFailedAnswer, _resetConversationMonitorForTest } = mod
 
 const DEVICE = { deviceID: 'D1', name: '小爱音箱Play', hardware: 'L05B', model: 'L05B', miotDID: 'm', presence: 'online', managed: true }
-const rec = (timestampMs: number, query: string, answer = '') => ({ timestampMs, query, answer })
+const rec = (timestampMs: number, query: string, answer = '', otherAnswers = '', answerType = answer ? 'TTS' : '') =>
+  ({ timestampMs, query, answer, answerType, otherAnswers })
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -81,6 +82,14 @@ describe('looksLikeFailedAnswer：空回答算失败，命中片段算失败', (
   it('词表是面板那份，不是写死的', () => {
     expect(looksLikeFailedAnswer('没听清你说什么', ['没有找到'])).toBe(false)
     expect(looksLikeFailedAnswer('没听清你说什么', ['没有找到', '没听清'])).toBe(true)
+  })
+
+  it('小爱另外端了东西（去放音乐了）就不算没答上 —— 连空回答也不算', () => {
+    expect(looksLikeFailedAnswer('', ['没有找到'], true)).toBe(false)
+    expect(looksLikeFailedAnswer('抱歉，没有找到你说的歌曲', ['没有找到'], true)).toBe(false)
+    // 没端别的东西时口径一个字不变
+    expect(looksLikeFailedAnswer('', ['没有找到'], false)).toBe(true)
+    expect(looksLikeFailedAnswer('抱歉，没有找到你说的歌曲', ['没有找到'])).toBe(true)
   })
 })
 
@@ -319,6 +328,52 @@ describe('接管（G3）的进料口', () => {
     expect(rows[0].answer).toBe('好的，为你播放稻香')
     // 首轮那批是历史 ⇒ 不许递给接管；这里只验"没多出一条/没重递"
     expect(h.submitAsk).not.toHaveBeenCalled()
+  })
+})
+
+describe('回答读全（LLM / Audio）：那一格别再误标', () => {
+  it('小爱走大模型答的也要落到那一行，且不算没答上', async () => {
+    h.fetchConversations.mockResolvedValue([rec(5000, '今天天气', '杭州今天晴', '', 'LLM')])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    const row = getConversationFeed().rows.find(r => r.timestampMs === 5000)!
+    expect(row.answer).toBe('杭州今天晴')
+    expect(row.answerType).toBe('LLM')
+    expect(row.looksFailed).toBe(false)
+  })
+
+  it('接住点歌口令时那项 Audio 原样落到那一行（它实际端了什么，看得见）', async () => {
+    const audio = '[{"type":"Audio","audio":{"duration":30024}}]'
+    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '请欣赏稻香试听版', audio)])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    const row = getConversationFeed().rows.find(r => r.timestampMs === 5000)!
+    expect(row.otherAnswers).toBe(audio)
+    expect(row.looksFailed).toBe(false)
+  })
+
+  it('只有 Audio、没有说话文本时也不算没答上（它去放音乐了，不是没听懂）', async () => {
+    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '', '[{"type":"Audio"}]')])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    const row = getConversationFeed().rows.find(r => r.timestampMs === 5000)!
+    expect(row.answer).toBe('')
+    expect(row.looksFailed).toBe(false)
+  })
+
+  it('Audio 那项也是后补的：同一行就地补上、标记跟着翻，不多出一条', async () => {
+    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '')])
+    await ensureConversationMonitor()
+    await vi.advanceTimersByTimeAsync(50)
+    // 先证明"补之前"确实是标着的，否则后面那条断言等于白过
+    expect(getConversationFeed().rows.find(r => r.timestampMs === 5000)!.looksFailed).toBe(true)
+
+    h.fetchConversations.mockResolvedValue([rec(5000, '播放稻香', '', '[{"type":"Audio"}]')])
+    await vi.advanceTimersByTimeAsync(2100)
+    const rows = getConversationFeed().rows.filter(r => r.timestampMs === 5000)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].otherAnswers).toBe('[{"type":"Audio"}]')
+    expect(rows[0].looksFailed).toBe(false)
   })
 })
 

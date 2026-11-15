@@ -850,7 +850,12 @@ export function SpeakerPanel() {
                     <th className="px-2 py-1.5 font-medium">你说</th>
                     <th className="px-2 py-1.5 font-medium">小爱答</th>
                     <th className="px-2 py-1.5 font-medium">延迟</th>
-                    <th className="px-2 py-1.5 font-medium">疑似没答上</th>
+                    <th
+                      className="px-2 py-1.5 font-medium"
+                      title="空回答、或命中上面那份话术片段才算。小爱另外端了东西（去放音乐了）不算没答上"
+                    >
+                      疑似没答上
+                    </th>
                     <th className="px-2 py-1.5 font-medium">处置</th>
                   </tr>
                 </thead>
@@ -862,7 +867,20 @@ export function SpeakerPanel() {
                         {r.fromBaseline ? <span className="ml-1 opacity-60">（历史）</span> : null}
                       </td>
                       <td className="px-2 py-1.5">{r.query || '—'}</td>
-                      <td className="px-2 py-1.5">{r.answer || '—'}</td>
+                      <td className="px-2 py-1.5">
+                        <div>
+                          {r.answer || '—'}
+                          {r.answerType === 'LLM' ? <span className="ml-1 opacity-60">（模型答的）</span> : null}
+                        </div>
+                        {r.otherAnswers ? (
+                          <div
+                            className="mt-0.5 max-w-[260px] truncate font-mono text-[10px] text-muted-foreground"
+                            title={r.otherAnswers}
+                          >
+                            还端了 {r.otherAnswers}
+                          </div>
+                        ) : null}
+                      </td>
                       <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px]">
                         {Math.max(0, Math.round((r.receivedAt - r.timestampMs) / 1000))}s
                       </td>
