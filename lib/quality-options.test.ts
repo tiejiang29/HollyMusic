@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveQuality, getAvailableQualities, nextLowerQuality } from './quality-options'
+import { resolveQuality, getAvailableQualities, nextLowerQuality, qualityFromBytes } from './quality-options'
 import type { QualityInfo, QualityType } from './types/music'
 
 /** 快速构造 types 数组 */
@@ -69,5 +69,30 @@ describe('nextLowerQuality - 解码失败降级链路', () => {
 
   it('128k（最低档）→ null，表示无法再降级，交跳歌逻辑', () => {
     expect(nextLowerQuality('128k')).toBeNull()
+  })
+})
+
+describe('qualityFromBytes - 入库按字节承认的档位记账', () => {
+  // 数字全部来自 2026-11-19 对生产库 514 行 quality='flac' 的逐文件魔数普查
+  it('Ogg 容器 + 80kbps（《晚秋》那份 2.0MB/212s 的 Ogg Vorbis）→ 128k，不是 flac', () => {
+    expect(qualityFromBytes({ container: 'ogg', sizeBytes: 2136443, durationSec: 212.0 }))
+      .toBe('128k')
+  })
+
+  it('mp3 容器即使码率够 320k 也不是无损（大海 3.2MB/267s=97kbps 同判 128k）', () => {
+    expect(qualityFromBytes({ container: 'mp3', sizeBytes: 3247865, durationSec: 267.145578231293 }))
+      .toBe('128k')
+    expect(qualityFromBytes({ container: 'mp3', sizeBytes: 9_600_000, durationSec: 240 }))
+      .toBe('320k')
+  })
+
+  it('flac 容器就认无损：本函数不用码率去质疑已经承认的容器', () => {
+    expect(qualityFromBytes({ container: 'flac', sizeBytes: 27_400_000, durationSec: 240 }))
+      .toBe('flac')
+  })
+
+  it('时长或字节缺失 → null（下不了结论，调用方保持旧行为）', () => {
+    expect(qualityFromBytes({ container: 'ogg', sizeBytes: 2136443, durationSec: 0 })).toBeNull()
+    expect(qualityFromBytes({ container: 'flac', sizeBytes: 0, durationSec: 212 })).toBeNull()
   })
 })

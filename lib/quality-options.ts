@@ -65,6 +65,34 @@ export function getSizeOf(types: QualityInfo[] | undefined, q: QualityType): str
   return types?.find(t => t.type === q)?.size
 }
 
+/** 有损档按码率分界：实测 320k 档落在 300~399kbps，128k 档落在 100~199kbps，中间是空的 */
+const LOSSY_320K_MIN_KBPS = 280
+
+/**
+ * 按**实际交付的字节**归档，供入库记账用（请求哪档 ≠ 拿到哪档）。
+ *
+ * 依据是 2026-11-19 对生产库 514 行 `quality='flac'` 的逐文件魔数普查：只有 447 行
+ * 字节真是 `fLaC`，其余 67 行里 64 行是 `ID3`（mp3）、1 行 `OggS`（《晚秋》那份
+ * 80kbps Ogg Vorbis，元数据期望 21.38M 而实收 2.0M）、1 行连已知容器都匹配不上。
+ * 标错档不只是显示难看：去重那步是「库内已有同档或更高就放弃入库」，一份冒充 flac 的
+ * mp3 会**永久挡住**后来真正的 flac，而库优先于在线源且没有自愈路径。
+ *
+ * 判据只用字节，不用元数据声明的 size：kg 那批的 `typesJson` 里只声明了 128k 一档、
+ * size 还是空串，拿它当尺子量不出东西来。
+ *
+ * 返回 null = 下不了结论（时长或字节缺失），调用方保持旧行为。
+ */
+export function qualityFromBytes(input: {
+  container: string | null
+  sizeBytes: number
+  durationSec: number
+}): QualityType | null {
+  if (!(input.durationSec > 0) || !(input.sizeBytes > 0)) return null
+  if (input.container === 'flac') return 'flac'
+  const kbps = (input.sizeBytes * 8) / 1000 / input.durationSec
+  return kbps >= LOSSY_320K_MIN_KBPS ? '320k' : '128k'
+}
+
 /**
  * 返回比给定音质低一档的音质（用于解码失败时降级重试）。
  * 已是最低档（128k）时返回 null。QUALITY_ORDER 已是高→低，故降级 = index + 1。

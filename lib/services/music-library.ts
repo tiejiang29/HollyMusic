@@ -26,7 +26,7 @@ import { isIncompleteTrial, parseDurationFromFile } from '@/lib/server/audio-int
 import { judgeUpstreamPayload, readHeadBytes, extFromContainer, mimeFromAudioExt } from '@/lib/server/audio-sniff'
 import { getAudioServeConfig, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, removeAudioCacheFiles, extFromContentType } from '@/lib/audio-serve'
 import { sanitizeFilename, extForQuality } from '@/lib/server/download-utils'
-import { QUALITY_ORDER, getAvailableQualities } from '@/lib/quality-options'
+import { QUALITY_ORDER, getAvailableQualities, qualityFromBytes } from '@/lib/quality-options'
 import type { QualityInfo } from '@/lib/types/music'
 import type { MusicInfo, QualityType } from '@/lib/types/music'
 import { parseIntervalToSeconds } from '@/lib/types/player'
@@ -171,6 +171,22 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     // 探测失败时才回退 interval，且拒绝明显脏的小值（<30s 多为元数据错误）
     const durationSec = probedSec ?? (intervalSec >= 30 ? intervalSec : 0)
 
+    // 记账档位以字节为准，但**只在请求了无损时下判据**，且**永不低于请求档以上**：
+    // 拿到 flac 字节却只请求了 320k 就记 320k（不虚报），拿到有损字节却请求了 flac
+    // 就降级记（那才是今天的病）。有损档之间不动——320k/128k 没有实测的冒充病例，
+    // 而 VBR 的码率天然会漂，照码率改判会把正常文件越记越低、招来重复下载。
+    const askedLossless = quality === 'flac' || quality === 'flac24bit'
+    const delivered = askedLossless
+      ? qualityFromBytes({ container: sniff.container, sizeBytes: srcStat.size, durationSec })
+      : null
+    const booked = !delivered || qualityRank(delivered) < qualityRank(quality) ? quality : delivered
+    if (booked !== quality) {
+      logger.warn(
+        `[music-library] 请求 ${quality} 但字节只够 ${booked}（容器 ${sniff.container ?? '未识别'}、` +
+          `${Math.round((srcStat.size * 8) / 1000 / (durationSec || 1))}kbps），按 ${booked} 记账: ${musicInfo.name}`
+      )
+    }
+
     const dedupeKey = buildDedupeKey(musicInfo.name, musicInfo.singer)
 
     // 去重：同 key 候选中时长容差 ±4s 视为同一录音
@@ -178,7 +194,7 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     const sameRecording = candidates.filter(row => Math.abs(row.durationSec - durationSec) <= 4)
 
     // 已有同录音的更高或同档音质 → 放弃入库（新文件留在 cache/ 当缓存）
-    if (sameRecording.some(row => qualityRank(row.quality) <= qualityRank(quality))) {
+    if (sameRecording.some(row => qualityRank(row.quality) <= qualityRank(booked))) {
       return { status: 'skip-lower', message: '库内已有更高音质' }
     }
 
@@ -207,7 +223,7 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     // 容器。视频可承载的容器（mp4/asf 等）不在容器表里，仍按记录 contentType 定名——
     // 源偶尔把 MV/MP4 当音频链路返回，按请求音质定名会得到假的 .flac。
     const ext =
-      extFromContainer(sniff.container) || extFromContentType(record.contentType) || extForQuality(quality)
+      extFromContainer(sniff.container) || extFromContentType(record.contentType) || extForQuality(booked)
     let destName = sanitizeFilename(`${normalizeText(musicInfo.singer)} - ${normalizeText(musicInfo.name)}${ext}`)
     // 同名冲突：同录音（将替换）外，追加序号
     const replacingIds = sameRecording.map(r => r.id)
@@ -246,7 +262,7 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
         name: normalizeText(musicInfo.name) || '未知歌曲',
         singer: normalizeText(musicInfo.singer) || '未知歌手',
         album: normalizeText(musicInfo.albumName) || '',
-        quality,
+        quality: booked,
         filePath: destPath,
         fileSize: srcStat.size,
         durationSec,
@@ -258,7 +274,7 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     await removeAudioCacheFiles(srcPath).catch(() => {})
 
     libraryFull = false
-    logger.info(`[music-library] 入库: ${destName} (${quality}, ${(srcStat.size / 1024 / 1024).toFixed(1)}MB)`)
+    logger.info(`[music-library] 入库: ${destName} (${booked}, ${(srcStat.size / 1024 / 1024).toFixed(1)}MB)`)
     return { status: 'ingested' }
   } catch (e) {
     logger.error('[music-library] ingest 失败:', e)
