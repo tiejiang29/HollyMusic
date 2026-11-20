@@ -829,3 +829,102 @@ describe('AudioServe.serve() 占位载荷指纹与换源', () => {
     expect(sourceHealth.view('坏源A', 'tx')?.badKinds['byte:fake']).toBeUndefined()
   })
 })
+
+// ===========================================================================
+// 占位载荷 × 真实网络分块（2026-11-20 生产：柳云API 对每首歌回同一条 20s TTS）
+//
+// 上面那组夹具是"整份 40KB 单块送达"，而真实 HTTPS 首块只有一个 TLS 记录那么大
+// （生产容器内实测同一地址三次都是 16147 字节）。首块闸门要求单块 ≥32KiB 才算得出
+// 指纹，于是它在生产里恒不生效：4 次占位载荷全部交付到客户端，只在完成阶段阻止落库。
+// 这组按真实分块复现，钉住"第三首必须在字节发出前换源"与"死源要能进冷却"。
+// ===========================================================================
+
+/** 按固定块大小交付，模拟真实网络分块（默认 16147 = 生产实测首块字节数） */
+function payloadResponseChunked(data: Buffer, ct: string, chunkBytes = 16_147): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      for (let off = 0; off < data.length; off += chunkBytes) {
+        c.enqueue(new Uint8Array(data.subarray(off, Math.min(off + chunkBytes, data.length))))
+      }
+      c.close()
+    },
+  })
+  return new Response(body, {
+    status: 200,
+    headers: { 'content-type': ct, 'content-length': String(data.length) },
+  })
+}
+
+describe('AudioServe.serve() 占位载荷 × 真实分块', () => {
+  // 118,995 字节 = 生产那 5 份提示音的实际大小（sha256 全等）
+  const NOTICE = Buffer.concat([Buffer.from('ID3\x03\x00', 'latin1'), Buffer.alloc(118_990, 0x42)])
+  const REAL = Buffer.concat([Buffer.from('ID3\x03\x00', 'latin1'), Buffer.alloc(199_990, 0x77)])
+
+  function wireNet() {
+    const badUrl = 'https://tts.example/notice.mp3'
+    const fetchUrls: string[] = []
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      fetchUrls.push(url)
+      return url === badUrl
+        ? payloadResponseChunked(NOTICE, 'audio/mpeg')
+        : payloadResponseChunked(REAL, 'audio/mpeg')
+    }) as unknown as typeof fetch
+
+    const excludeHistory: string[][] = []
+    const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders => {
+      excludeHistory.push([...excludeProviders])
+      return excludeProviders.has('坏源A')
+        ? { url: 'https://good.example/song.mp3', provider: '好源B' }
+        : { url: badUrl, provider: '坏源A' }
+    }
+    return { fetchUrls, excludeHistory, upstreamUrlResolver }
+  }
+
+  const serveNet = (w: ReturnType<typeof wireNet>, cacheKey: string) => audioServe.serve({
+    cacheKey,
+    upstreamUrlResolver: w.upstreamUrlResolver,
+    rangeHeader: null,
+    isHead: false,
+    intervalSec: 285,
+  })
+
+  it('首块只有 16KiB 时，第三首仍须在字节发出前换源（不是发完才判）', async () => {
+    checkTrialAudioMock.mockResolvedValue({ trial: true, actualSec: 20 })
+
+    // 第 1 首：无历史，放行并登记（《冬天的故事》那一格）
+    const w1 = wireNet()
+    const r1 = await serveNet(w1, 'tx:net1:flac')
+    expect(Buffer.from(await r1.arrayBuffer()).equals(NOTICE)).toBe(true)
+    await vi.waitFor(() => expect(fingerprintStats()).toEqual({ entries: 1, placeholders: 0 }))
+
+    // 第 2 首：完成阶段定性为占位。这一首按设计仍会漏出去（没有历史就无从判定）
+    const w2 = wireNet()
+    const r2 = await serveNet(w2, 'tx:net2:flac')
+    expect(Buffer.from(await r2.arrayBuffer()).equals(NOTICE)).toBe(true)
+    await vi.waitFor(() => expect(fingerprintStats()).toEqual({ entries: 1, placeholders: 1 }))
+
+    // 第 3 首：首块阶段就该识破 ⇒ 排除坏源A、换好源B，客户端拿到真字节
+    const w3 = wireNet()
+    const r3 = await serveNet(w3, 'tx:net3:flac')
+    expect(Buffer.from(await r3.arrayBuffer()).equals(REAL)).toBe(true)
+    expect(w3.fetchUrls).toEqual(['https://tts.example/notice.mp3', 'https://good.example/song.mp3'])
+    expect(w3.excludeHistory[1]).toContain('坏源A')
+  })
+
+  it('占位载荷不许先领一次"字节成功"：连续两首之后该源进冷却', async () => {
+    checkTrialAudioMock.mockResolvedValue({ trial: true, actualSec: 20 })
+
+    for (const key of ['tx:cool1:flac', 'tx:cool2:flac', 'tx:cool3:flac']) {
+      const w = wireNet()
+      const r = await serveNet(w, key)
+      await r.arrayBuffer()
+    }
+
+    // 第 1 首是试听（好样本），第 2、3 首各一条 fake ⇒ 连续坏达到 2 ⇒ 冷却
+    await vi.waitFor(() => {
+      expect(sourceHealth.view('坏源A', 'tx')?.badKinds['byte:fake']).toBe(2)
+    })
+    expect(sourceHealth.coolStatus('坏源A', 'tx').cooling).toBe(true)
+  })
+})

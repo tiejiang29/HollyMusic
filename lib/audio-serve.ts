@@ -29,7 +29,7 @@ import { logger } from '@/lib/logger'
 import { checkTrialAudio } from '@/lib/server/audio-integrity'
 import { judgeUpstreamPayload, readHeadBytes, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
 import { sourceHealth, isLikelyLocalNetworkFault, type ByteOutcome } from '@/lib/server/source-health'
-import { createHeadAccumulator, headFingerprint, matchKnownPlaceholder, observeCompleted } from '@/lib/server/audio-fingerprint'
+import { createHeadAccumulator, matchKnownPlaceholder, observeCompleted } from '@/lib/server/audio-fingerprint'
 import {
   getLyricSidecarPath,
   getTranslationLyricSidecarPath,
@@ -529,7 +529,7 @@ class AudioServe {
       stallTimer = opened.stallTimer
       // stall 超时覆盖 fetch header + body 全程：每次有新数据进展就续期
       const refreshTimer = () => stallTimer?.refresh()
-      const { reader, firstChunk, size } = opened
+      const { reader, preReadChunks, size } = opened
 
       entry.size = size
       entry.paths = resolvePaths(cacheKey, entry.contentType)
@@ -559,8 +559,8 @@ class AudioServe {
         if (!reader) throw new Error('upstream body empty')
 
         try {
-          // 首块已在 openUpstream 中读出（用于嗅探），先落盘再继续读剩余块
-          if (firstChunk) await writeChunk(firstChunk)
+          // 首块已在 openUpstream 中读出（用于嗅探与占位指纹），先落盘再继续读剩余块
+          for (const chunk of preReadChunks) await writeChunk(chunk)
           for (;;) {
             const { done, value } = await reader.read()
             if (done) break
@@ -621,6 +621,15 @@ class AudioServe {
         logger.debug(
           `[AudioServe] 与 ${fingerprint.otherSong} 是同一份字节但时长相符，按合法重复处理: ${cacheKey}`
         )
+      }
+      // 字节段的"成功"到这里才记（原先在 openUpstream 拿到合法容器就记）：占位载荷也是
+      // 合法容器，先领一次好样本会把连续坏清零，死源永远攒不满冷却阈值。试听片段仍算
+      // 好样本——源确实给出了合法音频，只是不完整，那是另一档结论。
+      if (
+        fingerprint.verdict !== 'placeholder' &&
+        entry.payloadVerdict === 'audio' && entry.provider && entry.platform
+      ) {
+        sourceHealth.recordByte(entry.provider, entry.platform, 'audio', opened.byteReason)
       }
       if (fingerprint.verdict === 'placeholder') {
         // 记成 `fake`：这是"字节合法但内容是占位符"的唯一坏证据，要让它进冷却
@@ -716,7 +725,10 @@ class AudioServe {
     upstreamUrlResolver: UpstreamUrlResolver,
   ): Promise<{
     reader: ReadableStreamDefaultReader<Uint8Array> | null
-    firstChunk: Uint8Array | null
+    /** 嗅探与指纹阶段已预读的块（首块往往只有一个 TLS 记录，不够 32KiB），下载器须原样写盘 */
+    preReadChunks: Uint8Array[]
+    /** 容器判定理由：字节段的"成功"记账挪到完成阶段，理由要带过去 */
+    byteReason: string
     size: number
     stallTimer: NodeJS.Timeout
   }> {
@@ -825,11 +837,27 @@ class AudioServe {
         throw new Error(`上游返回非音频内容：${judgment.reason}`)
       }
 
+      // 指纹要 32KiB 头部，而真实 HTTPS 首块只有一个 TLS 记录那么大（生产实测同一地址
+      // 三次都是 16147 字节）⇒ 只拿首块算哈希会恒为 null，这道闸门就永远不通电。
+      // 这里继续预读到攒满 32KiB 或上游结束，预读到的块随返回交给下载器原样写盘。
+      // 代价实测 0~154ms（4 次，中位约 43ms），远小于换源重取一次。
+      const preReadChunks: Uint8Array[] = firstChunk ? [firstChunk] : []
+      const preHead = createHeadAccumulator()
+      if (firstChunk) preHead.note(firstChunk)
+      while (preHead.hash() === null) {
+        const more = await reader.read()
+        if (more.done) break
+        if (!more.value || more.value.length === 0) continue
+        stallTimer.refresh()
+        preReadChunks.push(more.value)
+        preHead.note(more.value)
+      }
+
       // 占位载荷：同一份头部字节 + 同一声明大小已经发给过**别的歌**。到这里字节已经是
       // 合法音频，所以容器嗅探放得过、只有跨歌曲指纹能识破（成因见 audio-fingerprint 头注释）。
       // 拦在这里是因为此时 entry.size 还没置位、客户端响应尚未构造，换源对调用方无感知。
       {
-        const hit = matchKnownPlaceholder({ cacheKey, size, headHash: headFingerprint(firstChunk) })
+        const hit = matchKnownPlaceholder({ cacheKey, size, headHash: preHead.hash() })
         if (hit) {
           await reader.cancel().catch(() => {})
           clearTimeout(stallTimer)
@@ -867,8 +895,10 @@ class AudioServe {
       }
       entry.contentType = byteMime ?? contentType
       entry.payloadVerdict = judgment.verdict === 'audio' ? 'audio' : 'unverified'
-      if (judgment.verdict === 'audio') recordByte('audio', judgment.reason)
-      return { reader, firstChunk, size, stallTimer }
+      // 字节段的"成功"不在这里记：占位载荷是合法容器，先领一次好样本会把连续坏清零
+      // （source-health 一条好样本即清零），死源永远攒不满冷却阈值、下一首照样选它。
+      // 挪到完成阶段，与试听/指纹判据一起下结论。
+      return { reader, preReadChunks, byteReason: judgment.reason, size, stallTimer }
     }
   }
 
