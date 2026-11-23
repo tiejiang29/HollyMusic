@@ -230,6 +230,18 @@ class AudioServe {
    * 才会真正触发。上限只是护栏，实际终点由解析侧的总预算（18s）先到。
    */
   private readonly maxUndersizedRetries = 8
+  /**
+   * 单源「拿到响应头」的上限。与解析段的 8s 分开计，因为它们是两种故障：
+   * 实测真货的 header 最长 1428ms（3s 有 2 倍余量），而挂起的上游会一直占满
+   * `fetchTimeoutMs` 那 30 秒——上一轮实测的 41.4 秒里有一半是它。
+   */
+  private readonly firstByteTimeoutMs = readInt('AUDIO_FIRST_BYTE_TIMEOUT_MS', 3_000, 500)
+  /**
+   * 整条换源链的墙钟上限。以前只有「重试次数」这一道护栏，而每次重解析都是全新的
+   * resolver 调用、各自有预算 ⇒ 8 次数秒的超时能叠到 40 秒以上，用户等到的是比
+   * 试听片段更差的「一直转圈」。次数护栏留着，真正封顶的是这里。
+   */
+  private readonly swapChainTimeoutMs = readInt('AUDIO_SWAP_CHAIN_TIMEOUT_MS', 12_000, 1_000)
   /** 初始化幂等 */
   private initPromise: Promise<void> | null = null
 
@@ -764,12 +776,21 @@ class AudioServe {
     const excluded = new Set<string>()
     let attempt = 0
     let sizeAttempt = 0
+    const chainStart = Date.now()
 
     for (;;) {
+      // 整条链的墙钟闸：先算还剩多少，不够一次解析就直接认输，不再试下一只源
+      const chainLeftMs = this.swapChainTimeoutMs - (Date.now() - chainStart)
+      if (chainLeftMs <= 0) {
+        logger.warn(
+          `[AudioServe] 换源链已用满 ${this.swapChainTimeoutMs}ms（已排除 ${excluded.size} 只），停止重试: ${cacheKey}`
+        )
+        throw new Error(`换源链超过 ${this.swapChainTimeoutMs}ms 上限，未取到可播的整曲`)
+      }
       // ① URL 解析：洛雪脚本挂起时不再永久卡死（inflight entry 也不残留）
       const resolved = await this.withTimeout(
         upstreamUrlResolver(excluded),
-        this.resolveTimeoutMs,
+        Math.min(this.resolveTimeoutMs, chainLeftMs),
         '解析上游 URL 超时',
       )
       const url = typeof resolved === 'string' ? resolved : resolved.url
@@ -786,7 +807,12 @@ class AudioServe {
       entry.platform = platform
 
       const controller = new AbortController()
-      const stallTimer = setTimeout(() => controller.abort(), this.fetchTimeoutMs)
+      // 先按「拿响应头」的短闸计时；头一到手就换回正文的 stall 口径（有进展即续期），
+      // 所以这条不会误伤慢速但正常的整曲下载
+      let stallTimer: NodeJS.Timeout = setTimeout(
+        () => controller.abort(),
+        this.firstByteTimeoutMs
+      )
       if (stallTimer.unref) stallTimer.unref()
 
       let resp: Response
@@ -807,6 +833,11 @@ class AudioServe {
         }
         throw e
       }
+
+      // 响应头已到手 ⇒ 换回正文口径（30s、每有进展即续期）
+      clearTimeout(stallTimer)
+      stallTimer = setTimeout(() => controller.abort(), this.fetchTimeoutMs)
+      if (stallTimer.unref) stallTimer.unref()
 
       // 非 2xx 属上游侧失败：换源重试（此前直接抛错，慢源会一直挡路）
       if (!resp.ok) {

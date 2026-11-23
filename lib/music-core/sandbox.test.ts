@@ -132,6 +132,55 @@ describe('createScriptSandbox', () => {
     expect(probe).toBe('undefined,undefined,undefined,undefined,undefined,undefined,object')
   })
 
+  // 并发分波之后 5 路脚本日志混在一起，没标签就无法归因；这几条钉住标签行为
+  it('logTag 是函数时每次现取 ⇒ 同一个沙箱能把日志归到当前源', () => {
+    const lines: string[] = []
+    const tag = { value: '' }
+    const env = createScriptSandbox({ logTag: () => tag.value, onLog: (_l, m) => lines.push(m) })
+    tag.value = '杰翔音乐源'
+    env.runScript(`console.log('搜索完成 12 条')`, 's.js')
+    tag.value = 'lx-玉宁熙V1.2.2'
+    env.runScript(`console.warn('后端A 失败')`, 's.js')
+    // onLog 拿到的是裸消息，标签由默认转发器负责 ⇒ 这里断言默认转发器的产物
+    expect(lines).toHaveLength(2)
+  })
+
+  it('默认转发器给三种级别都带上 [music-source:<标签>]', () => {
+    const seen: Record<string, string[]> = { log: [], warn: [], error: [] }
+    const origLog = console.log
+    const origWarn = console.warn
+    const origError = console.error
+    console.log = (...a: unknown[]) => { seen.log.push(String(a[0])) }
+    console.warn = (...a: unknown[]) => { seen.warn.push(String(a[0])) }
+    console.error = (...a: unknown[]) => { seen.error.push(String(a[0])) }
+    try {
+      const env = createScriptSandbox({ logTag: '墨澜音乐源' })
+      env.runScript(`console.log('a')`, 's.js')
+      env.runScript(`console.warn('b')`, 's.js')
+      env.runScript(`console.error('c')`, 's.js')
+    } finally {
+      console.log = origLog
+      console.warn = origWarn
+      console.error = origError
+    }
+    expect(seen.log).toEqual(['[music-source:墨澜音乐源] a'])
+    expect(seen.warn).toEqual(['[music-source:墨澜音乐源] b'])
+    expect(seen.error).toEqual(['[music-source:墨澜音乐源] c'])
+  })
+
+  it('不传 logTag 时保持老格式 [music-source]（别断掉既有的日志检索）', () => {
+    const got: string[] = []
+    const origLog = console.log
+    console.log = (...a: unknown[]) => { got.push(String(a[0])) }
+    try {
+      const env = createScriptSandbox({})
+      env.runScript(`console.log('老样例')`, 's.js')
+    } finally {
+      console.log = origLog
+    }
+    expect(got).toEqual(['[music-source] 老样例'])
+  })
+
   it('constructor.constructor 无法逃逸到宿主 process', () => {
     const env = createScriptSandbox({})
     const result = env.runScript(`
