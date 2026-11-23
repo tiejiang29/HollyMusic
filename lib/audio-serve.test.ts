@@ -48,7 +48,16 @@ vi.mock('@/lib/logger', () => ({
 const { checkTrialAudioMock } = vi.hoisted(() => ({
   checkTrialAudioMock: vi.fn(async () => ({ trial: false, actualSec: null as number | null })),
 }))
-vi.mock('@/lib/server/audio-integrity', () => ({ checkTrialAudio: checkTrialAudioMock }))
+// Content-Length 早判要跑真实现，否则新分支在测试里是 undefined、永远不亮
+vi.mock('@/lib/server/audio-integrity', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/server/audio-integrity')>(
+    '@/lib/server/audio-integrity'
+  )
+  return {
+    checkTrialAudio: checkTrialAudioMock,
+    isUndersizedByContentLength: actual.isUndersizedByContentLength,
+  }
+})
 
 const { audioServe, _resetAudioServeConfigForTest } = await import('@/lib/audio-serve')
 const { prisma } = await import('@/lib/db')
@@ -485,6 +494,112 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     })
 
     expect(resp.status).toBe(502)
+    expect(prisma.audioCache.upsert).not.toHaveBeenCalled()
+  })
+
+  // --- Content-Length 早判试听片段（2026-11-23 新增）---------------------------
+  // 这类载荷 HTTP 200、容器合法（能过嗅探），只有"字节数 vs 声明档位"能识破。
+  // 夹具：声明最小档 1,000,000B ⇒ 阈值 350,000B；片段 100,000B（比值 0.10），
+  // 合法整曲降档 630,000B（比值 0.63，对齐生产实测的 0.628 那个最近锚点）。
+  const CLIP = Buffer.concat([Buffer.from('ID3\x03\x00'), Buffer.alloc(99_996, 0x42)])
+  const FULL_LOW = Buffer.concat([Buffer.from('ID3\x03\x00'), Buffer.alloc(629_996, 0x42)])
+
+  it('Content-Length 短到不可能是整曲 → 记 fake、排除该源，交付第二个源的完整文件', async () => {
+    const fetchUrls: string[] = []
+    const seenExcludes: string[][] = []
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      fetchUrls.push(url)
+      return url.includes('clip.example')
+        ? payloadResponse(CLIP, 'audio/mpeg')
+        : payloadResponse(FULL_LOW, 'audio/mpeg')
+    }) as unknown as typeof fetch
+
+    const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders => {
+      seenExcludes.push([...excludeProviders])
+      return excludeProviders.has('片段源A')
+        ? { url: 'https://good.example/full.mp3', provider: '好源B' }
+        : { url: 'https://clip.example/clip.mp3', provider: '片段源A' }
+    }
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:early1:flac',
+      upstreamUrlResolver,
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 200,
+      minDeclaredBytes: 1_000_000,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(fetchUrls).toHaveLength(2)
+    expect(seenExcludes[1]).toContain('片段源A')
+    // 片段一个字节都没下载，交付的是第二个源的完整字节
+    const body = await resp.arrayBuffer()
+    expect(body.byteLength).toBe(FULL_LOW.length)
+    expect(Buffer.from(body).equals(FULL_LOW)).toBe(true)
+    expect(sourceHealth.view('片段源A', 'tx')?.badKinds['byte:fake']).toBe(1)
+    expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1)
+  })
+
+  it('反向对照：不传 minDeclaredBytes 时同一份片段照旧直接交付（证明上条是本刀带来的改变）', async () => {
+    const fetchSpy = vi.fn(async () => payloadResponse(CLIP, 'audio/mpeg'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:early2:flac',
+      upstreamUrlResolver: async () => ({ url: 'https://clip.example/c2.mp3', provider: '片段源B' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 200,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const body = await resp.arrayBuffer()
+    expect(body.byteLength).toBe(CLIP.length)
+    // 没有基准可比 ⇒ 不判坏，这个源照旧领一次好样本
+    expect(sourceHealth.view('片段源B', 'tx')?.byteOk).toBe(1)
+    expect(sourceHealth.view('片段源B', 'tx')?.badKinds['byte:fake']).toBeUndefined()
+  })
+
+  it('合法降档（比值 0.63）不许被误杀：整曲低音质照常被交付', async () => {
+    globalThis.fetch = vi.fn(async () => payloadResponse(FULL_LOW, 'audio/mpeg')) as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:early3:flac',
+      upstreamUrlResolver: async () => ({ url: 'https://low.example/full.mp3', provider: '降档源' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 200,
+      minDeclaredBytes: 1_000_000,
+    })
+
+    expect(resp.status).toBe(200)
+    const body = await resp.arrayBuffer()
+    expect(body.byteLength).toBe(FULL_LOW.length)
+    expect(sourceHealth.view('降档源', 'tx')?.byteOk).toBe(1)
+  })
+
+  it('每只源都给片段 → 试满 1+8 次后明确失败（护栏由 maxUndersizedRetries 定），且不落缓存', async () => {
+    const fetchSpy = vi.fn(async () => payloadResponse(CLIP, 'audio/mpeg'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+    let seq = 0
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:early4:flac',
+      upstreamUrlResolver: async () => ({
+        url: `https://clip.example/c4-${seq}.mp3`,
+        provider: `片段源${++seq}`,
+      }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 200,
+      minDeclaredBytes: 1_000_000,
+    })
+
+    expect(resp.status).toBe(502)
+    expect(fetchSpy).toHaveBeenCalledTimes(9)
     expect(prisma.audioCache.upsert).not.toHaveBeenCalled()
   })
 })
