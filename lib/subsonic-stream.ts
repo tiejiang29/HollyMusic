@@ -9,6 +9,7 @@ import { logger } from '@/lib/logger'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import type { MusicInfo, QualityType } from '@/lib/types/music'
 import { parseIntervalToSeconds } from '@/lib/types/player'
+import { minDeclaredBytes as computeMinDeclaredBytes } from '@/lib/server/audio-integrity'
 
 // ============================================================================
 // QUALITY SELECTION —— selectQuality 实现已迁至 lib/subsonic-media.ts（与元数据端点共用同一条回退链）
@@ -98,6 +99,7 @@ export async function handleStream(request: NextRequest): Promise<Response> {
       rangeHeader,
       isHead: request.method === 'HEAD',
       intervalSec: parseIntervalToSeconds((musicInfo as MusicInfo).interval),
+      minDeclaredBytes: computeMinDeclaredBytes((musicInfo as MusicInfo).types?.map(t => t.size)),
       onCached: () => cacheNativeLyricForMusic(musicInfo as MusicInfo),
     })
 

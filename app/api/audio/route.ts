@@ -31,6 +31,7 @@ import { getAuthState } from '@/lib/services/user-context'
 import { verifyShareAudioToken } from '@/lib/services/auth'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { serveFromLibrary, ingestFromCache } from '@/lib/services/music-library'
+import { minDeclaredBytes as computeMinDeclaredBytes } from '@/lib/server/audio-integrity'
 
 function buildErrorResponse(status: number, code: string, message: string): Response {
   return new Response(
@@ -120,6 +121,8 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
       rangeHeader,
       isHead,
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
+      // 试听片段早判的对照基准：这首歌各档位声明的最小字节数（认不出就不校验）
+      minDeclaredBytes: computeMinDeclaredBytes(musicInfo.types?.map(t => t.size)),
       // 完成后：歌词预缓存 + 边听边下入库（music-library 内部处理去重/配额）
       onCached: () => Promise.all([
         cacheNativeLyricForMusic(musicInfo),

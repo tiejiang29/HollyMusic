@@ -26,7 +26,7 @@ import path from 'path'
 import { EventEmitter } from 'events'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
-import { checkTrialAudio } from '@/lib/server/audio-integrity'
+import { checkTrialAudio, isUndersizedByContentLength } from '@/lib/server/audio-integrity'
 import { judgeUpstreamPayload, readHeadBytes, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
 import { sourceHealth, isLikelyLocalNetworkFault, type ByteOutcome } from '@/lib/server/source-health'
 import { createHeadAccumulator, matchKnownPlaceholder, observeCompleted } from '@/lib/server/audio-fingerprint'
@@ -223,6 +223,13 @@ class AudioServe {
    * 上限 2 次，避免坏源连锁时把客户端等待时间拖长。
    */
   private readonly maxFakeRetries = readInt('AUDIO_FAKE_URL_RETRIES', 2, 0)
+  /**
+   * 「Content-Length 短到不可能是完整曲子」这一类的重试上限（不含首次）。
+   * 比 HTML 假地址那类要宽得多，是刻意的：这类载荷每次解析都**算成功**，所以只有
+   * 把同平台候选逐个排除干净，`getMusicUrlWithProvider` 里那条"同平台全失败才换平台"
+   * 才会真正触发。上限只是护栏，实际终点由解析侧的总预算（18s）先到。
+   */
+  private readonly maxUndersizedRetries = 8
   /** 初始化幂等 */
   private initPromise: Promise<void> | null = null
 
@@ -268,6 +275,9 @@ class AudioServe {
    * @param opts.intervalSec  期望时长（秒，来自歌曲元数据 interval）。用于试听
    *                          片段判定：下载完成后实际时长相差太远则不落库
    *                          （详见 lib/server/audio-integrity.ts）
+   * @param opts.minDeclaredBytes  这首歌各声明档位的最小字节数（由调用方从
+   *                          musicInfo.types 算）。用于在**拿到 Content-Length 时**
+   *                          就识破试听片段，不必等整段下完；null/缺省 = 不校验。
    */
   async serve(opts: {
     cacheKey: string
@@ -275,6 +285,7 @@ class AudioServe {
     rangeHeader: string | null
     isHead: boolean
     intervalSec: number
+    minDeclaredBytes?: number | null
     /** 音频完整写入缓存后触发的后台任务；失败不影响音频交付。 */
     onCached?: () => Promise<void>
     /**
@@ -317,7 +328,8 @@ class AudioServe {
         opts.cacheKey,
         opts.upstreamUrlResolver,
         opts.intervalSec,
-        opts.onCached
+        opts.onCached,
+        opts.minDeclaredBytes ?? null
       )
     }
 
@@ -482,7 +494,8 @@ class AudioServe {
     cacheKey: string,
     upstreamUrlResolver: UpstreamUrlResolver,
     intervalSec: number,
-    onCached?: () => Promise<void>
+    onCached?: () => Promise<void>,
+    minDeclaredBytes: number | null = null
   ): Promise<InflightEntry> {
     // 同步占位，保证并发请求只创建一个 entry（多用户去重核心）
     const entry: InflightEntry = {
@@ -500,7 +513,14 @@ class AudioServe {
     this.inflight.set(cacheKey, entry)
 
     // 后台异步执行（不阻塞调用方）
-    void this.runDownload(cacheKey, entry, upstreamUrlResolver, intervalSec, onCached).catch(e => {
+    void this.runDownload(
+      cacheKey,
+      entry,
+      upstreamUrlResolver,
+      intervalSec,
+      minDeclaredBytes,
+      onCached
+    ).catch(e => {
       // 防御纵深：runDownload 内部已 catch，正常不会到这里；
       // 但 emit('error') 在无监听者时会同步抛出（EventEmitter 语义），
       // 避免演变为 unhandled rejection 崩溃进程
@@ -518,6 +538,7 @@ class AudioServe {
     entry: InflightEntry,
     upstreamUrlResolver: UpstreamUrlResolver,
     intervalSec: number,
+    minDeclaredBytes: number | null = null,
     onCached?: () => Promise<void>
   ): Promise<void> {
     let stallTimer: NodeJS.Timeout | null = null
@@ -525,7 +546,13 @@ class AudioServe {
       // ① 打开上游：解析 URL → fetch → 读首块 → 嗅探载荷真伪。
       //    命中假地址（HTML/JSON/垃圾字节）时排除该音源重新解析——这一步
       //    发生在 entry.size 置位之前，客户端响应尚未构造，换源对其无感知。
-      const opened = await this.openUpstream(cacheKey, entry, upstreamUrlResolver)
+      const opened = await this.openUpstream(
+        cacheKey,
+        entry,
+        upstreamUrlResolver,
+        minDeclaredBytes,
+        intervalSec
+      )
       stallTimer = opened.stallTimer
       // stall 超时覆盖 fetch header + body 全程：每次有新数据进展就续期
       const refreshTimer = () => stallTimer?.refresh()
@@ -723,6 +750,8 @@ class AudioServe {
     cacheKey: string,
     entry: InflightEntry,
     upstreamUrlResolver: UpstreamUrlResolver,
+    minDeclaredBytes: number | null = null,
+    intervalSec = 0,
   ): Promise<{
     reader: ReadableStreamDefaultReader<Uint8Array> | null
     /** 嗅探与指纹阶段已预读的块（首块往往只有一个 TLS 记录，不够 32KiB），下载器须原样写盘 */
@@ -734,6 +763,7 @@ class AudioServe {
   }> {
     const excluded = new Set<string>()
     let attempt = 0
+    let sizeAttempt = 0
 
     for (;;) {
       // ① URL 解析：洛雪脚本挂起时不再永久卡死（inflight entry 也不残留）
@@ -803,6 +833,30 @@ class AudioServe {
         await resp.body?.cancel().catch(() => {})
         clearTimeout(stallTimer)
         throw new Error('上游未返回 Content-Length，无法缓存（建议启用透传模式）')
+      }
+
+      // Content-Length 早判试听片段：连最小的声明档位都不到，就不是「一首完整的歌
+      // 换成了低音质」，而是只给了开头几十秒。这类载荷 HTTP 200、容器也合法，字节
+      // 嗅探放得过、落库判据（要等下完）也只会「不落库但照样交付」，所以必须在这里
+      // 拦：一个字节都不下，直接记坏 + 排除该源重新解析。
+      const declaredMinBytes = minDeclaredBytes
+      if (declaredMinBytes !== null && isUndersizedByContentLength(size, declaredMinBytes, intervalSec)) {
+        await resp.body?.cancel().catch(() => {})
+        clearTimeout(stallTimer)
+        const reason =
+          `上游只给 ${size}B，低于最小声明档位 ${declaredMinBytes}B 的判据下限（疑似试听片段）`
+        recordByte('fake', reason)
+        // provider 认不出来就既不能记账也不能排除，只能直接失败——别拿同一个地址原地打转
+        if (provider && !excluded.has(provider) && sizeAttempt < this.maxUndersizedRetries) {
+          sizeAttempt++
+          excluded.add(provider)
+          logger.warn(
+            `[AudioServe] 字节数不足整曲、换源重试（排除 ${provider}）: ${cacheKey} — ${reason}`
+          )
+          continue
+        }
+        logger.warn(`[AudioServe] 字节数不足整曲（无可换音源）: ${cacheKey} — ${reason}`)
+        throw new Error(`上游载荷疑似试听片段：${reason}`)
       }
 
       // ② 读首块用于嗅探（后续块在 runDownload 中继续读同一个 reader）

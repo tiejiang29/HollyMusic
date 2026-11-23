@@ -9,6 +9,7 @@ import { audioServe } from '@/lib/audio-serve'
 import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { parseIntervalToSeconds } from '@/lib/types/player'
+import { minDeclaredBytes as computeMinDeclaredBytes } from '@/lib/server/audio-integrity'
 import { buildFilenameFromMusicInfo, buildContentDisposition, sanitizeFilename } from '@/lib/server/download-utils'
 import { resolveQuality } from '@/lib/quality-options'
 import type { QualityType } from '@/lib/types/music'
@@ -109,6 +110,7 @@ export async function GET(request: NextRequest) {
           rangeHeader: null,
           isHead: false,
           intervalSec: parseIntervalToSeconds(mi.interval),
+          minDeclaredBytes: computeMinDeclaredBytes(mi.types?.map(t => t.size)),
           onCached: () => cacheNativeLyricForMusic(mi),
         })
         if (!resp.ok || !resp.body) {

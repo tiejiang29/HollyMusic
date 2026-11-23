@@ -25,6 +25,7 @@ import { audioServe, buildFullResponse, buildPartialResponse, buildUnsatisfiable
 import type { UpstreamUrlResolver } from '@/lib/audio-serve'
 import { verifyShareAudioToken } from '@/lib/services/auth'
 import { parseIntervalToSeconds } from '@/lib/types/player'
+import { minDeclaredBytes as computeMinDeclaredBytes } from '@/lib/server/audio-integrity'
 import { findLibrarySong } from '@/lib/services/music-library'
 import { detectContainer, readHeadBytes, readBytesAt, mimeFromContainer } from '@/lib/server/audio-sniff'
 import { planMp3Seek, alignToFrameStart, NOMINAL_BYTES_PER_SEC, MP3_HEAD_BYTES } from '@/lib/server/mp3-seek'
@@ -201,6 +202,7 @@ async function handleSpeakerStream(request: NextRequest, isHead: boolean): Promi
       rangeHeader: effectiveRange,
       isHead,
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
+      minDeclaredBytes: computeMinDeclaredBytes(musicInfo.types?.map(t => t.size)),
     })
     const served = res.headers.get('content-type') ?? ''
     // 带 seek 的那份先换成 200 尾巴，之后的日志与返回都按**换完的**这条说

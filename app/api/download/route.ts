@@ -14,6 +14,7 @@ import { getLyricSidecarPath } from '@/lib/server/lyric-cache'
 import { planTaggedDelivery, createTaggedFileRead } from '@/lib/server/audio-tag-delivery'
 import { findLibrarySong, shouldServeLibraryFile } from '@/lib/services/music-library'
 import { parseIntervalToSeconds } from '@/lib/types/player'
+import { minDeclaredBytes as computeMinDeclaredBytes } from '@/lib/server/audio-integrity'
 import type { MusicInfo, QualityType } from '@/lib/types/music'
 import { assertPublicHttpUrl } from '@/lib/server/url-guard'
 import {
@@ -158,6 +159,7 @@ async function handleDownloadByUid(
     rangeHeader,
     isHead: false,
     intervalSec: parseIntervalToSeconds(musicInfo.interval),
+    minDeclaredBytes: computeMinDeclaredBytes(musicInfo.types?.map(t => t.size)),
     onCached: () => cacheNativeLyricForMusic(musicInfo),
     onServedFromDisk: info => { servedFromDisk = info },
   })
