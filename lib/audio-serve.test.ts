@@ -48,14 +48,14 @@ vi.mock('@/lib/logger', () => ({
 const { checkTrialAudioMock } = vi.hoisted(() => ({
   checkTrialAudioMock: vi.fn(async () => ({ trial: false, actualSec: null as number | null })),
 }))
-// Content-Length 早判要跑真实现，否则新分支在测试里是 undefined、永远不亮
+// 时长/长度判据要跑真实现，否则新分支在测试里是 undefined、永远不亮
 vi.mock('@/lib/server/audio-integrity', async () => {
   const actual = await vi.importActual<typeof import('@/lib/server/audio-integrity')>(
     '@/lib/server/audio-integrity'
   )
   return {
     checkTrialAudio: checkTrialAudioMock,
-    isUndersizedByContentLength: actual.isUndersizedByContentLength,
+    judgePayloadLength: actual.judgePayloadLength,
   }
 })
 
@@ -497,21 +497,34 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     expect(prisma.audioCache.upsert).not.toHaveBeenCalled()
   })
 
-  // --- Content-Length 早判试听片段（2026-11-23 新增）---------------------------
-  // 这类载荷 HTTP 200、容器合法（能过嗅探），只有"字节数 vs 声明档位"能识破。
-  // 夹具：声明最小档 1,000,000B ⇒ 阈值 350,000B；片段 100,000B（比值 0.10），
-  // 合法整曲降档 630,000B（比值 0.63，对齐生产实测的 0.628 那个最近锚点）。
-  const CLIP = Buffer.concat([Buffer.from('ID3\x03\x00'), Buffer.alloc(99_996, 0x42)])
-  const FULL_LOW = Buffer.concat([Buffer.from('ID3\x03\x00'), Buffer.alloc(629_996, 0x42)])
+  // --- 交付长度判据（2026-11-24：主判据=首块解真实时长，字节比值退为兜底）--------
+  // 这类载荷 HTTP 200、容器合法，字节嗅探放得过。生产实测 vkeys 的罐头字节恒 960887B，
+  // 而库里 128k 那 40 行平均 15568 B/s（CBR 128k 应为 16000）⇒ 按 CBR 折算是 60.1 秒。
+  // 夹具直接写 MPEG1 Layer-III 128kbps/44.1kHz 的帧头 FF FB 90 00，让时长判据通电。
+  function mp3Payload(total: number): Buffer {
+    const b = Buffer.alloc(total, 0x42)
+    b[0] = 0xff; b[1] = 0xfb; b[2] = 0x90; b[3] = 0x00
+    return b
+  }
+  /** m4a 的时长写在文件尾的 moov，首块解不出 ⇒ 只有这类才退回字节比值兜底 */
+  function mp4Payload(total: number): Buffer {
+    const b = Buffer.alloc(total, 0x41)
+    b.writeUInt32BE(0x18, 0)
+    b.write('ftyp', 4, 'latin1')
+    b.write('M4A ', 8, 'latin1')
+    return b
+  }
+  const CLIP60 = mp3Payload(960_887)        // ⇒ 60.1s
+  const FULL_LOW = mp3Payload(4_078_961)    // ⇒ 254.9s，整曲低音质，不许误杀
 
-  it('Content-Length 短到不可能是整曲 → 记 fake、排除该源，交付第二个源的完整文件', async () => {
+  it('首块解出 60 秒而期望 200 秒 → 记 fake、排除该源，交付第二个源的整曲字节', async () => {
     const fetchUrls: string[] = []
     const seenExcludes: string[][] = []
     globalThis.fetch = vi.fn(async (input: unknown) => {
       const url = String(input)
       fetchUrls.push(url)
       return url.includes('clip.example')
-        ? payloadResponse(CLIP, 'audio/mpeg')
+        ? payloadResponse(CLIP60, 'audio/mpeg')
         : payloadResponse(FULL_LOW, 'audio/mpeg')
     }) as unknown as typeof fetch
 
@@ -523,79 +536,116 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     }
 
     const resp = await audioServe.serve({
-      cacheKey: 'tx:early1:flac',
+      cacheKey: 'tx:len1:flac',
       upstreamUrlResolver,
       rangeHeader: null,
       isHead: false,
       intervalSec: 200,
-      minDeclaredBytes: 1_000_000,
     })
 
     expect(resp.status).toBe(200)
     expect(fetchUrls).toHaveLength(2)
     expect(seenExcludes[1]).toContain('片段源A')
-    // 片段一个字节都没下载，交付的是第二个源的完整字节
     const body = await resp.arrayBuffer()
     expect(body.byteLength).toBe(FULL_LOW.length)
-    expect(Buffer.from(body).equals(FULL_LOW)).toBe(true)
     expect(sourceHealth.view('片段源A', 'tx')?.badKinds['byte:fake']).toBe(1)
+    expect(sourceHealth.view('好源B', 'tx')?.byteOk).toBe(1)
     expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1)
   })
 
-  it('反向对照：不传 minDeclaredBytes 时同一份片段照旧直接交付（证明上条是本刀带来的改变）', async () => {
-    const fetchSpy = vi.fn(async () => payloadResponse(CLIP, 'audio/mpeg'))
-    globalThis.fetch = fetchSpy as unknown as typeof fetch
+  it('短歌不再漏检：同一份 60 秒罐头、期望 154 秒，仍然判死（0.35 那版正是这一档漏的）', async () => {
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      return url.includes('clip.example')
+        ? payloadResponse(CLIP60, 'audio/mpeg')
+        : payloadResponse(FULL_LOW, 'audio/mpeg')
+    }) as unknown as typeof fetch
+
+    const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders =>
+      excludeProviders.has('短歌片段源')
+        ? { url: 'https://good.example/f2.mp3', provider: '短歌好源' }
+        : { url: 'https://clip.example/c2.mp3', provider: '短歌片段源' }
 
     const resp = await audioServe.serve({
-      cacheKey: 'tx:early2:flac',
-      upstreamUrlResolver: async () => ({ url: 'https://clip.example/c2.mp3', provider: '片段源B' }),
+      cacheKey: 'tx:len2:flac',
+      upstreamUrlResolver,
       rangeHeader: null,
       isHead: false,
-      intervalSec: 200,
+      intervalSec: 154,
+      // 故意不传 minDeclaredBytes：主判据不依赖声明大小
     })
 
-    expect(resp.status).toBe(200)
-    expect(fetchSpy).toHaveBeenCalledTimes(1)
     const body = await resp.arrayBuffer()
-    expect(body.byteLength).toBe(CLIP.length)
-    // 没有基准可比 ⇒ 不判坏，这个源照旧领一次好样本
-    expect(sourceHealth.view('片段源B', 'tx')?.byteOk).toBe(1)
-    expect(sourceHealth.view('片段源B', 'tx')?.badKinds['byte:fake']).toBeUndefined()
+    expect(body.byteLength).toBe(FULL_LOW.length)
+    expect(sourceHealth.view('短歌片段源', 'tx')?.badKinds['byte:fake']).toBe(1)
   })
 
-  it('合法降档（比值 0.63）不许被误杀：整曲低音质照常被交付', async () => {
+  it('合法整曲低音质 mp3（解出 254.9s / 期望 254s）→ 不许误杀', async () => {
     globalThis.fetch = vi.fn(async () => payloadResponse(FULL_LOW, 'audio/mpeg')) as unknown as typeof fetch
 
     const resp = await audioServe.serve({
-      cacheKey: 'tx:early3:flac',
-      upstreamUrlResolver: async () => ({ url: 'https://low.example/full.mp3', provider: '降档源' }),
+      cacheKey: 'tx:len3:flac',
+      upstreamUrlResolver: async () => ({ url: 'https://low.example/f3.mp3', provider: '低码率整曲源' }),
       rangeHeader: null,
       isHead: false,
-      intervalSec: 200,
-      minDeclaredBytes: 1_000_000,
+      intervalSec: 254,
+      minDeclaredBytes: 4_078_961,
     })
 
     expect(resp.status).toBe(200)
     const body = await resp.arrayBuffer()
     expect(body.byteLength).toBe(FULL_LOW.length)
-    expect(sourceHealth.view('降档源', 'tx')?.byteOk).toBe(1)
+    expect(sourceHealth.view('低码率整曲源', 'tx')?.byteOk).toBe(1)
   })
 
-  it('每只源都给片段 → 试满 1+8 次后明确失败（护栏由 maxUndersizedRetries 定），且不落缓存', async () => {
-    const fetchSpy = vi.fn(async () => payloadResponse(CLIP, 'audio/mpeg'))
-    globalThis.fetch = fetchSpy as unknown as typeof fetch
-    let seq = 0
+  it('双向对照兜底：m4a 解不出时长时，有声明就按比值拒、没声明就放过', async () => {
+    const CLIP_MP4 = mp4Payload(100_000)
+    globalThis.fetch = vi.fn(async () => payloadResponse(CLIP_MP4, 'audio/mp4')) as unknown as typeof fetch
 
-    const resp = await audioServe.serve({
-      cacheKey: 'tx:early4:flac',
+    // resolver 按 excludeProviders 换源（生产的真实语义）：让每个 provider 只出现一次
+    let seq = 0
+    const rejected = await audioServe.serve({
+      cacheKey: 'tx:len4a:flac',
       upstreamUrlResolver: async () => ({
-        url: `https://clip.example/c4-${seq}.mp3`,
-        provider: `片段源${++seq}`,
+        url: `https://mp4.example/a${seq}.m4a`,
+        provider: `m4a片段源${++seq}`,
       }),
       rangeHeader: null,
       isHead: false,
       intervalSec: 200,
       minDeclaredBytes: 1_000_000,
+    })
+    expect(rejected.status).toBe(502)
+    expect(sourceHealth.view('m4a片段源1', 'tx')?.badKinds['byte:fake']).toBe(1)
+    expect(sourceHealth.view('m4a片段源2', 'tx')?.badKinds['byte:fake']).toBe(1)
+
+    const passed = await audioServe.serve({
+      cacheKey: 'tx:len4b:flac',
+      upstreamUrlResolver: async () => ({ url: 'https://mp4.example/b.m4a', provider: 'm4a无声明源' }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 200,
+    })
+    expect(passed.status).toBe(200)
+    const body = await passed.arrayBuffer()
+    expect(body.byteLength).toBe(CLIP_MP4.length)
+    expect(sourceHealth.view('m4a无声明源', 'tx')?.badKinds?.['byte:fake']).toBeUndefined()
+  })
+
+  it('每只源都给 60 秒罐头 → 试满 1+8 次后明确失败（护栏 maxUndersizedRetries），不落缓存', async () => {
+    const fetchSpy = vi.fn(async () => payloadResponse(CLIP60, 'audio/mpeg'))
+    globalThis.fetch = fetchSpy as unknown as typeof fetch
+    let seq = 0
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:len5:flac',
+      upstreamUrlResolver: async () => ({
+        url: `https://clip.example/c5-${seq}.mp3`,
+        provider: `罐头源${++seq}`,
+      }),
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 200,
     })
 
     expect(resp.status).toBe(502)

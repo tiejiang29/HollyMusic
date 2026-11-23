@@ -26,7 +26,7 @@ import path from 'path'
 import { EventEmitter } from 'events'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
-import { checkTrialAudio, isUndersizedByContentLength } from '@/lib/server/audio-integrity'
+import { checkTrialAudio, judgePayloadLength } from '@/lib/server/audio-integrity'
 import { judgeUpstreamPayload, readHeadBytes, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
 import { sourceHealth, isLikelyLocalNetworkFault, type ByteOutcome } from '@/lib/server/source-health'
 import { createHeadAccumulator, matchKnownPlaceholder, observeCompleted } from '@/lib/server/audio-fingerprint'
@@ -835,30 +835,6 @@ class AudioServe {
         throw new Error('上游未返回 Content-Length，无法缓存（建议启用透传模式）')
       }
 
-      // Content-Length 早判试听片段：连最小的声明档位都不到，就不是「一首完整的歌
-      // 换成了低音质」，而是只给了开头几十秒。这类载荷 HTTP 200、容器也合法，字节
-      // 嗅探放得过、落库判据（要等下完）也只会「不落库但照样交付」，所以必须在这里
-      // 拦：一个字节都不下，直接记坏 + 排除该源重新解析。
-      const declaredMinBytes = minDeclaredBytes
-      if (declaredMinBytes !== null && isUndersizedByContentLength(size, declaredMinBytes, intervalSec)) {
-        await resp.body?.cancel().catch(() => {})
-        clearTimeout(stallTimer)
-        const reason =
-          `上游只给 ${size}B，低于最小声明档位 ${declaredMinBytes}B 的判据下限（疑似试听片段）`
-        recordByte('fake', reason)
-        // provider 认不出来就既不能记账也不能排除，只能直接失败——别拿同一个地址原地打转
-        if (provider && !excluded.has(provider) && sizeAttempt < this.maxUndersizedRetries) {
-          sizeAttempt++
-          excluded.add(provider)
-          logger.warn(
-            `[AudioServe] 字节数不足整曲、换源重试（排除 ${provider}）: ${cacheKey} — ${reason}`
-          )
-          continue
-        }
-        logger.warn(`[AudioServe] 字节数不足整曲（无可换音源）: ${cacheKey} — ${reason}`)
-        throw new Error(`上游载荷疑似试听片段：${reason}`)
-      }
-
       // ② 读首块用于嗅探（后续块在 runDownload 中继续读同一个 reader）
       const reader = resp.body?.getReader() ?? null
       if (!reader) {
@@ -889,6 +865,35 @@ class AudioServe {
           `[AudioServe] 上游返回非音频内容（无可换音源）: ${cacheKey} — ${judgment.reason}`
         )
         throw new Error(`上游返回非音频内容：${judgment.reason}`)
+      }
+
+      // 交付长度判据：主判据是**首块解出的真实时长**，解不出才退回字节比值兜底。
+      // 这类载荷 HTTP 200、容器也合法，字节嗅探放得过；而下载完成后那次时长判定
+      // 只「不落库、照样交付」⇒ 用户先听 60 秒再没声，源也不换。这里只看到首块就判，
+      // 正文一字节都不下：记坏 + 排除该源重新解析，同平台用尽后跨平台换源自动接手。
+      const lenCheck = judgePayloadLength({
+        head: firstChunk,
+        sizeBytes: size,
+        minDeclaredBytes,
+        intervalSec,
+        container: judgment.container ?? null
+      })
+      if (lenCheck.reject) {
+        await reader.cancel().catch(() => {})
+        clearTimeout(stallTimer)
+        const reason = `疑似试听片段（${lenCheck.basis}）：${lenCheck.detail}`
+        recordByte('fake', reason)
+        // provider 认不出来就既不能记账也不能排除，只能直接失败——别拿同一个地址原地打转
+        if (provider && !excluded.has(provider) && sizeAttempt < this.maxUndersizedRetries) {
+          sizeAttempt++
+          excluded.add(provider)
+          logger.warn(
+            `[AudioServe] 时长不足整曲、换源重试（排除 ${provider}）: ${cacheKey} — ${reason}`
+          )
+          continue
+        }
+        logger.warn(`[AudioServe] 时长不足整曲（无可换音源）: ${cacheKey} — ${reason}`)
+        throw new Error(`上游载荷疑似试听片段：${reason}`)
       }
 
       // 指纹要 32KiB 头部，而真实 HTTPS 首块只有一个 TLS 记录那么大（生产实测同一地址
