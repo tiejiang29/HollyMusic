@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveQuality, getAvailableQualities, nextLowerQuality, qualityFromBytes } from './quality-options'
+import { resolveQuality, getAvailableQualities, nextLowerQuality, qualityFromBytes, meetsRequestedQuality } from './quality-options'
 import type { QualityInfo, QualityType } from './types/music'
 
 /** 快速构造 types 数组 */
@@ -69,6 +69,22 @@ describe('nextLowerQuality - 解码失败降级链路', () => {
 
   it('128k（最低档）→ null，表示无法再降级，交跳歌逻辑', () => {
     expect(nextLowerQuality('128k')).toBeNull()
+  })
+})
+
+describe('meetsRequestedQuality - 候选流按实际字节判达标', () => {
+  it('Hi-Res 请求遇到 FLAC 魔数即放行：现有字节判据分不出 16/24bit', () => {
+    expect(meetsRequestedQuality('flac', 'flac24bit')).toBe(true)
+  })
+
+  it('高档请求不会被低档冒充；同档与更高档都放行', () => {
+    expect(meetsRequestedQuality('320k', 'flac')).toBe(false)
+    expect(meetsRequestedQuality('128k', '128k')).toBe(true)
+    expect(meetsRequestedQuality('flac', '320k')).toBe(true)
+  })
+
+  it('证据不足返回 null 时不判达标，留给可播兜底', () => {
+    expect(meetsRequestedQuality(null, '320k')).toBe(false)
   })
 })
 

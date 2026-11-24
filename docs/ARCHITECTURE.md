@@ -136,6 +136,8 @@ API 路由层（app/api/**）        —— 参数校验、鉴权、响应包装
 
 **后端 lane 追踪与负缓存（2026-11-25 新增）**：`lib/music-core/backend-registry.js` 把脚本每次 `lx.request` 归一到 `endpoint（host+path，剥 query）+ keyHash（凭据哈希）`，用 `AsyncLocalStorage` 绑定到当前 `平台×歌曲×音质×源名` 调用；`getMusicUrlWithTrace` 经 runner IPC 回传实际用过的 lane，原始 key 不进入 trace/日志。完全相同的在途请求（method+URL+headers+body）共用一次网络调用，各订阅者拿到独立响应包装，取消只解绑不中断共享请求。audio-serve 只在**高置信度假载荷/试听片段**被拒时，把对应 lane 在 `平台×歌曲×音质` 范围内拉黑 5 分钟；普通 HTTP/网络错误不触发 lane 负缓存，同接口不同 key 互不连坐。旧 `getMusicUrl` 返回值与行为不变。
 
+**`/api/audio` 候选流复合模式（2026-11-25，本地未部署）**：路由按请求音质从 `flac24bit → flac → 320k → 128k` 构造阶梯；`music-source-manager.getMusicUrlCandidates` 在同一平台内按 priority 分波，波宽 6，谁先解析出地址谁先进入候选流，同 lane 只保留一个代表。audio-serve 最多同时打开 6 个候选的首块，逐个用容器嗅探、试听时长/声明大小和 `qualityFromBytes` 验收；第一个满足请求档的候选立即胜出，其余在途流取消或不再等待。可播但低档的最优候选保留 2 秒，期间等到高档就替换，否则直接交付已打开的 `reader/preReadChunks`，不重新取址。FLAC 魔数无法区分 16/24bit，因此 Hi-Res 请求遇到真 FLAC 即放行。胜者的 Content-Type/provider/platform 随 `OpenedUpstream` 返回并恢复，避免后试候选覆盖兜底流的元数据。当前默认走候选流，`AUDIO_COMPOSITE_MODE=0` 回退旧串行路径；面板/DB 开关与跨平台成员编排属于下一阶段，尚未落地。
+
 **音源配置** `config/music-sources.json`，每条：`path`（脚本路径）、`name`、`pt`（平台白名单）、`enabled`、`priority`（数字越小越先被尝试）。管理端的启停/排序修改会**原子写回这个文件**（临时文件 + rename）并触发运行时热重载（配置 MD5 变化 → 重建音源实例）。订阅源（subscription）支持在线 URL 自动更新脚本。
 
 **解析瀑布**（`_getMusicUrlSamePlatform`）：

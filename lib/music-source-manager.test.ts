@@ -29,6 +29,7 @@ beforeEach(() => {
 })
 
 const QUALITIES = ['128k', '320k', 'flac', 'flac24bit']
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 /** 造一个已初始化的假音源：只有 getMusicUrl 行为可定制 */
 function fakeSource(
@@ -516,5 +517,43 @@ describe('按调用路径覆盖取址预算', () => {
     expect(r.provider).toBe('后面的好源')
     expect(hangCalls()).toBe(1)
     expect(vi.mocked(logger.warn).mock.calls.some(c => String(c[0]).includes('已抬到下限'))).toBe(true)
+  })
+})
+
+describe('候选流并发波', () => {
+  it('波内按完成顺序产出，慢的高优先级源不挡住快的低优先级源', async () => {
+    const instances = [
+      fakeSource('慢源', async () => {
+        await sleep(80)
+        return 'https://example.com/slow.mp3'
+      }),
+      fakeSource('快源', async () => 'https://example.com/fast.mp3'),
+    ]
+    const manager = managerWith(instances, { urlMs: 1000, perSourceMs: 500, totalMs: 2000 })
+    const providers: string[] = []
+    for await (const candidate of manager.getMusicUrlCandidates(musicInfo, 'flac', { width: 2, deadline: Date.now() + 2000 })) {
+      providers.push(candidate.provider)
+    }
+    expect(providers[0]).toBe('快源')
+    expect(providers).toContain('慢源')
+  })
+
+  it('波宽 6：前 6 只同时出手，第 7 只等第一波落定后才开始', async () => {
+    let active = 0
+    let maxActive = 0
+    const instances = Array.from({ length: 7 }, (_, index) => fakeSource('候选' + index, async () => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      await sleep(40)
+      active--
+      return `https://example.com/${index}.mp3`
+    }))
+    const manager = managerWith(instances, { urlMs: 1000, perSourceMs: 500, totalMs: 2000, countBudgetTimeoutAsBad: true })
+    const results: string[] = []
+    for await (const candidate of manager.getMusicUrlCandidates(musicInfo, 'flac', { width: 6, deadline: Date.now() + 2000 })) {
+      results.push(candidate.url)
+    }
+    expect(maxActive).toBe(6)
+    expect(results).toHaveLength(7)
   })
 })

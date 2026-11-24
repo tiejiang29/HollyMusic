@@ -38,6 +38,21 @@ function isTrustworthyUrl(url: string): boolean {
   return blockedNetworkReason(url) === null
 }
 
+async function* completionOrder<T>(tasks: Promise<T>[]): AsyncGenerator<{ value?: T; error?: unknown }> {
+  const pending = new Map<number, Promise<{ index: number; value?: T; error?: unknown }>>()
+  tasks.forEach((task, index) => {
+    pending.set(index, task.then(
+      value => ({ index, value }),
+      error => ({ index, error }),
+    ))
+  })
+  while (pending.size > 0) {
+    const settled = await Promise.race(pending.values())
+    pending.delete(settled.index)
+    yield settled
+  }
+}
+
 /** 音源 slot 代理（子进程或 inline 直连），使用面与 LXEnvironmentSimulator 对齐 */
 interface BackendLaneTrace {
   laneId: string
@@ -546,6 +561,100 @@ export class MusicSourceManager {
     const instance = this.instances.find(item => item.config.name === provider)
     if (!instance || typeof instance.simulator.markBackendLanesBad !== 'function') return
     await instance.simulator.markBackendLanesBad(lanes, reason)
+  }
+
+  private async attemptCandidate(
+    instance: SimulatorInstance,
+    musicInfo: MusicInfo,
+    quality: QualityType,
+    timeoutMs: number,
+  ): Promise<{ url: string; provider: string; platform: string; usedLanes: BackendLaneTrace[] } | null> {
+    const sourceConfig = instance.sourceInfo?.sources[musicInfo.source]
+    if (!sourceConfig?.actions.includes('musicUrl')) return null
+    if (!sourceConfig.qualitys.includes(quality) || !musicInfo._types[quality]) return null
+    sourceHealth.claimProbe(instance.config.name, musicInfo.source)
+    const started = Date.now()
+    try {
+      const traced = typeof instance.simulator.getMusicUrlWithTrace === 'function'
+        ? await this.withTimeout(
+            instance.simulator.getMusicUrlWithTrace(musicInfo.source, musicInfo, quality),
+            timeoutMs,
+            `获取音乐URL超时: ${instance.config.name} - ${quality}`,
+          )
+        : {
+            url: await this.withTimeout(
+              instance.simulator.getMusicUrl(musicInfo.source, musicInfo, quality),
+              timeoutMs,
+              `获取音乐URL超时: ${instance.config.name} - ${quality}`,
+            ),
+            usedLanes: [],
+          }
+      const tookMs = Date.now() - started
+      const url = traced.url
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'no-address', tookMs)
+        return null
+      }
+      if (!isTrustworthyUrl(url)) {
+        sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'ssrf', tookMs, '返回私网/非 http(s) 地址')
+        return null
+      }
+      sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'ok', tookMs)
+      return { url, provider: instance.config.name, platform: musicInfo.source, usedLanes: traced.usedLanes || [] }
+    } catch (error) {
+      const tookMs = Date.now() - started
+      const message = error instanceof Error ? error.message : String(error)
+      const timedOut = error instanceof SourceTimeoutError
+      const outcome: ResolveOutcome = !timedOut && isContentMiss(message) ? 'no-address' : timedOut ? 'timeout' : 'error'
+      sourceHealth.recordResolve(instance.config.name, musicInfo.source, outcome, tookMs, message.slice(0, 120))
+      return null
+    }
+  }
+
+  async *getMusicUrlCandidates(
+    musicInfo: MusicInfo,
+    requestedQuality: QualityType,
+    opts: {
+      excludeProviders?: ReadonlySet<string>
+      excludeLanes?: ReadonlySet<string>
+      width?: number
+      deadline?: number
+      budgets?: ResolveBudgets
+    } = {},
+  ): AsyncGenerator<{ url: string; provider: string; platform: string; usedLanes: BackendLaneTrace[] }> {
+    const budgets = this.budgetsFor(opts.budgets)
+    const deadline = opts.deadline || Date.now() + budgets.totalMs
+    const width = Math.max(1, Math.min(opts.width || 6, 16))
+    const candidates = this.eligibleFor(
+      this.instances.filter(item => item.initialized),
+      musicInfo.source,
+      opts.excludeProviders,
+    )
+    const cooled = new Set<string>()
+    for (const instance of candidates) {
+      if (candidates.length - cooled.size <= 1) break
+      if (sourceHealth.coolStatus(instance.config.name, musicInfo.source).skip) cooled.add(instance.config.name)
+    }
+    const active = candidates.filter(item => !cooled.has(item.config.name))
+    const seenLanes = new Set(opts.excludeLanes || [])
+    for (let offset = 0; offset < active.length; offset += width) {
+      if (Date.now() >= deadline) return
+      const wave = active.slice(offset, offset + width)
+      const tasks = wave.map(instance => this.attemptCandidate(
+        instance,
+        musicInfo,
+        requestedQuality,
+        Math.max(250, Math.min(budgets.perSourceMs, deadline - Date.now())),
+      ))
+      for await (const settled of completionOrder(tasks)) {
+        const candidate = settled.value
+        if (!candidate) continue
+        const freshLanes = candidate.usedLanes.filter(lane => !seenLanes.has(lane.laneId))
+        if (candidate.usedLanes.length > 0 && freshLanes.length === 0) continue
+        for (const lane of freshLanes) seenLanes.add(lane.laneId)
+        yield { ...candidate, usedLanes: freshLanes }
+      }
+    }
   }
 
   async probeSourceUrl(

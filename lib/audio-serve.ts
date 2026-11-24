@@ -26,7 +26,9 @@ import path from 'path'
 import { EventEmitter } from 'events'
 import { prisma } from '@/lib/db'
 import { logger } from '@/lib/logger'
-import { checkTrialAudio, judgePayloadLength } from '@/lib/server/audio-integrity'
+import { checkTrialAudio, estimateDurationFromHead, judgePayloadLength } from '@/lib/server/audio-integrity'
+import { qualityFromBytes, meetsRequestedQuality } from '@/lib/quality-options'
+import type { QualityType } from '@/lib/types/music'
 import { judgeUpstreamPayload, readHeadBytes, mimeFromContainer, extFromAudioMime } from '@/lib/server/audio-sniff'
 import { sourceHealth, isLikelyLocalNetworkFault, type ByteOutcome } from '@/lib/server/source-health'
 import { createHeadAccumulator, matchKnownPlaceholder, observeCompleted } from '@/lib/server/audio-fingerprint'
@@ -68,6 +70,33 @@ export type BadLaneReporter = (
   lanes: BackendLaneTrace[],
   context: { provider: string | null; platform: string | null; cacheKey: string; reason: string },
 ) => void | Promise<void>
+
+export type UpstreamCandidateResolver = (
+  quality: QualityType,
+  excludeProviders: ReadonlySet<string>,
+  excludeLanes: ReadonlySet<string>,
+  deadline: number,
+) => AsyncIterable<ResolvedUpstream>
+
+interface OpenedUpstream {
+  reader: ReadableStreamDefaultReader<Uint8Array> | null
+  preReadChunks: Uint8Array[]
+  byteReason: string
+  size: number
+  stallTimer: NodeJS.Timeout
+  contentType: string | null
+  provider: string | null
+  platform: string | null
+  payloadVerdict: 'audio' | 'unverified'
+  actualQuality?: QualityType | null
+}
+
+const QUALITY_RANK: Record<QualityType, number> = {
+  '128k': 1,
+  '320k': 2,
+  flac: 3,
+  flac24bit: 4,
+}
 
 /**
  * 上游 URL 解析器。
@@ -216,6 +245,9 @@ interface InflightEntry {
   platform: string | null
   /** 高置信度坏载荷出现时，通知解析方把对应后端 lane 拉黑 */
   onBadLanes?: BadLaneReporter
+  /** 可选候选流模式：manager 按波并发产出候选，audio-serve 逐个股字节验收 */
+  candidateResolver?: UpstreamCandidateResolver
+  qualityLadder?: QualityType[]
 }
 
 class AudioServe {
@@ -319,6 +351,9 @@ class AudioServe {
     minDeclaredBytes?: number | null
     /** 高置信度假载荷/试听片段被拒时，按后端 lane 记账（可选） */
     onBadLanes?: BadLaneReporter
+    /** 候选流模式（与 upstreamUrlResolver 二选一；优先级更高） */
+    candidateResolver?: UpstreamCandidateResolver
+    qualityLadder?: QualityType[]
     /** 音频完整写入缓存后触发的后台任务；失败不影响音频交付。 */
     onCached?: () => Promise<void>
     /**
@@ -363,7 +398,9 @@ class AudioServe {
         opts.intervalSec,
         opts.onCached,
         opts.minDeclaredBytes ?? null,
-        opts.onBadLanes
+        opts.onBadLanes,
+        opts.candidateResolver,
+        opts.qualityLadder
       )
     }
 
@@ -531,6 +568,8 @@ class AudioServe {
     onCached?: () => Promise<void>,
     minDeclaredBytes: number | null = null,
     onBadLanes?: BadLaneReporter,
+    candidateResolver?: UpstreamCandidateResolver,
+    qualityLadder?: QualityType[],
   ): Promise<InflightEntry> {
     // 同步占位，保证并发请求只创建一个 entry（多用户去重核心）
     const entry: InflightEntry = {
@@ -545,6 +584,8 @@ class AudioServe {
       provider: null,
       platform: null,
       onBadLanes,
+      candidateResolver,
+      qualityLadder,
     }
     this.inflight.set(cacheKey, entry)
 
@@ -590,6 +631,10 @@ class AudioServe {
         intervalSec
       )
       stallTimer = opened.stallTimer
+      entry.contentType = opened.contentType
+      entry.provider = opened.provider
+      entry.platform = opened.platform
+      entry.payloadVerdict = opened.payloadVerdict
       // stall 超时覆盖 fetch header + body 全程：每次有新数据进展就续期
       const refreshTimer = () => stallTimer?.refresh()
       const { reader, preReadChunks, size } = opened
@@ -788,18 +833,17 @@ class AudioServe {
     upstreamUrlResolver: UpstreamUrlResolver,
     minDeclaredBytes: number | null = null,
     intervalSec = 0,
-  ): Promise<{
-    reader: ReadableStreamDefaultReader<Uint8Array> | null
-    /** 嗅探与指纹阶段已预读的块（首块往往只有一个 TLS 记录，不够 32KiB），下载器须原样写盘 */
-    preReadChunks: Uint8Array[]
-    /** 容器判定理由：字节段的"成功"记账挪到完成阶段，理由要带过去 */
-    byteReason: string
-    size: number
-    stallTimer: NodeJS.Timeout
-  }> {
+    retryLimit?: number,
+    useCandidateStream = true,
+  ): Promise<OpenedUpstream> {
+    if (useCandidateStream && entry.candidateResolver && entry.qualityLadder?.length) {
+      return this.openCandidateUpstream(cacheKey, entry, minDeclaredBytes, intervalSec)
+    }
     const excluded = new Set<string>()
     let attempt = 0
     let sizeAttempt = 0
+    const fakeRetries = retryLimit ?? this.maxFakeRetries
+    const undersizedRetries = retryLimit ?? this.maxUndersizedRetries
     const chainStart = Date.now()
 
     for (;;) {
@@ -877,7 +921,7 @@ class AudioServe {
         await resp.body?.cancel().catch(() => {})
         clearTimeout(stallTimer)
         recordByte('http-error', `上游返回 ${resp.status}`)
-        if (provider && attempt < this.maxFakeRetries) {
+        if (provider && attempt < fakeRetries) {
           attempt++
           excluded.add(provider)
           logger.warn(
@@ -918,7 +962,7 @@ class AudioServe {
         // 最高置信度的坏证据：HTTP 200 但字节是 HTML/JSON/图片等
         recordByte('fake', judgment.reason)
         await reportBadLanes(judgment.reason)
-        if (provider && attempt < this.maxFakeRetries) {
+        if (provider && attempt < fakeRetries) {
           attempt++
           excluded.add(provider)
           logger.warn(
@@ -950,7 +994,7 @@ class AudioServe {
         recordByte('fake', reason)
         await reportBadLanes(reason)
         // provider 认不出来就既不能记账也不能排除，只能直接失败——别拿同一个地址原地打转
-        if (provider && !excluded.has(provider) && sizeAttempt < this.maxUndersizedRetries) {
+        if (provider && !excluded.has(provider) && sizeAttempt < undersizedRetries) {
           sizeAttempt++
           excluded.add(provider)
           logger.warn(
@@ -987,7 +1031,7 @@ class AudioServe {
           await reader.cancel().catch(() => {})
           clearTimeout(stallTimer)
           recordByte('fake', `占位载荷：与 ${hit.otherSong} 是同一份字节`)
-          if (provider && attempt < this.maxFakeRetries) {
+          if (provider && attempt < fakeRetries) {
             attempt++
             excluded.add(provider)
             logger.warn(
@@ -1023,8 +1067,174 @@ class AudioServe {
       // 字节段的"成功"不在这里记：占位载荷是合法容器，先领一次好样本会把连续坏清零
       // （source-health 一条好样本即清零），死源永远攒不满冷却阈值、下一首照样选它。
       // 挪到完成阶段，与试听/指纹判据一起下结论。
-      return { reader, preReadChunks, byteReason: judgment.reason, size, stallTimer }
+      const estimated = estimateDurationFromHead(firstChunk, size, judgment.container)
+      const actualQuality = qualityFromBytes({
+        container: judgment.container,
+        sizeBytes: size,
+        durationSec: estimated.sec ?? intervalSec,
+      })
+      return {
+        reader,
+        preReadChunks,
+        byteReason: judgment.reason,
+        size,
+        stallTimer,
+        contentType: entry.contentType,
+        provider,
+        platform,
+        payloadVerdict: entry.payloadVerdict === 'audio' ? 'audio' : 'unverified',
+        actualQuality,
+      }
     }
+  }
+
+  private async openCandidateUpstream(
+    cacheKey: string,
+    entry: InflightEntry,
+    minDeclaredBytes: number | null,
+    intervalSec: number,
+  ): Promise<OpenedUpstream> {
+    const resolver = entry.candidateResolver!
+    const ladder = entry.qualityLadder!
+    const chainStart = Date.now()
+    const deadline = chainStart + this.swapChainTimeoutMs
+    const holdMs = 2_000
+    const maxOpen = 6
+    let fallback: { opened: OpenedUpstream; quality: QualityType; at: number } | null = null
+    const discardOpened = (opened: OpenedUpstream) => {
+      clearTimeout(opened.stallTimer)
+      opened.reader?.cancel().catch(() => {})
+    }
+    const discardFallback = () => {
+      if (!fallback) return
+      discardOpened(fallback.opened)
+      fallback = null
+    }
+
+    type NextEvent =
+      | { type: 'candidate'; candidate: ResolvedUpstream }
+      | { type: 'done' }
+      | { type: 'iterator-error' }
+    type OpenEvent =
+      | { type: 'opened'; index: number; opened: OpenedUpstream }
+      | { type: 'open-error'; index: number; candidate: ResolvedUpstream }
+      | { type: 'abandoned' }
+    type RaceEvent = NextEvent | OpenEvent | { type: 'timer' }
+
+    for (const quality of ladder) {
+      if (Date.now() >= deadline) break
+      const excludedProviders = new Set<string>()
+      const excludedLanes = new Set<string>()
+      const iterator = resolver(quality, excludedProviders, excludedLanes, deadline)[Symbol.asyncIterator]()
+      const pending = new Map<number, Promise<RaceEvent>>()
+      let nextRequest: Promise<NextEvent> | null = null
+      let iteratorDone = false
+      let abandoned = false
+      let nextIndex = 0
+      const requestNext = (): Promise<NextEvent> => {
+        if (!nextRequest) {
+          nextRequest = iterator.next().then(
+            result => result.done
+              ? { type: 'done' as const }
+              : { type: 'candidate' as const, candidate: result.value },
+            () => ({ type: 'iterator-error' as const }),
+          )
+        }
+        return nextRequest
+      }
+      const excludeCandidate = (candidate: ResolvedUpstream) => {
+        if (candidate.provider) excludedProviders.add(candidate.provider)
+        for (const lane of candidate.usedLanes || []) excludedLanes.add(lane.laneId)
+      }
+
+      try {
+        while (Date.now() < deadline) {
+          if (fallback && Date.now() - fallback.at >= holdMs) {
+            abandoned = true
+            return fallback.opened
+          }
+          if (iteratorDone && pending.size === 0) break
+
+          const racers: Promise<RaceEvent>[] = [...pending.values()]
+          if (!iteratorDone && pending.size < maxOpen) racers.push(requestNext())
+          const now = Date.now()
+          const holdLeft = fallback ? Math.max(0, holdMs - (Date.now() - fallback.at)) : Infinity
+          const waitMs = Math.min(deadline - now, holdLeft)
+          racers.push(sleep(waitMs).then(() => ({ type: 'timer' as const })))
+          const event = await Promise.race(racers)
+
+          if (event.type === 'timer') {
+            if (fallback) {
+              abandoned = true
+              return fallback.opened
+            }
+            abandoned = true
+            break
+          }
+          if (event.type === 'candidate') {
+            nextRequest = null
+            const candidate = event.candidate
+            const index = nextIndex++
+            const task = this.openUpstream(
+              cacheKey,
+              entry,
+              async () => candidate,
+              minDeclaredBytes,
+              intervalSec,
+              0,
+              false,
+            ).then<RaceEvent, RaceEvent>(
+              opened => abandoned
+                ? { type: 'abandoned' }
+                : { type: 'opened', index, opened },
+              () => abandoned
+                ? { type: 'abandoned' }
+                : { type: 'open-error', index, candidate },
+            )
+            pending.set(index, task)
+            continue
+          }
+          if (event.type === 'done' || event.type === 'iterator-error') {
+            nextRequest = null
+            iteratorDone = true
+            continue
+          }
+          if (event.type === 'abandoned') continue
+
+          pending.delete(event.index)
+          if (event.type === 'open-error') {
+            excludeCandidate(event.candidate)
+            continue
+          }
+
+          const opened = event.opened
+          const actual = opened.actualQuality || null
+          if (meetsRequestedQuality(actual, quality)) {
+            abandoned = true
+            discardFallback()
+            return opened
+          }
+          const candidateRank = actual ? QUALITY_RANK[actual] : 0
+          const fallbackRank = fallback?.quality ? QUALITY_RANK[fallback.quality] : 0
+          if (!fallback || candidateRank > fallbackRank) {
+            discardFallback()
+            fallback = { opened, quality: actual || '128k', at: Date.now() }
+            logger.info(
+              `[AudioServe] 保留低档可播兜底: ${cacheKey} 请求=${quality} 实际=${actual || '未知'}，最多等待 ${holdMs}ms`,
+            )
+          } else {
+            discardOpened(opened)
+          }
+        }
+      } finally {
+        try { const closing = iterator.return?.(); closing?.catch(() => {}) } catch {}
+      }
+      if (fallback) {
+        abandoned = true
+        return fallback.opened
+      }
+    }
+    throw new Error('所有并发候选均未提供可播音频')
   }
 
   // --------------------------------------------------------------------------

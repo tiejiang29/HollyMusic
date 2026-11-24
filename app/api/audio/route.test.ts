@@ -33,7 +33,16 @@ vi.mock('@/lib/db', () => ({
       name: '测试歌曲',
       singer: '测试歌手',
       interval: '03:00',
-      types: [{ type: '320k' }],
+      types: [
+        { type: '128k', size: '3MB' },
+        { type: '320k', size: '10MB' },
+        { type: 'flac', size: '30MB' },
+      ],
+      _types: {
+        '128k': { size: '3MB' },
+        '320k': { size: '10MB' },
+        flac: { size: '30MB' },
+      },
     }
   }),
 }))

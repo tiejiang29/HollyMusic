@@ -93,6 +93,13 @@ export function qualityFromBytes(input: {
   return kbps >= LOSSY_320K_MIN_KBPS ? '320k' : '128k'
 }
 
+/** 实际档位是否满足请求；FLAC 魔数无法区分 16/24bit，Hi-Res 请求按 FLAC 放行。 */
+export function meetsRequestedQuality(actual: QualityType | null, requested: QualityType): boolean {
+  if (!actual) return false
+  if (requested === 'flac24bit' && actual === 'flac') return true
+  return QUALITY_ORDER.indexOf(actual) <= QUALITY_ORDER.indexOf(requested)
+}
+
 /**
  * 返回比给定音质低一档的音质（用于解码失败时降级重试）。
  * 已是最低档（128k）时返回 null。QUALITY_ORDER 已是高→低，故降级 = index + 1。

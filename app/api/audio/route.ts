@@ -26,7 +26,7 @@ import { musicSourceManager } from '@/lib/music-source-manager'
 import type { QualityType } from '@/lib/types/music'
 import { parseIntervalToSeconds } from '@/lib/types/player'
 import { audioServe } from '@/lib/audio-serve'
-import type { UpstreamUrlResolver } from '@/lib/audio-serve'
+import type { UpstreamCandidateResolver, UpstreamUrlResolver } from '@/lib/audio-serve'
 import { getAuthState } from '@/lib/services/user-context'
 import { verifyShareAudioToken } from '@/lib/services/auth'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
@@ -115,9 +115,27 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
       return musicSourceManager.getMusicUrlWithProvider(musicInfo, quality, { excludeProviders })
     }
 
+    const qualityFallback: QualityType[] = ['flac24bit', 'flac', '320k', '128k']
+    const qualityStart = qualityFallback.indexOf(quality)
+    const qualityLadder = (qualityStart >= 0 ? qualityFallback.slice(qualityStart) : [quality, ...qualityFallback])
+      .filter(item => musicInfo._types[item])
+    const candidateResolver: UpstreamCandidateResolver = async function* (candidateQuality, excludeProviders, excludeLanes, deadline) {
+      if (!musicSourceManager.isInitialized()) {
+        await musicSourceManager.initialize()
+      }
+      yield* musicSourceManager.getMusicUrlCandidates(musicInfo, candidateQuality, {
+        excludeProviders,
+        excludeLanes,
+        width: 6,
+        deadline,
+      })
+    }
+
     return await audioServe.serve({
       cacheKey,
       upstreamUrlResolver,
+      candidateResolver: process.env.AUDIO_COMPOSITE_MODE === '0' ? undefined : candidateResolver,
+      qualityLadder: process.env.AUDIO_COMPOSITE_MODE === '0' ? undefined : qualityLadder,
       rangeHeader,
       isHead,
       intervalSec: parseIntervalToSeconds(musicInfo.interval),

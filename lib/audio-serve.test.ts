@@ -56,6 +56,7 @@ vi.mock('@/lib/server/audio-integrity', async () => {
   return {
     checkTrialAudio: checkTrialAudioMock,
     judgePayloadLength: actual.judgePayloadLength,
+    estimateDurationFromHead: actual.estimateDurationFromHead,
   }
 })
 
@@ -296,6 +297,11 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
   /** 合法音频载荷（ID3 头 + 填充字节，能通过容器嗅探） */
   const AUDIO = Buffer.concat([Buffer.from('ID3\x03\x00'), Buffer.alloc(4096, 0x42)])
   const HTML = '<!DOCTYPE html><html><body>需要开通VIP</body></html>'
+  // 生产库真 flac《搁浅》的前 48 字节：STREAMINFO 自带 240.13s，供候选流判档
+  const FLAC_HEAD = Buffer.from(
+    '664c614300000022100010000000100033790ac442f000a196c1b5974a0b2a510de985219493e4ce3461030001c20000',
+    'hex',
+  )
 
   function payloadResponse(data: Buffer | string, ct: string): Response {
     const body = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf-8')
@@ -640,6 +646,195 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     const body = await passed.arrayBuffer()
     expect(body.byteLength).toBe(CLIP_MP4.length)
     expect(sourceHealth.view('m4a无声明源', 'tx')?.badKinds?.['byte:fake']).toBeUndefined()
+  })
+
+  it('候选流：请求 flac 且首个候选就是真 flac → 立即交付，不等待 2 秒', async () => {
+    globalThis.fetch = vi.fn(async () => payloadResponse(FLAC_HEAD, 'audio/flac')) as unknown as typeof fetch
+    const started = Date.now()
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-win:flac',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* () {
+        yield { url: 'https://good.example/full.flac', provider: '候选源', platform: 'tx', usedLanes: [] }
+      },
+      qualityLadder: ['flac'],
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 240,
+    })
+    expect(resp.status).toBe(200)
+    expect(Date.now() - started).toBeLessThan(1_500)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(FLAC_HEAD)).toBe(true)
+  })
+
+  it('候选流：高档候选不可播时才降下一档，320k 达标即交付', async () => {
+    const mp3 = Buffer.concat([AUDIO, Buffer.alloc(4_320_000 - AUDIO.length, 0x33)])
+    globalThis.fetch = vi.fn(async (input: unknown) =>
+      payloadResponse(String(input).includes('bad.example') ? HTML : mp3, String(input).includes('bad.example') ? 'text/html' : 'audio/mpeg')
+    ) as unknown as typeof fetch
+    const qualities: string[] = []
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-ladder:flac',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* (quality) {
+        qualities.push(quality)
+        if (quality === 'flac') {
+          yield { url: 'https://bad.example/fake.flac', provider: '假高档源', platform: 'tx', usedLanes: [] }
+        } else {
+          yield { url: 'https://good.example/full.mp3', provider: '320k源', platform: 'tx', usedLanes: [] }
+        }
+      },
+      qualityLadder: ['flac', '320k', '128k'],
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 120,
+    })
+    expect(resp.status).toBe(200)
+    expect(qualities).toEqual(['flac', '320k'])
+    expect(Buffer.from(await resp.arrayBuffer()).equals(mp3)).toBe(true)
+  })
+
+  it('候选流：Hi-Res 请求拿到真 FLAC 立即交付，不因无法区分 24bit 多等 2 秒', async () => {
+    globalThis.fetch = vi.fn(async () => payloadResponse(FLAC_HEAD, 'audio/flac')) as unknown as typeof fetch
+    const started = Date.now()
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-hires:flac24bit',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* () {
+        yield { url: 'https://good.example/full.flac', provider: '候选源', platform: 'tx', usedLanes: [] }
+        await new Promise(() => {})
+      },
+      qualityLadder: ['flac24bit'],
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 240,
+    })
+    expect(resp.status).toBe(200)
+    expect(Date.now() - started).toBeLessThan(1_500)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(FLAC_HEAD)).toBe(true)
+  })
+
+  it('候选流：只有低档可播兜底 → 保留 2 秒后交付，不继续干等', async () => {
+    globalThis.fetch = vi.fn(async () => payloadResponse(AUDIO, 'audio/mpeg')) as unknown as typeof fetch
+    const started = Date.now()
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-fallback:flac24bit',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* () {
+        yield { url: 'https://fallback.example/full.mp3', provider: '兜底源', platform: 'tx', usedLanes: [] }
+        await new Promise(() => {})
+      },
+      qualityLadder: ['flac24bit'],
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 240,
+    })
+    expect(resp.status).toBe(200)
+    const elapsed = Date.now() - started
+    expect(elapsed).toBeGreaterThanOrEqual(1_900)
+    expect(elapsed).toBeLessThan(3_500)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(AUDIO)).toBe(true)
+  })
+
+  it('候选流：首块验收也并发，慢候选不再挡住后到的快候选', async () => {
+    let releaseSlow: (() => void) | undefined
+    const fetched: string[] = []
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input)
+      fetched.push(url)
+      if (url.includes('slow.example')) {
+        return new Promise<Response>(resolve => {
+          releaseSlow = () => resolve(payloadResponse(FLAC_HEAD, 'audio/flac'))
+        })
+      }
+      return payloadResponse(FLAC_HEAD, 'audio/flac')
+    }) as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-parallel-head:flac',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* () {
+        yield { url: 'https://slow.example/full.flac', provider: '慢头源', platform: 'tx', usedLanes: [] }
+        yield { url: 'https://fast.example/full.flac', provider: '快头源', platform: 'tx', usedLanes: [] }
+      },
+      qualityLadder: ['flac'],
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 240,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(fetched).toHaveLength(2)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(FLAC_HEAD)).toBe(true)
+    releaseSlow?.()
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }, 2_000)
+
+  it('候选流：后到的高档候选胜出 → 取消先前保留的低档流，避免连接泄漏', async () => {
+    let lowCancelled = 0
+    const lowBody = Buffer.concat([AUDIO, Buffer.alloc(32 * 1024 - AUDIO.length, 0x42)])
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      if (!String(input).includes('low.example')) return payloadResponse(FLAC_HEAD, 'audio/flac')
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(lowBody))
+        },
+        cancel() {
+          lowCancelled++
+        },
+      })
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'audio/mpeg', 'content-length': String(lowBody.length) },
+      })
+    }) as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-replace:flac',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* () {
+        yield { url: 'https://low.example/full.mp3', provider: '低档源', platform: 'tx', usedLanes: [] }
+        yield { url: 'https://high.example/full.flac', provider: '高档源', platform: 'tx', usedLanes: [] }
+      },
+      qualityLadder: ['flac'],
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 240,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(lowCancelled).toBe(1)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(FLAC_HEAD)).toBe(true)
+  })
+
+  it('候选流：低档兜底胜出时恢复它自己的 Content-Type，不被后试的低档候选覆盖', async () => {
+    const ogg = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(1_920_000 - 4, 0x11)])
+    const mp3 = Buffer.concat([AUDIO, Buffer.alloc(1_920_000 - AUDIO.length, 0x22)])
+    globalThis.fetch = vi.fn(async (input: unknown) =>
+      payloadResponse(String(input).includes('ogg.example') ? ogg : mp3, String(input).includes('ogg.example') ? 'audio/ogg' : 'audio/mpeg')
+    ) as unknown as typeof fetch
+
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-fallback-meta:flac',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* () {
+        yield { url: 'https://ogg.example/full.ogg', provider: 'Ogg兜底源', platform: 'tx', usedLanes: [] }
+        yield { url: 'https://mp3.example/full.mp3', provider: '后试低档源', platform: 'tx', usedLanes: [] }
+      },
+      qualityLadder: ['flac'],
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 120,
+    })
+
+    expect(resp.status).toBe(200)
+    expect(resp.headers.get('content-type')).toContain('audio/ogg')
+    expect(Buffer.from(await resp.arrayBuffer()).equals(ogg)).toBe(true)
+    const created = vi.mocked(prisma.audioCache.upsert).mock.calls[0][0] as unknown as {
+      create: { contentType: string | null; filePath: string }
+    }
+    expect(created.create.contentType).toBe('audio/ogg')
+    expect(created.create.filePath).toMatch(/\.ogg$/)
   })
 
   it('每只源都给 60 秒罐头 → 试满 1+8 次后明确失败（护栏 maxUndersizedRetries），不落缓存', async () => {
