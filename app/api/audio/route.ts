@@ -123,6 +123,10 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
       intervalSec: parseIntervalToSeconds(musicInfo.interval),
       // 试听片段早判的对照基准：这首歌各档位声明的最小字节数（认不出就不校验）
       minDeclaredBytes: computeMinDeclaredBytes(musicInfo.types?.map(t => t.size)),
+      onBadLanes: (lanes, context) => {
+        if (!context.provider) return
+        return musicSourceManager.markBackendLanesBad(context.provider, lanes, context.reason)
+      },
       // 完成后：歌词预缓存 + 边听边下入库（music-library 内部处理去重/配额）
       onCached: () => Promise.all([
         cacheNativeLyricForMusic(musicInfo),

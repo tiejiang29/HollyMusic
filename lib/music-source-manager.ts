@@ -39,9 +39,25 @@ function isTrustworthyUrl(url: string): boolean {
 }
 
 /** 音源 slot 代理（子进程或 inline 直连），使用面与 LXEnvironmentSimulator 对齐 */
+interface BackendLaneTrace {
+  laneId: string
+  endpoint: string
+  keyHash: string | null
+  platform?: string | null
+  songId?: string | null
+  quality?: string | null
+  sourceName?: string | null
+}
+
 interface SourceSlot {
   loadScript(scriptPath: string): Promise<SourceInfo>
   getMusicUrl(source: string, musicInfo: MusicInfo, quality?: string): Promise<string>
+  getMusicUrlWithTrace?(
+    source: string,
+    musicInfo: MusicInfo,
+    quality?: string,
+  ): Promise<{ url: string; usedLanes: BackendLaneTrace[] }>
+  markBackendLanesBad?(lanes: BackendLaneTrace[], reason: string): Promise<{ marked: number }> | { marked: number }
   getLyric(source: string, musicInfo: MusicInfo): Promise<unknown>
   getPic(...args: unknown[]): Promise<unknown>
   dispose?(): Promise<void> | void
@@ -479,7 +495,7 @@ export class MusicSourceManager {
     musicInfo: MusicInfo,
     requestedQuality: QualityType = '320k',
     ctx?: { toggle?: SourceToggleInfo | null; excludeProviders?: ReadonlySet<string>; budgets?: ResolveBudgets }
-  ): Promise<{ url: string; provider: string | null; platform: string | null }> {
+  ): Promise<{ url: string; provider: string | null; platform: string | null; usedLanes: BackendLaneTrace[] }> {
     try {
       return await this._getMusicUrlSamePlatform(
         musicInfo,
@@ -526,6 +542,12 @@ export class MusicSourceManager {
    * 测量范围改成按脚本声明之后，`pt` 闸门照样把 32 格拦在出网之前（`latencyMs=0`）。
    * 派活侧照旧由 `pt` 说了算（`eligibleFor` 那道没动），所以改的只是"看得见什么"。
    */
+  async markBackendLanesBad(provider: string, lanes: BackendLaneTrace[], reason: string): Promise<void> {
+    const instance = this.instances.find(item => item.config.name === provider)
+    if (!instance || typeof instance.simulator.markBackendLanesBad !== 'function') return
+    await instance.simulator.markBackendLanesBad(lanes, reason)
+  }
+
   async probeSourceUrl(
     sourceName: string,
     musicInfo: MusicInfo,
@@ -582,7 +604,7 @@ export class MusicSourceManager {
     requestedQuality: QualityType = '320k',
     excludeProviders?: ReadonlySet<string>,
     budgetOverride?: ResolveBudgets
-  ): Promise<{ url: string; provider: string | null; platform: string | null }> {
+  ): Promise<{ url: string; provider: string | null; platform: string | null; usedLanes: BackendLaneTrace[] }> {
     const budgets = this.budgetsFor(budgetOverride)
     // 在获取 URL 时检查配置是否变更
     if (this.initialized && this.checkConfigChanged()) {
@@ -698,11 +720,21 @@ export class MusicSourceManager {
           )
 
           // 单次调用加超时（洛雪脚本挂起时不阻塞整个请求），并被单源/总预算夹住
-          const url = await this.withTimeout(
-            instance.simulator.getMusicUrl(musicInfo.source, musicInfo, quality),
-            callTimeoutMs,
-            `获取音乐URL超时: ${instance.config.name} - ${quality}`,
-          )
+          const traced = typeof instance.simulator.getMusicUrlWithTrace === 'function'
+            ? await this.withTimeout(
+                instance.simulator.getMusicUrlWithTrace(musicInfo.source, musicInfo, quality),
+                callTimeoutMs,
+                `获取音乐URL超时: ${instance.config.name} - ${quality}`,
+              )
+            : {
+                url: await this.withTimeout(
+                  instance.simulator.getMusicUrl(musicInfo.source, musicInfo, quality),
+                  callTimeoutMs,
+                  `获取音乐URL超时: ${instance.config.name} - ${quality}`,
+                ),
+                usedLanes: [],
+              }
+          const url = traced.url
           const tookMs = Date.now() - attemptAt
 
           if (url && typeof url === 'string' && url.trim()) {
@@ -719,7 +751,7 @@ export class MusicSourceManager {
             )
             // 注意这只说明「拿到了地址」；到底能不能播由 audio-serve 的字节段判定入账
             sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'ok', tookMs)
-            return { url, provider: instance.config.name, platform: musicInfo.source }
+            return { url, provider: instance.config.name, platform: musicInfo.source, usedLanes: traced.usedLanes || [] }
           }
           // 返回空地址：多半是该源没有这首歌的版权，属正常事件，不计坏
           sourceHealth.recordResolve(instance.config.name, musicInfo.source, 'no-address', tookMs)

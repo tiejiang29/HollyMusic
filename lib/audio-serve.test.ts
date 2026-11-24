@@ -319,11 +319,16 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders => {
       seenExcludes.push([...excludeProviders])
       return excludeProviders.has('坏源A')
-        ? { url: 'https://good.example/a.mp3', provider: '好源B' }
-        : { url: 'https://bad.example/a.mp3', provider: '坏源A' }
+        ? { url: 'https://good.example/a.mp3', provider: '好源B', usedLanes: [] }
+        : {
+            url: 'https://bad.example/a.mp3',
+            provider: '坏源A',
+            usedLanes: [{ laneId: 'lane-bad', endpoint: 'https://bad.example/a.mp3', keyHash: 'hash-1', platform: 'kw', songId: 'fake1', quality: '320k' }],
+          }
     }
 
     const onCached = vi.fn(async () => {})
+    const onBadLanes = vi.fn<(lanes: unknown[], context: unknown) => Promise<void>>(async () => {})
     const resp = await audioServe.serve({
       cacheKey: 'kw:fake1:320k',
       upstreamUrlResolver,
@@ -331,6 +336,7 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
       isHead: false,
       intervalSec: 0,
       onCached,
+      onBadLanes,
     })
 
     expect(resp.status).toBe(200)
@@ -345,6 +351,10 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     // 字节段结论按 `音源×平台` 落账（provider 由 resolver 回传，平台退回 cacheKey 首段）
     expect(sourceHealth.view('坏源A', 'kw')?.badKinds['byte:fake']).toBe(1)
     expect(sourceHealth.view('好源B', 'kw')?.byteOk).toBe(1)
+    expect(onBadLanes).toHaveBeenCalledTimes(1)
+    expect(onBadLanes.mock.calls[0]?.[0]).toEqual([
+      { laneId: 'lane-bad', endpoint: 'https://bad.example/a.mp3', keyHash: 'hash-1', platform: 'kw', songId: 'fake1', quality: '320k' },
+    ])
   })
 
   it('上游 404 → 同样换源重试（坏链路不再挡路）', async () => {

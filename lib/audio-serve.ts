@@ -40,6 +40,16 @@ import {
 // 上游 URL 解析契约
 // ============================================================================
 
+export interface BackendLaneTrace {
+  laneId: string
+  endpoint: string
+  keyHash: string | null
+  platform?: string | null
+  songId?: string | null
+  quality?: string | null
+  sourceName?: string | null
+}
+
 /** 一次解析的产物：地址 + 命中的音源名与平台（用于假地址时排除重试与健康度归因） */
 export interface ResolvedUpstream {
   url: string
@@ -50,7 +60,14 @@ export interface ResolvedUpstream {
    * 健康度按 `音源×平台` 记账，所以必须由解析方回传，不能从 cacheKey 反推。
    */
   platform?: string | null
+  /** 脚本本次实际调用过的后端 lane（仅哈希，不含原始 key） */
+  usedLanes?: BackendLaneTrace[]
 }
+
+export type BadLaneReporter = (
+  lanes: BackendLaneTrace[],
+  context: { provider: string | null; platform: string | null; cacheKey: string; reason: string },
+) => void | Promise<void>
 
 /**
  * 上游 URL 解析器。
@@ -197,6 +214,8 @@ interface InflightEntry {
    */
   provider: string | null
   platform: string | null
+  /** 高置信度坏载荷出现时，通知解析方把对应后端 lane 拉黑 */
+  onBadLanes?: BadLaneReporter
 }
 
 class AudioServe {
@@ -298,6 +317,8 @@ class AudioServe {
     isHead: boolean
     intervalSec: number
     minDeclaredBytes?: number | null
+    /** 高置信度假载荷/试听片段被拒时，按后端 lane 记账（可选） */
+    onBadLanes?: BadLaneReporter
     /** 音频完整写入缓存后触发的后台任务；失败不影响音频交付。 */
     onCached?: () => Promise<void>
     /**
@@ -341,7 +362,8 @@ class AudioServe {
         opts.upstreamUrlResolver,
         opts.intervalSec,
         opts.onCached,
-        opts.minDeclaredBytes ?? null
+        opts.minDeclaredBytes ?? null,
+        opts.onBadLanes
       )
     }
 
@@ -507,7 +529,8 @@ class AudioServe {
     upstreamUrlResolver: UpstreamUrlResolver,
     intervalSec: number,
     onCached?: () => Promise<void>,
-    minDeclaredBytes: number | null = null
+    minDeclaredBytes: number | null = null,
+    onBadLanes?: BadLaneReporter,
   ): Promise<InflightEntry> {
     // 同步占位，保证并发请求只创建一个 entry（多用户去重核心）
     const entry: InflightEntry = {
@@ -521,6 +544,7 @@ class AudioServe {
       payloadVerdict: null,
       provider: null,
       platform: null,
+      onBadLanes,
     }
     this.inflight.set(cacheKey, entry)
 
@@ -795,6 +819,7 @@ class AudioServe {
       )
       const url = typeof resolved === 'string' ? resolved : resolved.url
       const provider = typeof resolved === 'string' ? null : resolved.provider
+      const usedLanes = typeof resolved === 'string' ? [] : (resolved.usedLanes || [])
       // 平台以解析方回传为准（跨平台换源后与 cacheKey 里的 source 不同）；
       // 老式只回传裸字符串的调用方没有这个信息，退回用 cacheKey 首段猜，且没有 provider
       // 时下面根本不记账，所以这个退回值只可能在"换源但没回传平台"的边角场景被用到。
@@ -802,6 +827,14 @@ class AudioServe {
       /** 字节段唯一能识破"有地址但播不了"的一段；provider 未知时无法归因，直接不记 */
       const recordByte = (outcome: ByteOutcome, reason?: string) => {
         if (provider && platform) sourceHealth.recordByte(provider, platform, outcome, reason)
+      }
+      const reportBadLanes = async (reason: string) => {
+        if (!entry.onBadLanes || usedLanes.length === 0) return
+        try {
+          await entry.onBadLanes(usedLanes, { provider, platform, cacheKey, reason })
+        } catch (error) {
+          logger.warn('[AudioServe] 后端 lane 负缓存上报失败:', error instanceof Error ? error.message : error)
+        }
       }
       entry.provider = provider
       entry.platform = platform
@@ -884,6 +917,7 @@ class AudioServe {
         clearTimeout(stallTimer)
         // 最高置信度的坏证据：HTTP 200 但字节是 HTML/JSON/图片等
         recordByte('fake', judgment.reason)
+        await reportBadLanes(judgment.reason)
         if (provider && attempt < this.maxFakeRetries) {
           attempt++
           excluded.add(provider)
@@ -914,6 +948,7 @@ class AudioServe {
         clearTimeout(stallTimer)
         const reason = `疑似试听片段（${lenCheck.basis}）：${lenCheck.detail}`
         recordByte('fake', reason)
+        await reportBadLanes(reason)
         // provider 认不出来就既不能记账也不能排除，只能直接失败——别拿同一个地址原地打转
         if (provider && !excluded.has(provider) && sizeAttempt < this.maxUndersizedRetries) {
           sizeAttempt++

@@ -50,4 +50,36 @@ describe('backend lane registry', () => {
     expect(registry.finishTrace(traceId).lanes).toHaveLength(1)
     expect(registry.finishTrace(traceId).lanes).toHaveLength(0)
   })
+
+  it('完全相同请求在途时只启动一次，结束后可再次请求', async () => {
+    let calls = 0
+    let release
+    const key = registry.buildRequestKey('GET', 'https://api.example.com/x?key=one', { headers: { 'X-A': '1' } })
+    const starter = () => { calls++; return new Promise(resolve => { release = resolve }) }
+    const a = registry.coalesceRequest(key, starter)
+    const b = registry.coalesceRequest(key, starter)
+    expect(calls).toBe(0)
+    await Promise.resolve()
+    expect(calls).toBe(1)
+    release({ ok: true })
+    await expect(a).resolves.toEqual({ ok: true })
+    await expect(b).resolves.toEqual({ ok: true })
+
+    await registry.coalesceRequest(key, async () => { calls++; return { ok: true } })
+    expect(calls).toBe(2)
+  })
+
+  it('lane 负缓存按平台/歌曲/音质/key 隔离，不同 key 不连坐', async () => {
+    const a = registry.describeRequest('https://api.example.com/x?key=one', {})
+    const b = registry.describeRequest('https://api.example.com/x?key=two', {})
+    const laneA = { ...a, platform: 'tx', songId: 'song-1', quality: 'flac' }
+    registry.markLaneBad(laneA, 'trial', 20)
+
+    expect(registry.isLaneBad(laneA)).toBe(true)
+    expect(registry.isLaneBad({ ...b, platform: 'tx', songId: 'song-1', quality: 'flac' })).toBe(false)
+    expect(registry.isLaneBad({ ...a, platform: 'tx', songId: 'song-2', quality: 'flac' })).toBe(false)
+    expect(registry.isLaneBad({ ...a, platform: 'tx', songId: 'song-1', quality: '320k' })).toBe(false)
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(registry.isLaneBad(laneA)).toBe(false)
+  })
 })

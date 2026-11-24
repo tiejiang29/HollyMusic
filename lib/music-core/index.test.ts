@@ -174,6 +174,43 @@ describe('LXEnvironmentSimulator 沙箱端到端', () => {
     }
   })
 
+  it('请求合并与 lane 负缓存：同请求只打一次，判坏后同歌同档不再发网络', async () => {
+    let hitCount = 0
+    const server = await startTestServer((_req, res) => {
+      hitCount++
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"ok":true}')
+    })
+    try {
+      const sim = new LXEnvironmentSimulator()
+      await sim.executeScript(`
+        const { EVENT_NAMES, on, send, request } = globalThis.lx
+        on(EVENT_NAMES.request, ({ action, info }) => {
+          if (action !== 'musicUrl') return Promise.reject(new Error('unsupported'))
+          const url = 'http://127.0.0.1:${server.port}/v1/song?apikey=same-key&mid=' + info.musicInfo.songmid
+          return new Promise((resolve, reject) => {
+            Promise.all([
+              new Promise((res, rej) => request(url, {}, (err, resp, body) => err ? rej(err) : res(body))),
+              new Promise((res, rej) => request(url, {}, (err, resp, body) => err ? rej(err) : res(body))),
+            ]).then(values => resolve('https://example.com/' + values[0].ok)).catch(reject)
+          })
+        })
+        ${INITED_KW}
+      `)
+
+      const first = await sim.getMusicUrlWithTrace('kw', { songmid: 'same-song' }, '128k')
+      expect(first.url).toBe('https://example.com/true')
+      expect(hitCount).toBe(1)
+      expect(first.usedLanes).toHaveLength(1)
+
+      sim.markBackendLanesBad(first.usedLanes, 'trial clip')
+      await expect(sim.getMusicUrl('kw', { songmid: 'same-song' }, '128k')).rejects.toThrow(/后端 lane 已标记不可用/)
+      expect(hitCount).toBe(1)
+    } finally {
+      await server.close()
+    }
+  })
+
   it('lx.request 网络桥：响应对象/JSON body/字节跨界转换', async () => {
     let hitCount = 0
     const server = await startTestServer((_req, res) => {

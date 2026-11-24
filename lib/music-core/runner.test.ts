@@ -103,6 +103,7 @@ describe('SourceRunnerClient 子进程集成', () => {
       const traced = (await slot.getMusicUrlWithTrace('kw', MUSIC_INFO, '128k')) as { url: string; usedLanes: unknown[] }
       expect(traced.url).toBe('https://example.com/stream.mp3')
       expect(traced.usedLanes).toEqual([])
+      await expect(slot.markBackendLanesBad([], 'test')).resolves.toEqual({ marked: 0 })
       const lyric = (await slot.getLyric('kw', MUSIC_INFO)) as { lyric: string }
       expect(lyric.lyric).toBe('lyric-ok')
     }
