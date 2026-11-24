@@ -134,6 +134,8 @@ API 路由层（app/api/**）        —— 参数校验、鉴权、响应包装
 
 **音源脚本**：一个音源 = 一个洛雪 JS 脚本，声明自己支持的平台（kw/tx/mg/wy/kg）、音质（128k/320k/flac/flac24bit）和 actions（musicUrl/getLyric/getPic）。脚本运行在一个**常驻 runner 子进程**里，宿主通过 IPC 调用（`slot.create` / `slot.load` / `slot.call`），脚本崩溃由熔断器自动重启。
 
+**后端 lane 追踪（2026-11-25 新增，仅观测）**：`lib/music-core/backend-registry.js` 把脚本每次 `lx.request` 归一到 `endpoint（host+path，剥 query）+ keyHash（凭据哈希）`，用 `AsyncLocalStorage` 绑定到当前 `平台×歌曲×音质×源名` 调用；`getMusicUrlWithTrace` 经 runner IPC 回传实际用过的 lane。原始 key 不进入 trace/日志。该层目前**不合并请求、不做负缓存、不改变选源**，旧 `getMusicUrl` 返回值与行为不变，供后续 CompositeSource 使用。
+
 **音源配置** `config/music-sources.json`，每条：`path`（脚本路径）、`name`、`pt`（平台白名单）、`enabled`、`priority`（数字越小越先被尝试）。管理端的启停/排序修改会**原子写回这个文件**（临时文件 + rename）并触发运行时热重载（配置 MD5 变化 → 重建音源实例）。订阅源（subscription）支持在线 URL 自动更新脚本。
 
 **解析瀑布**（`_getMusicUrlSamePlatform`）：

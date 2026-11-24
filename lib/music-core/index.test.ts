@@ -104,6 +104,76 @@ describe('LXEnvironmentSimulator 沙箱端到端', () => {
     expect(lyric.lyric).toBe('[00:00.00]hello')
   })
 
+  it('trace：记录脚本实际请求的 endpoint + keyHash，旧 getMusicUrl 仍返回字符串', async () => {
+    const server = await startTestServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"ok":true}')
+    })
+    try {
+      const sim = new LXEnvironmentSimulator()
+      await sim.executeScript(`
+        const { EVENT_NAMES, on, send, request } = globalThis.lx
+        on(EVENT_NAMES.request, ({ action, info }) => {
+          if (action !== 'musicUrl') return Promise.reject(new Error('unsupported'))
+          return new Promise((resolve, reject) => {
+            request('http://127.0.0.1:${server.port}/v1/song?apikey=raw-secret&mid=' + info.musicInfo.songmid,
+              { headers: { 'X-Test': 'yes' } }, (err, resp, body) => {
+                if (err) return reject(err)
+                resolve('https://example.com/' + body.ok + '/' + resp.statusCode)
+              })
+          })
+        })
+        ${INITED_KW}
+      `)
+
+      const legacy = await sim.getMusicUrl('kw', { songmid: 'legacy' }, '128k')
+      expect(legacy).toBe('https://example.com/true/200')
+
+      const traced = await sim.getMusicUrlWithTrace('kw', { songmid: 'trace-1' }, '128k')
+      expect(traced.url).toBe('https://example.com/true/200')
+      expect(traced.usedLanes).toHaveLength(1)
+      expect(traced.usedLanes[0].endpoint).toBe(`http://127.0.0.1:${server.port}/v1/song`)
+      expect(traced.usedLanes[0].songId).toBe('trace-1')
+      expect(JSON.stringify(traced)).not.toContain('raw-secret')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('trace 并发隔离：同一 simulator 两路调用不会串 songId 或 endpoint', async () => {
+    const server = await startTestServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"ok":true}')
+    })
+    try {
+      const sim = new LXEnvironmentSimulator()
+      await sim.executeScript(`
+        const { EVENT_NAMES, on, send, request } = globalThis.lx
+        on(EVENT_NAMES.request, ({ action, info }) => {
+          if (action !== 'musicUrl') return Promise.reject(new Error('unsupported'))
+          return new Promise((resolve, reject) => {
+            request('http://127.0.0.1:${server.port}/' + info.musicInfo.songmid, {}, (err, resp, body) => {
+              if (err) return reject(err)
+              resolve('https://example.com/' + info.musicInfo.songmid + '/' + body.ok)
+            })
+          })
+        })
+        ${INITED_KW}
+      `)
+
+      const [a, b] = await Promise.all([
+        sim.getMusicUrlWithTrace('kw', { songmid: 'song-A' }, '128k'),
+        sim.getMusicUrlWithTrace('kw', { songmid: 'song-B' }, '128k'),
+      ])
+      expect(a.usedLanes[0].songId).toBe('song-A')
+      expect(b.usedLanes[0].songId).toBe('song-B')
+      expect(a.usedLanes[0].endpoint).toBe(`http://127.0.0.1:${server.port}/song-A`)
+      expect(b.usedLanes[0].endpoint).toBe(`http://127.0.0.1:${server.port}/song-B`)
+    } finally {
+      await server.close()
+    }
+  })
+
   it('lx.request 网络桥：响应对象/JSON body/字节跨界转换', async () => {
     let hitCount = 0
     const server = await startTestServer((_req, res) => {

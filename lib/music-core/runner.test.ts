@@ -100,6 +100,9 @@ describe('SourceRunnerClient 子进程集成', () => {
       expect(Object.keys(sourceInfo.sources)).toEqual(['kw'])
 
       await expect(slot.getMusicUrl('kw', MUSIC_INFO, '128k')).resolves.toBe('https://example.com/stream.mp3')
+      const traced = (await slot.getMusicUrlWithTrace('kw', MUSIC_INFO, '128k')) as { url: string; usedLanes: unknown[] }
+      expect(traced.url).toBe('https://example.com/stream.mp3')
+      expect(traced.usedLanes).toEqual([])
       const lyric = (await slot.getLyric('kw', MUSIC_INFO)) as { lyric: string }
       expect(lyric.lyric).toBe('lyric-ok')
     }
@@ -185,6 +188,9 @@ describe('SourceRunnerClient 子进程集成', () => {
       const sourceInfo = (await slot.loadScript(script)) as { sources: Record<string, unknown> }
       expect(Object.keys(sourceInfo.sources)).toEqual(['kw'])
       await expect(slot.getMusicUrl('kw', MUSIC_INFO, '128k')).resolves.toBe('https://example.com/stream.mp3')
+      const traced = (await slot.getMusicUrlWithTrace('kw', MUSIC_INFO, '128k')) as { url: string; usedLanes: unknown[] }
+      expect(traced.url).toBe('https://example.com/stream.mp3')
+      expect(traced.usedLanes).toEqual([])
     }
   )
 })
