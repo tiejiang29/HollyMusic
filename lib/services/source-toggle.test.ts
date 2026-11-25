@@ -26,7 +26,7 @@ vi.mock('@/lib/search-config', () => ({
   getSearchSources: vi.fn(async () => []),
 }))
 
-const { findAlternatives, findBestAlternative, clearToggleCache } = await import('./source-toggle')
+const { findAlternatives, findBestAlternative, findAlternativesForPlatforms, clearToggleCache } = await import('./source-toggle')
 
 function mi(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -117,6 +117,38 @@ describe('findAlternatives 本地优先', () => {
     expect(candidates).toEqual([])
     expect(findManyMock).not.toHaveBeenCalled()
     expect(searchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('findAlternativesForPlatforms 复合源成员解析', () => {
+  beforeEach(() => {
+    findManyMock.mockReset()
+    searchMock.mockReset()
+    clearToggleCache()
+  })
+
+  it('本地有点名平台就直接用，只给缺失平台搜上游', async () => {
+    findManyMock.mockResolvedValue([row()])
+    searchMock.mockImplementation(async (platform: string) => ({
+      list: platform === 'kg' ? [mi({ source: 'kg', songmid: 'kg-9' })] : [],
+    }))
+
+    const candidates = await findAlternativesForPlatforms(mi(), ['wy', 'kg'])
+    expect(candidates.map(item => item.source)).toEqual(['wy', 'kg'])
+    expect(searchMock).toHaveBeenCalledTimes(1)
+    expect(searchMock.mock.calls[0][0]).toBe('kg')
+  })
+
+  it('同一首歌同一平台集合重复解析命中缓存，不再打上游', async () => {
+    findManyMock.mockResolvedValue([])
+    searchMock.mockImplementation(async (platform: string) => ({
+      list: [mi({ source: platform, songmid: `${platform}-9` })],
+    }))
+
+    await findAlternativesForPlatforms(mi(), ['wy', 'kg'])
+    const calls = searchMock.mock.calls.length
+    await findAlternativesForPlatforms(mi(), ['kg', 'wy'])
+    expect(searchMock.mock.calls.length).toBe(calls)
   })
 })
 

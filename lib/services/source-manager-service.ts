@@ -405,13 +405,20 @@ export interface SourceProbeVerdict {
 
 export async function listSourcesWithStatus(): Promise<SourceWithStatus[]> {
   const config = await readConfig()
+  const runtime = new Map(musicSourceManager.getHealthStatus().map(status => [status.source, status]))
   const result: SourceWithStatus[] = []
   for (const s of config.sources) {
     const exists = await scriptExists(s.path)
     // 账本的键是音源名，且沿用 manager 的同一个回退（name 缺省时用 path），
     // 两边不一致的话面板会对所有源都显示"无实测"
     const health = sourceHealth.ofSource(s.name || s.path)
-    result.push({ ...s, scriptExists: exists, ...(health.length ? { health } : {}) })
+    const supportedPlatforms = runtime.get(s.name || s.path)?.supportedSources
+    result.push({
+      ...s,
+      scriptExists: exists,
+      ...(supportedPlatforms?.length ? { supportedPlatforms } : {}),
+      ...(health.length ? { health } : {}),
+    })
   }
   return result
 }

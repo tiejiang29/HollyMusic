@@ -32,6 +32,7 @@ import { verifyShareAudioToken } from '@/lib/services/auth'
 import { cacheNativeLyricForMusic } from '@/lib/services/lyrics'
 import { serveFromLibrary, ingestFromCache } from '@/lib/services/music-library'
 import { minDeclaredBytes as computeMinDeclaredBytes } from '@/lib/server/audio-integrity'
+import { getCompositeSettings } from '@/lib/services/composite-source'
 
 function buildErrorResponse(status: number, code: string, message: string): Response {
   return new Response(
@@ -119,6 +120,8 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
     const qualityStart = qualityFallback.indexOf(quality)
     const qualityLadder = (qualityStart >= 0 ? qualityFallback.slice(qualityStart) : [quality, ...qualityFallback])
       .filter(item => musicInfo._types[item])
+    const composite = await getCompositeSettings()
+    const compositeEnabled = composite.enabled && composite.members.length > 0
     const candidateResolver: UpstreamCandidateResolver = async function* (candidateQuality, excludeProviders, excludeLanes, deadline) {
       if (!musicSourceManager.isInitialized()) {
         await musicSourceManager.initialize()
@@ -126,16 +129,26 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
       yield* musicSourceManager.getMusicUrlCandidates(musicInfo, candidateQuality, {
         excludeProviders,
         excludeLanes,
-        width: 6,
+        width: composite.width,
         deadline,
+        members: composite.members,
+        budgets: {
+          urlMs: composite.resolveMs,
+          perSourceMs: composite.resolveMs,
+          totalMs: composite.chainMs,
+        },
       })
     }
 
     return await audioServe.serve({
       cacheKey,
       upstreamUrlResolver,
-      candidateResolver: process.env.AUDIO_COMPOSITE_MODE === '0' ? undefined : candidateResolver,
-      qualityLadder: process.env.AUDIO_COMPOSITE_MODE === '0' ? undefined : qualityLadder,
+      candidateResolver: compositeEnabled ? candidateResolver : undefined,
+      qualityLadder: compositeEnabled ? qualityLadder : undefined,
+      candidateWidth: compositeEnabled ? composite.width : undefined,
+      candidateHoldMs: compositeEnabled ? composite.holdMs : undefined,
+      firstByteTimeoutMs: compositeEnabled ? composite.headerMs : undefined,
+      swapChainTimeoutMs: compositeEnabled ? composite.chainMs : undefined,
       rangeHeader,
       isHead,
       intervalSec: parseIntervalToSeconds(musicInfo.interval),

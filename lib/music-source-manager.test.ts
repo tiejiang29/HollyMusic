@@ -14,6 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // 跨平台换源会打 DB 与搜索，这里全部屏蔽：本测试只关心同平台瀑布的预算行为
 vi.mock('./services/source-toggle', () => ({
   findBestAlternative: vi.fn(async () => null),
+  findAlternativesForPlatforms: vi.fn(async () => []),
 }))
 vi.mock('./logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -21,11 +22,13 @@ vi.mock('./logger', () => ({
 
 const { MusicSourceManager, readUrlBudgets, readSpeakerUrlBudgets, SourceTimeoutError } = await import('./music-source-manager')
 const { sourceHealth } = await import('./server/source-health')
+const { findAlternativesForPlatforms } = await import('./services/source-toggle')
 const { logger } = await import('./logger')
 import type { SimulatorInstance } from './music-source-manager'
 
 beforeEach(() => {
   sourceHealth.reset()
+  vi.mocked(findAlternativesForPlatforms).mockReset().mockResolvedValue([])
 })
 
 const QUALITIES = ['128k', '320k', 'flac', 'flac24bit']
@@ -521,6 +524,43 @@ describe('按调用路径覆盖取址预算', () => {
 })
 
 describe('候选流并发波', () => {
+  it('跨平台成员先解析同款，再用该平台 MusicInfo 取址；原平台排除不连坐', async () => {
+    const txInfo = { ...musicInfo, source: 'tx', songmid: 'tx-1' } as never
+    const wyInfo = { ...musicInfo, source: 'wy', songmid: 'wy-1' } as never
+    vi.mocked(findAlternativesForPlatforms).mockResolvedValue([
+      { musicInfo: wyInfo, source: 'wy', intervalMatched: true },
+    ])
+    const manager = managerWith(
+      [fakeSource('跨平台源', async () => 'https://example.com/wy.flac', 'wy')],
+      { urlMs: 1000, perSourceMs: 500, totalMs: 2000 },
+    )
+
+    const results = []
+    for await (const candidate of manager.getMusicUrlCandidates(txInfo, 'flac', {
+      members: [{ sourceName: '跨平台源', platform: 'wy' }],
+      excludeProviders: new Set(['跨平台源']),
+      width: 2,
+      deadline: Date.now() + 2000,
+    })) results.push(candidate)
+
+    expect(findAlternativesForPlatforms).toHaveBeenCalledWith(txInfo, ['wy'])
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({ provider: '跨平台源', platform: 'wy', url: 'https://example.com/wy.flac' })
+  })
+
+  it('点名的跨平台没有同款时跳过，不拿原平台歌曲冒充', async () => {
+    const manager = managerWith(
+      [fakeSource('跨平台源', async () => 'https://example.com/wy.flac', 'wy')],
+      { urlMs: 1000, perSourceMs: 500, totalMs: 2000 },
+    )
+    const results = []
+    for await (const candidate of manager.getMusicUrlCandidates({ ...musicInfo, source: 'tx' } as never, 'flac', {
+      members: [{ sourceName: '跨平台源', platform: 'wy' }],
+      deadline: Date.now() + 2000,
+    })) results.push(candidate)
+    expect(results).toEqual([])
+  })
+
   it('波内按完成顺序产出，慢的高优先级源不挡住快的低优先级源', async () => {
     const instances = [
       fakeSource('慢源', async () => {

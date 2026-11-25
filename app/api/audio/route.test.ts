@@ -65,6 +65,22 @@ vi.mock('@/lib/services/lyrics', () => ({
   cacheNativeLyricForMusic: vi.fn(async () => {}),
 }))
 
+const compositeState = vi.hoisted(() => ({
+  settings: {
+    enabled: false,
+    members: [] as Array<{ sourceName: string; platform: 'tx' | 'wy' | 'kw' | 'kg' | 'mg' }>,
+    width: 1,
+    holdMs: 2_000,
+    resolveMs: 8_000,
+    headerMs: 3_000,
+    chainMs: 12_000,
+  },
+}))
+
+vi.mock('@/lib/services/composite-source', () => ({
+  getCompositeSettings: vi.fn(async () => compositeState.settings),
+}))
+
 vi.mock('@/lib/music-source-manager', () => ({
   musicSourceManager: {
     isInitialized: vi.fn(() => true),
@@ -91,6 +107,15 @@ const UID = 'kw-196030664'
 describe('GET /api/audio 鉴权矩阵', () => {
   beforeEach(() => {
     authMode = 'unauth'
+    compositeState.settings = {
+      enabled: false,
+      members: [],
+      width: 1,
+      holdMs: 2_000,
+      resolveMs: 8_000,
+      headerMs: 3_000,
+      chainMs: 12_000,
+    }
   })
 
   it('匿名且无 st → 401', async () => {
@@ -132,6 +157,30 @@ describe('GET /api/audio 鉴权矩阵', () => {
     expect(res.status).toBe(200)
   })
 
+  it('面板启用复合源后，把波宽/hold/首块/整链参数交给 audioServe', async () => {
+    authMode = 'ok'
+    compositeState.settings = {
+      enabled: true,
+      members: [{ sourceName: '测试源', platform: 'kw' }],
+      width: 6,
+      holdMs: 1_200,
+      resolveMs: 6_000,
+      headerMs: 2_000,
+      chainMs: 10_000,
+    }
+    const res = await GET(makeRequest({ uid: UID, quality: '320k' }))
+    expect(res.status).toBe(200)
+    const { audioServe } = await import('@/lib/audio-serve')
+    const options = vi.mocked(audioServe.serve).mock.calls.at(-1)?.[0]
+    expect(options).toMatchObject({
+      candidateWidth: 6,
+      candidateHoldMs: 1_200,
+      firstByteTimeoutMs: 2_000,
+      swapChainTimeoutMs: 10_000,
+    })
+    expect(options?.candidateResolver).toBeTypeOf('function')
+  })
+
   it('缺 uid → 400（先于鉴权）', async () => {
     const res = await GET(makeRequest({ quality: '320k' }))
     expect(res.status).toBe(400)
@@ -166,6 +215,15 @@ const CAR_HEADERS = { 'user-agent': 'Dalvik/2.1.0 (Linux; U; Android 16; 25019PN
 describe('未认证的取图式请求改道到公开封面', () => {
   beforeEach(() => {
     authMode = 'unauth'
+    compositeState.settings = {
+      enabled: false,
+      members: [],
+      width: 1,
+      holdMs: 2_000,
+      resolveMs: 8_000,
+      headerMs: 3_000,
+      chainMs: 12_000,
+    }
   })
 
   it('车机实测形状 → 302 到 /api/cover/<uid>，并 no-store', async () => {

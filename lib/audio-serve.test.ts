@@ -61,6 +61,7 @@ vi.mock('@/lib/server/audio-integrity', async () => {
 })
 
 const { audioServe, _resetAudioServeConfigForTest } = await import('@/lib/audio-serve')
+const { logger } = await import('@/lib/logger')
 const { prisma } = await import('@/lib/db')
 const { sourceHealth } = await import('@/lib/server/source-health')
 const { fingerprintStats, resetFingerprintsForTest } = await import('@/lib/server/audio-fingerprint')
@@ -655,7 +656,7 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
       cacheKey: 'tx:candidate-win:flac',
       upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
       candidateResolver: async function* () {
-        yield { url: 'https://good.example/full.flac', provider: '候选源', platform: 'tx', usedLanes: [] }
+        yield { url: 'https://good.example/full.flac', provider: '候选源', platform: 'tx', usedLanes: [], traceId: 'trace-test-1' }
       },
       qualityLadder: ['flac'],
       rangeHeader: null,
@@ -664,6 +665,7 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     })
     expect(resp.status).toBe(200)
     expect(Date.now() - started).toBeLessThan(1_500)
+    expect(vi.mocked(logger.info).mock.calls.some(call => String(call[0]).includes('trace-test-1'))).toBe(true)
     expect(Buffer.from(await resp.arrayBuffer()).equals(FLAC_HEAD)).toBe(true)
   })
 
@@ -769,6 +771,29 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     releaseSlow?.()
     await new Promise(resolve => setTimeout(resolve, 0))
   }, 2_000)
+
+  it('候选流：面板覆盖的 holdMs 生效，低档兜底不再固定等 2 秒', async () => {
+    globalThis.fetch = vi.fn(async () => payloadResponse(AUDIO, 'audio/mpeg')) as unknown as typeof fetch
+    const started = Date.now()
+    const resp = await audioServe.serve({
+      cacheKey: 'tx:candidate-hold-override:flac',
+      upstreamUrlResolver: async () => { throw new Error('候选流模式不应走旧 resolver') },
+      candidateResolver: async function* () {
+        yield { url: 'https://fallback.example/full.mp3', provider: '兜底源', platform: 'tx', usedLanes: [] }
+        await new Promise(() => {})
+      },
+      qualityLadder: ['flac'],
+      candidateHoldMs: 100,
+      candidateWidth: 1,
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 240,
+    })
+    expect(resp.status).toBe(200)
+    expect(Date.now() - started).toBeGreaterThanOrEqual(80)
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(Buffer.from(await resp.arrayBuffer()).equals(AUDIO)).toBe(true)
+  })
 
   it('候选流：后到的高档候选胜出 → 取消先前保留的低档流，避免连接泄漏', async () => {
     let lowCancelled = 0

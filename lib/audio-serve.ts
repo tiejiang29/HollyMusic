@@ -64,6 +64,8 @@ export interface ResolvedUpstream {
   platform?: string | null
   /** 脚本本次实际调用过的后端 lane（仅哈希，不含原始 key） */
   usedLanes?: BackendLaneTrace[]
+  /** 本次取址的 runner trace，供候选胜者与下载启动日志串联 */
+  traceId?: string
 }
 
 export type BadLaneReporter = (
@@ -89,6 +91,7 @@ interface OpenedUpstream {
   platform: string | null
   payloadVerdict: 'audio' | 'unverified'
   actualQuality?: QualityType | null
+  traceId: string | null
 }
 
 const QUALITY_RANK: Record<QualityType, number> = {
@@ -248,6 +251,10 @@ interface InflightEntry {
   /** 可选候选流模式：manager 按波并发产出候选，audio-serve 逐个股字节验收 */
   candidateResolver?: UpstreamCandidateResolver
   qualityLadder?: QualityType[]
+  candidateWidth?: number
+  candidateHoldMs?: number
+  firstByteTimeoutMs?: number
+  swapChainTimeoutMs?: number
 }
 
 class AudioServe {
@@ -354,6 +361,11 @@ class AudioServe {
     /** 候选流模式（与 upstreamUrlResolver 二选一；优先级更高） */
     candidateResolver?: UpstreamCandidateResolver
     qualityLadder?: QualityType[]
+    /** 候选流运行参数覆盖；不传沿用实例默认值 */
+    candidateWidth?: number
+    candidateHoldMs?: number
+    firstByteTimeoutMs?: number
+    swapChainTimeoutMs?: number
     /** 音频完整写入缓存后触发的后台任务；失败不影响音频交付。 */
     onCached?: () => Promise<void>
     /**
@@ -400,7 +412,11 @@ class AudioServe {
         opts.minDeclaredBytes ?? null,
         opts.onBadLanes,
         opts.candidateResolver,
-        opts.qualityLadder
+        opts.qualityLadder,
+        opts.candidateWidth,
+        opts.candidateHoldMs,
+        opts.firstByteTimeoutMs,
+        opts.swapChainTimeoutMs
       )
     }
 
@@ -570,6 +586,10 @@ class AudioServe {
     onBadLanes?: BadLaneReporter,
     candidateResolver?: UpstreamCandidateResolver,
     qualityLadder?: QualityType[],
+    candidateWidth?: number,
+    candidateHoldMs?: number,
+    firstByteTimeoutMs?: number,
+    swapChainTimeoutMs?: number,
   ): Promise<InflightEntry> {
     // 同步占位，保证并发请求只创建一个 entry（多用户去重核心）
     const entry: InflightEntry = {
@@ -586,6 +606,10 @@ class AudioServe {
       onBadLanes,
       candidateResolver,
       qualityLadder,
+      candidateWidth,
+      candidateHoldMs,
+      firstByteTimeoutMs,
+      swapChainTimeoutMs,
     }
     this.inflight.set(cacheKey, entry)
 
@@ -644,7 +668,7 @@ class AudioServe {
       await fsp.mkdir(entry.paths.shardDir, { recursive: true })
 
       logger.debug(
-        `[AudioServe] start ${cacheKey} size=${size} type=${entry.contentType}`
+        `[AudioServe] start ${cacheKey} size=${size} type=${entry.contentType} trace=${opened.traceId || '-'}`
       )
 
       // 边下边写盘（错误路径销毁句柄并清半成品，避免 Windows 文件锁与孤儿文件删不掉）
@@ -844,16 +868,18 @@ class AudioServe {
     let sizeAttempt = 0
     const fakeRetries = retryLimit ?? this.maxFakeRetries
     const undersizedRetries = retryLimit ?? this.maxUndersizedRetries
+    const chainTimeoutMs = entry.swapChainTimeoutMs ?? this.swapChainTimeoutMs
+    const firstByteTimeoutMs = entry.firstByteTimeoutMs ?? this.firstByteTimeoutMs
     const chainStart = Date.now()
 
     for (;;) {
       // 整条链的墙钟闸：先算还剩多少，不够一次解析就直接认输，不再试下一只源
-      const chainLeftMs = this.swapChainTimeoutMs - (Date.now() - chainStart)
+      const chainLeftMs = chainTimeoutMs - (Date.now() - chainStart)
       if (chainLeftMs <= 0) {
         logger.warn(
-          `[AudioServe] 换源链已用满 ${this.swapChainTimeoutMs}ms（已排除 ${excluded.size} 只），停止重试: ${cacheKey}`
+          `[AudioServe] 换源链已用满 ${chainTimeoutMs}ms（已排除 ${excluded.size} 只），停止重试: ${cacheKey}`
         )
-        throw new Error(`换源链超过 ${this.swapChainTimeoutMs}ms 上限，未取到可播的整曲`)
+        throw new Error(`换源链超过 ${chainTimeoutMs}ms 上限，未取到可播的整曲`)
       }
       // ① URL 解析：洛雪脚本挂起时不再永久卡死（inflight entry 也不残留）
       const resolved = await this.withTimeout(
@@ -864,6 +890,7 @@ class AudioServe {
       const url = typeof resolved === 'string' ? resolved : resolved.url
       const provider = typeof resolved === 'string' ? null : resolved.provider
       const usedLanes = typeof resolved === 'string' ? [] : (resolved.usedLanes || [])
+      const traceId = typeof resolved === 'string' ? null : (resolved.traceId || null)
       // 平台以解析方回传为准（跨平台换源后与 cacheKey 里的 source 不同）；
       // 老式只回传裸字符串的调用方没有这个信息，退回用 cacheKey 首段猜，且没有 provider
       // 时下面根本不记账，所以这个退回值只可能在"换源但没回传平台"的边角场景被用到。
@@ -888,7 +915,7 @@ class AudioServe {
       // 所以这条不会误伤慢速但正常的整曲下载
       let stallTimer: NodeJS.Timeout = setTimeout(
         () => controller.abort(),
-        this.firstByteTimeoutMs
+        firstByteTimeoutMs
       )
       if (stallTimer.unref) stallTimer.unref()
 
@@ -1084,6 +1111,7 @@ class AudioServe {
         platform,
         payloadVerdict: entry.payloadVerdict === 'audio' ? 'audio' : 'unverified',
         actualQuality,
+        traceId,
       }
     }
   }
@@ -1097,9 +1125,9 @@ class AudioServe {
     const resolver = entry.candidateResolver!
     const ladder = entry.qualityLadder!
     const chainStart = Date.now()
-    const deadline = chainStart + this.swapChainTimeoutMs
-    const holdMs = 2_000
-    const maxOpen = 6
+    const deadline = chainStart + (entry.swapChainTimeoutMs ?? this.swapChainTimeoutMs)
+    const holdMs = entry.candidateHoldMs ?? 2_000
+    const maxOpen = Math.max(1, Math.min(entry.candidateWidth ?? 6, 16))
     let fallback: { opened: OpenedUpstream; quality: QualityType; at: number } | null = null
     const discardOpened = (opened: OpenedUpstream) => {
       clearTimeout(opened.stallTimer)
@@ -1212,6 +1240,9 @@ class AudioServe {
           if (meetsRequestedQuality(actual, quality)) {
             abandoned = true
             discardFallback()
+            logger.info(
+              `[AudioServe] 候选胜出: ${cacheKey} 请求=${quality} 实际=${actual} trace=${opened.traceId || '-'}`,
+            )
             return opened
           }
           const candidateRank = actual ? QUALITY_RANK[actual] : 0
@@ -1220,7 +1251,7 @@ class AudioServe {
             discardFallback()
             fallback = { opened, quality: actual || '128k', at: Date.now() }
             logger.info(
-              `[AudioServe] 保留低档可播兜底: ${cacheKey} 请求=${quality} 实际=${actual || '未知'}，最多等待 ${holdMs}ms`,
+              `[AudioServe] 保留低档可播兜底: ${cacheKey} 请求=${quality} 实际=${actual || '未知'}，最多等待 ${holdMs}ms trace=${opened.traceId || '-'}`,
             )
           } else {
             discardOpened(opened)

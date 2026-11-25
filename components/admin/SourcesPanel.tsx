@@ -19,6 +19,7 @@ import {
 } from '@/lib/api/admin-sources'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { CompositeSourcePanel } from '@/components/admin/CompositeSourcePanel'
 import type { SourceHealthView } from '@/lib/server/source-health'
 import type { SourceProbeVerdict } from '@/lib/services/source-manager-service'
 import { Plus, Pencil, Trash2, Music, X, Loader2, Upload, AlertCircle, CheckCircle2, FileWarning, RefreshCw, Rss, Radar, Lightbulb, Undo2 } from 'lucide-react'
@@ -536,6 +537,8 @@ export function SourcesPanel() {
           </div>
         </div>
       )}
+
+      <CompositeSourcePanel sources={sources} />
 
       {loading ? (
         <LoadingSkeleton count={5} />

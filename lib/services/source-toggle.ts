@@ -29,6 +29,7 @@ const INTERVAL_TOLERANCE_SECONDS = 4
  */
 interface ToggleCacheEntry { value: MusicInfo | null; expiresAt: number }
 const toggleCache = new Map<string, ToggleCacheEntry>()
+const platformCache = new Map<string, { candidates: AlternativeCandidate[]; expiresAt: number }>()
 const TOGGLE_CACHE_MAX = 300
 /** 命中缓存时长（10 分钟） */
 const TOGGLE_HIT_TTL_MS = 10 * 60 * 1000
@@ -63,6 +64,7 @@ function cacheSet(key: string, value: MusicInfo | null): void {
 /** 仅供单测：清空换源缓存 */
 export function clearToggleCache(): void {
   toggleCache.clear()
+  platformCache.clear()
 }
 
 /** "04:29" → 269 秒；解析失败返回 null */
@@ -187,29 +189,18 @@ export interface FindAlternativesResult {
  * 直接返回，不再实时搜上游；库内无副本或 opts.forceUpstream 时走上游搜索
  * （每平台取前 5 个候选做匹配，避免大歌单关键词命中过多翻唱）。
  */
-export async function findAlternatives(
+async function searchUpstreamAlternatives(
   musicInfo: MusicInfo,
-  opts: { forceUpstream?: boolean } = {}
-): Promise<FindAlternativesResult> {
-  const { name, singer, source } = musicInfo
-  if (!name) return { candidates: [], origin: 'upstream' }
+  platforms: SourceType[],
+): Promise<AlternativeCandidate[]> {
+  const { name, singer } = musicInfo
+  if (!name || platforms.length === 0) return []
   const intervalSec = parseIntervalToSeconds(musicInfo.interval)
-
-  const local = opts.forceUpstream ? [] : await findLocalAlternatives(musicInfo, intervalSec)
-  if (local.length > 0) {
-    logger.info(
-      `[source-toggle] 本地同款歌命中: ${source}-${musicInfo.name}，库内副本 ${local.length} 条，跳过上游搜索`
-    )
-    return { candidates: sortCandidates(local), origin: 'local' }
-  }
-
   const keyword = singer ? `${name} ${singer}` : name
-
   const candidates: AlternativeCandidate[] = []
-  const others = TOGGLE_SOURCE_ORDER.filter(s => s !== source)
 
   await Promise.all(
-    others.map(async plat => {
+    platforms.map(async plat => {
       try {
         const result = await musicSearch.search(plat, keyword, 1, 8)
         const list = result?.list ?? []
@@ -228,8 +219,67 @@ export async function findAlternatives(
       }
     })
   )
+  return candidates
+}
 
-  // 按平台优先级排序，时长精确匹配的排前面
+/**
+ * 只解析复合源点名的平台：本地有同款就直接用，缺的平台才并行搜上游。
+ * 结果按「原歌 + 平台集合」缓存，避免同一首歌在多个音质档里重复搜四平台。
+ */
+export async function findAlternativesForPlatforms(
+  musicInfo: MusicInfo,
+  platforms: readonly SourceType[],
+): Promise<AlternativeCandidate[]> {
+  const wanted = [...new Set(platforms)].filter(platform => platform !== musicInfo.source).sort()
+  if (!musicInfo.name || wanted.length === 0) return []
+  const key = `${musicInfo.source}-${musicInfo.songmid}|${wanted.join(',')}`
+  const cached = platformCache.get(key)
+  if (cached && cached.expiresAt > Date.now()) return cached.candidates
+  if (cached) platformCache.delete(key)
+
+  const intervalSec = parseIntervalToSeconds(musicInfo.interval)
+  const local = (await findLocalAlternatives(musicInfo, intervalSec))
+    .filter(candidate => wanted.includes(candidate.source))
+  const found = new Set(local.map(candidate => candidate.source))
+  const upstream = await searchUpstreamAlternatives(musicInfo, wanted.filter(platform => !found.has(platform)))
+  const merged = sortCandidates([...local, ...upstream])
+    .filter(candidate => wanted.includes(candidate.source))
+  const deduped: AlternativeCandidate[] = []
+  const seen = new Set<string>()
+  for (const candidate of merged) {
+    const id = `${candidate.source}-${candidate.musicInfo.songmid}`
+    if (seen.has(id)) continue
+    seen.add(id)
+    deduped.push(candidate)
+    if (deduped.length >= wanted.length * 2) break
+  }
+
+  if (platformCache.size >= TOGGLE_CACHE_MAX) platformCache.clear()
+  platformCache.set(key, {
+    candidates: deduped,
+    expiresAt: Date.now() + (deduped.length > 0 ? TOGGLE_HIT_TTL_MS : TOGGLE_MISS_TTL_MS),
+  })
+  return deduped
+}
+
+export async function findAlternatives(
+  musicInfo: MusicInfo,
+  opts: { forceUpstream?: boolean } = {}
+): Promise<FindAlternativesResult> {
+  const { name, source } = musicInfo
+  if (!name) return { candidates: [], origin: 'upstream' }
+  const intervalSec = parseIntervalToSeconds(musicInfo.interval)
+
+  const local = opts.forceUpstream ? [] : await findLocalAlternatives(musicInfo, intervalSec)
+  if (local.length > 0) {
+    logger.info(
+      `[source-toggle] 本地同款歌命中: ${source}-${musicInfo.name}，库内副本 ${local.length} 条，跳过上游搜索`
+    )
+    return { candidates: sortCandidates(local), origin: 'local' }
+  }
+
+  const others = TOGGLE_SOURCE_ORDER.filter(s => s !== source)
+  const candidates = await searchUpstreamAlternatives(musicInfo, others)
   return { candidates: sortCandidates(candidates), origin: 'upstream' }
 }
 

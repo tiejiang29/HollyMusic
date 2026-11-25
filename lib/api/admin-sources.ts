@@ -9,6 +9,8 @@ import type { SourceProbeVerdict } from '@/lib/services/source-manager-service'
 
 export interface AdminSource extends SourceConfig {
   scriptExists: boolean
+  /** 脚本初始化后自报的平台；未初始化时可能为空 */
+  supportedPlatforms?: string[]
   /** 运行实测健康度（内存账本，按平台分别；重启清零） */
   health?: SourceHealthView[]
   /** 最近一次周测的结论（落库，跨重启） */

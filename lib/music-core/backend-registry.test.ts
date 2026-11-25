@@ -69,6 +69,32 @@ describe('backend lane registry', () => {
     expect(calls).toBe(2)
   })
 
+  it('lane 统计只暴露哈希与 HTTP 成败，判坏会显示冷却', () => {
+    const lane = {
+      ...registry.describeRequest('https://api.example.com/x?key=super-secret-key', {}),
+      platform: 'tx', songId: 'song-1', quality: 'flac', sourceName: '测试源',
+    }
+    registry.recordLaneResult(lane, true)
+    registry.recordLaneResult(lane, false, 'HTTP 503')
+    registry.markLaneBad(lane, '试听片段', 1000)
+
+    const [stat] = registry.listLaneStats()
+    expect(stat).toMatchObject({
+      laneId: lane.laneId,
+      endpoint: 'https://api.example.com/x',
+      sourceName: '测试源',
+      platform: 'tx',
+      attempts: 2,
+      httpOk: 1,
+      httpBad: 1,
+      payloadBad: 1,
+      successRate: 0.5,
+      cooling: true,
+    })
+    expect(stat.retryAfterMs).toBeGreaterThan(0)
+    expect(JSON.stringify(stat)).not.toContain('super-secret-key')
+  })
+
   it('lane 负缓存按平台/歌曲/音质/key 隔离，不同 key 不连坐', async () => {
     const a = registry.describeRequest('https://api.example.com/x?key=one', {})
     const b = registry.describeRequest('https://api.example.com/x?key=two', {})
