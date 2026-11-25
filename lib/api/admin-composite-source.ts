@@ -9,6 +9,7 @@ export interface CompositeMember {
 export interface CompositeSettings {
   enabled: boolean
   members: CompositeMember[]
+  crossPlatformMode: 'fallback' | 'parallel'
   width: number
   holdMs: number
   resolveMs: number

@@ -132,6 +132,7 @@ async function handleAudio(request: NextRequest, isHead: boolean): Promise<Respo
         width: composite.width,
         deadline,
         members: composite.members,
+        crossPlatformMode: composite.crossPlatformMode,
         budgets: {
           urlMs: composite.resolveMs,
           perSourceMs: composite.resolveMs,

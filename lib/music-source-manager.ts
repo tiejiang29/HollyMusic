@@ -14,7 +14,7 @@ import { decodeLyricEntities } from './server/lyric-decode'
 import { normalizeStructuredLyricText } from './server/lyric-normalize'
 import { findBestAlternative, findAlternativesForPlatforms } from './services/source-toggle'
 import { sourceHealth, isContentMiss, type ResolveOutcome } from './server/source-health'
-import type { CompositeMember } from './services/composite-source'
+import type { CompositeMember, CrossPlatformMode } from './services/composite-source'
 
 /** 换源元信息：本次取址发生跨平台自动换源时填充，供 API 层透出给前端展示 */
 export interface SourceToggleInfo {
@@ -622,35 +622,21 @@ export class MusicSourceManager {
       deadline?: number
       budgets?: ResolveBudgets
       members?: readonly CompositeMember[]
+      crossPlatformMode?: CrossPlatformMode
     } = {},
   ): AsyncGenerator<{ url: string; provider: string; platform: string; usedLanes: BackendLaneTrace[]; traceId?: string }> {
     const budgets = this.budgetsFor(opts.budgets)
     const deadline = opts.deadline || Date.now() + budgets.totalMs
     const width = Math.max(1, Math.min(opts.width || 6, 16))
+    const crossPlatformMode = opts.crossPlatformMode ?? 'fallback'
     type CandidateTarget = { instance: SimulatorInstance; musicInfo: MusicInfo }
-    let targets: CandidateTarget[] = []
 
-    if (opts.members?.length) {
-      const crossPlatforms = [...new Set(opts.members
-        .map(member => member.platform)
-        .filter(platform => platform !== musicInfo.source))]
-      const alternatives = new Map<SourceType, MusicInfo>()
-      if (crossPlatforms.length > 0) {
-        try {
-          const candidates = await this.withTimeout(
-            findAlternativesForPlatforms(musicInfo, crossPlatforms),
-            Math.max(250, deadline - Date.now()),
-            '跨平台同款搜索超时',
-          )
-          for (const candidate of candidates) {
-            if (!alternatives.has(candidate.source)) alternatives.set(candidate.source, candidate.musicInfo)
-          }
-        } catch (error) {
-          logger.warn('[composite] 跨平台同款搜索失败，继续使用原平台成员:', error)
-        }
-      }
-
-      for (const member of opts.members) {
+    const buildTargets = (
+      members: readonly CompositeMember[],
+      alternatives: Map<SourceType, MusicInfo>,
+    ): CandidateTarget[] => {
+      const targets: CandidateTarget[] = []
+      for (const member of members) {
         const instance = this.instances.find(item => item.initialized && item.config.name === member.sourceName)
         if (!instance) continue
         if (member.platform === musicInfo.source && opts.excludeProviders?.has(instance.config.name)) continue
@@ -659,52 +645,102 @@ export class MusicSourceManager {
         if (this.eligibleFor([instance], member.platform).length === 0) continue
         targets.push({ instance, musicInfo: targetInfo })
       }
-    } else {
-      targets = this.eligibleFor(
+      return targets
+    }
+
+    const resolveCrossTargets = async (members: readonly CompositeMember[]): Promise<{
+      targets: CandidateTarget[]
+      alternatives: Map<SourceType, MusicInfo>
+    }> => {
+      const crossPlatforms = [...new Set(members.map(member => member.platform))]
+      if (crossPlatforms.length === 0 || Date.now() >= deadline) return { targets: [], alternatives: new Map() }
+      const alternatives = new Map<SourceType, MusicInfo>()
+      try {
+        const candidates = await this.withTimeout(
+          findAlternativesForPlatforms(musicInfo, crossPlatforms),
+          Math.max(250, deadline - Date.now()),
+          '跨平台同款搜索超时',
+        )
+        for (const candidate of candidates) {
+          if (!alternatives.has(candidate.source)) alternatives.set(candidate.source, candidate.musicInfo)
+        }
+      } catch (error) {
+        logger.warn('[composite] 跨平台同款搜索失败，继续使用原平台成员:', error)
+      }
+      return { targets: buildTargets(members, alternatives), alternatives }
+    }
+
+    const activeTargets = (targets: CandidateTarget[]): CandidateTarget[] => {
+      const byPlatform = new Map<SourceType, CandidateTarget[]>()
+      for (const target of targets) {
+        const list = byPlatform.get(target.musicInfo.source) || []
+        list.push(target)
+        byPlatform.set(target.musicInfo.source, list)
+      }
+      const active = new Set<CandidateTarget>()
+      for (const platformTargets of byPlatform.values()) {
+        const cooled = new Set<string>()
+        for (const target of platformTargets) {
+          if (platformTargets.length - cooled.size <= 1) break
+          if (sourceHealth.coolStatus(target.instance.config.name, target.musicInfo.source).skip) {
+            cooled.add(target.instance.config.name)
+          }
+        }
+        for (const target of platformTargets) {
+          if (!cooled.has(target.instance.config.name)) active.add(target)
+        }
+      }
+      return targets.filter(target => active.has(target))
+    }
+
+    const seenLanes = new Set(opts.excludeLanes || [])
+    const attemptCandidate = (target: CandidateTarget) => this.attemptCandidate(
+      target.instance,
+      target.musicInfo,
+      requestedQuality,
+      Math.max(250, Math.min(budgets.perSourceMs, deadline - Date.now())),
+    )
+    const runTargets = async function* (targets: CandidateTarget[]) {
+      const orderedTargets = activeTargets(targets)
+      for (let offset = 0; offset < orderedTargets.length; offset += width) {
+        if (Date.now() >= deadline) return
+        const wave = orderedTargets.slice(offset, offset + width)
+        const tasks = wave.map(attemptCandidate)
+        for await (const settled of completionOrder(tasks)) {
+          const candidate = settled.value
+          if (!candidate) continue
+          const freshLanes = candidate.usedLanes.filter(lane => !seenLanes.has(lane.laneId))
+          if (candidate.usedLanes.length > 0 && freshLanes.length === 0) continue
+          for (const lane of freshLanes) seenLanes.add(lane.laneId)
+          yield { ...candidate, usedLanes: freshLanes }
+        }
+      }
+    }
+
+    if (!opts.members?.length) {
+      const targets = this.eligibleFor(
         this.instances.filter(item => item.initialized),
         musicInfo.source,
         opts.excludeProviders,
       ).map(instance => ({ instance, musicInfo }))
+      yield* runTargets(targets)
+      return
     }
 
-    const byPlatform = new Map<SourceType, CandidateTarget[]>()
-    for (const target of targets) {
-      const list = byPlatform.get(target.musicInfo.source) || []
-      list.push(target)
-      byPlatform.set(target.musicInfo.source, list)
+    const originalMembers = opts.members.filter(member => member.platform === musicInfo.source)
+    const crossMembers = opts.members.filter(member => member.platform !== musicInfo.source)
+    if (crossPlatformMode === 'parallel') {
+      const { alternatives } = await resolveCrossTargets(crossMembers)
+      const targets = buildTargets(opts.members, alternatives)
+      yield* runTargets(targets)
+      return
     }
-    const active = new Set<CandidateTarget>()
-    for (const platformTargets of byPlatform.values()) {
-      const cooled = new Set<string>()
-      for (const target of platformTargets) {
-        if (platformTargets.length - cooled.size <= 1) break
-        if (sourceHealth.coolStatus(target.instance.config.name, target.musicInfo.source).skip) {
-          cooled.add(target.instance.config.name)
-        }
-      }
-      for (const target of platformTargets) {
-        if (!cooled.has(target.instance.config.name)) active.add(target)
-      }
-    }
-    const orderedTargets = targets.filter(target => active.has(target))
-    const seenLanes = new Set(opts.excludeLanes || [])
-    for (let offset = 0; offset < orderedTargets.length; offset += width) {
-      if (Date.now() >= deadline) return
-      const wave = orderedTargets.slice(offset, offset + width)
-      const tasks = wave.map(target => this.attemptCandidate(
-        target.instance,
-        target.musicInfo,
-        requestedQuality,
-        Math.max(250, Math.min(budgets.perSourceMs, deadline - Date.now())),
-      ))
-      for await (const settled of completionOrder(tasks)) {
-        const candidate = settled.value
-        if (!candidate) continue
-        const freshLanes = candidate.usedLanes.filter(lane => !seenLanes.has(lane.laneId))
-        if (candidate.usedLanes.length > 0 && freshLanes.length === 0) continue
-        for (const lane of freshLanes) seenLanes.add(lane.laneId)
-        yield { ...candidate, usedLanes: freshLanes }
-      }
+
+    const originalTargets = buildTargets(originalMembers, new Map())
+    if (originalTargets.length > 0) yield* runTargets(originalTargets)
+    if (crossMembers.length > 0) {
+      const { targets: crossTargets } = await resolveCrossTargets(crossMembers)
+      yield* runTargets(crossTargets)
     }
   }
 

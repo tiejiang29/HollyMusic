@@ -39,6 +39,7 @@ const { GET, PUT } = await import('./route')
 const settings = {
   enabled: false,
   members: [],
+  crossPlatformMode: 'fallback',
   width: 1,
   holdMs: 2_000,
   resolveMs: 8_000,
@@ -77,7 +78,7 @@ describe('复合源管理 API', () => {
   })
 
   it('PUT 归一化后的配置由服务层保存，响应使用刚保存的视图', async () => {
-    const input = { ...settings, enabled: true, width: 6, members: [{ sourceName: '源A', platform: 'tx' }] }
+    const input = { ...settings, enabled: true, crossPlatformMode: 'parallel', width: 6, members: [{ sourceName: '源A', platform: 'tx' }] }
     const saved = { ...input }
     getCompositeView.mockResolvedValue({ settings: saved, lanes: [] })
     saveCompositeSettings.mockResolvedValue(saved)

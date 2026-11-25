@@ -69,6 +69,7 @@ const compositeState = vi.hoisted(() => ({
   settings: {
     enabled: false,
     members: [] as Array<{ sourceName: string; platform: 'tx' | 'wy' | 'kw' | 'kg' | 'mg' }>,
+    crossPlatformMode: 'fallback',
     width: 1,
     holdMs: 2_000,
     resolveMs: 8_000,
@@ -110,6 +111,7 @@ describe('GET /api/audio 鉴权矩阵', () => {
     compositeState.settings = {
       enabled: false,
       members: [],
+      crossPlatformMode: 'fallback',
       width: 1,
       holdMs: 2_000,
       resolveMs: 8_000,
@@ -218,6 +220,7 @@ describe('未认证的取图式请求改道到公开封面', () => {
     compositeState.settings = {
       enabled: false,
       members: [],
+      crossPlatformMode: 'fallback',
       width: 1,
       holdMs: 2_000,
       resolveMs: 8_000,

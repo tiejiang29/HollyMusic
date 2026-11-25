@@ -34,6 +34,9 @@ export async function PUT(request: NextRequest) {
     const settings = await saveCompositeSettings({
       enabled: typeof body?.enabled === 'boolean' ? body.enabled : undefined,
       members: Array.isArray(body?.members) ? body.members : undefined,
+      crossPlatformMode: body?.crossPlatformMode === 'parallel' || body?.crossPlatformMode === 'fallback'
+        ? body.crossPlatformMode
+        : undefined,
       width: body?.width,
       holdMs: body?.holdMs,
       resolveMs: body?.resolveMs,

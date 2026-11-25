@@ -561,6 +561,79 @@ describe('候选流并发波', () => {
     expect(results).toEqual([])
   })
 
+  it('延时兜底：原平台首个候选可用时，不搜跨平台同款', async () => {
+    const txInfo = { ...musicInfo, source: 'tx', songmid: 'tx-1' } as never
+    const manager = managerWith(
+      [fakeSource('腾讯源', async () => 'https://example.com/tx.flac', 'tx')],
+      { urlMs: 1000, perSourceMs: 500, totalMs: 2000 },
+    )
+    for await (const candidate of manager.getMusicUrlCandidates(txInfo, 'flac', {
+      members: [
+        { sourceName: '腾讯源', platform: 'tx' },
+        { sourceName: '网易源', platform: 'wy' },
+      ],
+      crossPlatformMode: 'fallback',
+      deadline: Date.now() + 2000,
+    })) {
+      expect(candidate.platform).toBe('tx')
+      break
+    }
+    expect(findAlternativesForPlatforms).not.toHaveBeenCalled()
+  })
+
+  it('延时兜底：原平台候选走完后才搜同款并让跨平台成员上场', async () => {
+    const txInfo = { ...musicInfo, source: 'tx', songmid: 'tx-1' } as never
+    const wyInfo = { ...musicInfo, source: 'wy', songmid: 'wy-1' } as never
+    vi.mocked(findAlternativesForPlatforms).mockResolvedValue([
+      { musicInfo: wyInfo, source: 'wy', intervalMatched: true },
+    ])
+    const manager = managerWith(
+      [
+        fakeSource('腾讯源', async () => { throw new Error('播放地址解析失败') }, 'tx'),
+        fakeSource('网易源', async () => 'https://example.com/wy.flac', 'wy'),
+      ],
+      { urlMs: 1000, perSourceMs: 500, totalMs: 2000 },
+    )
+    const results = []
+    for await (const candidate of manager.getMusicUrlCandidates(txInfo, 'flac', {
+      members: [
+        { sourceName: '腾讯源', platform: 'tx' },
+        { sourceName: '网易源', platform: 'wy' },
+      ],
+      crossPlatformMode: 'fallback',
+      deadline: Date.now() + 2000,
+    })) results.push(candidate)
+    expect(findAlternativesForPlatforms).toHaveBeenCalledTimes(1)
+    expect(results.map(item => item.platform)).toEqual(['wy'])
+  })
+
+  it('同时竞价：显式 parallel 时先解析跨平台同款，再统一分波', async () => {
+    const txInfo = { ...musicInfo, source: 'tx', songmid: 'tx-1' } as never
+    const wyInfo = { ...musicInfo, source: 'wy', songmid: 'wy-1' } as never
+    vi.mocked(findAlternativesForPlatforms).mockResolvedValue([
+      { musicInfo: wyInfo, source: 'wy', intervalMatched: true },
+    ])
+    const manager = managerWith(
+      [
+        fakeSource('腾讯源', async () => 'https://example.com/tx.flac', 'tx'),
+        fakeSource('网易源', async () => 'https://example.com/wy.flac', 'wy'),
+      ],
+      { urlMs: 1000, perSourceMs: 500, totalMs: 2000 },
+    )
+    const results = []
+    for await (const candidate of manager.getMusicUrlCandidates(txInfo, 'flac', {
+      members: [
+        { sourceName: '腾讯源', platform: 'tx' },
+        { sourceName: '网易源', platform: 'wy' },
+      ],
+      crossPlatformMode: 'parallel',
+      width: 2,
+      deadline: Date.now() + 2000,
+    })) results.push(candidate)
+    expect(findAlternativesForPlatforms).toHaveBeenCalledTimes(1)
+    expect(results.map(item => item.platform).sort()).toEqual(['tx', 'wy'])
+  })
+
   it('波内按完成顺序产出，慢的高优先级源不挡住快的低优先级源', async () => {
     const instances = [
       fakeSource('慢源', async () => {

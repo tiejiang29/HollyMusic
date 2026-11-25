@@ -143,7 +143,7 @@ export function CompositeSourcePanel({ sources }: { sources: AdminSource[] }) {
             复合音源（灰度）
           </h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            同一首歌按音质并发竞选；波宽 1 用于串行对照，6 用于完整并发。关闭后立即回到旧瀑布。
+            同一首歌按音质并发竞选；波宽 1 用于串行对照，6 用于完整并发。跨平台默认等原平台候选走完后兜底，关闭后立即回到旧瀑布。
           </p>
         </div>
         {settings && (
@@ -182,6 +182,18 @@ export function CompositeSourcePanel({ sources }: { sources: AdminSource[] }) {
                 className="mt-1 block w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground"
               >
                 {[1, 2, 3, 4, 5, 6].map(width => <option key={width} value={width}>{width}{width === 1 ? '（串行对照）' : width === 6 ? '（完整并发）' : ''}</option>)}
+              </select>
+            </label>
+            <label className="text-xs text-muted-foreground">
+              跨平台参与
+              <select
+                value={settings.crossPlatformMode}
+                disabled={saving}
+                onChange={event => setSettings({ ...settings, crossPlatformMode: event.target.value as 'fallback' | 'parallel' })}
+                className="mt-1 block w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+              >
+                <option value="fallback">原平台失败后兜底（推荐）</option>
+                <option value="parallel">从第一轮同时竞价</option>
               </select>
             </label>
             {([

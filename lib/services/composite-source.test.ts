@@ -61,6 +61,12 @@ describe('复合源配置归一化', () => {
     })
     expect(settings).toMatchObject({ width: 6, holdMs: 0, resolveMs: 19_000, headerMs: 19_000, chainMs: 19_000 })
   })
+
+  it('跨平台默认延时兜底，只有显式 parallel 才同时竞价', () => {
+    expect(normalizeCompositeSettings().crossPlatformMode).toBe('fallback')
+    expect(normalizeCompositeSettings({ crossPlatformMode: 'parallel' }).crossPlatformMode).toBe('parallel')
+    expect(normalizeCompositeSettings({ crossPlatformMode: 'unknown' as never }).crossPlatformMode).toBe('fallback')
+  })
 })
 
 describe('复合源配置持久化', () => {

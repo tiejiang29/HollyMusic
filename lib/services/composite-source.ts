@@ -10,9 +10,13 @@ export interface CompositeMember {
   platform: SourceType
 }
 
+export type CrossPlatformMode = 'fallback' | 'parallel'
+
 export interface CompositeSettings {
   enabled: boolean
   members: CompositeMember[]
+  /** 跨平台成员：原平台候选走完后兜底 / 从第一轮同时竞价 */
+  crossPlatformMode: CrossPlatformMode
   /** 1=串行灰度对照，6=完整并发 */
   width: number
   /** 低档可播兜底最多保留多久 */
@@ -47,6 +51,7 @@ export interface LaneStatView {
 export const DEFAULT_COMPOSITE_SETTINGS: CompositeSettings = {
   enabled: false,
   members: [],
+  crossPlatformMode: 'fallback',
   width: 1,
   holdMs: 2_000,
   resolveMs: 8_000,
@@ -97,6 +102,7 @@ export function normalizeCompositeSettings(input: Partial<CompositeSettings> = {
   return {
     enabled: input.enabled === true,
     members: normalizeCompositeMembers(input.members),
+    crossPlatformMode: input.crossPlatformMode === 'parallel' ? 'parallel' : 'fallback',
     width: clampInt(input.width, DEFAULT_COMPOSITE_SETTINGS.width, 1, 6),
     holdMs: clampInt(input.holdMs, DEFAULT_COMPOSITE_SETTINGS.holdMs, 0, 5_000),
     resolveMs: clampInt(input.resolveMs, DEFAULT_COMPOSITE_SETTINGS.resolveMs, 1_000, chainMs),
@@ -127,6 +133,7 @@ export async function saveCompositeSettings(patch: Partial<CompositeSettings>): 
   const next = normalizeCompositeSettings({
     enabled: patch.enabled ?? current.enabled,
     members: patch.members === undefined ? current.members : patch.members,
+    crossPlatformMode: patch.crossPlatformMode ?? current.crossPlatformMode,
     width: patch.width ?? current.width,
     holdMs: patch.holdMs ?? current.holdMs,
     resolveMs: patch.resolveMs ?? current.resolveMs,
