@@ -202,8 +202,40 @@ function mpegBytesPerSecond(b: Uint8Array): number | null {
   return null
 }
 
+const ADTS_SAMPLE_RATES = [96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350]
+
+/** ADTS AAC 没有总时长字段，用连续帧长的均值折算整文件帧数。 */
+function adtsDurationSec(head: Uint8Array, sizeBytes: number): number | null {
+  const start = id3v2Length(head)
+  if (start + 14 > head.length || sizeBytes <= start) return null
+  let offset = start
+  let frames = 0
+  let frameBytes = 0
+  let samples = 0
+  let sampleRate: number | null = null
+  while (offset + 7 <= head.length && frames < 512) {
+    if (head[offset] !== 0xff || (head[offset + 1] & 0xf6) !== 0xf0) break
+    const headerLength = (head[offset + 1] & 1) === 1 ? 7 : 9
+    if (offset + headerLength > head.length) break
+    const rateIndex = (head[offset + 2] >> 2) & 0x0f
+    const frameLength = ((head[offset + 3] & 0x03) << 11) | (head[offset + 4] << 3) | (head[offset + 5] >> 5)
+    const rawBlocks = head[offset + 6] & 0x03
+    if (rateIndex >= ADTS_SAMPLE_RATES.length || frameLength < headerLength || offset + frameLength > sizeBytes) break
+    const rate = ADTS_SAMPLE_RATES[rateIndex]
+    if (sampleRate === null) sampleRate = rate
+    else if (sampleRate !== rate) break
+    frames++
+    frameBytes += frameLength
+    samples += 1024 * (rawBlocks + 1)
+    offset += frameLength
+  }
+  if (frames < 3 || sampleRate === null || frameBytes <= 0) return null
+  const audioBytes = Math.max(1, sizeBytes - start)
+  return (audioBytes * samples) / (frameBytes * sampleRate)
+}
+
 /** 首块解时长的依据；null 表示这条容器路径解不出（交回兜底判据） */
-export type HeadDurationBasis = 'flac' | 'cbr-mp3' | null
+export type HeadDurationBasis = 'flac' | 'cbr-mp3' | 'adts-aac' | null
 
 /**
  * 只看首块就把时长估出来。
@@ -225,6 +257,11 @@ export function estimateDurationFromHead(
     if (sec !== null) return { sec, basis: 'flac' }
   }
   if (container === 'mp3' || container === 'mpeg-frame') {
+    const adtsOffset = id3v2Length(head)
+    if (head[adtsOffset] === 0xff && (head[adtsOffset + 1] & 0xf6) === 0xf0) {
+      const adtsSec = adtsDurationSec(head, sizeBytes)
+      return { sec: adtsSec, basis: adtsSec === null ? null : 'adts-aac' }
+    }
     const bps = mpegBytesPerSecond(head)
     if (bps !== null) {
       // ID3v2 那段不是音频，扣掉再折算，否则长标签会把时长抬高

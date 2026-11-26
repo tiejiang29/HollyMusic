@@ -22,7 +22,7 @@ import path from 'path'
 import { prisma, getStorageSongmidForMusicInfo } from '@/lib/db'
 import type { LibrarySong } from '@/lib/generated/prisma'
 import { logger } from '@/lib/logger'
-import { isIncompleteTrial, parseDurationFromFile } from '@/lib/server/audio-integrity'
+import { isIncompleteTrial, judgePayloadLength, minDeclaredBytes, parseDurationFromFile } from '@/lib/server/audio-integrity'
 import { judgeUpstreamPayload, readHeadBytes, extFromContainer, mimeFromAudioExt } from '@/lib/server/audio-sniff'
 import { getAudioServeConfig, buildFullResponse, buildPartialResponse, buildUnsatisfiable, parseRange, removeAudioCacheFiles, extFromContentType } from '@/lib/audio-serve'
 import { sanitizeFilename, extForQuality } from '@/lib/server/download-utils'
@@ -155,13 +155,25 @@ export async function ingestFromCache(cacheKey: string, musicInfo: MusicInfo, qu
     // 不入库，只留在缓存里继续可用（LRU 自然淘汰）。判据来自全库实测：
     // 302 个可正常播放的文件全部匹配已知容器魔数，唯一未匹配的正是那条
     // 「随机数据被误存为 mp3」的坏文件（audio-serve 现已在上游侧拦截同类载荷）。
-    const headBytes = await readHeadBytes(srcPath)
+    const headBytes = await readHeadBytes(srcPath, 32 * 1024)
     const sniff = judgeUpstreamPayload({ contentType: record.contentType, head: headBytes })
     if (sniff.verdict !== 'audio') {
       logger.warn(
         `[music-library] 载荷未通过容器校验，跳过入库: ${musicInfo.name} — ${sniff.reason}`
       )
       return { status: 'skip-error', message: `容器校验未通过：${sniff.reason}` }
+    }
+
+    const lengthCheck = judgePayloadLength({
+      head: headBytes,
+      sizeBytes: srcStat.size,
+      minDeclaredBytes: minDeclaredBytes(musicInfo.types?.map(item => item.size)),
+      intervalSec,
+      container: sniff.container,
+    })
+    if (lengthCheck.reject) {
+      logger.warn(`[music-library] 载荷长度不合格，跳过入库: ${musicInfo.name} — ${lengthCheck.detail}`)
+      return { status: 'skip-error', message: `长度校验未通过：${lengthCheck.detail}` }
     }
 
     const probedSec = await parseDurationFromFile(srcPath)

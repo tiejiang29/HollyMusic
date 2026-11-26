@@ -506,6 +506,19 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     b[0] = 0xff; b[1] = 0xfb; b[2] = 0x90; b[3] = 0x00
     return b
   }
+  function adtsPayload(frames: number, frameLength = 139): Buffer {
+    const frame = Buffer.alloc(frameLength, 0)
+    frame[0] = 0xff
+    frame[1] = 0xf1
+    frame[2] = (2 << 6) | (4 << 2)
+    frame[3] = ((frameLength >> 11) & 0x03) << 6
+    frame[4] = (frameLength >> 3) & 0xff
+    frame[5] = (frameLength & 0x07) << 5
+    if (frameLength >= 24) {
+      frame[20] = 0xff; frame[21] = 0xfb; frame[22] = 0x90; frame[23] = 0x00
+    }
+    return Buffer.concat(Array.from({ length: frames }, () => Buffer.from(frame)))
+  }
   /** m4a 的时长写在文件尾的 moov，首块解不出 ⇒ 只有这类才退回字节比值兜底 */
   function mp4Payload(total: number): Buffer {
     const b = Buffer.alloc(total, 0x41)
@@ -551,6 +564,28 @@ describe('AudioServe.serve() 假地址识别与换源重试', () => {
     expect(sourceHealth.view('片段源A', 'tx')?.badKinds['byte:fake']).toBe(1)
     expect(sourceHealth.view('好源B', 'tx')?.byteOk).toBe(1)
     expect(prisma.audioCache.upsert).toHaveBeenCalledTimes(1)
+  })
+
+  it('ADTS AAC 广告在首块阶段换源，不把 12.79 秒载荷当整曲交付', async () => {
+    const ad = adtsPayload(551)
+    globalThis.fetch = vi.fn(async (input: unknown) => String(input).includes('ad.example')
+      ? payloadResponse(ad, 'audio/x-aac')
+      : payloadResponse(FULL_LOW, 'audio/mpeg')) as unknown as typeof fetch
+    const upstreamUrlResolver: UpstreamUrlResolver = async excludeProviders =>
+      excludeProviders.has('AAC广告源')
+        ? { url: 'https://good.example/aac-full.mp3', provider: 'AAC好源' }
+        : { url: 'https://ad.example/kw.mp3', provider: 'AAC广告源' }
+
+    const resp = await audioServe.serve({
+      cacheKey: 'kw:aac-ad:flac',
+      upstreamUrlResolver,
+      rangeHeader: null,
+      isHead: false,
+      intervalSec: 300,
+    })
+    expect(resp.status).toBe(200)
+    expect((await resp.arrayBuffer()).byteLength).toBe(FULL_LOW.length)
+    expect(sourceHealth.view('AAC广告源', 'kw')?.badKinds['byte:fake']).toBe(1)
   })
 
   it('短歌不再漏检：同一份 60 秒罐头、期望 154 秒，仍然判死（0.35 那版正是这一档漏的）', async () => {

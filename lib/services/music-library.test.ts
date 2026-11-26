@@ -6,9 +6,8 @@
  *   → 拒绝入库，文件留在缓存（仍可播放，LRU 自然淘汰）
  * - 合法容器（ID3 头）→ 正常入库登记
  *
- * 不用「时长探测失败」当门槛的原因（实测结论）：库内 302 个可正常播放的文件
- * 里 116 个 music-metadata 解析不出时长（FLAC STREAMINFO 异常、ADTS/AAC 流等），
- * 而容器嗅探只否掉那 1 个真坏文件，零误伤。
+ * 不用「music-metadata 时长探测失败」当门槛：ADTS AAC 等容器改由首块帧头估算，
+ * 仍然解不出时才保持原有放过策略。
  *
  * 注意：getAudioServeConfig/getLibraryConfig 是模块级缓存，所以 env 必须在
  * import 之前设置好，且整个文件共用同一套临时目录。
@@ -81,6 +80,20 @@ function garbageBuffer(n: number): Buffer {
   return buf
 }
 
+function adtsPayload(frames: number, frameLength = 139): Buffer {
+  const frame = Buffer.alloc(frameLength, 0)
+  frame[0] = 0xff
+  frame[1] = 0xf1
+  frame[2] = (2 << 6) | (4 << 2)
+  frame[3] = ((frameLength >> 11) & 0x03) << 6
+  frame[4] = (frameLength >> 3) & 0xff
+  frame[5] = (frameLength & 0x07) << 5
+  if (frameLength >= 24) {
+    frame[20] = 0xff; frame[21] = 0xfb; frame[22] = 0x90; frame[23] = 0x00
+  }
+  return Buffer.concat(Array.from({ length: frames }, () => Buffer.from(frame)))
+}
+
 beforeAll(async () => {
   await fsp.mkdir(cacheDir, { recursive: true })
   await fsp.mkdir(libraryDir, { recursive: true })
@@ -147,6 +160,18 @@ describe('ingestFromCache 容器嗅探入库门槛', () => {
     expect(result.status).toBe('skip-error')
     expect(result.message).toContain('容器校验未通过')
     expect(prisma.librarySong.create).not.toHaveBeenCalled()
+  })
+
+  it('ADTS AAC 广告：首块帧头算出短时长 ⇒ 拒绝永久入库', async () => {
+    const content = adtsPayload(551)
+    const cacheAbs = await stageCacheFile('ab/aacad001.mp3', content, 'audio/x-aac')
+
+    const result = await ingestFromCache('kw:sm-test:320k', musicInfo, '320k')
+
+    expect(result.status).toBe('skip-error')
+    expect(result.message).toContain('长度校验未通过')
+    expect(prisma.librarySong.create).not.toHaveBeenCalled()
+    await expect(fsp.stat(cacheAbs)).resolves.toBeTruthy()
   })
 
   it('合法容器（ID3 头）→ 正常入库登记', async () => {

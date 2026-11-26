@@ -127,6 +127,24 @@ function mp3Head(total: number, id3BodyBytes = 0): Buffer {
   return b
 }
 
+function adtsFrame(frameLength = 139, sampleRateIndex = 4): Buffer {
+  const b = Buffer.alloc(frameLength, 0)
+  b[0] = 0xff
+  b[1] = 0xf1
+  b[2] = (2 << 6) | (sampleRateIndex << 2)
+  b[3] = ((frameLength >> 11) & 0x03) << 6
+  b[4] = (frameLength >> 3) & 0xff
+  b[5] = (frameLength & 0x07) << 5
+  if (frameLength >= 24) {
+    b[20] = 0xff; b[21] = 0xfb; b[22] = 0x90; b[23] = 0x00
+  }
+  return b
+}
+
+function adtsHead(frames: number, frameLength = 139): Buffer {
+  return Buffer.concat(Array.from({ length: frames }, () => adtsFrame(frameLength)))
+}
+
 /** mp4/m4a 头，并且在里面埋一个"看起来像 MP3 帧头"的四字节（用来验容器闸门） */
 function mp4HeadWithFakeFrame(total: number): Buffer {
   const b = Buffer.alloc(total, 0x41)
@@ -166,6 +184,21 @@ describe('estimateDurationFromHead 首块解时长', () => {
     expect(Math.abs(r.sec! - 60.06)).toBeLessThan(0.01)
   })
 
+  it('ADTS AAC：551 个 139B 帧 ⇒ 12.79s，正是今晚广告载荷的形状', () => {
+    const r = estimateDurationFromHead(adtsHead(551), 551 * 139, 'mpeg-frame')
+    expect(r.basis).toBe('adts-aac')
+    expect(r.sec!.toFixed(2)).toBe('12.79')
+  })
+
+  it('ADTS AAC 支持 ID3v2 前缀，帧不足 3 个时不下结论', () => {
+    const prefix = Buffer.from('ID3\x04\x00\x00\x00\x00\x00\x00', 'latin1')
+    const head = Buffer.concat([prefix, adtsHead(20)])
+    const r = estimateDurationFromHead(head, head.length, 'mp3')
+    expect(r.basis).toBe('adts-aac')
+    expect(Math.abs(r.sec! - (20 * 1024 / 44_100))).toBeLessThan(0.001)
+    expect(estimateDurationFromHead(adtsHead(2), 2 * 139, 'mpeg-frame').sec).toBeNull()
+  })
+
   it('容器闸门：mp4 里埋着伪帧头也不许当 mp3 解（否则乱码会造出假码率）', () => {
     const b = mp4HeadWithFakeFrame(100_000)
     expect(estimateDurationFromHead(b, 100_000, 'mp4').sec).toBeNull()
@@ -191,6 +224,32 @@ describe('judgePayloadLength 两条判据取或', () => {
     })
     expect(r.reject).toBe(true)
     expect(r.basis).toContain('cbr-mp3')
+  })
+
+  it('ADTS AAC 广告：12.79s 对期望 350s、无声明大小 ⇒ 仍判死', () => {
+    const r = judgePayloadLength({
+      head: adtsHead(551),
+      sizeBytes: 551 * 139,
+      minDeclaredBytes: null,
+      intervalSec: 350,
+      container: 'mpeg-frame',
+    })
+    expect(r.reject).toBe(true)
+    expect(r.basis).toBe('adts-aac')
+  })
+
+  it('合法整曲 AAC：按帧长折算 350s ⇒ 不误杀', () => {
+    const frames = 20
+    const frameLength = 139
+    const expectedFrames = Math.round(350 * 44_100 / 1024)
+    const r = judgePayloadLength({
+      head: adtsHead(frames, frameLength),
+      sizeBytes: expectedFrames * frameLength,
+      minDeclaredBytes: null,
+      intervalSec: 350,
+      container: 'mpeg-frame',
+    })
+    expect(r.reject).toBe(false)
   })
 
   it('整曲低音质 m4a（比值 0.628、时长解不出）⇒ 两条都不许拒', () => {
