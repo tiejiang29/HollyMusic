@@ -15,6 +15,7 @@ import { normalizeStructuredLyricText } from './server/lyric-normalize'
 import { findBestAlternative, findAlternativesForPlatforms } from './services/source-toggle'
 import { sourceHealth, isContentMiss, type ResolveOutcome } from './server/source-health'
 import type { CompositeMember, CrossPlatformMode } from './services/composite-source'
+import { getApiRequestPolicy, recordRuntimeTrace, type ApiRequestPolicy, type RuntimeApiLane } from './services/api-catalog'
 
 /** 换源元信息：本次取址发生跨平台自动换源时填充，供 API 层透出给前端展示 */
 export interface SourceToggleInfo {
@@ -54,16 +55,15 @@ async function* completionOrder<T>(tasks: Promise<T>[]): AsyncGenerator<{ value?
   }
 }
 
-/** 音源 slot 代理（子进程或 inline 直连），使用面与 LXEnvironmentSimulator 对齐 */
-interface BackendLaneTrace {
-  laneId: string
-  endpoint: string
-  keyHash: string | null
-  platform?: string | null
-  songId?: string | null
-  quality?: string | null
-  sourceName?: string | null
+function lanesFromError(error: unknown): BackendLaneTrace[] {
+  if (!error || typeof error !== 'object' || !('lxTrace' in error)) return []
+  const trace = (error as { lxTrace?: { lanes?: BackendLaneTrace[] } }).lxTrace
+  return trace?.lanes || []
 }
+
+/** 音源 slot 代理（子进程或 inline 直连），使用面与 LXEnvironmentSimulator 对齐 */
+type BackendLaneTrace = RuntimeApiLane
+type BackendLaneIdentity = Pick<RuntimeApiLane, 'laneId' | 'endpoint' | 'keyHash'>
 
 interface SourceSlot {
   loadScript(scriptPath: string): Promise<SourceInfo>
@@ -72,8 +72,9 @@ interface SourceSlot {
     source: string,
     musicInfo: MusicInfo,
     quality?: string,
+    options?: ApiRequestPolicy,
   ): Promise<{ url: string; usedLanes: BackendLaneTrace[]; traceId?: string }>
-  markBackendLanesBad?(lanes: BackendLaneTrace[], reason: string): Promise<{ marked: number }> | { marked: number }
+  markBackendLanesBad?(lanes: BackendLaneIdentity[], reason: string): Promise<{ marked: number }> | { marked: number }
   getLyric(source: string, musicInfo: MusicInfo): Promise<unknown>
   getPic(...args: unknown[]): Promise<unknown>
   dispose?(): Promise<void> | void
@@ -558,7 +559,7 @@ export class MusicSourceManager {
    * 测量范围改成按脚本声明之后，`pt` 闸门照样把 32 格拦在出网之前（`latencyMs=0`）。
    * 派活侧照旧由 `pt` 说了算（`eligibleFor` 那道没动），所以改的只是"看得见什么"。
    */
-  async markBackendLanesBad(provider: string, lanes: BackendLaneTrace[], reason: string): Promise<void> {
+  async markBackendLanesBad(provider: string, lanes: BackendLaneIdentity[], reason: string): Promise<void> {
     const instance = this.instances.find(item => item.config.name === provider)
     if (!instance || typeof instance.simulator.markBackendLanesBad !== 'function') return
     await instance.simulator.markBackendLanesBad(lanes, reason)
@@ -569,6 +570,7 @@ export class MusicSourceManager {
     musicInfo: MusicInfo,
     quality: QualityType,
     timeoutMs: number,
+    apiPolicy: ApiRequestPolicy,
   ): Promise<{ url: string; provider: string; platform: string; usedLanes: BackendLaneTrace[]; traceId?: string } | null> {
     const sourceConfig = instance.sourceInfo?.sources[musicInfo.source]
     if (!sourceConfig?.actions.includes('musicUrl')) return null
@@ -578,7 +580,7 @@ export class MusicSourceManager {
     try {
       const traced = typeof instance.simulator.getMusicUrlWithTrace === 'function'
         ? await this.withTimeout(
-            instance.simulator.getMusicUrlWithTrace(musicInfo.source, musicInfo, quality),
+            instance.simulator.getMusicUrlWithTrace(musicInfo.source, musicInfo, quality, apiPolicy),
             timeoutMs,
             `获取音乐URL超时: ${instance.config.name} - ${quality}`,
           )
@@ -590,6 +592,8 @@ export class MusicSourceManager {
             ),
             usedLanes: [],
           }
+      void recordRuntimeTrace({ lanes: traced.usedLanes || [] }, instance.config.name)
+        .catch(error => logger.warn('[api-catalog] 写入接口目录失败:', error))
       const tookMs = Date.now() - started
       const url = traced.url
       if (!url || typeof url !== 'string' || !url.trim()) {
@@ -605,10 +609,51 @@ export class MusicSourceManager {
     } catch (error) {
       const tookMs = Date.now() - started
       const message = error instanceof Error ? error.message : String(error)
+      const failedLanes = lanesFromError(error)
+      if (failedLanes.length > 0) {
+        void recordRuntimeTrace({ lanes: failedLanes }, instance.config.name)
+          .catch(writeError => logger.warn('[api-catalog] 写入失败接口目录失败:', writeError))
+      }
       const timedOut = error instanceof SourceTimeoutError
       const outcome: ResolveOutcome = !timedOut && isContentMiss(message) ? 'no-address' : timedOut ? 'timeout' : 'error'
       sourceHealth.recordResolve(instance.config.name, musicInfo.source, outcome, tookMs, message.slice(0, 120))
       return null
+    }
+  }
+
+  async probeSourceInterface(
+    sourceName: string,
+    musicInfo: MusicInfo,
+    quality: QualityType,
+    interfaceId: string,
+  ): Promise<{ url: string | null; usedLanes: BackendLaneTrace[]; latencyMs: number; error: string | null }> {
+    const instance = this.instances.find(item => item.initialized && item.config.name === sourceName)
+    if (!instance) throw new Error('音源未加载或已停用')
+    const sourceConfig = instance.sourceInfo?.sources[musicInfo.source]
+    if (!sourceConfig?.actions.includes('musicUrl')) throw new Error('该音源不支持此平台的 musicUrl')
+    const started = Date.now()
+    try {
+      const result = await this.withTimeout(
+        instance.simulator.getMusicUrlWithTrace!(musicInfo.source, musicInfo, quality, { disabledInterfaceIds: [], onlyInterfaceId: interfaceId }),
+        15_000,
+        '单接口测试超时',
+      )
+      return {
+        url: typeof result.url === 'string' && result.url.trim() ? result.url : null,
+        usedLanes: result.usedLanes || [],
+        latencyMs: Date.now() - started,
+        error: null,
+      }
+    } catch (error) {
+      const trace = error && typeof error === 'object' && 'lxTrace' in error
+        ? (error as { lxTrace?: { lanes?: BackendLaneTrace[] } }).lxTrace
+        : null
+      return {
+        url: null,
+        usedLanes: trace?.lanes || [],
+        latencyMs: Date.now() - started,
+        error: error instanceof Error ? error.message : String(error),
+      }
     }
   }
 
@@ -629,6 +674,7 @@ export class MusicSourceManager {
     const deadline = opts.deadline || Date.now() + budgets.totalMs
     const width = Math.max(1, Math.min(opts.width || 6, 16))
     const crossPlatformMode = opts.crossPlatformMode ?? 'fallback'
+    const apiPolicy = await getApiRequestPolicy()
     type CandidateTarget = { instance: SimulatorInstance; musicInfo: MusicInfo }
 
     const buildTargets = (
@@ -699,6 +745,7 @@ export class MusicSourceManager {
       target.musicInfo,
       requestedQuality,
       Math.max(250, Math.min(budgets.perSourceMs, deadline - Date.now())),
+      apiPolicy,
     )
     const runTargets = async function* (targets: CandidateTarget[]) {
       const orderedTargets = activeTargets(targets)
@@ -813,6 +860,7 @@ export class MusicSourceManager {
     }
 
     let availableInstances = this.instances.filter(i => i.initialized)
+    const apiPolicy = await getApiRequestPolicy()
 
     // 如果当前没有可用实例，尝试重新加载配置并初始化一次
     if (availableInstances.length === 0) {
@@ -918,7 +966,7 @@ export class MusicSourceManager {
           // 单次调用加超时（洛雪脚本挂起时不阻塞整个请求），并被单源/总预算夹住
           const traced = typeof instance.simulator.getMusicUrlWithTrace === 'function'
             ? await this.withTimeout(
-                instance.simulator.getMusicUrlWithTrace(musicInfo.source, musicInfo, quality),
+                instance.simulator.getMusicUrlWithTrace(musicInfo.source, musicInfo, quality, apiPolicy),
                 callTimeoutMs,
                 `获取音乐URL超时: ${instance.config.name} - ${quality}`,
               )
@@ -930,6 +978,8 @@ export class MusicSourceManager {
                 ),
                 usedLanes: [],
               }
+          void recordRuntimeTrace({ lanes: traced.usedLanes || [] }, instance.config.name)
+            .catch(error => logger.warn('[api-catalog] 写入接口目录失败:', error))
           const url = traced.url
           const tookMs = Date.now() - attemptAt
 
@@ -954,6 +1004,11 @@ export class MusicSourceManager {
         } catch (error) {
           const tookMs = Date.now() - attemptAt
           const message = error instanceof Error ? error.message : String(error)
+          const failedLanes = lanesFromError(error)
+          if (failedLanes.length > 0) {
+            void recordRuntimeTrace({ lanes: failedLanes }, instance.config.name)
+              .catch(writeError => logger.warn('[api-catalog] 写入失败接口目录失败:', writeError))
+          }
           // 到预算就是到预算，看身份不看时长
           const timedOut = error instanceof SourceTimeoutError
           // 源在说"这首歌我没有"而不是"我不行"：不少脚本对没版权是抛错而非返回空地址，

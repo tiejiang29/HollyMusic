@@ -138,6 +138,8 @@ API 路由层（app/api/**）        —— 参数校验、鉴权、响应包装
 
 **`/api/audio` 候选流复合模式（2026-11-25，本地未部署）**：配置落 AppSetting 单键 `audioComposite` 并在进程内缓存（面板保存即更新），由“音源管理”页顶部的复合源面板维护；默认关闭、波宽 1，面板可调成员、波宽、低档兜底保留、单源取址、首字节与整链预算，一键关闭立即回到旧串行瀑布。成员形状是 `{sourceName, platform}`：原平台成员直接复用当前 MusicInfo；跨平台成员默认等原平台候选流走完后才按歌名/歌手/时长找同款并上场，避免误匹配提前抢胜，也可切到“从第一轮同时竞价”。跨平台同款本地优先、缺的平台才搜上游，按“原歌+平台集合”缓存 10 分钟/未命中 60 秒。`music-source-manager.getMusicUrlCandidates` 按配置顺序分波，同 lane 只保留一个代表；audio-serve 按面板波宽同时打开候选首块，用容器嗅探、试听时长/声明大小和 `qualityFromBytes` 验收，第一个满足请求档的候选立即胜出。可播但低档的最优候选保留面板指定的 `holdMs`，期间等到高档就替换，否则直接交付已打开的 `reader/preReadChunks`，不重新取址。FLAC 魔数无法区分 16/24bit，因此 Hi-Res 请求遇到真 FLAC 即放行。胜者的 Content-Type/provider/platform 随 `OpenedUpstream` 返回并恢复，避免后试候选覆盖兜底流元数据。lane 观测只展示 `laneId/keyHash/endpoint`、HTTP 成功率、判坏次数与冷却剩余，不展示原始 key。
 
+**运行时接口目录与接口级启停（2026-11-26 新增，本地未部署）**：`lib/music-core/backend-registry.js` 在 lane 之上增加稳定的接口身份 `platform + endpoint + method + requestShapeHash + keyHash`。请求结构只哈希查询参数名、header 名和正文字段形状，不保存参数值；凭据仍只存哈希。`getMusicUrlWithTrace` 回传脚本调用次数、合并后的真实网络次数、HTTP 状态、Content-Type、body 类型、业务 code/msg 和是否带地址，manager 异步写入 `ApiInterface`，写库不阻塞播放。目录按配置音源名合并来源，以 `dedupeKey` 找同平台重复接口；面板支持筛选、批量启停和“每组保留首条”。停用身份由 `getApiRequestPolicy` 缓存 5 秒，经 IPC/`AsyncLocalStorage` 传入沙箱，在出网前阻断；未观察过的新接口默认放行，避免空目录误伤所有音源。单接口测试使用周测同套基准样本（可选歌曲与音质），只放行目标身份，前置登录/token 请求被阻断时记 `blocked`，不冒充接口失效；结果追加到 `ApiInterfaceProbe`，不写播放健康账本。请求合并键也修正为真正的稳定 JSON 哈希，避免不同对象请求都落成 `[object Object]` 而错误合并。
+
 **音源配置** `config/music-sources.json`，每条：`path`（脚本路径）、`name`、`pt`（平台白名单）、`enabled`、`priority`（数字越小越先被尝试）。管理端的启停/排序修改会**原子写回这个文件**（临时文件 + rename）并触发运行时热重载（配置 MD5 变化 → 重建音源实例）。订阅源（subscription）支持在线 URL 自动更新脚本。
 
 **解析瀑布**（`_getMusicUrlSamePlatform`）：
@@ -580,6 +582,8 @@ UA 不必冒充客户端（实测我们那串老 UA 同样出 20 条）。tx 的
 | DELETE | `/api/admin/recommend/[uid]`、`/batch-remove`、`/clear-all` | 取消推荐 |
 | POST | `/api/admin/recommend/ai-filter`、`/ai-generate` | AI 辅助筛选 / AI 生成名单（只读建议，不写库） |
 | GET/POST | `/api/admin/recommend-tasks` | 推荐任务列表 / 创建（含 cancel/rerun/rollback 子接口） |
+| GET/PUT | `/api/admin/api-catalog` | 运行时接口目录 / 单事务批量启停（`updates: [{id, enabled}]`） |
+| GET/POST | `/api/admin/api-catalog/probe` | 每平台两首单测基准样本 / 单接口测试（同进程只跑一轮，冲突 409） |
 | GET/POST | `/api/admin/sources` | 音源配置列表 / 新增 |
 | GET/POST | `/api/admin/sources/probe` | 周测状态 / 立即跑一批周测（POST 返回 202） |
 | GET/POST | `/api/admin/source-advice` | 周测建议 / 固化所选（`action=apply`，只认 id）/ 撤销上次固化（`action=undo`，逐字节还原配置原文） |
@@ -767,12 +771,14 @@ Android / Subsonic 客户端走完全相同的 `/api/audio` 入口（Subsonic �
 | `AudioCache` | 磁盘缓存索引 | cacheKey、filePath、size、contentType、lastAccessAt（LRU 依据） |
 | `LibrarySong` | 本地音乐库登记 | dedupeKey（归一化歌名\|主歌手）、uid、quality、filePath、durationSec |
 | `RecommendTask` | AI 推荐任务 | status、progressJson、addedUids（支持回滚） |
+| `ApiInterface` | 运行时接口目录与启停选择 | platform、endpoint、method、requestShapeHash、dedupeKey、keyHash、sourcesJson、enabled、调用/网络/响应/地址计数、最近业务回包 |
+| `ApiInterfaceProbe` | 单接口测试历史（append-only） | interfaceId、source、platform、quality、songmid、outcome、latencyMs、HTTP/code/msg、urlHost、container、detail |
 
 ---
 
 ## 10. 测试与质量保障
 
-- **两套 vitest**：根目录（node 环境，`lib/**` + `app/**`，服务端）与 frontend（jsdom，hooks/components）。当前服务端 59 文件 / 590 测试。
+- **两套 vitest**：根目录（node 环境，`lib/**` + `app/**`，服务端）与 frontend（jsdom，hooks/components）。当前服务端 116 文件 / 1762 测试，前端 12 文件 / 78 测试。
 - **验证惯例**（每次改动后跑全）：`typecheck` → `lint`（0 error 基线）→ `vitest run` → `pnpm build`；关键改动另做真机探测脚本（起 dev 后 curl 全链路断言，跑完即删）。
 - **写用例时不要用"连一个没人监听的端口"来制造网络错误**：WSL mirrored 网络下 `127.0.0.1` 上没监听的端口**不回 RST、SYN 被静默丢弃**（裸 TCP 实测 10 秒毫无结果），这类断言在 Windows 上秒过、在 WSL 上挂到测试超时。要造错就**起一个真的在听、收到连接立刻 `socket.destroy()` 的服务**（两边都必然拿到 ECONNRESET / socket hang up），并且只断言"走到了错误分支"，不把具体错误码钉进正则。2026-10-16 就是照这条把 `lib/music-core/index.test.ts` 那条环境红改绿的。
 - 测试风格：接口测试 mock Prisma（图级替换），纯逻辑（嗅探/凭据/限速）直接单测；audio-serve 用临时目录 + mock fetch 流验证「跟随交付」语义。

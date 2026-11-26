@@ -19,16 +19,22 @@ vi.mock('./services/source-toggle', () => ({
 vi.mock('./logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
+vi.mock('./services/api-catalog', () => ({
+  getApiRequestPolicy: vi.fn(async () => ({ disabledInterfaceIds: [] })),
+  recordRuntimeTrace: vi.fn(async () => {}),
+}))
 
 const { MusicSourceManager, readUrlBudgets, readSpeakerUrlBudgets, SourceTimeoutError } = await import('./music-source-manager')
 const { sourceHealth } = await import('./server/source-health')
 const { findAlternativesForPlatforms } = await import('./services/source-toggle')
+const { getApiRequestPolicy, recordRuntimeTrace } = await import('./services/api-catalog')
 const { logger } = await import('./logger')
 import type { SimulatorInstance } from './music-source-manager'
 
 beforeEach(() => {
   sourceHealth.reset()
   vi.mocked(findAlternativesForPlatforms).mockReset().mockResolvedValue([])
+  vi.mocked(recordRuntimeTrace).mockClear()
 })
 
 const QUALITIES = ['128k', '320k', 'flac', 'flac24bit']
@@ -379,6 +385,45 @@ describe('周测取址不受 pt 拦（pt 只管派活，不能拿来筛题目）
     const kg = await manager().probeSourceUrl('摘了腾讯的源', { ...musicInfo, source: 'kg' } as never, '320k', 5000)
     expect(kg).toMatchObject({ ok: false, outcome: 'unsupported', latencyMs: 0 })
     expect(kg.reason).toContain('未声明')
+  })
+})
+
+describe('单接口调用的策略与证据隔离', () => {
+  it('只传目标接口身份，不写播放健康账本', async () => {
+    const call = vi.fn(async () => ({ url: 'https://ok/target.flac', usedLanes: [{ interfaceId: 'a'.repeat(24) }] }))
+    const instance = fakeSource('单测源', async () => 'https://unused')
+    instance.simulator.getMusicUrlWithTrace = call as never
+    const manager = managerWith([instance], {})
+    const result = await manager.probeSourceInterface('单测源', musicInfo, '320k', 'a'.repeat(24))
+    expect(call).toHaveBeenCalledWith('kw', musicInfo, '320k', {
+      disabledInterfaceIds: [], onlyInterfaceId: 'a'.repeat(24),
+    })
+    expect(result).toMatchObject({ url: 'https://ok/target.flac', error: null })
+    expect(sourceHealth.view('单测源', 'kw')).toBeNull()
+  })
+
+  it('脚本抛错时也保留已观察接口，失败接口不会从目录消失', async () => {
+    const lane = {
+      laneId: 'a'.repeat(24), interfaceId: 'a'.repeat(24), dedupeKey: 'd'.repeat(24),
+      endpoint: 'https://api.example.com/fail', method: 'GET', requestShapeHash: 's'.repeat(24), keyHash: null,
+    }
+    const instance = fakeSource('失败源', async () => 'https://unused')
+    instance.simulator.getMusicUrlWithTrace = vi.fn(async () => {
+      throw Object.assign(new Error('业务失败'), { lxTrace: { lanes: [lane] } })
+    }) as never
+    const manager = managerWith([instance], {})
+    await expect(manager.getMusicUrlWithProvider(musicInfo, '320k')).rejects.toThrow()
+    expect(recordRuntimeTrace).toHaveBeenCalledWith({ lanes: [lane] }, '失败源')
+  })
+
+  it('真实瀑布读取停用策略并传给脚本', async () => {
+    vi.mocked(getApiRequestPolicy).mockResolvedValueOnce({ disabledInterfaceIds: ['a'.repeat(24)] })
+    const call = vi.fn(async () => ({ url: 'https://ok/target.flac', usedLanes: [] }))
+    const instance = fakeSource('白名单源', async () => 'https://unused')
+    instance.simulator.getMusicUrlWithTrace = call as never
+    const manager = managerWith([instance], {})
+    await manager.getMusicUrlWithProvider(musicInfo, '320k')
+    expect(call).toHaveBeenCalledWith('kw', musicInfo, '320k', { disabledInterfaceIds: ['a'.repeat(24)] })
   })
 })
 

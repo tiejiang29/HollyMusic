@@ -404,3 +404,56 @@ model SourceCandidate {
   @@index([nameKey])
   @@index([verdict, score])
 }
+
+/// 运行时接口目录：从真实取址链路观察到的后端身份，不存脚本正文、请求参数或原始凭据。
+model ApiInterface {
+  id               String              @id
+  platform         String
+  endpoint         String
+  method           String
+  requestShapeHash String
+  dedupeKey        String              @default("")
+  keyHash          String?
+  sourcesJson      String              @default("[]")
+  enabled          Boolean             @default(true)
+  callCount        Int                 @default(0)
+  networkCount     Int                 @default(0)
+  responseCount    Int                 @default(0)
+  httpOkCount      Int                 @default(0)
+  addressCount     Int                 @default(0)
+  lastStatusCode   Int?
+  lastContentType  String?
+  lastBodyType     String?
+  lastCode         String?
+  lastMsg          String?
+  lastUrlExists    Boolean?
+  firstSeenAt      DateTime            @default(now())
+  lastSeenAt       DateTime            @default(now())
+  probes           ApiInterfaceProbe[]
+
+  @@index([platform, endpoint])
+  @@index([lastSeenAt])
+}
+
+/// 管理面板发起的单接口测试，append-only，按 createdAt 取最近一次。
+model ApiInterfaceProbe {
+  id          String       @id
+  interfaceId String
+  interface   ApiInterface @relation(fields: [interfaceId], references: id, onDelete: Cascade)
+  source      String
+  platform    String
+  quality     String
+  songmid     String
+  outcome     String
+  latencyMs   Int?
+  statusCode  Int?
+  code        String?
+  msg         String?
+  urlExists   Boolean?
+  urlHost     String?
+  container   String?
+  detail      String?
+  createdAt   DateTime     @default(now())
+
+  @@index([interfaceId, createdAt])
+}

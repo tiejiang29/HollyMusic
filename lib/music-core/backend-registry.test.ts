@@ -17,6 +17,47 @@ describe('backend lane registry', () => {
     expect(a.keyHash).not.toBe(c.keyHash)
   })
 
+  it('接口身份区分方法、请求结构与 key，平台不同的同名接口不合并', () => {
+    const get = registry.describeRequest('https://api.example.com/x?mid=1', { form: { id: '1' } }, 'get')
+    const sameShape = registry.describeRequest('https://api.example.com/x?mid=2', { form: { id: '2' } }, 'get')
+    const post = registry.describeRequest('https://api.example.com/x?mid=1', { form: { id: '1' } }, 'post')
+    const otherShape = registry.describeRequest('https://api.example.com/x?mid=1', { form: { name: '1' } }, 'get')
+    const otherKey = registry.describeRequest('https://api.example.com/x?mid=1&key=a', { form: { id: '1' } }, 'get')
+
+    expect(get.requestShapeHash).toBe(sameShape.requestShapeHash)
+    expect(new Set([get.interfaceId, post.interfaceId, otherShape.interfaceId, otherKey.interfaceId]).size).toBe(4)
+
+    const tx = registry.beginTrace({ platform: 'tx' })
+    const wy = registry.beginTrace({ platform: 'wy' })
+    registry.recordLane(tx, get)
+    registry.recordLane(wy, get)
+    const txLane = registry.finishTrace(tx).lanes[0]
+    const wyLane = registry.finishTrace(wy).lanes[0]
+    expect(txLane.interfaceId).not.toBe(wyLane.interfaceId)
+    expect(txLane.dedupeKey).toBe(wyLane.dedupeKey)
+  })
+
+  it('trace 回传业务元数据与真实网络次数，不携带响应正文', () => {
+    const traceId = registry.beginTrace({ platform: 'tx', sourceName: '配置源名' })
+    const request = registry.describeRequest('https://api.example.com/x?key=secret', {}, 'post')
+    registry.recordLane(traceId, request)
+    registry.recordLaneResponseMeta(traceId, request, registry.responseMeta(
+      { statusCode: 200, headers: { 'Content-Type': 'application/json' }, bytes: 123 },
+      { code: 503, msg: '系统运行错误', data: { url: 'https://cdn.example.com/a.flac' }, secret: 'never-copy' },
+    ), 1)
+    const lane = registry.finishTrace(traceId).lanes[0]
+
+    expect(lane).toMatchObject({
+      method: 'POST', sourceName: '配置源名', statusCode: 200, code: '503',
+      msg: '系统运行错误', urlExists: true, networkCount: 1, responseCount: 1,
+    })
+    expect(JSON.stringify(lane)).not.toContain('never-copy')
+    expect(JSON.stringify(lane)).not.toContain('cdn.example.com')
+    expect(JSON.stringify(lane)).not.toContain('secret')
+    const redacted = registry.responseMeta({ statusCode: 200 }, { msg: '失败 https://api.example.com/x?token=raw-token key=raw-key' })
+    expect(redacted.msg).toBe('失败 https://api.example.com/x key=[redacted]')
+  })
+
   it('query/header/body 里的凭据都参与 keyHash', () => {
     const query = registry.describeRequest('https://api.example.com/x?token=abc123', {})
     const header = registry.describeRequest('https://api.example.com/x', { headers: { Authorization: 'Bearer abc123' } })
@@ -49,6 +90,13 @@ describe('backend lane registry', () => {
 
     expect(registry.finishTrace(traceId).lanes).toHaveLength(1)
     expect(registry.finishTrace(traceId).lanes).toHaveLength(0)
+  })
+
+  it('请求合并键保留方法与正文，不再把不同对象请求混成一把', () => {
+    const a = registry.buildRequestKey('POST', 'https://api.example.com/x', { form: { id: '1' } })
+    const b = registry.buildRequestKey('POST', 'https://api.example.com/x', { form: { id: '2' } })
+    const c = registry.buildRequestKey('GET', 'https://api.example.com/x', { form: { id: '1' } })
+    expect(new Set([a, b, c]).size).toBe(3)
   })
 
   it('完全相同请求在途时只启动一次，结束后可再次请求', async () => {

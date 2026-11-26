@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -14,6 +14,19 @@ import path from 'node:path'
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { SourceRunnerClient, buildChildEnv } = require('./runner-client')
+
+describe('IPC 错误证据', () => {
+  it('子进程回传的 lane trace 挂在 Error 上，不丢业务元数据', () => {
+    const client = new SourceRunnerClient()
+    const reject = vi.fn()
+    const trace = { lanes: [{ interfaceId: 'a'.repeat(24), statusCode: 200, code: '503' }] }
+    client.pending.set(7, { resolve: vi.fn(), reject, label: 'slot.call' })
+    client.handleMessage({ t: 'result', reqId: 7, ok: false, error: { message: '业务失败' }, trace })
+    expect(reject).toHaveBeenCalledTimes(1)
+    expect(reject.mock.calls[0][0].message).toBe('业务失败')
+    expect(reject.mock.calls[0][0].lxTrace).toEqual(trace)
+  })
+})
 
 describe('buildChildEnv 白名单（防环境变量泄漏）', () => {
   it('业务机密不进入子进程环境变量', () => {

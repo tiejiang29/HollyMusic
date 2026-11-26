@@ -25,6 +25,8 @@ async function startTestServer(handler: http.RequestListener): Promise<{ port: n
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const LXEnvironmentSimulator = require('./index')
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const backendRegistry = require('./backend-registry')
 
 const INITED_KW = `send(EVENT_NAMES.inited, { sources: { kw: { type: 'music', actions: ['musicUrl', 'lyric'], qualitys: ['128k', '320k'] } } })`
 
@@ -135,6 +137,58 @@ describe('LXEnvironmentSimulator 沙箱端到端', () => {
       expect(traced.usedLanes[0].endpoint).toBe(`http://127.0.0.1:${server.port}/v1/song`)
       expect(traced.usedLanes[0].songId).toBe('trace-1')
       expect(JSON.stringify(traced)).not.toContain('raw-secret')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('单接口策略只放行目标身份，停用接口在出网前阻断', async () => {
+    let hitCount = 0
+    const server = await startTestServer((req, res) => {
+      hitCount++
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"ok":true}')
+    })
+    try {
+      const sim = new LXEnvironmentSimulator()
+      await sim.executeScript(`
+        const { EVENT_NAMES, on, send, request } = globalThis.lx
+        on(EVENT_NAMES.request, ({ action }) => {
+          if (action !== 'musicUrl') return Promise.reject(new Error('unsupported'))
+          return new Promise((resolve, reject) => {
+            const base = 'http://127.0.0.1:${server.port}'
+            request(base + '/blocked', {}, err => {
+              if (!err) return reject(new Error('blocked endpoint reached network'))
+              request(base + '/target', {}, (targetErr, resp, body) => {
+                if (targetErr) return reject(targetErr)
+                resolve('https://example.com/' + body.ok + '/' + resp.statusCode)
+              })
+            })
+          })
+        })
+        ${INITED_KW}
+      `)
+      const targetUrl = `http://127.0.0.1:${server.port}/target`
+      const targetDescriptor = backendRegistry.describeRequest(targetUrl, {}, 'get')
+      const targetId = backendRegistry.buildInterfaceId('kw', targetDescriptor)
+      backendRegistry.markLaneBad({
+        ...targetDescriptor,
+        platform: 'kw',
+        songId: 'policy-1',
+        quality: '128k',
+      }, '先前的坏载荷', 60_000)
+      const traced = await sim.getMusicUrlWithTrace('kw', { songmid: 'policy-1' }, '128k', {
+        disabledInterfaceIds: [], onlyInterfaceId: targetId,
+      })
+      expect(traced.url).toBe('https://example.com/true/200')
+      expect(hitCount).toBe(1)
+      expect(traced.usedLanes).toHaveLength(2)
+      expect(traced.usedLanes.find((lane: { interfaceId: string }) => lane.interfaceId === targetId)?.networkCount).toBe(1)
+
+      await expect(sim.getMusicUrlWithTrace('kw', { songmid: 'policy-2' }, '128k', {
+        disabledInterfaceIds: [targetId], onlyInterfaceId: targetId,
+      })).rejects.toThrow(/接口已被管理员停用/)
+      expect(hitCount).toBe(1)
     } finally {
       await server.close()
     }
